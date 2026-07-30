@@ -20,7 +20,7 @@ jobs:
         run: |
           set -euo pipefail
           ALLOWED="rust_decimal thiserror proptest"
-          DEPS=$(cargo tree -p kaikei-core --edges normal --prefix none \
+          DEPS=$(cargo tree -p kaikei-core --edges normal --depth 1 --prefix none \
                  | sed 's/ v[0-9].*//' \
                  | grep -v '^kaikei-core$' \
                  | grep -v '^$' \
