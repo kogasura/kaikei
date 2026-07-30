@@ -1,0 +1,22 @@
+# .github/workflows/supply-chain.yml
+#
+# 依存の脆弱性・ライセンス・出所を検査する。設定は deny.toml。
+# kaikei-core の依存許可（rust_decimal/thiserrorのみ）自体は
+# architecture.yml が別途検査する。
+
+name: supply-chain
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1" # 毎週月曜 03:00 UTC。新規に公表された脆弱性を検知する
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

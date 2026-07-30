@@ -1,0 +1,37 @@
+# cargo-deny 設定。
+# `cargo deny check` で依存の脆弱性・ライセンス・出所を検査する。
+# kaikei-core の依存許可（rust_decimal/thiserrorのみ）は
+# .github/workflows/architecture.yml が別途検査する。ここではライブラリ全体の
+# サプライチェーン健全性（脆弱性・ライセンス・出所）を扱う。
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-workspace = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
