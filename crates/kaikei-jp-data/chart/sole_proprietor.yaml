@@ -1,0 +1,79 @@
+# kaikei-jp-data/chart/sole_proprietor.yaml
+#
+# 個人事業主（青色申告）向けの標準勘定科目テンプレート。
+# ユーザーはこれを複製して自由に編集できる。
+#
+# account_type: Asset | Liability | Equity | Revenue | Expense
+# postable: false なら見出し科目（記帳不可・集計専用）
+
+version: 1
+name: 個人事業主（青色申告）標準
+
+accounts:
+  # ===== 資産 =====
+  - { code: "100", name: "現金",         type: Asset, sort: 100 }
+  - { code: "110", name: "普通預金",     type: Asset, sort: 110 }
+  - { code: "120", name: "定期預金",     type: Asset, sort: 120 }
+  - { code: "130", name: "受取手形",     type: Asset, sort: 130 }
+  - { code: "135", name: "売掛金",       type: Asset, sort: 135 }
+  - { code: "140", name: "有価証券",     type: Asset, sort: 140 }
+  - { code: "150", name: "棚卸資産",     type: Asset, sort: 150 }
+  - { code: "160", name: "前払金",       type: Asset, sort: 160 }
+  - { code: "165", name: "貸付金",       type: Asset, sort: 165 }
+  - { code: "170", name: "立替金",       type: Asset, sort: 170 }
+  - { code: "180", name: "仮払消費税等", type: Asset, sort: 180 }
+  - { code: "200", name: "建物",         type: Asset, sort: 200 }
+  - { code: "210", name: "工具器具備品", type: Asset, sort: 210 }
+  - { code: "220", name: "車両運搬具",   type: Asset, sort: 220 }
+  - { code: "230", name: "ソフトウェア", type: Asset, sort: 230 }
+  - { code: "240", name: "減価償却累計額", type: Asset, sort: 240 }
+  - { code: "250", name: "敷金・保証金", type: Asset, sort: 250 }
+
+  # ===== 負債 =====
+  - { code: "300", name: "支払手形",     type: Liability, sort: 300 }
+  - { code: "310", name: "買掛金",       type: Liability, sort: 310 }
+  - { code: "320", name: "借入金",       type: Liability, sort: 320 }
+  - { code: "325", name: "未払金",       type: Liability, sort: 325 }
+  - { code: "328", name: "前受金",       type: Liability, sort: 328 }
+  - { code: "330", name: "仮受消費税等", type: Liability, sort: 330 }
+  - { code: "335", name: "預り金",       type: Liability, sort: 335 }
+
+  # ===== 純資産 =====
+  - { code: "400", name: "元入金",       type: Equity, sort: 400 }
+  - { code: "410", name: "事業主貸",     type: Equity, sort: 410 }   # 借方残。期首でリセット
+  - { code: "420", name: "事業主借",     type: Equity, sort: 420 }   # 貸方残。期首でリセット
+
+  # ===== 収益 =====
+  - { code: "500", name: "売上高",       type: Revenue, sort: 500 }
+  - { code: "510", name: "家事消費等",   type: Revenue, sort: 510 }
+  - { code: "520", name: "雑収入",       type: Revenue, sort: 520 }
+
+  # ===== 売上原価 =====
+  - { code: "550", name: "期首商品棚卸高", type: Expense, sort: 550 }
+  - { code: "555", name: "仕入高",       type: Expense, sort: 555 }
+  - { code: "560", name: "期末商品棚卸高", type: Expense, sort: 560 }
+
+  # ===== 経費（青色申告決算書の科目に対応）=====
+  - { code: "600", name: "租税公課",     type: Expense, sort: 600 }
+  - { code: "601", name: "荷造運賃",     type: Expense, sort: 601 }
+  - { code: "602", name: "水道光熱費",   type: Expense, sort: 602 }
+  - { code: "603", name: "旅費交通費",   type: Expense, sort: 603 }
+  - { code: "604", name: "通信費",       type: Expense, sort: 604 }
+  - { code: "605", name: "広告宣伝費",   type: Expense, sort: 605 }
+  - { code: "606", name: "接待交際費",   type: Expense, sort: 606 }
+  - { code: "607", name: "損害保険料",   type: Expense, sort: 607 }
+  - { code: "608", name: "修繕費",       type: Expense, sort: 608 }
+  - { code: "609", name: "消耗品費",     type: Expense, sort: 609 }
+  - { code: "610", name: "減価償却費",   type: Expense, sort: 610 }
+  - { code: "611", name: "福利厚生費",   type: Expense, sort: 611 }
+  - { code: "612", name: "給料賃金",     type: Expense, sort: 612 }
+  - { code: "613", name: "外注工賃",     type: Expense, sort: 613 }
+  - { code: "614", name: "利子割引料",   type: Expense, sort: 614 }
+  - { code: "615", name: "地代家賃",     type: Expense, sort: 615 }
+  - { code: "616", name: "貸倒金",       type: Expense, sort: 616 }
+  - { code: "620", name: "支払手数料",   type: Expense, sort: 620 }
+  - { code: "621", name: "新聞図書費",   type: Expense, sort: 621 }
+  - { code: "622", name: "研修費",       type: Expense, sort: 622 }
+  - { code: "623", name: "会議費",       type: Expense, sort: 623 }
+  - { code: "624", name: "車両費",       type: Expense, sort: 624 }
+  - { code: "690", name: "雑費",         type: Expense, sort: 690 }

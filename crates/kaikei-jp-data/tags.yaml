@@ -1,0 +1,47 @@
+# kaikei-jp-data/tags.yaml
+#
+# タグスキーマ。kaikei-core が未登録キーを拒否するため、
+# 新しいタグを使う前に必ずここへ登録する。
+#
+# value_type:   Code | Text | Decimal | Date
+# aggregatable: true なら TrialBalance の group_by に使える
+# required_for: この科目種別の明細では必須（Asset/Liability/Equity/Revenue/Expense）
+
+version: 1
+
+tags:
+  tax_category:
+    value_type: Code
+    aggregatable: true
+    required_for: [Revenue, Expense]
+    description: "消費税区分。tax/jp/{year}.yaml の categories[].code を参照"
+
+  counterparty:
+    value_type: Code
+    aggregatable: true
+    required_for: []
+    description: "取引先コード。counterparties テーブルを参照"
+
+  project:
+    value_type: Code
+    aggregatable: true
+    required_for: []
+    description: "案件・プロジェクトコード。クライアント別粗利の集計に使う"
+
+  business_ratio:
+    value_type: Decimal
+    aggregatable: false
+    required_for: []
+    description: "家事按分の事業割合（0〜1）。税務調査時の根拠として記録する"
+
+  invoice_reg_no:
+    value_type: Text
+    aggregatable: false
+    required_for: []
+    description: "適格請求書発行事業者登録番号（T + 13桁）"
+
+  imported_tx_id:
+    value_type: Text
+    aggregatable: false
+    required_for: []
+    description: "この明細の元になった取込明細の ID（トレーサビリティ）"

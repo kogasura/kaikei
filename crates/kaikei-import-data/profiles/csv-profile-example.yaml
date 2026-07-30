@@ -1,0 +1,74 @@
+# kaikei-import-data/profiles/*.yaml
+#
+# 銀行・カードごとの CSV フォーマット定義。
+# 新しい金融機関への対応は「この YAML を 1 枚追加するだけ」で済むこと。
+# コミュニティからの PR を受け付けやすくするための設計。
+#
+# ★ テスト用の fixture には実データを絶対に置かない。ダミーデータを自作する。
+
+# ============================================================
+# 例1: 入金列と出金列が分かれているタイプ（多くの邦銀）
+# ============================================================
+id: example_bank_separate
+name: サンプル銀行（入出金別列）
+kind: bank
+encoding: Shift_JIS          # 邦銀はほぼこれ
+delimiter: ","
+skip_rows: 1                 # ヘッダ行
+skip_trailing_rows: 0        # 末尾の合計行などがある場合
+
+date:
+  column: 0
+  format: "%Y/%m/%d"
+  era: false                 # true なら和暦（R08/04/15 → 2026-04-15）
+
+amount:
+  mode: separate_columns
+  debit_column: 2            # 出金（お支払金額）
+  credit_column: 3           # 入金（お預り金額）
+  thousands_separator: true  # "1,234" 形式
+
+description:
+  columns: [4, 5]
+  separator: " "
+  trim: true
+  normalize_kana: true       # 半角カナ → 全角（検索性のため）
+
+balance:
+  column: 6
+  optional: true
+
+# external_key の構成要素。冪等性のキーになる。
+# balance を含めると同日同額同摘要の取引を区別できる。
+external_key: [date, amount, direction, description, balance]
+
+---
+# ============================================================
+# 例2: 符号付き 1 列のタイプ（一部のカード会社）
+# ============================================================
+id: example_card_signed
+name: サンプルカード（符号付き）
+kind: credit_card
+encoding: Shift_JIS
+delimiter: ","
+skip_rows: 1
+
+date:
+  column: 0
+  format: "%Y/%m/%d"
+
+amount:
+  mode: signed_column
+  column: 2
+  positive_means: Out        # 正の値が「利用（出金）」を意味する
+  thousands_separator: true
+
+description:
+  columns: [1]
+  trim: true
+  normalize_kana: true
+
+balance:
+  optional: true
+
+external_key: [date, amount, direction, description]

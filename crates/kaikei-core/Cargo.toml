@@ -1,0 +1,20 @@
+# crates/kaikei-core/Cargo.toml
+#
+# ★★★ このファイルに依存を追加してはいけない ★★★
+# CI (architecture.yml) が rust_decimal と thiserror 以外を検出したら失敗する。
+# 追加が必要と判断した場合、実装を止めて人間に相談すること。
+
+[package]
+name = "kaikei-core"
+version = "0.0.1"
+description = "複式簿記のコアエンジン（国・年度に依存しない不変層）"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rust_decimal = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

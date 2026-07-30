@@ -1,0 +1,105 @@
+# .github/workflows/architecture.yml
+#
+# 設計を人間の意志ではなく仕組みで守るための CI。
+# これを無効化・緩和してはいけない。緩和が必要と判断したら人間に相談する。
+
+name: architecture
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  dependency-direction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: kaikei-core は許可された依存のみ
+        run: |
+          set -euo pipefail
+          ALLOWED="rust_decimal thiserror proptest"
+          DEPS=$(cargo tree -p kaikei-core --edges normal --prefix none \
+                 | sed 's/ v[0-9].*//' \
+                 | grep -v '^kaikei-core$' \
+                 | grep -v '^$' \
+                 | sort -u)
+          FAIL=0
+          for d in $DEPS; do
+            if ! echo "$ALLOWED" | grep -qw "$d"; then
+              echo "::error::kaikei-core に禁止された依存: $d"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "kaikei-core は不変層です。DOMAIN.md と CLAUDE.md を確認してください。"
+            echo "依存の追加が本当に必要な場合、実装を止めて人間に相談してください。"
+            exit 1
+          fi
+          echo "OK: $DEPS"
+
+      - name: kaikei-core は sqlx / tokio / serde を参照しない
+        run: |
+          set -euo pipefail
+          if grep -rnE '\b(sqlx|tokio|serde|serde_json|chrono|uuid)\b' crates/kaikei-core/src/; then
+            echo "::error::kaikei-core 内でインフラ層のクレートを参照しています"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: kaikei-import は kaikei-core に依存しない（別コンテキスト）
+        run: |
+          set -euo pipefail
+          if [ -d crates/kaikei-import ]; then
+            if cargo tree -p kaikei-import --edges normal --prefix none \
+               | grep -q 'kaikei-core'; then
+              echo "::error::kaikei-import が kaikei-core に依存しています"
+              echo "取込コンテキストと記帳コンテキストは分離してください（DECISIONS.md D-008）"
+              exit 1
+            fi
+          fi
+          echo "OK"
+
+      - name: 帳簿への UPDATE / DELETE が書かれていない
+        run: |
+          set -euo pipefail
+          if grep -rniE '(update|delete)[[:space:]]+(from[[:space:]]+)?journal_(entries|lines)' \
+             crates/ --include='*.rs' --include='*.sql' \
+             | grep -v 'REVOKE' | grep -v 'no_update' | grep -v 'reject_mutation'; then
+            echo "::error::帳簿本体への UPDATE / DELETE が検出されました"
+            echo "訂正は逆仕訳（reverse）のみです（CLAUDE.md §2）"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: JournalEntry に変更系メソッドが無い
+        run: |
+          set -euo pipefail
+          if grep -nE 'fn[[:space:]]+(update|delete|set_|edit|modify)' \
+             crates/kaikei-core/src/journal.rs crates/kaikei-core/src/journal/*.rs 2>/dev/null; then
+            echo "::error::JournalEntry に変更系メソッドが定義されています"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: f64 が金額に使われていない
+        run: |
+          set -euo pipefail
+          if grep -rn 'f64' crates/kaikei-core/src/ crates/kaikei-jp/src/ 2>/dev/null; then
+            echo "::error::f64 が検出されました。金額に浮動小数点を使わないでください"
+            exit 1
+          fi
+          echo "OK"
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
