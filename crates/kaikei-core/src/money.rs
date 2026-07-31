@@ -220,18 +220,30 @@ impl Money {
     }
 
     /// 按分等に使用する。丸めは `mode` に従う。
-    pub fn mul_ratio(&self, ratio: Ratio, mode: RoundMode) -> Money {
-        let exact = Decimal::from(self.minor) * ratio.as_decimal();
+    /// 符号付き `minor` に対する標準的な丸め（Floor/Ceil は数直線上の切捨/切上）に従う。
+    ///
+    /// `minor` が `rust_decimal::Decimal` の表現上限（約7.9×10^28）を超える場合は
+    /// `CoreError::InvalidAmount` を返す。
+    pub fn mul_ratio(&self, ratio: Ratio, mode: RoundMode) -> Result<Money, CoreError> {
+        let base = Decimal::try_from_i128_with_scale(self.minor, 0).map_err(|_| {
+            CoreError::InvalidAmount {
+                reason: format!(
+                    "金額が範囲外です（{} は rust_decimal の表現上限を超えています）",
+                    self.minor
+                ),
+            }
+        })?;
+        let exact = base * ratio.as_decimal();
         let strategy = match mode {
             RoundMode::Floor => RoundingStrategy::ToNegativeInfinity,
             RoundMode::Ceil => RoundingStrategy::ToPositiveInfinity,
             RoundMode::HalfUp => RoundingStrategy::MidpointAwayFromZero,
         };
         let rounded = exact.round_dp_with_strategy(0, strategy);
-        Money {
+        Ok(Money {
             minor: rounded.mantissa(),
             currency: self.currency,
-        }
+        })
     }
 
     /// 表示用文字列。`"1,234.56"` 形式。`minor_unit` に従って小数点位置を変える
@@ -515,7 +527,10 @@ mod tests {
     fn money_mul_ratio_floor_thirty_percent() {
         let m = Money::from_minor(100_000, Currency::JPY);
         let ratio = Ratio::parse_fraction("0.30").unwrap();
-        assert_eq!(m.mul_ratio(ratio, RoundMode::Floor).minor(), 30_000);
+        assert_eq!(
+            m.mul_ratio(ratio, RoundMode::Floor).unwrap().minor(),
+            30_000
+        );
     }
 
     // M-27
@@ -523,7 +538,7 @@ mod tests {
     fn money_mul_ratio_floor_repeating_decimal() {
         let m = Money::from_minor(100, Currency::JPY);
         let ratio = Ratio::parse_fraction("0.333").unwrap();
-        assert_eq!(m.mul_ratio(ratio, RoundMode::Floor).minor(), 33);
+        assert_eq!(m.mul_ratio(ratio, RoundMode::Floor).unwrap().minor(), 33);
     }
 
     // M-28
@@ -531,7 +546,7 @@ mod tests {
     fn money_mul_ratio_ceil_repeating_decimal() {
         let m = Money::from_minor(100, Currency::JPY);
         let ratio = Ratio::parse_fraction("0.333").unwrap();
-        assert_eq!(m.mul_ratio(ratio, RoundMode::Ceil).minor(), 34);
+        assert_eq!(m.mul_ratio(ratio, RoundMode::Ceil).unwrap().minor(), 34);
     }
 
     // M-29
@@ -539,7 +554,7 @@ mod tests {
     fn money_mul_ratio_half_up() {
         let m = Money::from_minor(1000, Currency::JPY);
         let ratio = Ratio::parse_fraction("0.335").unwrap();
-        assert_eq!(m.mul_ratio(ratio, RoundMode::HalfUp).minor(), 335);
+        assert_eq!(m.mul_ratio(ratio, RoundMode::HalfUp).unwrap().minor(), 335);
     }
 
     // レビュー指摘1: 正しい3桁区切りのカンマは受理する
@@ -558,6 +573,17 @@ mod tests {
         assert!(Money::parse("1234,56", Currency::USD).is_err());
         assert!(Money::parse("1,23", Currency::JPY).is_err());
         assert!(Money::parse("1,2345", Currency::JPY).is_err());
+    }
+
+    // レビュー指摘3: rust_decimal の表現上限を超える金額への mul_ratio は InvalidAmount
+    #[test]
+    fn money_mul_ratio_out_of_decimal_range_is_error() {
+        let m = Money::from_minor(i128::MAX / 2, Currency::JPY);
+        let ratio = Ratio::parse_fraction("0.5").unwrap();
+        assert!(matches!(
+            m.mul_ratio(ratio, RoundMode::Floor),
+            Err(CoreError::InvalidAmount { .. })
+        ));
     }
 
     // M-30
@@ -628,7 +654,7 @@ mod tests {
                 _ => RoundMode::HalfUp,
             };
             let m = Money::from_minor(minor, Currency::JPY);
-            let result = m.mul_ratio(ratio, mode);
+            let result = m.mul_ratio(ratio, mode).unwrap();
             prop_assert!(result.minor() <= m.minor());
         }
     }
