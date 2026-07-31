@@ -3,4 +3,4 @@
 *.sqlite
 *.sqlite3
 .DS_Store
-.claude/
+.claude/scheduled_tasks.lock
