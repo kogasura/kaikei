@@ -31,12 +31,31 @@ impl Currency {
         minor_unit: 2,
     };
 
-    /// 通貨を作る。コードは英大文字3文字でなければならない。
+    /// `minor_unit` に許容する最大値（18）。
+    ///
+    /// ISO 4217 の実在通貨で最大の小数桁数は 4 桁だが、`DOMAIN.md` は
+    /// 暗号資産（8桁以上）への対応を示唆しており、Ethereum の最小単位 Wei は
+    /// 18 桁である。これを許容範囲の上限とする。上限が無いと
+    /// `to_display_string` の `10u128.pow(minor_unit)` が桁あふれし、
+    /// 金額を無言に誤表示（release ビルド）または panic（debug ビルド）させる
+    /// （`DECISIONS.md` D-020）。
+    pub const MAX_MINOR_UNIT: u8 = 18;
+
+    /// 通貨を作る。コードは英大文字3文字、`minor_unit` は 0〜`MAX_MINOR_UNIT`
+    /// でなければならない。
     pub fn new(code: &str, minor_unit: u8) -> Result<Self, CoreError> {
         let bytes = code.as_bytes();
         if bytes.len() != 3 || !bytes.iter().all(u8::is_ascii_uppercase) {
             return Err(CoreError::InvalidValue {
                 reason: format!("通貨コードは英大文字3文字である必要があります: \"{code}\""),
+            });
+        }
+        if minor_unit > Self::MAX_MINOR_UNIT {
+            return Err(CoreError::InvalidValue {
+                reason: format!(
+                    "小数桁数は0〜{}である必要があります: {minor_unit}",
+                    Self::MAX_MINOR_UNIT
+                ),
             });
         }
         let mut array = [0u8; 3];
@@ -230,8 +249,10 @@ impl Money {
     /// 按分等に使用する。丸めは `mode` に従う。
     /// 符号付き `minor` に対する標準的な丸め（Floor/Ceil は数直線上の切捨/切上）に従う。
     ///
-    /// `minor` が `rust_decimal::Decimal` の表現上限（約7.9×10^28）を超える場合は
-    /// `CoreError::InvalidAmount` を返す。
+    /// `minor` 自体が `rust_decimal::Decimal` の表現上限（約7.9×10^28）を超える場合、
+    /// または**金額 × 比率の結果**が表現上限を超える場合は `CoreError::InvalidAmount` を返す。
+    /// `Ratio::parse_rate` は上限を設けていないため、小さい金額でも巨大な比率と
+    /// 掛け合わせれば積が上限を超えうる（`DECISIONS.md` D-018 / D-020）。
     pub fn mul_ratio(&self, ratio: Ratio, mode: RoundMode) -> Result<Money, CoreError> {
         let base = Decimal::try_from_i128_with_scale(self.minor, 0).map_err(|_| {
             CoreError::InvalidAmount {
@@ -241,12 +262,26 @@ impl Money {
                 ),
             }
         })?;
-        let exact = base * ratio.as_decimal();
+        let exact = base.checked_mul(ratio.as_decimal()).ok_or_else(|| {
+            CoreError::InvalidAmount {
+                reason: format!(
+                    "金額 {} と比率 {} の積が rust_decimal の表現上限（約7.9×10^28）を超えています。\
+                     より小さい金額または比率を指定してください",
+                    self.minor,
+                    ratio.as_decimal()
+                ),
+            }
+        })?;
         let strategy = match mode {
             RoundMode::Floor => RoundingStrategy::ToNegativeInfinity,
             RoundMode::Ceil => RoundingStrategy::ToPositiveInfinity,
             RoundMode::HalfUp => RoundingStrategy::MidpointAwayFromZero,
         };
+        // `round_dp_with_strategy` はスケールを 0 まで縮小する（内部表現を除算で
+        // 縮める）だけで、最後に高々 1 を加算するのみ。`exact` は既に
+        // `Decimal` として表現可能な値なので、この操作が桁あふれで panic することはない
+        // （rust_decimal 1.42.1 の実装を確認済み。乗算のような非 checked な
+        // オーバーフローを起こす経路が無い）。
         let rounded = exact.round_dp_with_strategy(0, strategy);
         Ok(Money {
             minor: rounded.mantissa(),
@@ -258,7 +293,12 @@ impl Money {
     /// （JPY は小数なし）。
     pub fn to_display_string(&self) -> String {
         let minor_unit = self.currency.minor_unit() as u32;
-        let scale = 10u128.pow(minor_unit);
+        // `Currency::new` が `minor_unit <= MAX_MINOR_UNIT` を保証するため、
+        // 通常この経路は `checked_pow` が必ず `Some` を返す。それでも
+        // `Currency` を直接構築できる経路が将来できた場合に備え、桁あふれで
+        // panic しないよう多層防御する（失敗時は現実的にありえない巨大な
+        // scale にフォールバックし、整数部と小数部の計算自体は破綻させない）。
+        let scale = 10u128.checked_pow(minor_unit).unwrap_or(u128::MAX);
         let magnitude = self.minor.unsigned_abs();
         let integer_part = magnitude / scale;
         let fractional_part = magnitude % scale;
@@ -481,6 +521,41 @@ mod tests {
         assert_eq!(m.minor(), 1234);
     }
 
+    // ---- Currency ----
+
+    // バグ[B]: 上限値ちょうど（MAX_MINOR_UNIT = 18）は許容する
+    #[test]
+    fn currency_new_at_max_minor_unit_succeeds() {
+        let c = Currency::new("XXX", Currency::MAX_MINOR_UNIT).unwrap();
+        assert_eq!(c.minor_unit(), 18);
+    }
+
+    // バグ[B]: 上限を1でも超えたら拒否する
+    #[test]
+    fn currency_new_above_max_minor_unit_is_error() {
+        assert!(matches!(
+            Currency::new("XXX", Currency::MAX_MINOR_UNIT + 1),
+            Err(CoreError::InvalidValue { .. })
+        ));
+    }
+
+    // バグ[B]: u8 の上限に近い極端な値も拒否する
+    #[test]
+    fn currency_new_extreme_minor_unit_is_error() {
+        assert!(matches!(
+            Currency::new("XXX", 255),
+            Err(CoreError::InvalidValue { .. })
+        ));
+    }
+
+    // バグ[B]: 既存の想定値（0/2/3）は引き続き作れる
+    #[test]
+    fn currency_new_common_minor_units_succeed() {
+        assert!(Currency::new("JPY", 0).is_ok());
+        assert!(Currency::new("USD", 2).is_ok());
+        assert!(Currency::new("KWD", 3).is_ok());
+    }
+
     // ---- 演算 ----
 
     // M-20
@@ -589,10 +664,24 @@ mod tests {
     }
 
     // レビュー指摘3: rust_decimal の表現上限を超える金額への mul_ratio は InvalidAmount
+    // （変換ガード側で落ちる経路。掛け算そのものには到達しない）
     #[test]
     fn money_mul_ratio_out_of_decimal_range_is_error() {
         let m = Money::from_minor(i128::MAX / 2, Currency::JPY);
         let ratio = Ratio::parse_fraction("0.5").unwrap();
+        assert!(matches!(
+            m.mul_ratio(ratio, RoundMode::Floor),
+            Err(CoreError::InvalidAmount { .. })
+        ));
+    }
+
+    // バグ[A]: 金額そのものは表現できても「積」が表現上限を超える場合は
+    // InvalidAmount を返す（panic しない）。2円という現実的な金額でも、
+    // `Ratio::parse_rate` に上限が無いため巨大な比率と組み合わせると到達する経路。
+    #[test]
+    fn money_mul_ratio_product_overflow_is_error() {
+        let m = Money::from_minor(2, Currency::JPY);
+        let ratio = Ratio::parse_rate("79228162514264337593543950335").unwrap();
         assert!(matches!(
             m.mul_ratio(ratio, RoundMode::Floor),
             Err(CoreError::InvalidAmount { .. })
@@ -664,34 +753,53 @@ mod tests {
         ]
     }
 
+    /// PT-04 用。境界値を含む複数の `minor_unit`（0, 1, 2, 3, 4, `MAX_MINOR_UNIT`）を
+    /// 持つ通貨を生成する。かつては JPY/USD/KWD（0, 2, 3）の3値のみで、
+    /// `Currency::new` の `minor_unit` 上限検証（バグ[B]）の境界を
+    /// 機械的に踏めなかった。
+    fn any_currency() -> impl Strategy<Value = Currency> {
+        prop_oneof![
+            Just(Currency::JPY),
+            Just(Currency::USD),
+            Just(Currency::new("KWD", 3).unwrap()),
+            Just(Currency::new("ONE", 1).unwrap()),
+            Just(Currency::new("FOR", 4).unwrap()),
+            Just(Currency::new("MAX", Currency::MAX_MINOR_UNIT).unwrap()),
+        ]
+    }
+
     proptest! {
         // PT-04: Money::parse(m.to_display_string()) が元に戻る
         #[test]
         fn money_parse_display_round_trip(
             minor in any_minor(),
-            currency_idx in 0u8..3,
+            currency in any_currency(),
         ) {
-            let currency = match currency_idx {
-                0 => Currency::JPY,
-                1 => Currency::USD,
-                _ => Currency::new("KWD", 3).unwrap(),
-            };
             let original = Money::from_minor(minor, currency);
             let parsed = Money::parse(&original.to_display_string(), currency).unwrap();
             prop_assert_eq!(parsed.minor(), original.minor());
             prop_assert_eq!(parsed.currency(), original.currency());
         }
 
-        // PT-05: mul_ratio の結果が ratio<=1 のとき元金額を超えない
-        // （rust_decimal の表現上限を超えて mul_ratio が Err を返す場合は対象外。
-        //  その挙動は money_mul_ratio_out_of_decimal_range_is_error で確認済み）
+        // PT-05: mul_ratio の結果は ratio<=1 のとき元金額を超えない。
+        // ratio>1 のときはこの性質は成り立たないため、その場合は結果が `Ok` に
+        // なること自体は許容し、上限比較は行わない。
+        //
+        // かつては `parse_fraction`（ratio<=1 限定）のみを生成しており、
+        // 「金額 × 比率」の積が表現上限を超えて panic するバグ[A]の経路を
+        // 構造的に踏めなかった。`parse_rate` で 1 を超える比率も生成対象に
+        // 含めることで、この proptest 自体がバグ[A]の回帰検知にもなる
+        // （修正前は特定の組み合わせで panic し、テストが失敗していた）。
         #[test]
         fn money_mul_ratio_does_not_exceed_original_when_ratio_le_one(
             minor in any_non_negative_minor(),
-            ratio_str in "0\\.[0-9]{1,3}",
+            ratio_str in prop_oneof![
+                "0\\.[0-9]{1,3}",
+                "[1-9][0-9]{0,2}\\.[0-9]{1,3}",
+            ],
             mode_idx in 0u8..3,
         ) {
-            let ratio = Ratio::parse_fraction(&ratio_str).unwrap();
+            let ratio = Ratio::parse_rate(&ratio_str).unwrap();
             let mode = match mode_idx {
                 0 => RoundMode::Floor,
                 1 => RoundMode::Ceil,
@@ -699,7 +807,9 @@ mod tests {
             };
             let m = Money::from_minor(minor, Currency::JPY);
             if let Ok(result) = m.mul_ratio(ratio, mode) {
-                prop_assert!(result.minor() <= m.minor());
+                if ratio.as_decimal() <= Decimal::ONE {
+                    prop_assert!(result.minor() <= m.minor());
+                }
             }
         }
     }

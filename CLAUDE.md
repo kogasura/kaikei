@@ -204,3 +204,38 @@ MCP 経由で AI が自己修正できる形にする。
 `.github/workflows/commit-hygiene.yml` が PR のコミットメッセージと本文を検査し、
 該当パターンがあれば CI を失敗させる（マージ不可になる）。コミットする際は
 このトレーラー・フッターを付けないこと。
+
+---
+
+## 13. CI が通らないものはマージしない
+
+`main` はブランチ保護下にあり、以下が強制される。**この設定を緩めないこと。**
+
+- PR 経由でしかマージできない（直 push は拒否される）
+- 必須チェックが**全て成功**するまでマージできない（1つでも失敗・実行中ならブロック）
+- `enforce_admins` が有効。リポジトリオーナーもバイパスできない
+- force push とブランチ削除は禁止。履歴は線形に保つ
+
+### 必須チェックに登録されているジョブ
+
+| ジョブ | 定義元 | 検査内容 |
+|---|---|---|
+| `dependency-direction` | `architecture.yml` | core の依存方向、append-only、f64 禁止 |
+| `quality` | `architecture.yml` | fmt / clippy -D warnings / test |
+| `cargo-deny` | `supply-chain.yml` | 脆弱性・ライセンス・依存元 |
+| `no-ai-attribution` | `commit-hygiene.yml` | §12 の AI 帰属表示 |
+
+### 新しい CI ジョブを追加したときの掟
+
+**必須チェックのリストは手動管理であり、ジョブを増やしても自動では追加されない。**
+登録を忘れると、そのジョブが失敗してもマージできてしまい、CI を置いた意味が消える。
+
+新しいジョブを追加したら、**同じ PR の中で**必須チェックにも登録すること:
+
+```bash
+gh api repos/kogasura/kaikei/branches/main/protection/required_status_checks/contexts \
+  -X POST -f 'contexts[]=<新しいジョブ名>'
+```
+
+登録後は上の表にも行を追加する。`gh api repos/kogasura/kaikei/branches/main/protection --jq '.required_status_checks.contexts'`
+で現在の登録状況を確認できる。

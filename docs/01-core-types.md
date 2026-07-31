@@ -19,6 +19,10 @@ impl Currency {
     pub const JPY: Currency = Currency { code: *b"JPY", minor_unit: 0 };
     pub const USD: Currency = Currency { code: *b"USD", minor_unit: 2 };
 
+    /// minor_unit に許容する最大値（18）。暗号資産（Wei は18桁）を上限とする
+    pub const MAX_MINOR_UNIT: u8 = 18;
+
+    /// コードは英大文字3文字、minor_unit は 0〜MAX_MINOR_UNIT でなければエラー
     pub fn new(code: &str, minor_unit: u8) -> Result<Self, CoreError>;
     pub fn code(&self) -> &str;
     pub fn minor_unit(&self) -> u8;
@@ -50,8 +54,10 @@ impl Money {
     pub fn abs(&self) -> Money;
 
     /// 按分等に使用。丸めは呼び出し側の責務（round_mode を明示的に渡す）。
-    /// minor が rust_decimal::Decimal の表現上限を超える場合は
-    /// CoreError::InvalidAmount を返す（D-018）
+    /// minor が rust_decimal::Decimal の表現上限を超える場合、または
+    /// 「金額 × 比率」の積が表現上限を超える場合は CoreError::InvalidAmount を
+    /// 返す（D-018 / D-020）。Ratio::parse_rate に上限が無いため、小さい金額
+    /// でも巨大な比率と組み合わせれば積がオーバーフローしうる
     pub fn mul_ratio(&self, ratio: Ratio, mode: RoundMode) -> Result<Money, CoreError>;
 
     /// 表示用。"1,234.56" 形式
