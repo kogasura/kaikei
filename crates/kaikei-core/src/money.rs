@@ -116,11 +116,18 @@ impl Money {
             None => "0".repeat(minor_unit),
         };
 
-        let magnitude: i128 = format!("{integer_digits}{decimal_digits}")
+        // magnitude は u128 で受ける。i128::MIN の絶対値（i128::MAX + 1）は
+        // i128 で表現できないため、符号を反映する段階で特別扱いする。
+        let magnitude: u128 = format!("{integer_digits}{decimal_digits}")
             .parse()
             .map_err(|_| invalid_amount(format!("数値として解釈できません: \"{s}\"")))?;
 
-        let minor = if negative { -magnitude } else { magnitude };
+        let minor = match (negative, i128::try_from(magnitude)) {
+            (false, Ok(m)) => m,
+            (true, Ok(m)) => -m,
+            (true, Err(_)) if magnitude == i128::MIN.unsigned_abs() => i128::MIN,
+            _ => return Err(invalid_amount(format!("数値として解釈できません: \"{s}\""))),
+        };
         Ok(Money { minor, currency })
     }
 
@@ -594,6 +601,14 @@ mod tests {
         assert!(matches!(a.add(&b), Err(CoreError::InvalidAmount { .. })));
     }
 
+    // レビュー指摘1: i128::MIN もラウンドトリップできる
+    #[test]
+    fn money_parse_display_round_trip_handles_i128_min() {
+        let original = Money::from_minor(i128::MIN, Currency::JPY);
+        let parsed = Money::parse(&original.to_display_string(), Currency::JPY).unwrap();
+        assert_eq!(parsed.minor(), i128::MIN);
+    }
+
     // ---- Ratio ----
 
     // M-40
@@ -622,11 +637,32 @@ mod tests {
 
     // ---- プロパティテスト ----
 
+    /// PT-04/PT-05 共通。通常のランダム範囲に加え、`i128` の境界値
+    /// （`MIN`, `MAX`, `0`）を明示的に含める。今回の `i128::MIN` ラウンドトリップ
+    /// バグはこの境界値を生成範囲に含めていれば機械的に発見できた。
+    fn any_minor() -> impl Strategy<Value = i128> {
+        prop_oneof![
+            8 => -1_000_000_000_000_000i128..=1_000_000_000_000_000i128,
+            1 => Just(i128::MIN),
+            1 => Just(i128::MAX),
+            1 => Just(0i128),
+        ]
+    }
+
+    /// PT-05 用。`mul_ratio` の引数は非負の金額のみを想定するため 0 以上。
+    fn any_non_negative_minor() -> impl Strategy<Value = i128> {
+        prop_oneof![
+            8 => 0i128..=1_000_000_000_000_000i128,
+            1 => Just(i128::MAX),
+            1 => Just(0i128),
+        ]
+    }
+
     proptest! {
         // PT-04: Money::parse(m.to_display_string()) が元に戻る
         #[test]
         fn money_parse_display_round_trip(
-            minor in -1_000_000_000_000_000i128..=1_000_000_000_000_000i128,
+            minor in any_minor(),
             currency_idx in 0u8..3,
         ) {
             let currency = match currency_idx {
@@ -641,9 +677,11 @@ mod tests {
         }
 
         // PT-05: mul_ratio の結果が ratio<=1 のとき元金額を超えない
+        // （rust_decimal の表現上限を超えて mul_ratio が Err を返す場合は対象外。
+        //  その挙動は money_mul_ratio_out_of_decimal_range_is_error で確認済み）
         #[test]
         fn money_mul_ratio_does_not_exceed_original_when_ratio_le_one(
-            minor in 0i128..=1_000_000_000_000_000i128,
+            minor in any_non_negative_minor(),
             ratio_str in "0\\.[0-9]{1,3}",
             mode_idx in 0u8..3,
         ) {
@@ -654,8 +692,9 @@ mod tests {
                 _ => RoundMode::HalfUp,
             };
             let m = Money::from_minor(minor, Currency::JPY);
-            let result = m.mul_ratio(ratio, mode).unwrap();
-            prop_assert!(result.minor() <= m.minor());
+            if let Ok(result) = m.mul_ratio(ratio, mode) {
+                prop_assert!(result.minor() <= m.minor());
+            }
         }
     }
 }
