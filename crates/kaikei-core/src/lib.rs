@@ -10,6 +10,7 @@ mod journal;
 mod money;
 mod period;
 mod tag;
+mod trial_balance;
 
 pub use account::*;
 pub use clock::*;
@@ -18,3 +19,4 @@ pub use journal::*;
 pub use money::*;
 pub use period::*;
 pub use tag::*;
+pub use trial_balance::*;
