@@ -778,8 +778,10 @@ fn reverse_of_reverse_is_allowed() {
 
 // R-10
 //
-// 「元仕訳と逆仕訳を合算すると全科目ゼロ」の完全な検証は `trial_balance.rs`
-// （未実装。次PRで対応）で行う。ここでは `JournalEntry` レベルで確認できる範囲、
+// 「元仕訳と逆仕訳を合算すると全科目ゼロ」の完全な検証は `tests/trial_balance.rs` の
+// `reverse_and_original_combined_have_zero_balance_for_every_account`（決定的な具体例）と
+// `pt03_entry_plus_its_reversal_has_zero_balance_for_every_account`（任意の貸借一致明細に
+// 対する性質としての検証）で行う。ここでは `JournalEntry` レベルで確認できる範囲、
 // すなわち「逆仕訳の借方合計・貸方合計が元仕訳のそれと入れ替わっている」ことのみ検証する。
 #[test]
 fn reverse_and_original_totals_are_swapped() {
