@@ -1020,6 +1020,102 @@ NUL バイトは Postgres 側のエラーメッセージが「なぜ拒否され
 制御文字拒否を足すべきかは未解決のまま残る（core は不変層であり変更は
 人間の承認事項。`CLAUDE.md` §9）。この疑問は `docs/` へ書き出す判断を
 人間に委ねる（Phase 1 の他の申し送りと同様の扱い）。
+## D-042 試算表read modelは集計対象全体で通貨が単一であることを要求する
+
+**決定**: `kaikei-store::query::trial_balance`（PR-6）は、集計結果に
+2種類以上の `(currency, currency_minor_unit)` の組が現れた場合、
+`RepoError::Unsupported` を返す。`journal_lines` は行ごとに
+`currency`/`currency_minor_unit` を持つため理論上は同一期間・同一科目に
+複数通貨が混在しうるが、判定の粒度は科目単位ではなく**集計対象全体**とする。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 科目単位で通貨が一致していればよいとする（`GROUP BY` に通貨を含め、科目ごとに異なる通貨の行を許容する） | `kaikei_core::TrialBalance::from_entries` は対象の仕訳集合**全体**で通貨が単一であることを要求し（`CoreError::CurrencyMismatch`）、科目単位の判定ではない。read model側だけ緩い基準にすると、同じデータに対してcoreとSQL集計で異なる成功/失敗の結果になり、差分テスト（`tests/trial_balance_differential.rs`）で対照できなくなる |
+| 複数通貨をそのまま複数行として返す（呼び出し側に通貨ごとの合算を委ねる） | Phase 1は個人事業主のJPY単一通貨を前提としており（`README.md`）、呼び出し側（app層、PR-7）に複数通貨対応の合算ロジックを要求するのはスコープ外の先取り実装になる（YAGNI）。外貨対応は`DECISIONS.md` D-016で明示的に将来課題とされている |
+
+**理由**: `kaikei_core::TrialBalance::from_entries` と同じ粒度で失敗させることで、
+「SQL集計とcoreの`from_entries`が一致する」という差分テストの前提
+（`tests/trial_balance_differential.rs::trial_balance_rejects_mixed_currencies_like_core_does`）
+が成立する。エラー種別は`RepoError::CurrencyMismatch`のような専用バリアントを
+`kaikei-app::error::RepoError`に追加するのではなく、既存の`Unsupported`
+（「現在の実装ではサポートしていない操作」）を使う。複数通貨のデータ自体は
+不正ではなく（`journal_lines`のスキーマ上正当なデータ）、単に Phase 1 の
+read modelがそれを表示する手段を持たないだけなので、`Corrupt`（データが
+不正）ではなく`Unsupported`（機能未対応）が意味的に正しい。
+
+**トレードオフ**: `RepoError`に新しいバリアントを追加する余地は今回は
+使わない。`Unsupported`は元々「逆仕訳への証憑紐付け」等の別の意味でも
+使われており、`reason`文字列を読まないと具体的に何が未対応なのか
+分からない。次の手が分かる文言（`CLAUDE.md` §11）は`reason`側で担保する
+（「期間や科目を絞り込んで再実行してください」という具体的な対処法を含める）。
+
+---
+
+## D-043 差分テストは`group_by`空のケースを主戦場にし、`group_by`ありは科目単位のロールアップで間接検証する
+
+**決定**: `tests/trial_balance_differential.rs`は、`group_by = &[]`
+（グループ化なし）のケースを主戦場にして、SQL集計とcoreの
+`TrialBalance::from_entries`の結果を行単位で完全に比較する
+（`trial_balance_matches_core_for_empty_group_by`。5科目種別すべての
+残高の向きもここで検証する）。`group_by`ありのケースは、SQL側の結果を
+科目ごとにロールアップして`TrialBalance::balance_of`と突き合わせ、
+かつ各グループの内容（`GroupKeyView`）はテストが構築した既知のタグ
+割り当てに対する期待値と直接比較する
+（`trial_balance_group_by_rolls_up_to_the_same_balance_as_core`）。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `kaikei_core::GroupKey`にアクセサ（`iter()`等）を追加し、SQL側の`GroupKeyView`と直接比較する | phase1計画 §0-7/R9で確認済みのとおり、`GroupKey`は現在`impl`ブロックを1つも持たない不変層（`kaikei-core`）の型であり、変更は人間の承認事項（`CLAUDE.md` §9）。Phase 1のスコープでは変更しない。必要と判断されたらPhase 2以降に人間の承認を得て提案する |
+| `group_by`ありのケースを丸ごとテストしない（`group_by = &[]`のみで済ませる） | `group_by`はこのPRの完了条件の一部（`kaikei_app::ports::TrialBalanceQuery`のシグネチャに含まれる主要な引数）であり、SQL側の実装（`unnest`+`jsonb_object_agg`によるグルーピング）を全く検証しないのは欠陥を見逃すリスクが高い |
+
+**理由**: `GroupKey`を直接比較できないという制約の下で、実務上十分な
+検証強度を得るために2段構えにした。「主戦場」（`group_by`なし）は
+最も基本的なケースであり、残高の向き・SUMの正しさ・LEFT JOINの正しさ
+など、grouping以外の全てのロジックを完全な行単位一致で検証する。
+「間接検証」（`group_by`あり）は、coreが提供する唯一の公開API
+（`balance_of`。科目単位で全グループを合算する）を使ってロールアップの
+整合性を検証しつつ、グルーピングの分割そのものが正しいことは、
+テストが構築した既知の入力データに対する直接的な期待値比較で担保する。
+
+**トレードオフ**: 「SQL側が生成した`GroupKeyView`の集合とcoreの
+`GroupKey`の集合が完全に同型である」ことを機械的に証明してはいない
+（テストデータに対する期待値ベースの検証にとどまる）。`GroupKey`に
+アクセサが追加されれば、より強い自動的な差分比較に置き換えられる。
+
+---
+
+## D-044 `journal_lines.account_code`に対応する`accounts`行が無い場合は`RepoError::Corrupt`にする（`accounts`へのJOINは`LEFT JOIN`）
+
+**決定**: `kaikei-store::query::trial_balance`は`accounts`へ`LEFT JOIN`する
+（`INNER JOIN`にしない）。対応する科目が見つからない
+（`account_type`が`NULL`）行が集計結果に含まれる場合、その行を黙って
+除外せず`RepoError::Corrupt`を返す。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `accounts`へ`INNER JOIN`する | `journal_lines.account_code`に`accounts.code`への外部キー制約は無い（`docs/03-database.md` §2、`crates/kaikei-store/tests/common/mod.rs`のコメント）。`INNER JOIN`にすると、対応する科目が存在しない行が**黙って**試算表の集計から除外される。これは「借方合計と貸方合計が一致しない試算表を返す」という、CLAUDE.md §2・§11が最も嫌う「気づかれない静かなデータ破損」を生む |
+| 科目が見つからない場合は`account_type`不明のまま行を返す（呼び出し側に判断を委ねる） | `kaikei_app::view::BalanceRowView::account_type`は`Option`ではなく必須フィールドであり、契約（`kaikei-app/src/view.rs`、★凍結済み）を変更する必要がある。PR-6の権限内では契約を変更しない |
+
+**理由**: phase1計画 R4「無検証APIの危険面積を減らす」と同じ規律
+（`journal/mapper.rs`の9項目再検証と同種）を、read model側にも適用した。
+`accounts`はマスタ（可変）であり、`journal_lines`は帳簿（append-only）
+なので、両者の整合性はDBの制約だけでは保証されない
+（`docs/03-database.md` §2「過去の仕訳が参照しているため物理削除しない」
+という運用上の前提はあるが、DBのCHECK/FKとして強制されてはいない）。
+「保存できないものを静かに落とさない」という規律を、書き込み側
+（`journal/mapper.rs`、PR-5）だけでなく読み取り側（read model、PR-6）にも
+一貫して適用する。
+
+**トレードオフ**: 通常運用（マスタと帳簿が整合している）では
+`LEFT JOIN`と`INNER JOIN`の実行結果に差は無く、`LEFT JOIN`によるJOIN
+コストのわずかな増加のみがトレードオフになる（個人事業主規模の
+仕訳件数では無視できる）。
 ## D-045 ユースケース関数は依存を素の引数として受け取る（`PostEntryDeps` のような集約構造体を導入しない）
 
 **決定**: `kaikei-app::usecase::{post_entry, reverse_entry, report}::execute`

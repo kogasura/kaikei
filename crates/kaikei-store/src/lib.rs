@@ -17,8 +17,11 @@
 //!   の実装本体と、`JournalRepo`/`ChartRepo`/`PeriodRepo`/`NumberingRepo` の
 //!   各 PostgreSQL 実装（`PgTx` 自体は crate 内部の実装詳細であり公開しない。
 //!   利用側は [`pool::PgStore`] と `kaikei_app::tx::with_tx` を経由する）
-//!
-//! `query`（read model の SQL 集計）はまだここでは宣言しない。PR-6 が追加する。
+//! - [`query`]: `TrialBalanceQuery`（試算表）の SQL 集計による実装
+//!   （`kaikei_app::ports::TrialBalanceQuery` を実装する
+//!   `query::PgTrialBalanceQuery`）。書き込みと違い `Store`/`PgTx` を
+//!   経由せず、SQL から DTO へ直行する（`CLAUDE.md` §6「read model は
+//!   物理的に分離する」）
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -30,6 +33,7 @@ mod journal;
 mod numbering;
 mod period;
 pub mod pool;
+pub mod query;
 pub mod sqlstate;
 mod store;
 pub mod tags;

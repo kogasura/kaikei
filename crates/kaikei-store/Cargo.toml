@@ -26,7 +26,8 @@ rust_decimal = { workspace = true }
 uuid = { workspace = true }
 # PgTx の Drop: commit/rollback 忘れを tracing::warn! で知らせる（phase1計画 R10）
 tracing = { workspace = true }
-# store.rs / journal.rs / chart.rs / period.rs / numbering.rs の #[async_trait] 実装用
+# 書き込み側（store/journal/chart/period/numbering）と read model（query）の
+# 双方で #[async_trait] 実装に使う
 async-trait = { workspace = true }
 # bin/kaikei-migrate.rs 専用（#[tokio::main]）
 tokio = { workspace = true }
@@ -67,4 +68,9 @@ required-features = ["pg-tests"]
 [[test]]
 name = "round_trip"
 path = "tests/round_trip.rs"
+required-features = ["pg-tests"]
+
+[[test]]
+name = "trial_balance_differential"
+path = "tests/trial_balance_differential.rs"
 required-features = ["pg-tests"]

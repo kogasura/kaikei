@@ -1,0 +1,60 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                l.account_code                                                   AS \"account_code!\",\n                a.account_type                                                   AS \"account_type?\",\n                l.currency                                                       AS \"currency!\",\n                l.currency_minor_unit                                            AS \"currency_minor_unit!\",\n                (SELECT jsonb_object_agg(k, l.tags -> k ->> 'v')\n                   FROM unnest($3::text[]) AS k\n                  WHERE l.tags ? k)                                              AS \"group_keys: serde_json::Value\",\n                SUM(CASE WHEN l.side = 1 THEN l.amount_minor ELSE 0 END)::BIGINT AS \"debit_total!: i64\",\n                SUM(CASE WHEN l.side = 2 THEN l.amount_minor ELSE 0 END)::BIGINT AS \"credit_total!: i64\"\n            FROM journal_lines l\n            JOIN journal_entries e ON e.id = l.entry_id\n            LEFT JOIN accounts a   ON a.code = l.account_code\n            WHERE e.entry_date BETWEEN $1 AND $2\n            GROUP BY 1, 2, 3, 4, 5\n            ORDER BY 1, 5\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_code!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_type?",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 2,
+        "name": "currency!",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "currency_minor_unit!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 4,
+        "name": "group_keys: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "debit_total!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "credit_total!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Date",
+        "Date",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "9b93fa64ee1f8ed6f79deb401ef1770fb6ad4bb727b62bbeac789b96dd72ab80"
+}
