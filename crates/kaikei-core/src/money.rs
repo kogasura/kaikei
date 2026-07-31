@@ -337,3 +337,237 @@ pub enum RoundMode {
     /// 四捨五入。
     HalfUp,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ---- 生成と表示 ----
+
+    // M-01
+    #[test]
+    fn money_from_minor_jpy_displays_without_decimal() {
+        let m = Money::from_minor(1000, Currency::JPY);
+        assert_eq!(m.to_display_string(), "1,000");
+    }
+
+    // M-02
+    #[test]
+    fn money_from_minor_usd_displays_with_two_decimals() {
+        let m = Money::from_minor(123_456, Currency::USD);
+        assert_eq!(m.to_display_string(), "1,234.56");
+    }
+
+    // M-03
+    #[test]
+    fn money_parse_jpy_integer_succeeds() {
+        let m = Money::parse("1000", Currency::JPY).unwrap();
+        assert_eq!(m.minor(), 1000);
+    }
+
+    // M-04
+    #[test]
+    fn money_parse_usd_decimal_succeeds() {
+        let m = Money::parse("1234.56", Currency::USD).unwrap();
+        assert_eq!(m.minor(), 123_456);
+    }
+
+    // M-05
+    #[test]
+    fn money_parse_jpy_with_decimal_is_error() {
+        assert!(Money::parse("1000.5", Currency::JPY).is_err());
+    }
+
+    // M-06
+    #[test]
+    fn money_parse_usd_too_many_decimal_digits_is_error() {
+        assert!(Money::parse("1.234", Currency::USD).is_err());
+    }
+
+    // M-07
+    #[test]
+    fn money_parse_non_numeric_is_error() {
+        assert!(Money::parse("abc", Currency::JPY).is_err());
+    }
+
+    // M-08
+    #[test]
+    fn money_parse_negative_value_succeeds() {
+        let m = Money::parse("-500", Currency::JPY).unwrap();
+        assert_eq!(m.minor(), -500);
+    }
+
+    // M-09
+    #[test]
+    fn money_zero_is_zero() {
+        assert!(Money::zero(Currency::JPY).is_zero());
+    }
+
+    // M-10
+    #[test]
+    fn money_parse_three_decimal_currency_succeeds() {
+        let kwd = Currency::new("KWD", 3).unwrap();
+        let m = Money::parse("1.234", kwd).unwrap();
+        assert_eq!(m.minor(), 1234);
+    }
+
+    // ---- 演算 ----
+
+    // M-20
+    #[test]
+    fn money_add_same_currency_succeeds() {
+        let a = Money::from_minor(100, Currency::JPY);
+        let b = Money::from_minor(200, Currency::JPY);
+        assert_eq!(a.add(&b).unwrap().minor(), 300);
+    }
+
+    // M-21
+    #[test]
+    fn money_add_currency_mismatch_is_error() {
+        let a = Money::from_minor(100, Currency::JPY);
+        let b = Money::from_minor(100, Currency::USD);
+        assert!(matches!(a.add(&b), Err(CoreError::CurrencyMismatch { .. })));
+    }
+
+    // M-22
+    #[test]
+    fn money_sub_same_currency_allows_negative_result() {
+        let a = Money::from_minor(100, Currency::JPY);
+        let b = Money::from_minor(150, Currency::JPY);
+        assert_eq!(a.sub(&b).unwrap().minor(), -50);
+    }
+
+    // M-23
+    #[test]
+    fn money_neg_and_abs_invert_and_take_absolute_value() {
+        let a = Money::from_minor(100, Currency::JPY);
+        assert_eq!(a.neg().minor(), -100);
+        assert_eq!(a.neg().abs().minor(), 100);
+    }
+
+    // M-24
+    #[test]
+    fn sum_money_empty_iterator_returns_none() {
+        let items: Vec<Money> = Vec::new();
+        assert_eq!(sum_money(items.iter()).unwrap(), None);
+    }
+
+    // M-25
+    #[test]
+    fn sum_money_currency_mismatch_is_error() {
+        let items = [
+            Money::from_minor(100, Currency::JPY),
+            Money::from_minor(100, Currency::USD),
+        ];
+        assert!(matches!(
+            sum_money(items.iter()),
+            Err(CoreError::CurrencyMismatch { .. })
+        ));
+    }
+
+    // M-26
+    #[test]
+    fn money_mul_ratio_floor_thirty_percent() {
+        let m = Money::from_minor(100_000, Currency::JPY);
+        let ratio = Ratio::parse_fraction("0.30").unwrap();
+        assert_eq!(m.mul_ratio(ratio, RoundMode::Floor).minor(), 30_000);
+    }
+
+    // M-27
+    #[test]
+    fn money_mul_ratio_floor_repeating_decimal() {
+        let m = Money::from_minor(100, Currency::JPY);
+        let ratio = Ratio::parse_fraction("0.333").unwrap();
+        assert_eq!(m.mul_ratio(ratio, RoundMode::Floor).minor(), 33);
+    }
+
+    // M-28
+    #[test]
+    fn money_mul_ratio_ceil_repeating_decimal() {
+        let m = Money::from_minor(100, Currency::JPY);
+        let ratio = Ratio::parse_fraction("0.333").unwrap();
+        assert_eq!(m.mul_ratio(ratio, RoundMode::Ceil).minor(), 34);
+    }
+
+    // M-29
+    #[test]
+    fn money_mul_ratio_half_up() {
+        let m = Money::from_minor(1000, Currency::JPY);
+        let ratio = Ratio::parse_fraction("0.335").unwrap();
+        assert_eq!(m.mul_ratio(ratio, RoundMode::HalfUp).minor(), 335);
+    }
+
+    // M-30
+    #[test]
+    fn money_add_near_i128_max_does_not_overflow() {
+        let a = Money::from_minor(i128::MAX - 1, Currency::JPY);
+        let b = Money::from_minor(2, Currency::JPY);
+        assert!(matches!(a.add(&b), Err(CoreError::InvalidAmount { .. })));
+    }
+
+    // ---- Ratio ----
+
+    // M-40
+    #[test]
+    fn ratio_parse_fraction_valid() {
+        assert!(Ratio::parse_fraction("0.3").is_ok());
+    }
+
+    // M-41
+    #[test]
+    fn ratio_parse_fraction_over_one_is_error() {
+        assert!(Ratio::parse_fraction("1.5").is_err());
+    }
+
+    // M-42
+    #[test]
+    fn ratio_parse_fraction_negative_is_error() {
+        assert!(Ratio::parse_fraction("-0.1").is_err());
+    }
+
+    // M-43
+    #[test]
+    fn ratio_parse_rate_valid() {
+        assert!(Ratio::parse_rate("0.08").is_ok());
+    }
+
+    // ---- プロパティテスト ----
+
+    proptest! {
+        // PT-04: Money::parse(m.to_display_string()) が元に戻る
+        #[test]
+        fn money_parse_display_round_trip(
+            minor in -1_000_000_000_000_000i128..=1_000_000_000_000_000i128,
+            currency_idx in 0u8..3,
+        ) {
+            let currency = match currency_idx {
+                0 => Currency::JPY,
+                1 => Currency::USD,
+                _ => Currency::new("KWD", 3).unwrap(),
+            };
+            let original = Money::from_minor(minor, currency);
+            let parsed = Money::parse(&original.to_display_string(), currency).unwrap();
+            prop_assert_eq!(parsed.minor(), original.minor());
+            prop_assert_eq!(parsed.currency(), original.currency());
+        }
+
+        // PT-05: mul_ratio の結果が ratio<=1 のとき元金額を超えない
+        #[test]
+        fn money_mul_ratio_does_not_exceed_original_when_ratio_le_one(
+            minor in 0i128..=1_000_000_000_000_000i128,
+            ratio_str in "0\\.[0-9]{1,3}",
+            mode_idx in 0u8..3,
+        ) {
+            let ratio = Ratio::parse_fraction(&ratio_str).unwrap();
+            let mode = match mode_idx {
+                0 => RoundMode::Floor,
+                1 => RoundMode::Ceil,
+                _ => RoundMode::HalfUp,
+            };
+            let m = Money::from_minor(minor, Currency::JPY);
+            let result = m.mul_ratio(ratio, mode);
+            prop_assert!(result.minor() <= m.minor());
+        }
+    }
+}
