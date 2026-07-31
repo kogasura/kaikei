@@ -49,8 +49,10 @@ impl Money {
     pub fn neg(&self) -> Money;
     pub fn abs(&self) -> Money;
 
-    /// 按分等に使用。丸めは呼び出し側の責務（round_mode を明示的に渡す）
-    pub fn mul_ratio(&self, ratio: Ratio, mode: RoundMode) -> Money;
+    /// 按分等に使用。丸めは呼び出し側の責務（round_mode を明示的に渡す）。
+    /// minor が rust_decimal::Decimal の表現上限を超える場合は
+    /// CoreError::InvalidAmount を返す（D-018）
+    pub fn mul_ratio(&self, ratio: Ratio, mode: RoundMode) -> Result<Money, CoreError>;
 
     /// 表示用。"1,234.56" 形式
     pub fn to_display_string(&self) -> String;

@@ -256,3 +256,26 @@ D-006（DB 権限）と多層防御になる。
 **拡張の余地**: `kaikei-jp/src/sole_proprietor/` と切ってあるので、
 将来 `corporation/` が並ぶだけ。core は無変更で済む
 （`ClosingPolicy` を trait にした D-001 の設計が効く）。
+
+---
+
+## D-018 Money::mul_ratio は Result を返す
+
+**決定**: `pub fn mul_ratio(&self, ratio: Ratio, mode: RoundMode) -> Result<Money, CoreError>`。
+`minor` を `rust_decimal::Decimal` に変換できない場合（表現上限 約7.9×10^28 を超える場合）は
+`CoreError::InvalidAmount` を返す。
+
+**却下した選択肢**: シグネチャを `-> Money` のまま維持し、変換失敗時は内部で panic させる。
+
+**理由**: Phase 0 コードレビューで、初期実装が `Decimal::from(self.minor)`
+（内部で `unwrap()` する変換）を使っており、`i128` の値が `Decimal` の表現上限を
+超えると `mul_ratio` がパニックすることが発覚した。`Money` は `i128` 全域の値を
+保持できるが `Decimal` は保持できないため、両者の境界には失敗しうる変換が必ず存在する。
+`JournalEntry::new` の貸借検証と同様、失敗しうる操作は `Result` で呼び出し側に返すべきで、
+core 内部での panic は避ける（`CLAUDE.md` の「次の手が分かる文言にする」という
+エラーメッセージ方針とも整合する）。
+
+**トレードオフ**: 呼び出し側は `mul_ratio` の結果を都度 `?` や `match` で処理する必要があり、
+他の演算メソッド（`add`/`sub`）と同じく `Result` ベースの API になる。
+`Money` は元々 `i128` の全域を扱える設計だが、実務上の按分計算でこの上限を
+超える金額はまず発生しない。安全側に倒すコストとして許容する。
