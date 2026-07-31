@@ -230,8 +230,10 @@ impl Money {
     /// 按分等に使用する。丸めは `mode` に従う。
     /// 符号付き `minor` に対する標準的な丸め（Floor/Ceil は数直線上の切捨/切上）に従う。
     ///
-    /// `minor` が `rust_decimal::Decimal` の表現上限（約7.9×10^28）を超える場合は
-    /// `CoreError::InvalidAmount` を返す。
+    /// `minor` 自体が `rust_decimal::Decimal` の表現上限（約7.9×10^28）を超える場合、
+    /// または**金額 × 比率の結果**が表現上限を超える場合は `CoreError::InvalidAmount` を返す。
+    /// `Ratio::parse_rate` は上限を設けていないため、小さい金額でも巨大な比率と
+    /// 掛け合わせれば積が上限を超えうる（`DECISIONS.md` D-018 / D-020）。
     pub fn mul_ratio(&self, ratio: Ratio, mode: RoundMode) -> Result<Money, CoreError> {
         let base = Decimal::try_from_i128_with_scale(self.minor, 0).map_err(|_| {
             CoreError::InvalidAmount {
@@ -241,12 +243,26 @@ impl Money {
                 ),
             }
         })?;
-        let exact = base * ratio.as_decimal();
+        let exact = base.checked_mul(ratio.as_decimal()).ok_or_else(|| {
+            CoreError::InvalidAmount {
+                reason: format!(
+                    "金額 {} と比率 {} の積が rust_decimal の表現上限（約7.9×10^28）を超えています。\
+                     より小さい金額または比率を指定してください",
+                    self.minor,
+                    ratio.as_decimal()
+                ),
+            }
+        })?;
         let strategy = match mode {
             RoundMode::Floor => RoundingStrategy::ToNegativeInfinity,
             RoundMode::Ceil => RoundingStrategy::ToPositiveInfinity,
             RoundMode::HalfUp => RoundingStrategy::MidpointAwayFromZero,
         };
+        // `round_dp_with_strategy` はスケールを 0 まで縮小する（内部表現を除算で
+        // 縮める）だけで、最後に高々 1 を加算するのみ。`exact` は既に
+        // `Decimal` として表現可能な値なので、この操作が桁あふれで panic することはない
+        // （rust_decimal 1.42.1 の実装を確認済み。乗算のような非 checked な
+        // オーバーフローを起こす経路が無い）。
         let rounded = exact.round_dp_with_strategy(0, strategy);
         Ok(Money {
             minor: rounded.mantissa(),
@@ -589,10 +605,24 @@ mod tests {
     }
 
     // レビュー指摘3: rust_decimal の表現上限を超える金額への mul_ratio は InvalidAmount
+    // （変換ガード側で落ちる経路。掛け算そのものには到達しない）
     #[test]
     fn money_mul_ratio_out_of_decimal_range_is_error() {
         let m = Money::from_minor(i128::MAX / 2, Currency::JPY);
         let ratio = Ratio::parse_fraction("0.5").unwrap();
+        assert!(matches!(
+            m.mul_ratio(ratio, RoundMode::Floor),
+            Err(CoreError::InvalidAmount { .. })
+        ));
+    }
+
+    // バグ[A]: 金額そのものは表現できても「積」が表現上限を超える場合は
+    // InvalidAmount を返す（panic しない）。2円という現実的な金額でも、
+    // `Ratio::parse_rate` に上限が無いため巨大な比率と組み合わせると到達する経路。
+    #[test]
+    fn money_mul_ratio_product_overflow_is_error() {
+        let m = Money::from_minor(2, Currency::JPY);
+        let ratio = Ratio::parse_rate("79228162514264337593543950335").unwrap();
         assert!(matches!(
             m.mul_ratio(ratio, RoundMode::Floor),
             Err(CoreError::InvalidAmount { .. })
@@ -682,16 +712,25 @@ mod tests {
             prop_assert_eq!(parsed.currency(), original.currency());
         }
 
-        // PT-05: mul_ratio の結果が ratio<=1 のとき元金額を超えない
-        // （rust_decimal の表現上限を超えて mul_ratio が Err を返す場合は対象外。
-        //  その挙動は money_mul_ratio_out_of_decimal_range_is_error で確認済み）
+        // PT-05: mul_ratio の結果は ratio<=1 のとき元金額を超えない。
+        // ratio>1 のときはこの性質は成り立たないため、その場合は結果が `Ok` に
+        // なること自体は許容し、上限比較は行わない。
+        //
+        // かつては `parse_fraction`（ratio<=1 限定）のみを生成しており、
+        // 「金額 × 比率」の積が表現上限を超えて panic するバグ[A]の経路を
+        // 構造的に踏めなかった。`parse_rate` で 1 を超える比率も生成対象に
+        // 含めることで、この proptest 自体がバグ[A]の回帰検知にもなる
+        // （修正前は特定の組み合わせで panic し、テストが失敗していた）。
         #[test]
         fn money_mul_ratio_does_not_exceed_original_when_ratio_le_one(
             minor in any_non_negative_minor(),
-            ratio_str in "0\\.[0-9]{1,3}",
+            ratio_str in prop_oneof![
+                "0\\.[0-9]{1,3}",
+                "[1-9][0-9]{0,2}\\.[0-9]{1,3}",
+            ],
             mode_idx in 0u8..3,
         ) {
-            let ratio = Ratio::parse_fraction(&ratio_str).unwrap();
+            let ratio = Ratio::parse_rate(&ratio_str).unwrap();
             let mode = match mode_idx {
                 0 => RoundMode::Floor,
                 1 => RoundMode::Ceil,
@@ -699,7 +738,9 @@ mod tests {
             };
             let m = Money::from_minor(minor, Currency::JPY);
             if let Ok(result) = m.mul_ratio(ratio, mode) {
-                prop_assert!(result.minor() <= m.minor());
+                if ratio.as_decimal() <= Decimal::ONE {
+                    prop_assert!(result.minor() <= m.minor());
+                }
             }
         }
     }
