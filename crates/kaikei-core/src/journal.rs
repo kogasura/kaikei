@@ -22,7 +22,7 @@
 use crate::account::{AccountCode, AccountType, ChartOfAccounts};
 use crate::clock::{Clock, Timestamp};
 use crate::error::CoreError;
-use crate::money::{Currency, Money};
+use crate::money::{sum_money, Currency, Money};
 use crate::period::{AccountingDate, FiscalYear, PeriodGuard, PeriodStatus};
 use crate::tag::{TagSchema, TagSet};
 
@@ -189,11 +189,14 @@ pub struct NewEntry {
 /// `lines` が単一通貨であることは呼び出し側の責務
 /// （`JournalEntry::new` の通貨検証、または `rehydrate` の呼び出し元の責任で保証される）。
 /// 該当する明細が無ければゼロを返す。
+///
+/// 合算そのものは `money.rs` の [`sum_money`] に委譲する（縮約ロジックの重複を避ける）。
 fn sum_side(lines: &[JournalLine], currency: Currency, side: Side) -> Result<Money, CoreError> {
-    lines
+    let amounts = lines
         .iter()
         .filter(|line| line.side == side)
-        .try_fold(Money::zero(currency), |acc, line| acc.add(&line.amount))
+        .map(|line| line.amount());
+    Ok(sum_money(amounts)?.unwrap_or_else(|| Money::zero(currency)))
 }
 
 impl JournalEntry {
@@ -311,6 +314,15 @@ impl JournalEntry {
     /// 復元時に同じ検証を繰り返す必要はない（`chart` や `schema` の現在版と
     /// 過去の記帳内容が食い違っていても、それは仕様変更の履歴であって
     /// エラーではない）。
+    ///
+    /// # Panics
+    ///
+    /// この関数自体は panic しないが、ここで検証しなかった不正なデータ
+    /// （`lines` が空、`lines` 内の通貨が混在している等）を渡すと、
+    /// 後から [`JournalEntry::currency`] / [`JournalEntry::debit_total`] /
+    /// [`JournalEntry::credit_total`] を呼び出した時点で panic する。
+    /// 呼び出し側（store層）は [`JournalEntry::new`] を経て永続化されたデータのみを
+    /// 渡す責任を負う。
     #[allow(clippy::too_many_arguments)]
     pub fn rehydrate(
         id: EntryId,
@@ -467,22 +479,67 @@ impl JournalEntry {
     }
 
     /// 借方合計を返す。
+    ///
+    /// # Panics
+    ///
+    /// [`JournalEntry::rehydrate`] 経由で `lines` が空、または通貨が混在した
+    /// インスタンスが作られている場合に panic する（詳細は `rehydrate` の doc を参照）。
     pub fn debit_total(&self) -> Money {
-        sum_side(&self.lines, self.currency(), Side::Debit)
-            .expect("構築時に同一通貨・オーバーフロー無しであることを検証済みのため失敗しない")
+        let currency = self.currency();
+        debug_assert!(
+            self.lines
+                .iter()
+                .all(|line| line.amount().currency() == currency),
+            "JournalEntry::debit_total: 明細の通貨が混在しています。\
+             rehydrate に通貨混在の lines を渡していないか確認してください（store層のバグ）"
+        );
+        sum_side(&self.lines, currency, Side::Debit).expect(
+            "JournalEntry は new/reverse 経由なら常に単一通貨で構築されるため、\
+             明細の合算は（オーバーフローしない限り）失敗しない。\
+             rehydrate 経由でこれが成り立たない場合は呼び出し元（store層）のバグ",
+        )
     }
 
     /// 貸方合計を返す。
+    ///
+    /// # Panics
+    ///
+    /// [`JournalEntry::rehydrate`] 経由で `lines` が空、または通貨が混在した
+    /// インスタンスが作られている場合に panic する（詳細は `rehydrate` の doc を参照）。
     pub fn credit_total(&self) -> Money {
-        sum_side(&self.lines, self.currency(), Side::Credit)
-            .expect("構築時に同一通貨・オーバーフロー無しであることを検証済みのため失敗しない")
+        let currency = self.currency();
+        debug_assert!(
+            self.lines
+                .iter()
+                .all(|line| line.amount().currency() == currency),
+            "JournalEntry::credit_total: 明細の通貨が混在しています。\
+             rehydrate に通貨混在の lines を渡していないか確認してください（store層のバグ）"
+        );
+        sum_side(&self.lines, currency, Side::Credit).expect(
+            "JournalEntry は new/reverse 経由なら常に単一通貨で構築されるため、\
+             明細の合算は（オーバーフローしない限り）失敗しない。\
+             rehydrate 経由でこれが成り立たない場合は呼び出し元（store層）のバグ",
+        )
     }
 
     /// この仕訳の通貨を返す（全明細で共通）。
+    ///
+    /// # Panics
+    ///
+    /// [`JournalEntry::rehydrate`] 経由で `lines` が空のインスタンスが作られている場合に
+    /// panic する（詳細は `rehydrate` の doc を参照）。
     pub fn currency(&self) -> Currency {
+        debug_assert!(
+            !self.lines.is_empty(),
+            "JournalEntry::currency: 明細が空です。\
+             rehydrate に空の lines を渡していないか確認してください（store層のバグ）"
+        );
         self.lines
             .first()
-            .expect("JournalEntry は常に2行以上の明細を持つ（new が構築時に検証済み）")
+            .expect(
+                "JournalEntry は new/reverse 経由なら常に2行以上の明細を持つ。\
+                 rehydrate 経由でこれが成り立たない場合は呼び出し元（store層）のバグ",
+            )
             .amount()
             .currency()
     }
