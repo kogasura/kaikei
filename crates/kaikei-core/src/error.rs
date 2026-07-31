@@ -3,10 +3,12 @@
 //! MCP 経由で AI が自己修正できる文言にする（`CLAUDE.md` §11）。
 //! 差額や期待値を必ず含め、「次に何をすべきか」が読み取れるメッセージにすること。
 
+use crate::account::AccountType;
+
 /// `kaikei-core` の操作が失敗したときに返すエラー。
 ///
-/// `TagTypeMismatch`（`expected: TagValueType` を持つ）と `MissingRequiredTag`
-/// （`account_type: AccountType` を持つ）は未実装。理由は enum 内のコメントを参照。
+/// `TagTypeMismatch`（`expected: TagValueType` を持つ）は `TagValueType`
+/// （`tag.rs`、未実装）に依存するため未実装。理由は enum 内のコメントを参照。
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     /// 貸借が一致しない。
@@ -66,9 +68,15 @@ pub enum CoreError {
 
     // TagTypeMismatch { key: String, expected: TagValueType } は
     // TagValueType（tag.rs、未実装）に依存するため Phase 0 後続PRで追加する。
-    //
-    // MissingRequiredTag { key: String, account_type: AccountType } は
-    // AccountType（account.rs、未実装）に依存するため Phase 0 後続PRで追加する。
+    /// タグスキーマ上、その科目種別の明細では必須のタグが欠落している。
+    #[error("タグ {key} は{}の明細では必須です", account_type.label_ja())]
+    MissingRequiredTag {
+        /// 欠落しているタグキー。
+        key: String,
+        /// 対象の科目種別。
+        account_type: AccountType,
+    },
+
     /// 取引日が会計年度の範囲外。
     #[error("取引日 {date} は会計年度 {fy}（{start}〜{end}）の範囲外です")]
     DateOutOfFiscalYear {

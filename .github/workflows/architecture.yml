@@ -43,7 +43,14 @@ jobs:
       - name: kaikei-core は sqlx / tokio / serde を参照しない
         run: |
           set -euo pipefail
-          if grep -rnE '\b(sqlx|tokio|serde|serde_json|chrono|uuid)\b' crates/kaikei-core/src/; then
+          # use 文・パス参照・extern crate という「実際のコード参照」のみを見る。
+          # 単なる単語一致だと「chrono は使わない」のような、依存しない理由を
+          # 説明する doc コメント自体を誤検知してしまうため。
+          HITS=$(grep -rnE '(^|[^[:alnum:]_])(sqlx|tokio|serde|serde_json|chrono|uuid)::|^[[:space:]]*use[[:space:]]+(sqlx|tokio|serde|serde_json|chrono|uuid)\b|^[[:space:]]*extern[[:space:]]+crate[[:space:]]+(sqlx|tokio|serde|serde_json|chrono|uuid)\b' \
+                 crates/kaikei-core/src/ \
+                 | grep -vE ':[0-9]+:[[:space:]]*//' || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS"
             echo "::error::kaikei-core 内でインフラ層のクレートを参照しています"
             exit 1
           fi
