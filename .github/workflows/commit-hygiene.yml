@@ -23,7 +23,10 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          PATTERN='Co-Authored-By:.*Claude|noreply@anthropic\.com|Generated with.*Claude Code|claude\.com/claude-code'
+          # メールアドレス・URLなど実際のトレーラー/フッターに固有の文字列のみを見る。
+          # 「Co-Authored-By: Claude」のような自然文的なパターンは、この仕組み自体を
+          # 説明するコミットメッセージ（このコミット等）を誤検知するため使わない。
+          PATTERN='noreply@anthropic\.com|claude\.com/claude-code'
           BAD=$(git log --format=%B "$BASE_SHA".."$HEAD_SHA" | grep -inE "$PATTERN" || true)
           if [ -n "$BAD" ]; then
             echo "::error::コミットメッセージにAI帰属表示が含まれています:"
@@ -39,7 +42,7 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-          PATTERN='Co-Authored-By:.*Claude|noreply@anthropic\.com|Generated with.*Claude Code|claude\.com/claude-code'
+          PATTERN='noreply@anthropic\.com|claude\.com/claude-code'
           if printf '%s' "$PR_BODY" | grep -inE "$PATTERN"; then
             echo "::error::PR本文にAI帰属表示が含まれています。PRの説明文から取り除いてください。"
             exit 1
