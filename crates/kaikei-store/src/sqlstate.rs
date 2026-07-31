@@ -10,18 +10,45 @@
 //! で、テストのためだけにスタブ実装を用意するコストが見合わない。写像
 //! ロジックだけをこの純関数として切り出して検証し、`sqlx::Error` を実際に
 //! 構築して検証するテストは PostgreSQL が必要な `pg-tests` 側
-//! （`tests/append_only.rs` 等）に委ねる）。
+//! （`tests/append_only.rs` / `tests/schema_constraints.rs`）に委ねる）。
 //!
-//! # 対応表（`DECISIONS.md` D-032）
+//! # 対応表（`DECISIONS.md` D-032 / D-038）
 //!
 //! | SQLSTATE | 意味 | 写像先 |
 //! |---|---|---|
 //! | `42501` | insufficient_privilege（`kaikei_app` が帳簿を UPDATE 等しようとした） | [`RepoError::AppendOnlyViolation`] |
-//! | `P0001` | raise_exception（append-only トリガ `reject_mutation` が発火） | [`RepoError::AppendOnlyViolation`] |
+//! | `P0010` | `reject_mutation` トリガの発火（append-only 違反。`migrations/0008_distinct_error_codes.sql`） | [`RepoError::AppendOnlyViolation`] |
+//! | `P0011` | `assert_entry_is_balanced` トリガの発火（貸借不一致。store層のバグ検出。同上） | [`RepoError::Corrupt`]（理由は下記） |
+//! | `P0001` | raise_exception（ERRCODE を指定しない汎用の `RAISE EXCEPTION`。どのトリガかを断定できない） | [`RepoError::Backend`]（理由は下記） |
 //! | `23505` | unique_violation | [`RepoError::Conflict`] |
 //! | `22003` | numeric_value_out_of_range（`SUM(...)::BIGINT` の桁あふれ等。`DECISIONS.md` D-033） | [`RepoError::OutOfRange`] |
 //! | `23502` / `23514` | not_null_violation / check_violation | [`RepoError::Corrupt`]（理由は下記） |
 //! | その他 | 未分類 | [`RepoError::Backend`] |
+//!
+//! ## `P0010`/`P0011` を分けた経緯（`DECISIONS.md` D-038。D-037 を上書きする決定）
+//!
+//! 当初 `migrations/0004_append_only_triggers.sql` の `reject_mutation`
+//! （append-only 違反）と `assert_entry_is_balanced`（貸借不一致検出）は
+//! どちらも ERRCODE を指定しない `RAISE EXCEPTION` を使っており、結果として
+//! 両方とも PostgreSQL の既定コード `P0001` を返していた。この状態で
+//! `P0001` を `AppendOnlyViolation` に写像すると、貸借不一致（store層の
+//! バグでしか起こりえない）が「append-only 違反」として報告され、
+//! 「訂正は逆仕訳で行ってください」という**完全に誤った対処法**を
+//! 提示してしまう（`CLAUDE.md` §11 違反。Phase 0 の循環参照バグ「無関係の
+//! 科目を犯人として名指しし、破壊的で無駄な修正に誘導する」と同じ欠陥
+//! クラス）。`migrations/0008_distinct_error_codes.sql` で両トリガに
+//! 別々の ERRCODE（`P0010`/`P0011`）を与えることでこれを解消した
+//! （D-037 の「既知の限界として受容する」という判断を D-038 で覆した）。
+//!
+//! ## なぜ `P0001` を `Backend` にしたか
+//!
+//! `P0010`/`P0011` を専用コードとして切り出した後も、`P0001` 自体は
+//! 汎用の `raise_exception`（将来 ERRCODE を指定しない `RAISE EXCEPTION` が
+//! 別の用途で追加される可能性がある）として残る。この汎用コードだけからは
+//! 「append-only 違反」なのか「貸借不一致」なのか、あるいは全く別の理由
+//! なのかを一切断定できないため、`AppendOnlyViolation`（「逆仕訳で」という
+//! 特定の対処法を案内する）に寄せることはできない。診断情報を失わせない
+//! `Backend` に写像し、`reason` にメッセージ本文をそのまま含める。
 //!
 //! ## なぜ `23502`/`23514` を `Corrupt` にしたか（`DECISIONS.md` D-037）
 //!
@@ -34,26 +61,16 @@
 //! [`RepoError::Corrupt`] の doc コメントは主に「復元処理の直前に行う
 //! 再検証で検出した不整合」を指すが、「永続化しようとしたデータが構造的な
 //! 不変条件を満たさない」という点で性質が同じであり、既存の7バリアントの
-//! 中ではこれが最も近い。
-//!
-//! ## 既知の限界: `P0001` は `reject_mutation` 以外のトリガとも共有される
-//!
-//! `migrations/0004_append_only_triggers.sql` の `assert_entry_is_balanced`
-//! （貸借不一致を検出する遅延制約トリガ）も無条件の `RAISE EXCEPTION`
-//! （既定 SQLSTATE `P0001`）を使う。したがってこの写像は、本来 append-only
-//! 違反ではない「貸借不一致トリガの発火」（`JournalEntry::new` の検証を
-//! 経ずに `journal_lines` へ書き込まれた場合のみ起こりうる store 層のバグ）も
-//! `AppendOnlyViolation` として報告してしまう。両者を判別するにはメッセージ
-//! 文字列の内容を見るほかなく、`reject_mutation`（意図したユーザー操作の
-//! 拒否）が P0001 の主要な発生源であるため、現時点ではこの限界を意図的に
-//! 許容している（このコミットのスコープではメッセージによる判別ロジックを
-//! 追加しない）。
+//! 中ではこれが最も近い。`P0011`（貸借不一致）も同じ理由で `Corrupt` にし、
+//! メッセージは「逆仕訳で訂正してください」とは案内しない（対処法が
+//! 全く異なるため。逆仕訳で直せるのは正しく記帳された仕訳の取消であり、
+//! 貸借不一致はそもそも記帳処理自体が壊れていたことを示す）。
 
 use kaikei_app::error::RepoError;
 
 /// SQLSTATE コードとメッセージから [`RepoError`] を組み立てる。
 ///
-/// `code` は5文字の SQLSTATE（例: `"42501"`, `"P0001"`）。`message` は
+/// `code` は5文字の SQLSTATE（例: `"42501"`, `"P0010"`）。`message` は
 /// データベースが返した人間可読のエラーメッセージで、そのまま `reason` に
 /// 含める（診断情報として有用なため）。
 pub fn map_sqlstate(code: &str, message: &str) -> RepoError {
@@ -61,9 +78,16 @@ pub fn map_sqlstate(code: &str, message: &str) -> RepoError {
         "42501" => RepoError::AppendOnlyViolation {
             reason: format!("権限エラーです（SQLSTATE 42501: insufficient_privilege）: {message}"),
         },
-        "P0001" => RepoError::AppendOnlyViolation {
+        "P0010" => RepoError::AppendOnlyViolation {
             reason: format!(
-                "データベースのトリガによって拒否されました（SQLSTATE P0001）: {message}"
+                "append-only トリガによって拒否されました（SQLSTATE P0010）: {message}"
+            ),
+        },
+        "P0011" => RepoError::Corrupt {
+            reason: format!(
+                "貸借不一致を検出しました（SQLSTATE P0011）。アプリ層の検証\
+                 （JournalEntry::new）を経ずに journal_lines へ書き込まれた\
+                 可能性があります（store層のバグ）: {message}"
             ),
         },
         "23505" => RepoError::Conflict {
@@ -108,12 +132,31 @@ mod tests {
     }
 
     #[test]
-    fn raise_exception_maps_to_append_only_violation() {
+    fn reject_mutation_trigger_maps_to_append_only_violation() {
         let err = map_sqlstate(
-            "P0001",
+            "P0010",
             "append-only table: journal_entries は変更できません（訂正は逆仕訳で行ってください）",
         );
         assert!(matches!(err, RepoError::AppendOnlyViolation { .. }));
+    }
+
+    // D-038: 貸借不一致トリガ（P0011）は AppendOnlyViolation ではなく Corrupt に
+    // 写像され、「逆仕訳で」という誤った対処法を案内しないこと。
+    #[test]
+    fn unbalanced_entry_trigger_maps_to_corrupt_not_append_only_violation() {
+        let err = map_sqlstate(
+            "P0011",
+            "貸借不一致: entry_id=... の借方合計(1000) と貸方合計(500) が一致しません",
+        );
+        assert!(matches!(err, RepoError::Corrupt { .. }));
+        assert!(!err.to_string().contains("逆仕訳"));
+    }
+
+    // 汎用の raise_exception（P0001）はどちらのトリガかを断定できないため Backend。
+    #[test]
+    fn generic_raise_exception_maps_to_backend() {
+        let err = map_sqlstate("P0001", "some other raised exception");
+        assert!(matches!(err, RepoError::Backend { .. }));
     }
 
     #[test]

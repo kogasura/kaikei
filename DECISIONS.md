@@ -810,3 +810,68 @@ DB のワイヤ形式が保持できないため）。PR-5 本体の `tests/roun
 `JournalEntry::new` の検証を経ずに `journal_lines` へ書き込まれた場合
 （store 層のバグ）に限られ、通常運用では発生しない前提のため、メッセージ
 文字列による判別ロジックは本コミットのスコープでは追加しない。
+
+> **追記（この決定は覆した）**: 上記の「既知の限界として受容する」という
+> 判断は、`CLAUDE.md` §11（次の手が分かる文言にする）違反であり、
+> Phase 0 の循環参照バグ（無関係の科目を犯人として名指しし、破壊的で
+> 無駄な修正に誘導する）と同じ欠陥クラスであると判明したため、
+> **D-038 で覆した**。`P0001` は現在 `RepoError::Backend` に写像される
+> （`AppendOnlyViolation` ではない）。詳細は D-038 を参照。
+
+---
+
+## D-038 append-only 違反と貸借不一致の SQLSTATE を分離する（D-037 を覆す決定）
+
+**決定**: 新規マイグレーション `migrations/0008_distinct_error_codes.sql`
+（`CREATE OR REPLACE FUNCTION`。適用済みの `0004_append_only_triggers.sql`
+は編集しない）で、`reject_mutation()`（append-only 違反）と
+`assert_entry_is_balanced()`（貸借不一致検出）の2つのトリガ関数それぞれに
+`RAISE EXCEPTION ... USING ERRCODE = '...'` で異なる SQLSTATE を明示する。
+
+- `P0010`: `reject_mutation()`（append-only 違反）
+- `P0011`: `assert_entry_is_balanced()`（貸借不一致。store層のバグ検出）
+
+これに伴い `kaikei-store::sqlstate::map_sqlstate` を更新する。
+`P0010` → `RepoError::AppendOnlyViolation`、`P0011` → `RepoError::Corrupt`
+（`AppendOnlyViolation` ではない。「逆仕訳で訂正してください」とは案内
+しない）。`P0001` 自体は ERRCODE を指定しない汎用の `raise_exception` として
+残り、`RepoError::Backend` に写像する（どちらのトリガかを断定できない
+汎用コードから特定の対処法を案内するとかえって誤りうるため）。エラー
+メッセージ本文は変更しない。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `0004_append_only_triggers.sql` を直接編集して ERRCODE を追加する | `CLAUDE.md` §2 マイグレーションの掟（適用済みファイルを書き換えない）に反する。`sqlx` は `_sqlx_migrations` テーブルで各マイグレーションの checksum を検証しており、適用済みファイルを1バイトでも書き換えると次回の `migrate run` が checksum 不一致で失敗する（R11） |
+| `P0001` のままメッセージ文字列の内容で判別する（D-037 の「既知の限界」を維持する） | メッセージ文字列のパターンマッチはトリガの文言変更に対して壊れやすく、`kaikei-store::sqlstate` という「SQLSTATE を見て判断する」という設計方針（`DECISIONS.md` D-032）にも反する。ERRCODE そのものを分ける方が構造的に確実 |
+| `P0001` を維持しつつ `assert_entry_is_balanced()` だけ新しいコードに変える（`reject_mutation()` は `P0001` のまま） | `reject_mutation()` は append-only 違反という最も高頻度に発生しうる経路であり、これを汎用コード `P0001` に残したままにすると、将来 ERRCODE 未指定の別の `RAISE EXCEPTION` が追加されたときに再び判別不能になる。両方を専用コードへ移し、`P0001` 自体は「どちらでもない」ことを表す汎用コードとして空けておく方が将来の拡張に対して頑健 |
+
+**理由**: 当初（D-037）は「`P0001` の共有は起こりにくい状況（store層の
+バグでしか貸借不一致トリガは発火しない）なので、意図的に許容する」と
+判断していた。しかしこの判断は、`RepoError::AppendOnlyViolation` の
+Display（`kaikei-app::error::RepoError`）が常に「訂正は逆仕訳で行って
+ください」という文言を含むため、貸借不一致（store層のバグ、逆仕訳では
+直せない）が発生した場合に**完全に誤った対処法を案内する**ことを意味する。
+これは `CLAUDE.md` §11「次の手が分かる文言にする」に反し、Phase 0 で
+発見された循環参照バグ（`ChartOfAccounts::new` が循環に無関係な科目を
+犯人として名指しし、その科目を修正するという無駄で的外れな対応に
+誘導した）と同じ欠陥クラス（**誤った診断が誤った、時に破壊的な対応に
+誘導する**）である。SQLSTATE を実際に分離することで、`map_sqlstate`
+という1箇所の写像ロジックだけで正しい案内を機械的に保証できる。
+
+ERRCODE の選定は PostgreSQL のエラーコード一覧でクラス `P0`
+（PL/pgSQL Error Codes）を使う。このクラスの `P0000`〜`P0004`
+（`plpgsql_error` / `raise_exception` / `no_data_found` / `too_many_rows` /
+`assign_incompatible_datatypes`）は PL/pgSQL 本体の組み込み擬似エラーとして
+既に割り当て済みだが、`P0005` 以降はどの組み込みコードにも割り当てられて
+いない。将来 PostgreSQL 本体がこのクラスに新しい組み込みコードを追加する
+可能性に備えて `P0005`〜`P0009` を空けたうえで `P0010`/`P0011` を割り当てた
+（クラス自体は PL/pgSQL の `RAISE EXCEPTION` から生じるアプリケーション
+固有のエラーという意味で一致しており、既存の標準 SQLSTATE とは衝突しない）。
+
+**トレードオフ**: 新規マイグレーション1件が増える（`0004` を直接編集
+できないため）。また `P0001` を `Backend` に落とすことで、将来
+ERRCODE 未指定の `RAISE EXCEPTION` が別の意図で追加された場合、その
+エラーも「未分類」として扱われる（適切な専用 ERRCODE を都度割り当てる
+運用を続ける必要がある）。

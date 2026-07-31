@@ -10,13 +10,16 @@
 //! 確認する経路は2つ（phase1計画 R5）:
 //! - kaikei_app（アプリロール）: ロール権限（REVOKE）で拒否される → 42501
 //! - kaikei_migrator（テーブル所有者）: REVOKE をバイパスできるため、
-//!   トリガ（reject_mutation）が最後の砦として拒否する → P0001
+//!   トリガ（reject_mutation）が最後の砦として拒否する → P0010
+//!   （`migrations/0008_distinct_error_codes.sql` で `P0001` から分離。
+//!   `DECISIONS.md` D-038）
 
 #![cfg(feature = "pg-tests")]
 
 mod common;
 
 use common::sqlstate;
+use kaikei_app::error::RepoError;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use uuid::Uuid;
 
@@ -38,7 +41,13 @@ async fn kaikei_app_update_journal_entries_is_denied_with_42501(
 }
 
 /// kaikei_migrator（所有者）は REVOKE をバイパスできるため権限では止まらないが、
-/// トリガ（reject_mutation）が P0001 で拒否する。行トリガのため対象行が必要。
+/// トリガ（reject_mutation）が P0010 で拒否する。行トリガのため対象行が必要。
+///
+/// SQLSTATE が `RepoError::AppendOnlyViolation` に正しく写像されることも
+/// あわせて検証する（`kaikei-store::sqlstate::map_sqlstate` は DB 無しの
+/// 純関数テストで検証済みだが、実際の `sqlx::Error` から
+/// `kaikei-store::error::from_sqlx_error` を通す経路は PostgreSQL が必要な
+/// ためここで確認する）。
 #[sqlx::test]
 async fn kaikei_migrator_update_journal_entries_is_rejected_by_trigger(
     pool_opts: PgPoolOptions,
@@ -56,7 +65,11 @@ async fn kaikei_migrator_update_journal_entries_is_rejected_by_trigger(
         .await;
 
     let err = result.expect_err("kaikei_migrator であっても UPDATE は成功してはいけません");
-    assert_eq!(sqlstate(&err).as_deref(), Some("P0001"));
+    assert_eq!(sqlstate(&err).as_deref(), Some("P0010"));
+    assert!(matches!(
+        kaikei_store::error::from_sqlx_error(err),
+        RepoError::AppendOnlyViolation { .. }
+    ));
 }
 
 /// kaikei_app による TRUNCATE も権限不足で拒否される（phase1計画 R6）。
@@ -75,9 +88,10 @@ async fn kaikei_app_truncate_journal_tables_is_denied_with_42501(
     assert_eq!(sqlstate(&err).as_deref(), Some("42501"));
 }
 
-/// kaikei_migrator（所有者）による TRUNCATE も STATEMENT トリガが P0001 で拒否する
+/// kaikei_migrator（所有者）による TRUNCATE も STATEMENT トリガが P0010 で拒否する
 /// （TRUNCATE は行トリガを起動しないため、STATEMENT トリガが無いと素通りしてしまう。
-/// phase1計画 R6）。
+/// phase1計画 R6。`no_truncate_*` トリガも `reject_mutation()` を使うため、
+/// UPDATE と同じ P0010 になる）。
 #[sqlx::test]
 async fn kaikei_migrator_truncate_journal_tables_is_rejected_by_trigger(
     pool_opts: PgPoolOptions,
@@ -90,5 +104,5 @@ async fn kaikei_migrator_truncate_journal_tables_is_rejected_by_trigger(
         .await;
 
     let err = result.expect_err("kaikei_migrator であっても TRUNCATE は成功してはいけません");
-    assert_eq!(sqlstate(&err).as_deref(), Some("P0001"));
+    assert_eq!(sqlstate(&err).as_deref(), Some("P0010"));
 }
