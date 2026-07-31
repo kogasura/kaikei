@@ -10,9 +10,9 @@
 mod common;
 
 use kaikei_core::{
-    AccountCode, AccountingDate, ChartOfAccounts, CoreError, Currency, EntryId, EntryNumber,
-    FiscalYear, JournalEntry, JournalLine, Money, NewEntry, PeriodGuard, Side, TagKey, TagSchema,
-    TagSet, TagValue,
+    AccountCode, AccountingDate, ChartOfAccounts, CoreError, Currency, DocumentRef, EntryId,
+    EntryNumber, FiscalYear, JournalEntry, JournalLine, Money, NewEntry, PeriodGuard, Side, TagKey,
+    TagSchema, TagSet, TagValue, Timestamp,
 };
 
 // ---- 汎用ヘルパー ----
@@ -487,6 +487,71 @@ fn journal_entry_lines_returns_read_only_view() {
 
     assert_eq!(entry.lines().len(), 2);
     assert_eq!(entry.lines()[0].amount().minor(), 100);
+}
+
+// =====================================================================
+// journal — rehydrate
+// =====================================================================
+
+// `docs/02-test-cases.md` に専用のケースIDは無いが、`rehydrate` は10引数の
+// `#[allow(clippy::too_many_arguments)]` なコンストラクタであり、将来フィールドを
+// 追加した際の配線ミス（引数の取り違え）を検出する安全網が無かったため追加する。
+// 各引数に他のどのフィールドとも異なる値を与え、`rehydrate` で構築した
+// `JournalEntry` の全ゲッターが元の値と一致することを確認する。
+#[test]
+fn rehydrate_round_trips_all_fields_with_distinct_values() {
+    let id = EntryId::new(111);
+    let fiscal_year = 2025;
+    let entry_no = EntryNumber::new(222);
+    let entry_date = date(2025, 6, 20);
+    let description = "手動で組み立てた仕訳".to_string();
+    let line_tags = tags_with(&[("counterparty", TagValue::Code("A社".to_string()))]);
+    let lines = vec![
+        debit_with_tags("100", 300, line_tags.clone()),
+        credit("400", 300),
+    ];
+    let document_refs = vec![DocumentRef {
+        document_id: 999,
+        label: "領収書".to_string(),
+    }];
+    let reverses = Some(EntryId::new(50));
+    let reverse_reason = Some("金額誤り".to_string());
+    let recorded_at = Timestamp::from_unix_nanos(123_456_789);
+
+    let entry = JournalEntry::rehydrate(
+        id,
+        fiscal_year,
+        entry_no,
+        entry_date,
+        description.clone(),
+        lines.clone(),
+        document_refs.clone(),
+        reverses,
+        reverse_reason.clone(),
+        recorded_at,
+    );
+
+    assert_eq!(entry.id(), id);
+    assert_eq!(entry.fiscal_year(), fiscal_year);
+    assert_eq!(entry.entry_no(), entry_no);
+    assert_eq!(entry.entry_date(), entry_date);
+    assert_eq!(entry.description(), description);
+
+    assert_eq!(entry.lines().len(), lines.len());
+    assert_eq!(entry.lines()[0].account().as_str(), "100");
+    assert!(entry.lines()[0].is_debit());
+    assert_eq!(entry.lines()[0].amount().minor(), 300);
+    assert_eq!(entry.lines()[0].tags(), &line_tags);
+    assert_eq!(entry.lines()[1].account().as_str(), "400");
+    assert!(!entry.lines()[1].is_debit());
+
+    assert_eq!(entry.document_refs().len(), 1);
+    assert_eq!(entry.document_refs()[0].document_id, 999);
+    assert_eq!(entry.document_refs()[0].label, "領収書");
+
+    assert_eq!(entry.reverses(), reverses);
+    assert_eq!(entry.reverse_reason(), reverse_reason.as_deref());
+    assert_eq!(entry.recorded_at(), recorded_at);
 }
 
 // =====================================================================
