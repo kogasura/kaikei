@@ -335,3 +335,31 @@ debug ビルドでは `panic!`、release ビルド（`overflow-checks` 既定で
 **トレードオフ**: 18 桁を超える極めて特殊な最小通貨単位（一部のメームコイン等）は
 表現できない。→ 個人事業主向けという `DECISIONS.md` D-017 のスコープでは
 現実的に発生しない。将来必要になれば `MAX_MINOR_UNIT` の見直しとして検討する。
+
+---
+
+## D-025 TaxContext は国非依存の4項目に限定する
+
+**決定**: `kaikei-policy::TaxContext<'a>` は `{ as_of, chart, tag_schema,
+counterparties }` の4項目（`AccountingDate` と core の型2つ、
+`kaikei-policy` 自身の `CounterpartyIndex`）のみを持つ。年度別税区分マスタ
+（`TaxCategoryTable`）や事業者設定（`JpSettings`）等の `kaikei-jp` 固有の型は
+一切含めない。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `docs/04-jp-tax.md` 初期案（`categories: &TaxCategoryTable` / `settings: &JpSettings` を含む） | `TaxCategoryTable` / `JpSettings` は `kaikei-jp` の型（`ARCHITECTURE.md` §7）。そのまま `kaikei-policy` に書くと policy → jp の循環依存になり、`kaikei-app` も jp の型を知る必要が生じて `CLAUDE.md` §1 の依存方向が崩れる |
+| 国非依存の `TaxCategoryTable` を `kaikei-policy` に置く | `direction: sales\|purchase` や `deductible` は VAT型（日本・EU）固有の構造で、`DOMAIN.md` §5 が言う米国 Sales Tax 型と両立しない。抽象層に置くのは筋が悪い |
+| `TaxContext` を lookup trait のトレイトオブジェクトにする | 抽象が1段増えるだけで、実効は上記の決定と変わらない |
+
+**理由**: 年度別税区分マスタと事業者設定は、`JpTaxPolicy`（Phase 2 の
+`kaikei-jp` 実装）が**構築時**に保持すればよい。年度の選択は
+`TaxContext::as_of`（取引日）で行える。YAML の読み込みは合成ルートの
+起動時 I/O であり、trait メソッド自体は引き続き純関数のままになる
+（D-005 を満たす）。
+
+**トレードオフ**: 設定変更（税率改定・事業者区分の変更等）を反映するには
+`Arc<dyn TaxPolicy>` を作り直す必要がある。単一ユーザー・自己ホスト前提
+（D-015）なので、プロセス再起動で足りる。

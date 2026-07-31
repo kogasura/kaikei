@@ -15,3 +15,8 @@ license.workspace = true
 [dependencies]
 kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
 thiserror = { workspace = true }
+
+[features]
+# テスト用ダミー実装（testing.rs）を有効にする。他 crate のテストから使うことを
+# 想定するため #[cfg(test)] ではなく feature で切る。
+test-doubles = []
