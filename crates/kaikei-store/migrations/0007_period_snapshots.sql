@@ -9,7 +9,7 @@ CREATE TABLE period_snapshots (
     closed_at           TIMESTAMPTZ NOT NULL,
     balances            JSONB   NOT NULL,   -- 締め時点の全科目残高
     currency            CHAR(3) NOT NULL,
-    -- ★ 人間承認済みの決定（B-1）。journal_lines と同じ理由でDEFAULTを付けない。
+    -- ★ 人間承認済みの決定（B-1、DECISIONS.md D-021）。journal_lines と同じ理由でDEFAULTを付けない。
     -- balances の金額をどの通貨・何桁の最小単位で解釈するかは currency /
     -- currency_minor_unit の組で決まるため、journal_lines と対の構造にする。
     currency_minor_unit SMALLINT NOT NULL CHECK (currency_minor_unit BETWEEN 0 AND 18),

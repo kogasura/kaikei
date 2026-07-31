@@ -289,8 +289,13 @@ append-only の帳簿には通常のマイグレーション常識が通用し�
 1. **既存の仕訳行を書き換えるマイグレーションを書かない。**
    一度でも書くと、この仕組みの根拠が崩れる
 2. カラム追加は NULL 許容のみ
-3. 開発中の壊れたデータは DB を丸ごと作り直す（`sqlx database reset`）。
-   本番では逆仕訳で直す
+3. 開発中の壊れたデータは DB を丸ごと作り直す（`docker compose down -v` で
+   named volume ごと作り直す。README 参照）。本番では逆仕訳で直す。
+   **`sqlx database reset`（`DROP DATABASE`）は使わない**: `DROP DATABASE` には
+   対象データベースの所有者権限が必要だが、`kaikei` データベースの所有者は
+   コンテナ初期化用スーパーユーザー（`kaikei_root`）であり、マイグレーション実行用の
+   `kaikei_migrator` は所有者ではない（`kaikei_migrator` が所有者なのはテーブルと
+   `public` スキーマのみ）
 4. タグの意味が変わる場合、新キーを作って旧キーは残す
    （`tax_category` → `tax_category_v2`）
 5. マイグレーションは `kaikei_migrator` ロールで実行。`kaikei_app` では実行できない

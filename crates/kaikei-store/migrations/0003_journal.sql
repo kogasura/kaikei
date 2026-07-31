@@ -31,7 +31,7 @@ CREATE TABLE journal_lines (
     side                SMALLINT NOT NULL CHECK (side IN (1, 2)),  -- 1=借方, 2=貸方
     amount_minor        BIGINT   NOT NULL CHECK (amount_minor > 0),
     currency            CHAR(3)  NOT NULL,
-    -- ★ 人間承認済みの決定（B-1）: DEFAULT を付けない。
+    -- ★ 人間承認済みの決定（B-1、DECISIONS.md D-021）: DEFAULT を付けない。
     -- currency だけ指定して currency_minor_unit が既定0になると、金額が100倍
     -- ズレて保存されても下のCHECKには引っかからないため。上限18は
     -- Currency::MAX_MINOR_UNIT（kaikei-core、DECISIONS.md D-020）と一致させる。

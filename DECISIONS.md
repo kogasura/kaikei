@@ -338,6 +338,85 @@ debug ビルドでは `panic!`、release ビルド（`overflow-checks` 既定で
 
 ---
 
+## D-021 `journal_lines` / `period_snapshots` の `currency` / `currency_minor_unit` に DEFAULT を付けない
+
+**決定**: `journal_lines.currency_minor_unit`（`SMALLINT NOT NULL CHECK (BETWEEN 0 AND 18)`）
+を新設し、`currency` と合わせて両カラムとも `DEFAULT` を付けない。同じ理由で
+`period_snapshots` にも `currency` / `currency_minor_unit` の組を新設し、同じく
+`DEFAULT` を付けない（`balances` の金額をどの通貨・何桁の最小単位で解釈するかを
+一意に決めるため。`journal_lines` と対称な構造にする）。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `currency_minor_unit SMALLINT NOT NULL DEFAULT 0` | `currency='USD'` のように通貨コードだけ指定して `currency_minor_unit` を書き忘れると既定で 0 になり、**本来 2 桁の通貨の金額が 100 倍ズレて保存されても `CHECK` 制約に引っかからない**。無言のデータ破損を許す設計になる |
+| 通貨マスタテーブルを作って `minor_unit` を JOIN で引く | マスタは可変なので、後からマスタの `minor_unit` を直すと過去に記帳した金額の意味が変わってしまう。append-only の思想（D-006）に反する |
+
+**理由**: `kaikei-core` の `Currency::new(code, minor_unit)` は `minor_unit` を必須で
+要求し、`Money::to_display_string()` は `10^minor_unit` で小数点位置を決める。列が
+無いと `Money` を復元できず、store 層に JPY=0/USD=2 のようなハードコード表を作る
+しかなくなる（`CLAUDE.md` §8 違反）。また `CLAUDE.md` §2 マイグレーションの掟2
+「カラム追加は NULL 許容のみ」により、**後から `NOT NULL` の列を足す道は塞がっている**
+ため、テーブルがまだ存在しない Phase 1 が唯一の機会だった。上限 18 は
+`Currency::MAX_MINOR_UNIT`（D-020）と一致させる。
+
+**トレードオフ**: `INSERT` 時に毎回 `currency_minor_unit` を明示する必要があり、
+省略すると（デフォルトが無いため）`NOT NULL` 違反で拒否される。→ これは意図した
+挙動であり、トレードオフではなく設計の目的そのもの。
+
+---
+
+## D-022 ロール作成・権限付与をマイグレーションから分離する
+
+**決定**: `kaikei_migrator` / `kaikei_app` ロールの作成とパスワード設定を
+`docker/postgres/init/01-roles.sql` に集約し、マイグレーション（`crates/kaikei-store/migrations/`）
+には一切書かない。`docker-compose`（`docker-entrypoint-initdb.d` 経由）と CI
+（`database.yml` が明示的に `psql -f` で実行）の両方から、この同一ファイルを流す。
+
+**却下した選択肢**: ロール作成を `0001` マイグレーションの中で行う
+（`docs/03-database.md` の初期案 `0001_roles_and_grants.sql`）。
+
+**理由**: ロールは PostgreSQL の**クラスタ単位**のオブジェクトであり、特定の
+データベースに属さない。一方 `#[sqlx::test]` はテストのたびに新しいデータベースを
+作成してマイグレーションを最初から再実行するため、ロール作成をマイグレーションに
+書くと **2件目以降のテストが「ロールは既に存在する」エラーで全滅する**。
+また、マイグレーションと初期化スクリプトを分けることで「ロール作成・権限付与の
+記述箇所はここだけ」という真実の点が1つに定まり、docker-compose と CI で
+権限設定がズレる事故を防げる。
+
+**トレードオフ**: マイグレーション一式（`sqlx migrate run`）だけを実行しても
+ロールが無ければ何も始まらず、`docker/postgres/init/01-roles.sql` を先に実行する
+という前提知識が別途必要になる。→ `0001_baseline_privileges.sql` の `DO` ブロックが
+前提条件（`kaikei_app` の存在と権限属性）を検証し、満たされていなければ
+明示的なエラーメッセージで教える形で緩和する。
+
+---
+
+## D-023 採番は仕訳 INSERT と同一トランザクションで行う（欠番は原理的に発生しない）
+
+**決定**: `entry_counters` の採番（`SELECT ... FOR UPDATE` → `UPDATE next_no`）を
+仕訳（`journal_entries` / `journal_lines`）の `INSERT` と**同一トランザクション**で
+行う。`entry_counters.skipped` は、それでも**意図的に**番号を飛ばした場合の理由を
+記録するための専用フィールドであり、Phase 1 では書き込みを実装しない。
+
+**却下した選択肢**: 採番を別トランザクション（例: Postgres の `SEQUENCE`）で行い、
+検証失敗時は欠番として `skipped` に自動記録する。
+
+**理由**: Postgres の `SEQUENCE` はトランザクションのロールバックとは独立に値を
+払い出すため、検証失敗でロールバックしても採番した値は消費済みのままになり、
+欠番が生じる。これに対し、`entry_counters` 行のロック＋更新を仕訳 INSERT と同じ
+トランザクションに置けば、検証失敗時はカウンタの増分も仕訳行も一緒に巻き戻るため、
+**通常は欠番が発生しない**。`docs/03-database.md` 初期案の「トランザクションが
+失敗した場合、その番号は使用されず欠番となる」という記述は、採番を別トランザクションで
+行う実装を前提としたものであり、同一トランザクション採番とは整合しないため
+本決定に合わせて改訂した。
+
+**トレードオフ**: 欠番の自動記録は行わない。運用上「意図的に」番号を飛ばしたい
+（例: 誤って仕訳を作りかけて中断した痕跡を残したい）場合は、`skipped` への
+書き込みを別途実装する必要がある。→ Phase 1 のスコープ外とし、必要になった時点で
+追加する（欠番はロールバックで消えるため、記録には別トランザクションが要る。
+監査ログ基盤を入れる Phase 3 に合わせるのが自然）。
 ## D-025 TaxContext は国非依存の4項目に限定する
 
 **決定**: `kaikei-policy::TaxContext<'a>` は `{ as_of, chart, tag_schema,

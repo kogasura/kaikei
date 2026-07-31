@@ -34,6 +34,12 @@ jobs:
       PGPORT: 5432
       PGUSER: kaikei_root
       PGPASSWORD: kaikei_root_ci_password
+      # psql は既定で「接続ユーザー名と同名のDB」に接続しようとする（この場合
+      # kaikei_root）。サービス定義は POSTGRES_DB: postgres なので、明示しないと
+      # `FATAL: database "kaikei_root" does not exist` で必ず失敗する
+      # （docker-compose 側は docker-entrypoint.sh の docker_process_sql() が
+      # 内部で --dbname "$POSTGRES_DB" を明示しているため問題にならない）。
+      PGDATABASE: postgres
       KAIKEI_MIGRATOR_PASSWORD: kaikei_migrator_ci_password
       KAIKEI_APP_PASSWORD: kaikei_app_ci_password
       # `#[sqlx::test]` は DATABASE_URL を「データベースを作れる接続」として使う

@@ -71,11 +71,23 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO kaikei_app;
 
 -- データベース自体への CREATE 権限（`CREATE SCHEMA` に必要。スキーマの CREATE とは
--- 別のACLで、既定では PUBLIC にも付与されない）。`#[sqlx::test]` はテスト管理用に
--- `_sqlx_test` スキーマを DATABASE_URL が指すデータベース自身に作成するため必須
--- （実測: これが無いと `permission denied for database <db>` で `#[sqlx::test]`
--- の全テストが失敗する）。現在のデータベース名は動的に取得する
--- （docker-compose では "kaikei"、CI では "postgres" のように呼び出し環境で異なるため）。
+-- 別のACLで、既定では PUBLIC にも付与されない。データベースの所有者のみが持つ）。
+--
+-- なぜ必要か: `#[sqlx::test]` はテストのたびに、`DATABASE_URL` が指すデータベース
+-- 自身に管理用の `_sqlx_test` スキーマ（テスト用DB名の記録簿）を作成する
+-- （sqlx-postgres-0.8.6/src/testing/mod.rs で確認済み）。`kaikei` / `postgres` の
+-- どちらの db もコンテナ初期化用スーパーユーザー（kaikei_root）の所有であり
+-- kaikei_migrator は所有者ではないため、これが無いと `_sqlx_test` スキーマの
+-- 作成時点で `permission denied for database <db>` となり `#[sqlx::test]` を使う
+-- 全テストが失敗する（実測確認済み: 一時的にこの GRANT を外すと全滅し、戻すと復帰する）。
+--
+-- 権限拡大にならない理由: `kaikei_migrator` は本ファイルで既に `public` スキーマの
+-- 所有者にしており（トリガ以外の全ての制約をバイパスできる = R5）、テーブルの
+-- CREATE/ALTER/DROP は元々自由に行える完全信頼ロールである。データベースへの
+-- CREATE を追加してもこの脅威モデルは変わらない（`kaikei_app` には一切関係しない）。
+--
+-- 現在のデータベース名は動的に取得する（docker-compose では "kaikei"、
+-- CI では "postgres" のように呼び出し環境で異なるため）。
 DO $$
 BEGIN
   EXECUTE format('GRANT CREATE ON DATABASE %I TO kaikei_migrator', current_database());
