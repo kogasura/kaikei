@@ -27,6 +27,11 @@ impl TagKey {
     /// - 末尾はアンダースコアにできない
     /// - アンダースコアを連続させられない（`__` は不可）
     /// - 全体の文字数は1〜64文字
+    ///
+    /// 許容文字が ASCII に限定されているため、`account.rs` の
+    /// `AccountCode::parse` と同様にバイト列として検証する
+    /// （非ASCII文字は文字種チェックで拒否されるため、文字数とバイト数の
+    /// 違いは結果に影響しない）。
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         let invalid = || CoreError::InvalidValue {
             reason: format!(
@@ -36,23 +41,23 @@ impl TagKey {
             ),
         };
 
-        let chars: Vec<char> = s.chars().collect();
-        if chars.is_empty() || chars.len() > 64 {
+        let bytes = s.as_bytes();
+        if bytes.is_empty() || bytes.len() > 64 {
             return Err(invalid());
         }
-        if !chars
+        if !bytes
             .iter()
-            .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         {
             return Err(invalid());
         }
-        if !chars[0].is_ascii_lowercase() {
+        if !bytes[0].is_ascii_lowercase() {
             return Err(invalid());
         }
-        if *chars.last().expect("空文字列は上で弾いている") == '_' {
+        if *bytes.last().expect("空文字列は上で弾いている") == b'_' {
             return Err(invalid());
         }
-        if chars.windows(2).any(|w| w[0] == '_' && w[1] == '_') {
+        if bytes.windows(2).any(|w| w[0] == b'_' && w[1] == b'_') {
             return Err(invalid());
         }
         Ok(TagKey(s.to_string()))
@@ -167,6 +172,8 @@ pub struct TagSchema {
 
 impl TagSchema {
     /// タグ定義の一覧からスキーマを作る。
+    ///
+    /// 重複するキーが渡された場合は `TagSet::insert` と同様に後勝ちで上書きする。
     pub fn new(defs: Vec<(TagKey, TagDef)>) -> Self {
         TagSchema {
             defs: defs.into_iter().collect(),
@@ -186,13 +193,25 @@ impl TagSchema {
     /// 1. 未登録キー → `CoreError::UnknownTagKey`
     /// 2. 型不一致 → `CoreError::TagTypeMismatch`
     /// 3. `account_type` に対して必須のキーが欠落 → `CoreError::MissingRequiredTag`
+    ///
+    /// 未登録キーと型不一致が同一 `TagSet` 内に複数あっても、判定順序が
+    /// `BTreeMap` のキー昇順に依存しないよう、未登録キーの検出を型不一致の
+    /// 検出より前に完全に終わらせる（ループを分離する）。
     pub fn validate(&self, tags: &TagSet, account_type: AccountType) -> Result<(), CoreError> {
+        for (key, _) in tags.iter() {
+            if !self.defs.contains_key(key) {
+                return Err(CoreError::UnknownTagKey {
+                    key: key.as_str().to_string(),
+                });
+            }
+        }
+
         for (key, value) in tags.iter() {
-            let def = self.defs.get(key).ok_or_else(|| CoreError::UnknownTagKey {
-                key: key.as_str().to_string(),
-            })?;
-            let actual = value.value_type();
-            if actual != def.value_type {
+            let def = self
+                .defs
+                .get(key)
+                .expect("直前のループで全キーの存在確認済み");
+            if value.value_type() != def.value_type {
                 return Err(CoreError::TagTypeMismatch {
                     key: key.as_str().to_string(),
                     expected: def.value_type,
@@ -224,6 +243,18 @@ mod tests {
 
     fn key(s: &str) -> TagKey {
         TagKey::parse(s).unwrap()
+    }
+
+    fn tag_def(
+        value_type: TagValueType,
+        aggregatable: bool,
+        required_for: Vec<AccountType>,
+    ) -> TagDef {
+        TagDef {
+            value_type,
+            aggregatable,
+            required_for,
+        }
     }
 
     // T-01
@@ -306,11 +337,7 @@ mod tests {
     fn tag_schema_validate_type_mismatch_is_error() {
         let schema = TagSchema::new(vec![(
             key("tax_category"),
-            TagDef {
-                value_type: TagValueType::Code,
-                aggregatable: true,
-                required_for: vec![],
-            },
+            tag_def(TagValueType::Code, true, vec![]),
         )]);
         let mut tags = TagSet::new();
         tags.insert(
@@ -328,11 +355,7 @@ mod tests {
     fn tag_schema_validate_missing_required_tag_is_error() {
         let schema = TagSchema::new(vec![(
             key("tax_category"),
-            TagDef {
-                value_type: TagValueType::Code,
-                aggregatable: true,
-                required_for: vec![AccountType::Expense],
-            },
+            tag_def(TagValueType::Code, true, vec![AccountType::Expense]),
         )]);
         let tags = TagSet::new();
         assert!(matches!(
@@ -346,14 +369,44 @@ mod tests {
     fn tag_schema_validate_missing_tag_not_required_for_account_type_succeeds() {
         let schema = TagSchema::new(vec![(
             key("tax_category"),
-            TagDef {
-                value_type: TagValueType::Code,
-                aggregatable: true,
-                required_for: vec![AccountType::Expense],
-            },
+            tag_def(TagValueType::Code, true, vec![AccountType::Expense]),
         )]);
         let tags = TagSet::new();
         assert!(schema.validate(&tags, AccountType::Asset).is_ok());
+    }
+
+    // 修正1の回帰テスト: 未登録キーと型不一致が同一 TagSet に同時に存在する場合、
+    // キー名の辞書順によらず常に UnknownTagKey が優先される
+    #[test]
+    fn tag_schema_validate_prioritizes_unknown_key_over_type_mismatch_regardless_of_key_order() {
+        let schema = TagSchema::new(vec![(
+            key("tax_category"),
+            tag_def(TagValueType::Code, true, vec![]),
+        )]);
+
+        // 未登録キーが辞書順で先に来るケース
+        let mut tags_unknown_first = TagSet::new();
+        tags_unknown_first.insert(key("aaa_unknown"), TagValue::Text("x".to_string()));
+        tags_unknown_first.insert(
+            key("tax_category"),
+            TagValue::Decimal(rust_decimal::Decimal::ONE),
+        );
+        assert!(matches!(
+            schema.validate(&tags_unknown_first, AccountType::Expense),
+            Err(CoreError::UnknownTagKey { .. })
+        ));
+
+        // 未登録キーが辞書順で後に来るケース
+        let mut tags_unknown_last = TagSet::new();
+        tags_unknown_last.insert(
+            key("tax_category"),
+            TagValue::Decimal(rust_decimal::Decimal::ONE),
+        );
+        tags_unknown_last.insert(key("zzz_unknown"), TagValue::Text("x".to_string()));
+        assert!(matches!(
+            schema.validate(&tags_unknown_last, AccountType::Expense),
+            Err(CoreError::UnknownTagKey { .. })
+        ));
     }
 
     // T-08
@@ -382,19 +435,11 @@ mod tests {
         let schema = TagSchema::new(vec![
             (
                 key("counterparty"),
-                TagDef {
-                    value_type: TagValueType::Code,
-                    aggregatable: true,
-                    required_for: vec![],
-                },
+                tag_def(TagValueType::Code, true, vec![]),
             ),
             (
                 key("business_ratio"),
-                TagDef {
-                    value_type: TagValueType::Decimal,
-                    aggregatable: false,
-                    required_for: vec![],
-                },
+                tag_def(TagValueType::Decimal, false, vec![]),
             ),
         ]);
         assert!(schema.is_aggregatable(&key("counterparty")));
