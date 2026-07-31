@@ -1,0 +1,19 @@
+# crates/kaikei-app/Cargo.toml
+#
+# ★ application 層。I/O を行うのはこの層だけだが、infra（sqlx 等）は知らない ★
+# ports（trait）を定義するのみで、実装は kaikei-store 等の下位層が持つ。
+# CI (architecture.yml) が sqlx / kaikei-store / kaikei-jp への依存を検出したら失敗する。
+
+[package]
+name = "kaikei-app"
+version = "0.0.1"
+description = "application 層。ユースケースとポート（trait）定義"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+kaikei-policy = { path = "../kaikei-policy", version = "0.0.1" }
+thiserror = { workspace = true }
+async-trait = { workspace = true }

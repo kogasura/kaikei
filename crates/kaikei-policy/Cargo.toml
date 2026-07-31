@@ -1,0 +1,17 @@
+# crates/kaikei-policy/Cargo.toml
+#
+# ★ trait 定義のみの純粋層。async-trait / sqlx / tokio を入れてはいけない ★
+# CI (architecture.yml) が kaikei-core / thiserror 以外の依存と async/I/O の
+# 出現を検出したら失敗する。追加が必要と判断した場合、実装を止めて人間に相談すること。
+
+[package]
+name = "kaikei-policy"
+version = "0.0.1"
+description = "可変部（税制・決算・様式・採番規則）の抽象（trait のみ）"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+thiserror = { workspace = true }
