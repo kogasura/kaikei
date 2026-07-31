@@ -69,7 +69,7 @@ pub enum CoreError {
     // TagTypeMismatch { key: String, expected: TagValueType } は
     // TagValueType（tag.rs、未実装）に依存するため Phase 0 後続PRで追加する。
     /// タグスキーマ上、その科目種別の明細では必須のタグが欠落している。
-    #[error("タグ {key} は {account_type:?} の明細では必須です")]
+    #[error("タグ {key} は{}の明細では必須です", account_type.label_ja())]
     MissingRequiredTag {
         /// 欠落しているタグキー。
         key: String,

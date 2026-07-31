@@ -56,6 +56,21 @@ impl AccountType {
     pub fn is_debit_normal(&self) -> bool {
         matches!(self, AccountType::Asset | AccountType::Expense)
     }
+
+    /// 5要素分類の日本語ラベルを返す（資産・負債・純資産・収益・費用）。
+    ///
+    /// `CLAUDE.md` §1 が禁止する「勘定科目の日本語名」は現金・売掛金等の
+    /// 個別科目名を指す。`AccountType` は世界共通の5要素分類であり、
+    /// `docs/01-core-types.md` が明示的に core に置くと定めているため対象外。
+    pub fn label_ja(&self) -> &'static str {
+        match self {
+            AccountType::Asset => "資産",
+            AccountType::Liability => "負債",
+            AccountType::Equity => "純資産",
+            AccountType::Revenue => "収益",
+            AccountType::Expense => "費用",
+        }
+    }
 }
 
 /// 勘定科目の定義。
@@ -144,11 +159,17 @@ impl ChartOfAccounts {
     }
 
     /// 全科目定義を巡回する。
+    ///
+    /// 内部で `BTreeMap::values()` を使っているため、返す順序は科目コードの
+    /// 昇順で決定的である（`descendants` とは異なり順序が規定されている）。
     pub fn iter(&self) -> impl Iterator<Item = &AccountDef> {
         self.accounts.values()
     }
 
     /// 指定した科目の子孫（子・孫・…）すべてを返す。指定科目自身は含まない。
+    ///
+    /// 戻り値の順序は未規定。呼び出し側は順序に依存しないこと。
+    /// 指定コードが勘定科目表に存在しない場合は空の `Vec` を返す。
     pub fn descendants(&self, code: &AccountCode) -> Vec<&AccountDef> {
         let mut result = Vec::new();
         let mut frontier = vec![code.clone()];
@@ -325,5 +346,18 @@ mod tests {
         let chart = ChartOfAccounts::new(defs).unwrap();
         let leaf = AccountCode::parse("110").unwrap();
         assert!(chart.descendants(&leaf).is_empty());
+    }
+
+    #[test]
+    fn chart_of_accounts_new_empty_is_ok() {
+        assert!(ChartOfAccounts::new(vec![]).is_ok());
+    }
+
+    #[test]
+    fn descendants_of_unknown_code_is_empty() {
+        let defs = vec![account("100", AccountType::Asset, None, true)];
+        let chart = ChartOfAccounts::new(defs).unwrap();
+        let unknown = AccountCode::parse("999").unwrap();
+        assert!(chart.descendants(&unknown).is_empty());
     }
 }

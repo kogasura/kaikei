@@ -75,6 +75,18 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_from_unix_nanos_round_trips_i128_min() {
+        let ts = Timestamp::from_unix_nanos(i128::MIN);
+        assert_eq!(ts.as_unix_nanos(), i128::MIN);
+    }
+
+    #[test]
+    fn timestamp_from_unix_nanos_round_trips_i128_max() {
+        let ts = Timestamp::from_unix_nanos(i128::MAX);
+        assert_eq!(ts.as_unix_nanos(), i128::MAX);
+    }
+
+    #[test]
     fn fixed_clock_works_as_trait_object() {
         let ts = Timestamp::from_unix_nanos(-7);
         let clock = FixedClock(ts);
