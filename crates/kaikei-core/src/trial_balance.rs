@@ -80,17 +80,37 @@ fn build_group_key(tags: &TagSet, group_by: &[TagKey]) -> GroupKey {
     GroupKey(pairs)
 }
 
+/// `from_entries` の集計中に使う、科目×グループ単位の借方・貸方の積み上げ。
+///
+/// 位置タプル（`(AccountType, Money, Money)`）ではなく名前付きフィールドにすることで、
+/// 「借方は index 1、貸方は index 2」のようなマジックインデックスに起因する
+/// 貸借取り違えのリスクを排除する。
+struct Bucket {
+    account_type: AccountType,
+    debit_total: Money,
+    credit_total: Money,
+}
+
 impl TrialBalance {
     /// 仕訳の集合から試算表を構築する。
     ///
     /// - `group_by` が空なら科目のみで集計する
     /// - `group_by` に `schema.is_aggregatable()` が `false` のキーが含まれていたら
     ///   `CoreError::NotAggregatable`
+    /// - `group_by` に同じキーを複数回渡してもエラーにはならず、クラッシュもしない。
+    ///   同じ値が `GroupKey` の中に重複して入るか（値を持つ明細の場合）、
+    ///   両方とも欠落する（値を持たない明細の場合）だけで、行の分割（集計結果）は
+    ///   重複を取り除いた場合と変わらない。ただし冗長なので、呼び出し側で
+    ///   事前に重複を取り除くことを推奨する
     /// - 同一科目（・同一グループ）への記帳は集約されて1行になる（`docs/02-test-cases.md` B-03）
     /// - `chart` に存在しない科目を参照する明細があれば `CoreError::UnknownAccount`
     ///   （`entries` は本来この `chart` で検証済みのはずだが、呼び出し側が異なる
     ///   `chart` を渡した場合に備えて防御的に検証する）
     /// - `entries` が異なる通貨を混在させていたら `CoreError::CurrencyMismatch`
+    /// - `entries` が空の場合、内部通貨は `Currency::JPY` にフォールバックする
+    ///   （`rows()` も空になるため、この場合の残高計算そのものには影響しない）。
+    ///   これは外貨換算が未実装であることによる暫定措置であり（`DECISIONS.md` D-016）、
+    ///   外貨のみを扱う帳簿に対応する際に再検討する
     pub fn from_entries<'a>(
         entries: impl Iterator<Item = &'a JournalEntry>,
         chart: &ChartOfAccounts,
@@ -106,8 +126,7 @@ impl TrialBalance {
         }
 
         let mut currency: Option<Currency> = None;
-        let mut buckets: BTreeMap<(AccountCode, GroupKey), (AccountType, Money, Money)> =
-            BTreeMap::new();
+        let mut buckets: BTreeMap<(AccountCode, GroupKey), Bucket> = BTreeMap::new();
 
         for entry in entries {
             let entry_currency = entry.currency();
@@ -129,17 +148,19 @@ impl TrialBalance {
                         code: line.account().as_str().to_string(),
                     })?;
                 let group = build_group_key(line.tags(), group_by);
+                // `AccountCode` の clone と `GroupKey` の Vec 構築が、キーが既に
+                // `buckets` に存在する場合でも毎回発生する。想定規模（個人事業主の
+                // 年間仕訳数）では無視できるコストだが、将来ここがホットパスになった
+                // 場合は「既存キーを先に検索し、無いときだけ構築する」形に変更する余地がある。
                 let bucket_key = (line.account().clone(), group);
-                let bucket = buckets.entry(bucket_key).or_insert_with(|| {
-                    (
-                        def.account_type,
-                        Money::zero(entry_currency),
-                        Money::zero(entry_currency),
-                    )
+                let bucket = buckets.entry(bucket_key).or_insert_with(|| Bucket {
+                    account_type: def.account_type,
+                    debit_total: Money::zero(entry_currency),
+                    credit_total: Money::zero(entry_currency),
                 });
                 match line.side() {
-                    Side::Debit => bucket.1 = bucket.1.add(line.amount())?,
-                    Side::Credit => bucket.2 = bucket.2.add(line.amount())?,
+                    Side::Debit => bucket.debit_total = bucket.debit_total.add(line.amount())?,
+                    Side::Credit => bucket.credit_total = bucket.credit_total.add(line.amount())?,
                 }
             }
         }
@@ -147,7 +168,12 @@ impl TrialBalance {
         let currency = currency.unwrap_or(Currency::JPY);
 
         let mut rows = Vec::with_capacity(buckets.len());
-        for ((account, group), (account_type, debit_total, credit_total)) in buckets {
+        for ((account, group), bucket) in buckets {
+            let Bucket {
+                account_type,
+                debit_total,
+                credit_total,
+            } = bucket;
             let balance = if account_type.is_debit_normal() {
                 debit_total.sub(&credit_total)?
             } else {
@@ -173,23 +199,46 @@ impl TrialBalance {
 
     /// 指定した科目の残高を返す。`group_by` を指定して構築した試算表では、
     /// 同一科目の全グループの残高を合算して返す。該当する行が無ければ `None`。
+    ///
+    /// # Panics
+    ///
+    /// 通貨不一致による panic は起こらない（同一 `TrialBalance` 内の全行は
+    /// [`TrialBalance::from_entries`] の構築時に同一通貨であることが保証されている）。
+    /// ただし合算対象の残高がオーバーフローするほど極端に大きい場合は panic する
+    /// （`journal.rs` の `debit_total`/`credit_total` と同じ制約）。
     pub fn balance_of(&self, account: &AccountCode) -> Option<Money> {
         let balances = self
             .rows
             .iter()
             .filter(|row| &row.account == account)
             .map(|row| &row.balance);
-        sum_money(balances).expect("同一 TrialBalance 内の残高は同一通貨であるため加算は失敗しない")
+        sum_money(balances).expect(
+            "同一 TrialBalance 内の残高は同一通貨であるため、\
+             合算は（オーバーフローしない限り）失敗しない",
+        )
     }
 
     /// 借方合計と貸方合計を返す。複式簿記の恒等式により、正しく構築された
     /// 試算表では必ず一致する（不一致なら実装のバグ）。
+    ///
+    /// # Panics
+    ///
+    /// 通貨不一致による panic は起こらない（同一 `TrialBalance` 内の全行は
+    /// [`TrialBalance::from_entries`] の構築時に同一通貨であることが保証されている）。
+    /// ただし合算対象の金額がオーバーフローするほど極端に大きい場合は panic する
+    /// （`journal.rs` の `debit_total`/`credit_total` と同じ制約）。
     pub fn totals(&self) -> (Money, Money) {
         let debit_total = sum_money(self.rows.iter().map(|row| &row.debit_total))
-            .expect("同一 TrialBalance 内の debit_total は同一通貨であるため加算は失敗しない")
+            .expect(
+                "同一 TrialBalance 内の debit_total は同一通貨であるため、\
+                 合算は（オーバーフローしない限り）失敗しない",
+            )
             .unwrap_or_else(|| Money::zero(self.currency));
         let credit_total = sum_money(self.rows.iter().map(|row| &row.credit_total))
-            .expect("同一 TrialBalance 内の credit_total は同一通貨であるため加算は失敗しない")
+            .expect(
+                "同一 TrialBalance 内の credit_total は同一通貨であるため、\
+                 合算は（オーバーフローしない限り）失敗しない",
+            )
             .unwrap_or_else(|| Money::zero(self.currency));
         (debit_total, credit_total)
     }
@@ -201,7 +250,15 @@ impl TrialBalance {
         debit_total == credit_total
     }
 
-    /// 指定した科目種別に属する全行の残高（符号付き）の合計を返す。
+    /// 指定した科目種別に属する全行の残高（符号付き）の合計を返す。`group_by` を
+    /// 指定して構築した試算表でも、同一科目種別に属する全グループの残高を合算する。
+    ///
+    /// # Panics
+    ///
+    /// 通貨不一致による panic は起こらない（同一 `TrialBalance` 内の全行は
+    /// [`TrialBalance::from_entries`] の構築時に同一通貨であることが保証されている）。
+    /// ただし合算対象の残高がオーバーフローするほど極端に大きい場合は panic する
+    /// （`journal.rs` の `debit_total`/`credit_total` と同じ制約）。
     pub fn total_by_type(&self, t: AccountType) -> Money {
         let balances = self
             .rows
@@ -209,7 +266,10 @@ impl TrialBalance {
             .filter(|row| row.account_type == t)
             .map(|row| &row.balance);
         sum_money(balances)
-            .expect("同一 TrialBalance 内の残高は同一通貨であるため加算は失敗しない")
+            .expect(
+                "同一 TrialBalance 内の残高は同一通貨であるため、\
+                 合算は（オーバーフローしない限り）失敗しない",
+            )
             .unwrap_or_else(|| Money::zero(self.currency))
     }
 }

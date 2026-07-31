@@ -21,12 +21,6 @@
 //! 将来 private フィールドの直接検証が必要になったら、そのテストだけ
 //! `src/journal.rs` 内のユニットテストに切り替える。
 
-// `tests/` 配下の各統合テストファイルはそれぞれ独立したバイナリとしてこのモジュールを
-// 取り込む。ヘルパーによっては一部のテストファイルからしか使われないため、
-// 使わないファイル側で `dead_code` 警告が出る。このモジュール全体を共通ライブラリと
-// 位置づけ、警告を抑止する。
-#![allow(dead_code)]
-
 use kaikei_core::{
     AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, Currency, FixedClock,
     JournalLine, Money, PeriodGuard, PeriodStatus, Side, TagDef, TagKey, TagSchema, TagSet,
@@ -112,6 +106,11 @@ impl PeriodGuard for AlwaysOpen {
     }
 }
 
+// `closed_guard`（締められた期間の検証、`journal.rs` の R-11/R-63 等）専用。
+// `trial_balance.rs` からは使われないため、`tests/` 配下の各統合テストファイルが
+// それぞれ独立したバイナリとしてこのモジュールを取り込む構成上、`trial_balance.rs`
+// のビルドでは `dead_code` として警告される。
+#[allow(dead_code)]
 struct AlwaysClosed;
 
 impl PeriodGuard for AlwaysClosed {
@@ -126,6 +125,11 @@ pub fn open_guard() -> impl PeriodGuard {
 }
 
 /// 常に `PeriodStatus::Closed` を返す `PeriodGuard`。
+///
+/// `journal.rs` の R-11/R-63 等でのみ使われる。`trial_balance.rs` からは使われないため、
+/// `tests/` 配下の各統合テストファイルがそれぞれ独立したバイナリとしてこのモジュールを
+/// 取り込む構成上、`trial_balance.rs` のビルドでは `dead_code` として警告される。
+#[allow(dead_code)]
 pub fn closed_guard() -> impl PeriodGuard {
     AlwaysClosed
 }
@@ -141,6 +145,11 @@ pub fn fixed_clock() -> FixedClock {
 /// 科目のみを選ぶ。ランダム生成のたびに `tax_category` タグを用意する必要がなくなり、
 /// 生成戦略をシンプルに保てる（収益・費用科目の必須タグ検証は `journal.rs` の
 /// J-52 等、他のテストで別途カバーされている）。
+///
+/// `tests/` 配下の各統合テストファイルはそれぞれ独立したバイナリとしてこのモジュールを
+/// 取り込むため、`balanced_lines_strategy` を使わないテストファイル側からは
+/// `dead_code` として警告される。実際には `trial_balance.rs` から使われている。
+#[allow(dead_code)]
 const BALANCED_LINE_ACCOUNTS: [&str; 8] = ["100", "135", "180", "310", "330", "400", "410", "420"];
 
 /// `total` を正の整数 `count` 個に分割する `proptest` 戦略。
@@ -149,6 +158,18 @@ const BALANCED_LINE_ACCOUNTS: [&str; 8] = ["100", "135", "180", "310", "330", "4
 /// 生じた余り）は最後の要素に足し込む。各要素の初期値が 1 以上であることと、
 /// `count` 個の合計が `total` を超えないように上限を選んでいることから、
 /// 端数を足し込んだ後も全要素が 1 以上のまま合計はちょうど `total` になる。
+///
+/// この足し込み方のため、生成される分布には偏りがある。**最後の要素は端数を
+/// 引き受ける分、他の要素より大きくなりやすい**（特に `count` が小さいときや
+/// `total` が `count` で割り切れないときに顕著）。金額の合計が `total` に一致する
+/// ことだけを保証したい用途（貸借一致した明細の生成）では問題にならないが、
+/// 各要素がおおむね均等な大きさになることを期待する用途には使わないこと。
+///
+/// `balanced_lines_strategy` からのみ呼ばれるが、`tests/` 配下の各統合テスト
+/// ファイルは独立したバイナリとしてこのモジュールを取り込むため、
+/// `balanced_lines_strategy` を使わないファイル側からは `dead_code` として
+/// 警告される。
+#[allow(dead_code)]
 fn split_into_parts(total: i128, count: usize) -> impl Strategy<Value = Vec<i128>> {
     let max_weight = (total / count as i128).max(1);
     proptest::collection::vec(1..=max_weight, count).prop_map(move |mut parts| {
@@ -166,6 +187,11 @@ fn split_into_parts(total: i128, count: usize) -> impl Strategy<Value = Vec<i128
 /// 貸借一致を構造的に保証する（後から金額を調整して合わせるのではなく、
 /// 生成の時点で一致以外の値が作れない）。通貨は JPY 固定、タグは付けない
 /// （`BALANCED_LINE_ACCOUNTS` の科目はタグ必須ではないため）。
+///
+/// `tests/` 配下の各統合テストファイルはそれぞれ独立したバイナリとしてこのモジュールを
+/// 取り込むため、この関数を使わないテストファイル側からは `dead_code` として警告される。
+/// 実際には `trial_balance.rs` から使われている。
+#[allow(dead_code)]
 pub fn balanced_lines_strategy() -> impl Strategy<Value = Vec<JournalLine>> {
     (1i128..=1_000_000, 1usize..=3, 1usize..=3)
         .prop_flat_map(|(total, debit_count_req, credit_count_req)| {
@@ -194,6 +220,11 @@ pub fn balanced_lines_strategy() -> impl Strategy<Value = Vec<JournalLine>> {
 }
 
 /// `balanced_lines_strategy` 内部専用。次の科目インデックスと金額から1明細を作る。
+///
+/// `tests/` 配下の各統合テストファイルはそれぞれ独立したバイナリとしてこのモジュールを
+/// 取り込むため、`balanced_lines_strategy` を使わないファイル側からは `dead_code` として
+/// 警告される。
+#[allow(dead_code)]
 fn balanced_line(
     account_indices: &mut impl Iterator<Item = usize>,
     side: Side,

@@ -11,9 +11,9 @@
 mod common;
 
 use kaikei_core::{
-    AccountCode, AccountingDate, ChartOfAccounts, CoreError, Currency, EntryId, EntryNumber,
-    FiscalYear, JournalEntry, JournalLine, Money, NewEntry, Side, TagKey, TagSchema, TagSet,
-    TagValue, TrialBalance,
+    AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, CoreError, Currency,
+    EntryId, EntryNumber, FiscalYear, JournalEntry, JournalLine, Money, NewEntry, Side, TagKey,
+    TagSchema, TagSet, TagValue, TrialBalance,
 };
 use proptest::prelude::*;
 
@@ -21,6 +21,10 @@ use proptest::prelude::*;
 
 fn jpy(minor: i128) -> Money {
     Money::from_minor(minor, Currency::JPY)
+}
+
+fn usd(minor: i128) -> Money {
+    Money::from_minor(minor, Currency::USD)
 }
 
 fn acct(code: &str) -> AccountCode {
@@ -35,6 +39,16 @@ fn debit(code: &str, minor: i128) -> JournalLine {
 fn credit(code: &str, minor: i128) -> JournalLine {
     JournalLine::new(acct(code), Side::Credit, jpy(minor), TagSet::new(), None)
         .expect("テスト用の貸方明細は常に構築できる")
+}
+
+fn debit_usd(code: &str, minor: i128) -> JournalLine {
+    JournalLine::new(acct(code), Side::Debit, usd(minor), TagSet::new(), None)
+        .expect("テスト用の借方明細（USD）は常に構築できる")
+}
+
+fn credit_usd(code: &str, minor: i128) -> JournalLine {
+    JournalLine::new(acct(code), Side::Credit, usd(minor), TagSet::new(), None)
+        .expect("テスト用の貸方明細（USD）は常に構築できる")
 }
 
 fn tags_with(pairs: &[(&str, TagValue)]) -> TagSet {
@@ -535,6 +549,148 @@ fn trial_balance_totals_match_regardless_of_group_by() {
 }
 
 // =====================================================================
+// from_entries の未規定挙動の固定（レビュー指摘対応）
+//
+// 以下は `docs/02-test-cases.md` に専用のケースIDは無いが、コードレビューで
+// 「実装はされているが仕様として未規定・テストも無い」と指摘された挙動を、
+// 現在の実装の挙動を変えないままテストと doc で固定するもの。
+// =====================================================================
+
+// `from_entries` の防御的検証: `entries` を検証した勘定科目表と異なる
+// （明細が参照する科目を含まない）`chart` を渡すと `UnknownAccount` になる。
+#[test]
+fn trial_balance_from_entries_with_chart_missing_referenced_account_is_unknown_account() {
+    let e = entry(1, vec![debit("100", 100), credit("400", 100)]);
+
+    // "100"（現金）を含まない縮小版の勘定科目表。
+    let reduced_chart = ChartOfAccounts::new(vec![AccountDef {
+        code: acct("400"),
+        name: "元入金".to_string(),
+        account_type: AccountType::Equity,
+        parent: None,
+        postable: true,
+    }])
+    .expect("縮小版の勘定科目表は構築できる");
+
+    let err = trial_balance(
+        [&e].into_iter(),
+        &reduced_chart,
+        &common::test_schema(),
+        &[],
+    )
+    .unwrap_err();
+    assert!(matches!(err, CoreError::UnknownAccount { .. }));
+}
+
+// `from_entries` の防御的検証: `entries` の中に通貨が異なる仕訳が混在していると
+// `CurrencyMismatch` になる。
+#[test]
+fn trial_balance_from_entries_currency_mismatch_across_entries_is_error() {
+    let jpy_entry = entry(1, vec![debit("100", 100), credit("400", 100)]);
+    let usd_entry = new_entry(
+        2,
+        2,
+        date(2026, 4, 15),
+        "USD建ての仕訳",
+        vec![debit_usd("100", 100), credit_usd("400", 100)],
+    )
+    .expect("USD建ての仕訳も貸借一致していれば構築できる");
+
+    let err = trial_balance(
+        [&jpy_entry, &usd_entry].into_iter(),
+        &common::test_chart(),
+        &common::test_schema(),
+        &[],
+    )
+    .unwrap_err();
+    assert!(matches!(err, CoreError::CurrencyMismatch { .. }));
+}
+
+// `balance_of` / `total_by_type` は `group_by` を指定して構築した試算表でも、
+// 同一科目（・同一科目種別）の全グループの残高を合算して返す。
+#[test]
+fn trial_balance_balance_of_and_total_by_type_aggregate_across_groups_when_group_by_is_set() {
+    let e1 = entry(
+        1,
+        vec![
+            debit("100", 100),
+            credit_with_tags("500", 100, counterparty_tag("A")),
+        ],
+    );
+    let e2 = entry(
+        2,
+        vec![
+            debit("100", 200),
+            credit_with_tags("500", 200, counterparty_tag("B")),
+        ],
+    );
+
+    let group_by = [tag_key("counterparty")];
+    let tb = trial_balance(
+        [&e1, &e2].into_iter(),
+        &common::test_chart(),
+        &common::test_schema(),
+        &group_by,
+    )
+    .unwrap();
+
+    // "500" は counterparty ごとに2行へ分割されているはずだが、balance_of は
+    // それらを合算した科目単位の残高を返す。
+    assert_eq!(
+        tb.rows()
+            .iter()
+            .filter(|r| r.account.as_str() == "500")
+            .count(),
+        2
+    );
+    assert_eq!(tb.balance_of(&acct("500")).unwrap().minor(), 300);
+    assert_eq!(tb.total_by_type(AccountType::Revenue).minor(), 300);
+}
+
+// `group_by` に同じキーを複数回渡してもエラーにもクラッシュにもならず、
+// 集計結果の分割は重複を取り除いた場合と変わらない。
+#[test]
+fn trial_balance_group_by_with_duplicate_key_does_not_change_partitioning() {
+    let e1 = entry(
+        1,
+        vec![
+            debit("100", 100),
+            credit_with_tags("500", 100, counterparty_tag("A")),
+        ],
+    );
+    let e2 = entry(
+        2,
+        vec![
+            debit("100", 200),
+            credit_with_tags("500", 200, counterparty_tag("B")),
+        ],
+    );
+
+    let chart = common::test_chart();
+    let schema = common::test_schema();
+    let single_key = [tag_key("counterparty")];
+    let duplicate_key = [tag_key("counterparty"), tag_key("counterparty")];
+
+    let tb_single = trial_balance([&e1, &e2].into_iter(), &chart, &schema, &single_key).unwrap();
+    let tb_duplicate =
+        trial_balance([&e1, &e2].into_iter(), &chart, &schema, &duplicate_key).unwrap();
+
+    let rows_500_single = tb_single
+        .rows()
+        .iter()
+        .filter(|r| r.account.as_str() == "500")
+        .count();
+    let rows_500_duplicate = tb_duplicate
+        .rows()
+        .iter()
+        .filter(|r| r.account.as_str() == "500")
+        .count();
+    assert_eq!(rows_500_single, rows_500_duplicate);
+    assert!(tb_duplicate.is_balanced());
+    assert_eq!(tb_single.totals(), tb_duplicate.totals());
+}
+
+// =====================================================================
 // 検算シナリオ（統合テスト）（B-30〜B-33）
 // =====================================================================
 
@@ -650,41 +806,11 @@ fn trial_balance_wrong_entry_reversal_and_correct_entry_matches_correct_only() {
     );
 }
 
-// B-33: 100件の仕訳をランダム生成して集計しても常に is_balanced()
-#[test]
-fn trial_balance_100_randomly_generated_entries_is_always_balanced() {
-    use proptest::strategy::{Strategy as _, ValueTree as _};
-    use proptest::test_runner::TestRunner;
-
-    let strategy = common::balanced_lines_strategy();
-    let mut runner = TestRunner::default();
-
-    let mut entries = Vec::with_capacity(100);
-    for i in 0..100u32 {
-        let lines = strategy
-            .new_tree(&mut runner)
-            .expect("戦略からのサンプリングは失敗しない")
-            .current();
-        let entry = new_entry(
-            u128::from(i) + 1,
-            i + 1,
-            date(2026, 4, 15),
-            "ランダム生成テスト仕訳",
-            lines,
-        )
-        .expect("balanced_lines_strategy が生成する明細は常に貸借一致する");
-        entries.push(entry);
-    }
-
-    let tb = trial_balance(
-        entries.iter(),
-        &common::test_chart(),
-        &common::test_schema(),
-        &[],
-    )
-    .unwrap();
-    assert!(tb.is_balanced());
-}
+// B-33 は `proptest!` マクロで書く PT-02（下記）に統合した。生成上限を100件に
+// 広げることで「100件の仕訳をランダム生成して集計しても常に is_balanced()」を
+// カバーする。元々は `proptest::test_runner::TestRunner` を手動で回す実装
+// だったため、失敗時の自動シュリンクや `proptest-regressions/` への再現ケース
+// 保存が効かなかった。マクロ経由に統合することでこれらが機能するようになる。
 
 // =====================================================================
 // R-10（trial_balance.rs での完全な検証）
@@ -744,9 +870,12 @@ proptest! {
     }
 
     // PT-02: 任意の仕訳集合で TrialBalance::is_balanced() が true
+    //
+    // 上限を100件まで広げることで、B-33（「100件の仕訳をランダム生成して集計しても
+    // 常に is_balanced()」）もこの性質テストでカバーする。
     #[test]
     fn pt02_trial_balance_is_balanced_for_any_entry_set(
-        line_sets in prop::collection::vec(common::balanced_lines_strategy(), 1..=20)
+        line_sets in prop::collection::vec(common::balanced_lines_strategy(), 1..=100)
     ) {
         let entries: Vec<JournalEntry> = line_sets
             .into_iter()
