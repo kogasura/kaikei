@@ -33,6 +33,9 @@ kaikei-app = { path = ".", features = ["testing"] }
 # 後続 PR（PR-7 のユースケーステスト）が test-doubles（NoTaxPolicy 等）を
 # 使うことを見越して、統合テストの経路でも有効化しておく。
 kaikei-policy = { path = "../kaikei-policy", version = "0.0.1", features = ["test-doubles"] }
+# ユースケースの貸借一致プロパティテスト専用。normal edge には出ない
+# （`cargo tree --edges normal` では検出されない）。
+proptest = { workspace = true }
 
 [features]
 # テスト用のインメモリ fake（testing.rs）を有効にする。他 crate のテストから

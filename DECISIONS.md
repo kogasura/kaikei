@@ -875,3 +875,30 @@ ERRCODE の選定は PostgreSQL のエラーコード一覧でクラス `P0`
 ERRCODE 未指定の `RAISE EXCEPTION` が別の意図で追加された場合、その
 エラーも「未分類」として扱われる（適切な専用 ERRCODE を都度割り当てる
 運用を続ける必要がある）。
+
+---
+
+## D-045 ユースケース関数は依存を素の引数として受け取る（`PostEntryDeps` のような集約構造体を導入しない）
+
+**決定**: `kaikei-app::usecase::{post_entry, reverse_entry, report}::execute`
+は、依存（`&dyn TaxPolicy` / `&TagSchema` / `&dyn IdGenerator` /
+`&dyn AppClock` / `&BookSettings` 等）を1つずつの素の引数として受け取る。
+これらをまとめる `PostEntryDeps<'a>` のような集約構造体は導入しない。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `PostEntryDeps<'a> { tax: &'a dyn TaxPolicy, tag_schema: &'a TagSchema, .. }` に依存をまとめ、`execute(tx, deps, input)` の3引数にする | `CLAUDE.md` §6「1ユースケース = 1関数。依存が引数に全部現れる」の趣旨（呼び出し側が何を注入する必要があるかシグネチャを見ただけで分かる）が、`Deps` 構造体1個の中に隠れてしまう。呼び出し側は結局 `Deps` の各フィールドを埋める必要があり、引数の見た目が減るだけで実質的な複雑さは変わらない |
+
+**理由**: `post_entry::execute` の引数は現時点で7本
+（`tx, tax, tag_schema, id_gen, clock, settings, input`）で、
+`clippy::too_many_arguments` の既定閾値（7本まで許容、8本以上で警告）に
+ちょうど収まっている。素の引数のままで `CLAUDE.md` §6 の利点を最大化しつつ、
+clippy 違反も発生しない。
+
+**トレードオフ**: 8本目の依存が必要になった瞬間、
+`#[allow(clippy::too_many_arguments)]` を付けるか、`PostEntryDeps` の導入と
+すべての呼び出し側（PR-8 の合成ルート、Phase 3 の MCP サーバー等）の
+書き換えのどちらかを迫られる。**その時点で初めて `PostEntryDeps` の導入を
+検討する**方針とし、今は導入しない（YAGNI。今必要ないものは作らない）。

@@ -5,7 +5,10 @@
 //!
 //! 二重訂正（既に赤伝済みの仕訳を再度訂正すること）は既定で拒否する
 //! （[`AppError::AlreadyReversed`]）。`allow_double_reversal: true` を明示した
-//! 場合のみ許可する。
+//! 場合のみ許可する。なお、この拒否は「同じ元仕訳を2回赤伝すること」を
+//! 対象とし、「赤伝そのものをさらに訂正すること」（逆仕訳の逆仕訳）は別扱い
+//! （`original_id` に元の仕訳ではなく赤伝のIDを指定すれば通常どおり許可される。
+//! `kaikei_core::JournalEntry::reverse` が意図的に許可している設計と対応する）。
 //!
 //! # 実行順序
 //!
@@ -19,6 +22,9 @@
 //!    の直前に置く
 //! 5. **domain**: [`kaikei_core::JournalEntry::reverse`] で逆仕訳を構築する
 //! 6. **I/O**: 仕訳を追加する
+//!
+//! テストID（`RE-1` 等）はこのファイル内でのみ一意な連番であり、
+//! `docs/02-test-cases.md` のID体系とは独立している。
 
 use crate::context::{load_posting_context, BookSettings, PostingContext};
 use crate::error::{AppError, RepoError};
@@ -43,6 +49,18 @@ pub struct ReverseEntryInput {
 ///
 /// トランザクションの開始・確定・破棄は行わない（呼び出し側が
 /// [`crate::tx::with_tx`] で管理する）。実行順序は本モジュール doc を参照。
+///
+/// # Errors
+///
+/// - `input.original_id` の仕訳が存在しない場合は
+///   [`AppError::Repo`]（[`RepoError::NotFound`]）
+/// - `input.allow_double_reversal` が `false` で、`input.original_id` が
+///   既に他の仕訳から訂正されている場合は [`AppError::AlreadyReversed`]
+/// - `tx` からの読み込み（勘定科目表・締め状態・採番）・書き込み
+///   （`insert_entry`）が失敗した場合は [`AppError::Repo`]
+/// - [`kaikei_core::JournalEntry::reverse`] の検証（科目の記帳可否・通貨・
+///   タグスキーマ・会計年度・締め状態・摘要）に失敗した場合は
+///   [`AppError::Core`]
 pub async fn execute<Tx>(
     tx: &mut Tx,
     tag_schema: &TagSchema,
@@ -107,51 +125,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::FiscalYearRule;
     use crate::ports::{JournalRepo, NumberingRepo, Store, TxScope};
+    use crate::test_support::{fixed_clock, sample_chart, settings, AllOpen};
     use crate::testing::{InMemoryStore, SequentialIdGenerator};
     use crate::tx::with_tx;
-    use kaikei_core::{
-        AccountCode, AccountDef, AccountType, ChartOfAccounts, Currency, FixedClock, JournalLine,
-        Money, NewEntry, PeriodGuard, PeriodStatus, Side, TagSet, Timestamp,
-    };
-
-    fn sample_chart() -> ChartOfAccounts {
-        ChartOfAccounts::new(vec![
-            AccountDef {
-                code: AccountCode::parse("100").unwrap(),
-                name: "現金".to_string(),
-                account_type: AccountType::Asset,
-                parent: None,
-                postable: true,
-            },
-            AccountDef {
-                code: AccountCode::parse("500").unwrap(),
-                name: "売上高".to_string(),
-                account_type: AccountType::Revenue,
-                parent: None,
-                postable: true,
-            },
-        ])
-        .unwrap()
-    }
-
-    fn settings() -> BookSettings {
-        BookSettings {
-            fiscal_year_rule: FiscalYearRule::CalendarYear,
-        }
-    }
-
-    fn fixed_clock() -> FixedClock {
-        FixedClock(Timestamp::from_unix_nanos(0))
-    }
-
-    struct AllOpen;
-    impl PeriodGuard for AllOpen {
-        fn status(&self, _date: AccountingDate) -> PeriodStatus {
-            PeriodStatus::Open
-        }
-    }
+    use kaikei_core::{AccountCode, Currency, JournalLine, Money, NewEntry, Side, TagSet};
 
     /// 貸借が一致した最小限の仕訳を1件、`store` にコミット済みの状態で作る。
     ///
@@ -224,7 +202,7 @@ mod tests {
         .await
     }
 
-    // R-1: 正常系。逆仕訳が貸借反転して作られ、insert_entry まで到達する。
+    // RE-1: 正常系。逆仕訳が貸借反転して作られ、insert_entry まで到達する。
     #[tokio::test]
     async fn reverse_entry_succeeds_and_flips_sides() {
         let store = InMemoryStore::with_chart(sample_chart());
@@ -246,7 +224,7 @@ mod tests {
         assert_eq!(store.committed_entries().len(), 2);
     }
 
-    // R-2: 二重訂正は既定で AlreadyReversed になり、既存逆仕訳の番号が入る。
+    // RE-2: 二重訂正は既定で AlreadyReversed になり、既存逆仕訳の番号が入る。
     #[tokio::test]
     async fn reverse_entry_rejects_double_reversal_by_default() {
         let store = InMemoryStore::with_chart(sample_chart());
@@ -283,7 +261,7 @@ mod tests {
         }
     }
 
-    // R-3: allow_double_reversal: true を指定すれば二重訂正が許可される。
+    // RE-3: allow_double_reversal: true を指定すれば二重訂正が許可される。
     #[tokio::test]
     async fn reverse_entry_allows_double_reversal_when_explicitly_enabled() {
         let store = InMemoryStore::with_chart(sample_chart());
@@ -310,7 +288,7 @@ mod tests {
         assert_eq!(store.committed_entries().len(), 3);
     }
 
-    // R-4: 元仕訳が別年度でも、逆仕訳は指定日付（reverse_date）の年度に属する。
+    // RE-4: 元仕訳が別年度でも、逆仕訳は指定日付（reverse_date）の年度に属する。
     #[tokio::test]
     async fn reverse_entry_belongs_to_the_fiscal_year_of_reverse_date() {
         let store = InMemoryStore::with_chart(sample_chart());
@@ -334,7 +312,7 @@ mod tests {
         );
     }
 
-    // R-5: 存在しない仕訳IDを訂正しようとすると RepoError::NotFound になる。
+    // RE-5: 存在しない仕訳IDを訂正しようとすると RepoError::NotFound になる。
     #[tokio::test]
     async fn reverse_entry_rejects_unknown_original_id() {
         let store = InMemoryStore::with_chart(sample_chart());
@@ -354,7 +332,7 @@ mod tests {
         ));
     }
 
-    // R-6: 締められた期間への訂正は PeriodClosed になる
+    // RE-6: 締められた期間への訂正は PeriodClosed になる
     // （逆仕訳の取引日＝reverse_date に対して締め状態が判定される）。
     #[tokio::test]
     async fn reverse_entry_rejects_reversal_in_closed_period() {
@@ -376,5 +354,42 @@ mod tests {
             result,
             Err(AppError::Core(kaikei_core::CoreError::PeriodClosed { .. }))
         ));
+    }
+
+    // RE-7（修正5-3）: 元仕訳が既に逆仕訳（訂正仕訳）である場合でも、
+    // その赤伝自体をさらに訂正すること（逆仕訳の逆仕訳）は通常どおり許可される
+    // （`allow_double_reversal` を明示しなくても良い。二重訂正の拒否対象は
+    // 「同じ元仕訳を2回赤伝すること」であり、「赤伝を訂正すること」ではない）。
+    #[tokio::test]
+    async fn reverse_entry_of_a_reversal_entry_is_allowed_without_the_double_reversal_flag() {
+        let store = InMemoryStore::with_chart(sample_chart());
+        let original_date = AccountingDate::new(2026, 4, 1).unwrap();
+        seed_entry(&store, 1, original_date).await;
+
+        // 1回目: 元仕訳(1)を訂正して赤伝(reversal_of_original)を作る。
+        let first_input = ReverseEntryInput {
+            original_id: EntryId::new(1),
+            reverse_date: AccountingDate::new(2026, 4, 5).unwrap(),
+            reason: "誤りに気づいたので取り消す".to_string(),
+            allow_double_reversal: false,
+        };
+        let reversal_of_original = run_reverse_entry(&store, 100, first_input).await.unwrap();
+
+        // 2回目: 赤伝そのものを訂正する（赤伝の打ち間違いを取り消す）。
+        // original_id には赤伝(reversal_of_original)のIDを指定する。
+        let second_input = ReverseEntryInput {
+            original_id: reversal_of_original.id(),
+            reverse_date: AccountingDate::new(2026, 4, 12).unwrap(),
+            reason: "赤伝自体の打ち間違いを取り消す".to_string(),
+            allow_double_reversal: false,
+        };
+        let second_result = run_reverse_entry(&store, 200, second_input).await;
+
+        let reversal_of_reversal = second_result.unwrap();
+        assert_eq!(
+            reversal_of_reversal.reverses(),
+            Some(reversal_of_original.id())
+        );
+        assert_eq!(store.committed_entries().len(), 3);
     }
 }

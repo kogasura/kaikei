@@ -43,6 +43,8 @@ pub mod error;
 pub mod id;
 pub mod period_guard;
 pub mod ports;
+#[cfg(test)]
+mod test_support;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod tx;

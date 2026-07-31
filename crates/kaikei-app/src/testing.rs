@@ -404,41 +404,18 @@ mod tests {
     /// テスト専用の仕訳ビルダー。`tests` モジュールの複数のテストから
     /// 使うための共通ヘルパ。
     mod tests_support {
+        use crate::test_support::{sample_chart, AllOpen};
         use kaikei_core::{
-            AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, Currency,
-            EntryId, EntryNumber, FiscalYear, FixedClock, JournalEntry, JournalLine, Money,
-            NewEntry, PeriodGuard, PeriodStatus, Side, TagSchema, TagSet, Timestamp,
+            AccountCode, AccountingDate, Currency, EntryId, EntryNumber, FiscalYear, JournalEntry,
+            JournalLine, Money, NewEntry, Side, TagSchema, TagSet,
         };
-
-        struct AllOpen;
-        impl PeriodGuard for AllOpen {
-            fn status(&self, _date: AccountingDate) -> PeriodStatus {
-                PeriodStatus::Open
-            }
-        }
 
         /// テストで使う、貸借が一致した最小限の仕訳を1件組み立てる。
         pub(super) fn sample_entry(id: u128, entry_no: u32) -> JournalEntry {
-            let chart = ChartOfAccounts::new(vec![
-                AccountDef {
-                    code: AccountCode::parse("100").unwrap(),
-                    name: "現金".to_string(),
-                    account_type: AccountType::Asset,
-                    parent: None,
-                    postable: true,
-                },
-                AccountDef {
-                    code: AccountCode::parse("500").unwrap(),
-                    name: "売上高".to_string(),
-                    account_type: AccountType::Revenue,
-                    parent: None,
-                    postable: true,
-                },
-            ])
-            .unwrap();
+            let chart = sample_chart();
             let schema = TagSchema::empty();
             let fy = FiscalYear::calendar_year(2026);
-            let clock = FixedClock(Timestamp::from_unix_nanos(0));
+            let clock = crate::test_support::fixed_clock();
 
             let lines = vec![
                 JournalLine::new(
