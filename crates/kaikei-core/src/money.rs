@@ -87,11 +87,7 @@ impl Money {
         let integer_part = parts.next().expect("splitn は常に1要素以上を返す");
         let decimal_part = parts.next();
 
-        // to_display_string() が挿入する桁区切りカンマを許容する（ラウンドトリップのため）。
-        let integer_digits: String = integer_part.chars().filter(|&c| c != ',').collect();
-        if integer_digits.is_empty() || !integer_digits.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(invalid_amount(format!("数値として解釈できません: \"{s}\"")));
-        }
+        let integer_digits = parse_integer_digits(integer_part, s)?;
 
         let minor_unit = currency.minor_unit() as usize;
 
@@ -192,17 +188,33 @@ impl Money {
     }
 
     /// 符号反転した金額を返す。
+    ///
+    /// # Panics
+    ///
+    /// `minor()` が `i128::MIN` の場合（符号反転を表現できない）。
+    /// 現実的な会計金額では発生しない前提。
     pub fn neg(&self) -> Money {
         Money {
-            minor: -self.minor,
+            minor: self
+                .minor
+                .checked_neg()
+                .expect("Money::neg: i128::MIN の符号反転は表現できません"),
             currency: self.currency,
         }
     }
 
     /// 絶対値の金額を返す。
+    ///
+    /// # Panics
+    ///
+    /// `minor()` が `i128::MIN` の場合（絶対値を表現できない）。
+    /// 現実的な会計金額では発生しない前提。
     pub fn abs(&self) -> Money {
         Money {
-            minor: self.minor.abs(),
+            minor: self
+                .minor
+                .checked_abs()
+                .expect("Money::abs: i128::MIN の絶対値は表現できません"),
             currency: self.currency,
         }
     }
@@ -255,6 +267,38 @@ impl Money {
         }
         Ok(())
     }
+}
+
+/// 整数部の文字列から桁区切りカンマを検証つきで取り除く。
+///
+/// カンマを含まない場合は数字のみで構成されていることを確認する。
+/// カンマを含む場合は「先頭グループが1〜3桁、以降のグループが正確に3桁」
+/// という正しい3桁区切りの場合のみ受理する（`to_display_string()` の出力
+/// をラウンドトリップさせるため）。`"1234,56"` のような不正な区切りは拒否する。
+fn parse_integer_digits(integer_part: &str, original: &str) -> Result<String, CoreError> {
+    let invalid = || CoreError::InvalidAmount {
+        reason: format!("数値として解釈できません: \"{original}\""),
+    };
+
+    if !integer_part.contains(',') {
+        if integer_part.is_empty() || !integer_part.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        return Ok(integer_part.to_string());
+    }
+
+    let groups: Vec<&str> = integer_part.split(',').collect();
+    let is_valid_group = |g: &str| !g.is_empty() && g.bytes().all(|b| b.is_ascii_digit());
+    let Some((first, rest)) = groups.split_first() else {
+        return Err(invalid());
+    };
+    let valid = is_valid_group(first)
+        && first.len() <= 3
+        && rest.iter().all(|g| g.len() == 3 && is_valid_group(g));
+    if !valid {
+        return Err(invalid());
+    }
+    Ok(groups.concat())
 }
 
 /// 3桁ごとにカンマを挿入する。
@@ -496,6 +540,24 @@ mod tests {
         let m = Money::from_minor(1000, Currency::JPY);
         let ratio = Ratio::parse_fraction("0.335").unwrap();
         assert_eq!(m.mul_ratio(ratio, RoundMode::HalfUp).minor(), 335);
+    }
+
+    // レビュー指摘1: 正しい3桁区切りのカンマは受理する
+    #[test]
+    fn money_parse_correctly_grouped_commas_succeeds() {
+        assert_eq!(Money::parse("1,234", Currency::JPY).unwrap().minor(), 1234);
+        assert_eq!(
+            Money::parse("1,234,567.89", Currency::USD).unwrap().minor(),
+            123_456_789
+        );
+    }
+
+    // レビュー指摘1: 不正な桁区切り（例: "1234,56"）は拒否する
+    #[test]
+    fn money_parse_incorrectly_grouped_commas_is_error() {
+        assert!(Money::parse("1234,56", Currency::USD).is_err());
+        assert!(Money::parse("1,23", Currency::JPY).is_err());
+        assert!(Money::parse("1,2345", Currency::JPY).is_err());
     }
 
     // M-30
