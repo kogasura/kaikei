@@ -528,3 +528,120 @@ PRが新たに持ち込んだ矛盾ではない。(b) 取引先マスタを完�
 その国の `TaxPolicy` 実装にとって意味を持たない（常に `None` になる）。
 他国対応が具体化した時点で、属性バッグ化（例: 汎用のキー・値フィールドへの
 置き換え）を検討する余地を残す。
+
+---
+
+## D-029 トランザクション境界は `&mut Tx` を引数で引き回す（`kaikei-app` のポート層）
+
+**決定**: `kaikei-app::ports::Store` は `begin(&self) -> Result<Self::Tx, RepoError>`
+のみを持ち、ユースケース本体は `begin` も `commit`/`rollback` も呼ばない。
+リポジトリ trait（`JournalRepo` / `ChartRepo` / `PeriodRepo` / `NumberingRepo`）は
+すべて `&mut self` を取り、ユースケースは `&mut Tx`（`Tx: TxOps`）を引数として
+受け取ってこれらを直接呼ぶ。`Store::Tx` はライフタイム引数を持たない関連型
+（GAT にしない）。`begin`/`commit`/`rollback` は `tx::with_tx` ヘルパに一本化し、
+`Store::begin` は `#[doc(hidden)]` にして直接呼ばないよう案内する。
+
+**却下した選択肢**（3案を独立に設計・採点し、3人の審査員が 9/9/9 の満場一致で
+本決定を選んだ）:
+
+| 候補 | 却下理由 |
+|---|---|
+| 案1: UnitOfWork（`&mut dyn UnitOfWork` のような trait object にリポジトリ群を束ね、`execute` と `execute_in_tx` の2関数構成でユースケースの合成を扱う） | 「トランザクション内から別ユースケースを呼べない」問題を2関数構成で毎回回避する必要があり、`CLAUDE.md` §6「1ユースケース=1関数」を素直に満たせない。`&mut dyn Tx` はどのリポジトリに依存するかがシグネチャから消える |
+| 案3: クロージャに実行させる（`Box<dyn for<'t> FnOnce(&'t mut (dyn Tx + 't)) -> BoxFuture<'t, Result<Box<dyn Any + Send>, _>> + Send + 's>` のような型でユースケースを表現） | GAT・HRTB・`Box<dyn Any>`・`self: Box<Self>` レシーバが要る最も複雑な形。`implementation of FnOnce is not general enough` を誘発しやすく、案3自身が回避策を3つ要すると認めている |
+
+**理由**:
+
+1. `ARCHITECTURE.md` §5 の規定シグネチャ（`execute<R, T>(repo: &R, tax: &T, ...) where R: JournalRepository`）とほぼ同型で、`CLAUDE.md` §6「依存が引数に全部現れる」を `where Tx: JournalRepo + ChartRepo + ...`（束ね trait `TxOps` を使えば `where Tx: TxOps`）という境界の形で素直に満たす
+2. GAT・HRTB・`Box<dyn Any>` のような exotic な型機構が一切不要。`&mut Tx` の連続呼び出しは各式で借用が閉じるため、Rust が最も得意とする形になる
+3. `begin`/`commit` を持たないため、ユースケースの合成（あるユースケースの中から別のユースケースを呼ぶ）が構造的に無料で手に入る
+4. テストが境界を完全に握れる（`with_tx` に閉じたことで、fake に対する commit/rollback の検証が1箇所で完結する。`crates/kaikei-app/src/tx.rs` の `with_tx` テストを参照）
+
+採用にあたり、他案から次の要素を取り込んだ:
+- `AppClock: Clock + Send + Sync` のブランケット trait（`&dyn Clock` が `!Send` になる問題を1箇所に閉じる。`ports.rs`）
+- 束ね trait `TxOps`（`where` 句を毎回4本書かずに済む）
+- `RepoError` をドメイン語彙の enum にする（`error.rs`。D-032 参照）
+- `with_tx` を唯一の推奨入口にし、`Store::begin` を `#[doc(hidden)]` にする
+
+**トレードオフ**: `Store::Tx` に `'static` 相当の関連型を要求するため、実装側
+（`kaikei-store`）はトランザクションを所有型として持つ必要がある
+（`sqlx::PgPool::begin()` が `Transaction<'static, Postgres>` を返すため、この
+制約は無理なく満たせる）。また `Store::begin` を直接呼んで `commit` を書き忘れる
+と、エラーも警告も出ずに何も保存されない構造的リスクが残る（`with_tx` への
+一本化と `#[doc(hidden)]` で緩和するが、完全には防げない）。
+
+---
+
+## D-030 `SystemClock` は記帳時刻をマイクロ秒粒度に丸めて返す
+
+**決定**: `kaikei-app::clock::SystemClock`（`kaikei_core::Clock` の実装）は、
+`SystemTime::now()` から得たナノ秒単位の値を、生成した時点でマイクロ秒に
+丸めてから `Timestamp` に格納する（`nanos / 1_000 * 1_000`）。
+
+**却下した選択肢**: ナノ秒のまま `Timestamp::from_unix_nanos` に渡す（丸めない）。
+
+**理由**: `journal_entries.recorded_at` は `TIMESTAMPTZ`（PostgreSQL、マイクロ秒
+精度）で保存される一方、`kaikei_core::Timestamp` はナノ秒精度を持つ。丸めずに
+生成すると、保存して読み戻した値がナノ秒未満の端数だけ元の値と食い違い、
+save → find の往復同値性を検証する proptest が必ず失敗する。生成時点（`Clock`
+の実装）で丸めておけば、store 側は何も丸めずに素直に保存・復元でき、
+「テストの方を緩める」という誤った圧力を避けられる。
+
+**トレードオフ**: `SystemClock::now()` はナノ秒精度の情報を意図的に捨てる。
+`kaikei_core::Timestamp` 自体はナノ秒を保持できる型なので、`FixedClock` 等の
+テスト用 `Clock` にナノ秒未満の値を直接渡すことは引き続き可能（この場合は
+丸めの対象外であり、`Timestamp` の往復同値性テスト自体は core 側に既に
+存在する）。丸めるのは実時刻を返す `SystemClock` の実装だけであり、
+`Timestamp` という型自体の精度を落とす決定ではない。
+
+---
+
+## D-031 read model 用の DTO（`view.rs`）を `kaikei-app` に持つ
+
+**決定**: `kaikei_core::GroupKey` / `BalanceRow` / `TrialBalance` を read model の
+戻り値としてそのまま使わず、`kaikei-app::view::BalanceRowView` /
+`TrialBalanceView` という DTO を新設し、`ports::TrialBalanceQuery::trial_balance`
+はこの DTO を返す。
+
+**却下した選択肢**: `kaikei_core::BalanceRow` / `TrialBalance` を `kaikei-store`
+の SQL 集計結果から直接構築して返す。
+
+**理由**: `kaikei_core::GroupKey`（`trial_balance.rs`）には `impl` ブロックが
+1つも無く、公開コンストラクタもアクセサも存在しない（実測確認済み）。
+`BalanceRow` のフィールドは `pub` だが `group: GroupKey` を構築する手段が
+core の外に無いため、`BalanceRow` / `TrialBalance` は core の外から**構築不能**
+である。SQL 集計（`kaikei-store::query`）から直接組み立てられる DTO が
+存在しないと read model 自体を実装できない。`GroupKeyView`（`BTreeMap<String,
+String>`）はキーの型を `TagKey` ではなく `String` にし、SQL の集計結果
+（例: `jsonb_object_agg`）から検証済みキーの再構築を経ずに直接組み立てられる
+ようにしている。
+
+**トレードオフ**: `kaikei_core::BalanceRow` と `kaikei-app::view::BalanceRowView`
+はフィールド構成が似た別の型として並存する（呼び出し側が2つの型を意識する
+必要がある）。`GroupKey::iter()` のようなアクセサを core に追加すれば
+DTO を無くせる可能性があるが、core の変更は人間の承認事項（`CLAUDE.md` §9）
+であり、Phase 1 ではこの DTO で対応する。
+
+---
+
+## D-032 `RepoError` はドメイン語彙の enum にする（`Box<dyn Error>` 一本にしない）
+
+**決定**: `kaikei-app::error::RepoError` を `NotFound` / `AppendOnlyViolation` /
+`Conflict` / `Corrupt` / `OutOfRange` / `Unsupported` / `Backend` の7バリアントを
+持つ enum として定義する。SQLSTATE（`42501` = 権限拒否 / `P0001` = トリガ /
+`23505` = 一意制約 等）の判別・写像は実装側（`kaikei-store`）が行う。
+
+**却下した選択肢**: `RepoError::Backend(Box<dyn std::error::Error + Send +
+Sync>)` のような単一バリアントに永続化層のエラーをすべて包む。
+
+**理由**: 単一バリアントに包むと、append-only 違反（DB権限の REVOKE、または
+トリガによる拒否）が「ただの DB エラー」に潰れてしまい、`CLAUDE.md` §11
+「次の手が分かる文言にする」を満たせなくなる。`RepoError::AppendOnlyViolation`
+を受け取ったユースケースは「訂正は逆仕訳（`reverse`）で行ってください」と
+案内できるが、単一バリアントではこの分岐ができない。同様に `Corrupt`
+（`rehydrate` 前の再検証で検出した保存データの不整合）と `OutOfRange`
+（`i128→i64`・`u32→i32` の変換失敗）を分けたのは、いずれも呼び出し側が
+取るべき対応が異なるため。
+
+**トレードオフ**: `kaikei-store` 側で SQLSTATE からこの enum への写像コードを
+書く手間が生じる（`Box<dyn Error>` に包むだけの実装より初期コストが高い）。
+会計データにおいて「次の手が分かるエラー」の価値がこのコストに見合うと判断した。

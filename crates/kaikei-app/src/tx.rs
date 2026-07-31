@@ -1,0 +1,119 @@
+//! `with_tx` — トランザクションの開始・確定・破棄を1箇所に閉じる唯一の推奨入口。
+//!
+//! [`crate::ports::Store::begin`] を直接呼んで commit を書き忘れると、
+//! エラーも警告も出ずに何も保存されない（会計データでは致命的）。この
+//! ヘルパに閉じることで、commit 漏れが構造的に起きにくくなる。
+
+use crate::error::AppError;
+use crate::ports::{Store, TxScope};
+use std::future::Future;
+use std::pin::Pin;
+
+/// `with_tx` に渡すクロージャが返す future を trait object 化するためのエイリアス。
+///
+/// クロージャは `&mut S::Tx` を借用するため、戻り値の future はその借用の
+/// ライフタイムを持つ（`BoxFut<'a, _>`）。
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// トランザクションを開始し、`f` を実行し、成功したら commit・失敗したら
+/// rollback する。
+///
+/// `f` の中で `store.begin()` や別のトランザクションを開始しないこと
+/// （このトランザクションと二重にネストする必要が生じるユースケースは
+/// 現時点で想定していない）。また `f` の中では DB 以外の I/O
+/// （証憑ファイルの書き込み・外部API・LLM呼び出し等）を行わないこと。
+/// トランザクション（例: 採番カウンタの行ロック）を握ったまま外部応答を
+/// 待つ状態（idle-in-transaction）を防ぐため。
+pub async fn with_tx<S, T, F>(store: &S, f: F) -> Result<T, AppError>
+where
+    S: Store,
+    T: Send,
+    F: for<'a> FnOnce(&'a mut S::Tx) -> BoxFut<'a, Result<T, AppError>> + Send,
+{
+    let mut tx = store.begin().await?;
+    // ★ ここで `match f(&mut tx).await { .. }` と書くと E0505 になる。
+    //   match のスクルティニー（`f(&mut tx).await` の一時値）が match 式
+    //   全体のスコープで生存し続け、`Ok`/`Err` 分岐内で行う `tx.commit()`
+    //   （`self` を消費する = `tx` を move する）と `&mut tx` の借用が
+    //   衝突するため。必ず `let` で受けて `&mut tx` への借用をここで
+    //   終わらせてから分岐する。
+    let result = f(&mut tx).await;
+    match result {
+        Ok(value) => {
+            tx.commit().await?;
+            Ok(value)
+        }
+        Err(err) => {
+            // rollback 自体の失敗は元のエラーを覆い隠さない（呼び出し側には
+            // 元の失敗理由を返す）。rollback 失敗はログに残す価値があるが、
+            // ログ基盤の導入は本 PR の対象外なので握りつぶす。
+            let _ = tx.rollback().await;
+            Err(err)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::{ChartRepo, NumberingRepo};
+    use crate::testing::InMemoryStore;
+    use kaikei_core::{AccountCode, AccountDef, AccountType, ChartOfAccounts};
+
+    fn sample_chart() -> ChartOfAccounts {
+        ChartOfAccounts::new(vec![AccountDef {
+            code: AccountCode::parse("100").unwrap(),
+            name: "現金".to_string(),
+            account_type: AccountType::Asset,
+            parent: None,
+            postable: true,
+        }])
+        .unwrap()
+    }
+
+    // with_tx が実際にコンパイルでき、成功時に commit されることを確認する
+    // （E0505 を踏んでいないことの証明でもある）。
+    #[tokio::test]
+    async fn with_tx_commits_on_success() {
+        let store = InMemoryStore::with_chart(sample_chart());
+
+        let result: Result<usize, AppError> = with_tx(&store, |tx| {
+            Box::pin(async move {
+                let chart = tx.load_chart().await?;
+                Ok(chart.iter().count())
+            })
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    // 失敗時は rollback され、コミット経路と異なることを確認する
+    // （インメモリ fake は commit されたものだけを採番の永続化に反映するため、
+    // rollback 側の効果が無いことを裏から確認する）。
+    #[tokio::test]
+    async fn with_tx_rolls_back_on_failure() {
+        let store = InMemoryStore::new();
+
+        let result: Result<(), AppError> = with_tx(&store, |tx| {
+            Box::pin(async move {
+                let _ = tx.next_entry_no(2026).await?;
+                Err(AppError::Rejected {
+                    reason: "テスト用の意図的な失敗".to_string(),
+                })
+            })
+        })
+        .await;
+
+        assert!(result.is_err());
+        // ロールバックしたので、採番カウンタは進んでいないはず。
+        let next: Result<_, AppError> = with_tx(&store, |tx| {
+            Box::pin(async move {
+                let no = tx.next_entry_no(2026).await?;
+                Ok(no)
+            })
+        })
+        .await;
+        assert_eq!(next.unwrap().as_u32(), 1);
+    }
+}

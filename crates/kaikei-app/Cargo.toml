@@ -17,3 +17,15 @@ kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
 kaikei-policy = { path = "../kaikei-policy", version = "0.0.1" }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# 非同期テスト（`#[tokio::test]`）専用のランタイム。normal edge には出ない
+# （`cargo tree --edges normal` では検出されない。CI の
+# 「kaikei-app は infra を知らない」ステップもこの edge を見ていない）。
+tokio = { workspace = true }
+
+[features]
+# テスト用のインメモリ fake（testing.rs）を有効にする。他 crate のテストから
+# 使うことを想定するため #[cfg(test)] だけでなく feature でも切る。
+testing = []
