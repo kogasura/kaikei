@@ -72,6 +72,23 @@ Phase 0 完了時点の成果物は
 「貸借不一致の仕訳がプログラム上に存在できないRust製簿記エンジン」であり、
 これ単体で公開・議論に足る。
 
+## ローカル開発環境（PostgreSQL）
+
+Phase 1 以降は PostgreSQL が必要（`docs/03-database.md`、`DECISIONS.md` D-010）。
+
+```sh
+cp .env.example .env   # パスワードを埋める
+docker compose up -d   # postgres:17-alpine が起動し、ロール作成が自動実行される
+sqlx migrate run --source crates/kaikei-store/migrations \
+  --database-url "$MIGRATOR_DATABASE_URL"
+```
+
+**開発中に壊れたデータを直す場合は `docker compose down -v`。**
+1行だけ `UPDATE` して直そうとしない（`CLAUDE.md` §2 掟3。append-only は
+DB権限とトリガで強制されているため、そもそも `UPDATE` は通らない）。
+named volume（`kaikei_pgdata`）ごと作り直せば、次回起動時に
+`docker/postgres/init/01-roles.sql` からロール作成〜マイグレーションをやり直せる。
+
 ## 未決定事項（着手前に人間が決める）
 
 - crate名 / プロジェクト名の最終決定（`kaikei` は仮）
