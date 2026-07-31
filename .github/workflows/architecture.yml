@@ -69,12 +69,120 @@ jobs:
           fi
           echo "OK"
 
+      - name: kaikei-policy は純粋層（依存）
+        run: |
+          set -euo pipefail
+          ALLOWED="kaikei-core thiserror rust_decimal proptest"
+          DEPS=$(cargo tree -p kaikei-policy --edges normal --depth 1 --prefix none \
+                 | sed 's/ v[0-9].*//' \
+                 | grep -v '^kaikei-policy$' \
+                 | grep -v '^$' \
+                 | sort -u)
+          FAIL=0
+          for d in $DEPS; do
+            if ! echo "$ALLOWED" | grep -qw "$d"; then
+              echo "::error::kaikei-policy に禁止された依存: $d"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "kaikei-policy は trait 定義のみの純粋層です。CLAUDE.md §1/§3 を確認してください。"
+            exit 1
+          fi
+          echo "OK: $DEPS"
+
+      - name: kaikei-policy に async / I/O が無い
+        run: |
+          set -euo pipefail
+          # CLAUDE.md §1・§3 が明示的に禁止している（policy trait は純関数を保つ）が、
+          # これまでこれを機械的に検査する CI が存在しなかった。
+          HITS=$(grep -rnE 'async[[:space:]]+fn|async_trait|(^|[^[:alnum:]_])(sqlx|tokio|reqwest)::|std::fs' \
+                 crates/kaikei-policy/src/ \
+                 | grep -vE ':[0-9]+:[[:space:]]*//' || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS"
+            echo "::error::kaikei-policy に async / I/O の兆候が検出されました"
+            echo "policy trait は純関数を保つ規律です（CLAUDE.md §3）"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: kaikei-app は infra を知らない
+        run: |
+          set -euo pipefail
+          FORBIDDEN="sqlx kaikei-store kaikei-jp kaikei-import"
+          DEPS=$(cargo tree -p kaikei-app --edges normal --prefix none \
+                 | sed 's/ v[0-9].*//' \
+                 | sort -u)
+          FAIL=0
+          for f in $FORBIDDEN; do
+            if echo "$DEPS" | grep -qx "$f"; then
+              echo "::error::kaikei-app が infra 層に依存しています: $f"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "kaikei-app は application 層です。infra（sqlx等）は注入される側で、"
+            echo "app 自身が知ってはいけません（CLAUDE.md §1）。"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: kaikei-store は kaikei-jp / kaikei-policy に依存しない
+        run: |
+          set -euo pipefail
+          # ここで見るのは直接依存のみ（--depth 1）。kaikei-app 経由の
+          # 推移的依存としては kaikei-policy が現れうるが、それは正当な依存方向。
+          DEPS=$(cargo tree -p kaikei-store --edges normal --depth 1 --prefix none \
+                 | sed 's/ v[0-9].*//' \
+                 | grep -v '^kaikei-store$' \
+                 | grep -v '^$')
+          FAIL=0
+          for forbidden in kaikei-jp kaikei-policy; do
+            if echo "$DEPS" | grep -qx "$forbidden"; then
+              echo "::error::kaikei-store が禁止された依存を直接持っています: $forbidden"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "kaikei-store は kaikei-app 経由でのみ上位層の型を扱ってください（ARCHITECTURE.md §3）"
+            exit 1
+          fi
+          echo "OK: $DEPS"
+
+      - name: rehydrate の呼び出しは1箇所に限定
+        run: |
+          set -euo pipefail
+          # 無検証 API（Phase 0 申し送り(a)）への防御。定義元 kaikei-core（自身の
+          # src/journal.rs と、その挙動を直接検証する tests/journal.rs）と、検証を
+          # 経由してから呼ぶ唯一の外部呼び出し元 kaikei-store/src/journal/mapper.rs
+          # 以外からの呼び出しを禁止する。
+          HITS=$(grep -rn 'rehydrate' crates/ --include='*.rs' \
+                 | grep -v '^crates/kaikei-core/' \
+                 | grep -v '^crates/kaikei-store/src/journal/mapper.rs' || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS"
+            echo "::error::rehydrate の呼び出しが許可された箇所以外に存在します"
+            exit 1
+          fi
+          echo "OK"
+
       - name: 帳簿への UPDATE / DELETE が書かれていない
         run: |
           set -euo pipefail
+          # 除外語 'ci-allow: append-only-probe' は権限テスト等で意図的に
+          # UPDATE/DELETE を文字列として書く場合の明示的なマーカー（人間承認済み）。
+          # 文字列連結（例: format!("UPDATE {}", "journal_entries")）ですり抜ける
+          # 書き方は禁止（マーカーで意図を明示すること）。
           if grep -rniE '(update|delete)[[:space:]]+(from[[:space:]]+)?journal_(entries|lines)' \
              crates/ --include='*.rs' --include='*.sql' \
-             | grep -v 'REVOKE' | grep -v 'no_update' | grep -v 'reject_mutation'; then
+             | grep -v 'REVOKE' \
+             | grep -v 'no_update' | grep -v 'no_delete' | grep -v 'no_truncate' \
+             | grep -v 'reject_mutation' \
+             | grep -v 'ci-allow: append-only-probe'; then
             echo "::error::帳簿本体への UPDATE / DELETE が検出されました"
             echo "訂正は逆仕訳（reverse）のみです（CLAUDE.md §2）"
             exit 1
@@ -94,7 +202,10 @@ jobs:
       - name: f64 が金額に使われていない
         run: |
           set -euo pipefail
-          if grep -rn 'f64' crates/kaikei-core/src/ crates/kaikei-jp/src/ 2>/dev/null; then
+          # コメント行（f64 を使わない理由を説明する doc コメント）は誤検知のため除外する。
+          HITS=$(grep -rn 'f64' crates/*/src/ 2>/dev/null | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS"
             echo "::error::f64 が検出されました。金額に浮動小数点を使わないでください"
             exit 1
           fi
@@ -102,6 +213,10 @@ jobs:
 
   quality:
     runs-on: ubuntu-latest
+    env:
+      # kaikei-store が DB 不在でもコンパイルできるようにする。
+      # これが無いと sqlx マクロが接続を要求し、後続 PR で必須チェックが赤のままマージ不能になる。
+      SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
