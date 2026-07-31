@@ -5,10 +5,8 @@
 
 /// `kaikei-core` の操作が失敗したときに返すエラー。
 ///
-/// 一部のバリアント（`TagTypeMismatch` の `expected: TagValueType`、
-/// `MissingRequiredTag` の `account_type: AccountType` を持つもの）は、
-/// 依存する型が `tag.rs` / `account.rs`（いずれも未実装）にあるため、
-/// Phase 0 後続PR（tag.rs / account.rs 実装時）に追加する。
+/// `TagTypeMismatch`（`expected: TagValueType` を持つ）と `MissingRequiredTag`
+/// （`account_type: AccountType` を持つ）は未実装。理由は enum 内のコメントを参照。
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     /// 貸借が一致しない。

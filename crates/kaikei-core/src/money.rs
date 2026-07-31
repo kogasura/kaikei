@@ -5,6 +5,7 @@
 
 use crate::error::CoreError;
 use rust_decimal::{Decimal, RoundingStrategy};
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 /// 通貨。ISO 4217 風のコード（英大文字3文字）と小数桁数を持つ。
@@ -87,7 +88,7 @@ impl Money {
         let integer_part = parts.next().expect("splitn は常に1要素以上を返す");
         let decimal_part = parts.next();
 
-        let integer_digits = parse_integer_digits(integer_part, s)?;
+        let integer_digits = validate_and_strip_thousands_separators(integer_part, s)?;
 
         let minor_unit = currency.minor_unit() as usize;
 
@@ -269,10 +270,12 @@ impl Money {
         out.push_str(&group_thousands(integer_part));
         if minor_unit > 0 {
             out.push('.');
-            out.push_str(&format!(
+            write!(
+                out,
                 "{fractional_part:0width$}",
                 width = minor_unit as usize
-            ));
+            )
+            .expect("String への write! は失敗しない");
         }
         out
     }
@@ -294,7 +297,10 @@ impl Money {
 /// カンマを含む場合は「先頭グループが1〜3桁、以降のグループが正確に3桁」
 /// という正しい3桁区切りの場合のみ受理する（`to_display_string()` の出力
 /// をラウンドトリップさせるため）。`"1234,56"` のような不正な区切りは拒否する。
-fn parse_integer_digits(integer_part: &str, original: &str) -> Result<String, CoreError> {
+fn validate_and_strip_thousands_separators(
+    integer_part: &str,
+    original: &str,
+) -> Result<String, CoreError> {
     let invalid = || CoreError::InvalidAmount {
         reason: format!("数値として解釈できません: \"{original}\""),
     };
