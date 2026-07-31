@@ -403,11 +403,13 @@ impl JournalEntry {
     // getter のみ。setter は作らない
     pub fn id(&self) -> EntryId;
     pub fn entry_no(&self) -> EntryNumber;
+    pub fn fiscal_year(&self) -> i32;
     pub fn entry_date(&self) -> AccountingDate;
     pub fn description(&self) -> &str;
     pub fn lines(&self) -> &[JournalLine];
     pub fn document_refs(&self) -> &[DocumentRef];
     pub fn reverses(&self) -> Option<EntryId>;
+    pub fn reverse_reason(&self) -> Option<&str>;
     pub fn is_reversal(&self) -> bool;
     pub fn recorded_at(&self) -> Timestamp;
 
@@ -417,6 +419,10 @@ impl JournalEntry {
 }
 ```
 
+`fiscal_year` と `reverse_reason` は同名の private フィールドに対応する読み取り専用ゲッター。
+`reverses` に対で `reverse_reason` を、`FiscalYear::label()` に対応する値を確認する手段として
+`fiscal_year` を公開する（内部フィールドを保持しながら外部から参照できないのは不整合であるため）。
+
 ### reverse の仕様
 
 - 全明細の `side` を反転（Debit ⇄ Credit）
@@ -425,6 +431,10 @@ impl JournalEntry {
 - `reverses` に元の `id`、`reverse_reason` に理由
 - 逆仕訳の逆仕訳は許可する（が `reverses` は直前の仕訳を指す）
 - 元仕訳が別年度でも、逆仕訳は指定された日付の年度に属する
+- `document_refs` は常に空にする。元仕訳の証憑は複製しない。
+  逆仕訳固有の証憑（訂正理由書など）と元仕訳の証憑のどちらを持たせるべきかは
+  会計運用の判断であり、core が決める事項ではないため。Phase 1（`kaikei-app` の
+  逆仕訳ユースケース）で呼び出し側が選べるようにするか再検討する
 
 ---
 
