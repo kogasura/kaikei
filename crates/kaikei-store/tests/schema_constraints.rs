@@ -8,6 +8,7 @@
 mod common;
 
 use common::sqlstate;
+use kaikei_app::error::RepoError;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use uuid::Uuid;
 
@@ -177,6 +178,14 @@ async fn journal_entries_fiscal_year_entry_no_must_be_unique(
 }
 
 /// 貸借が一致しない仕訳は、コミット時に遅延制約トリガが拒否する（phase1計画 R4）。
+///
+/// SQLSTATE は `P0011`（`migrations/0008_distinct_error_codes.sql` で
+/// `assert_entry_is_balanced` 専用に分離。`DECISIONS.md` D-038）で、
+/// append-only 違反の `P0010`（`tests/append_only.rs` 参照）とは異なる
+/// コードになること、および `kaikei-store::sqlstate::map_sqlstate` を
+/// 通したときに `RepoError::Corrupt` になり `RepoError::AppendOnlyViolation`
+/// **にはならない**こと（「訂正は逆仕訳で」という誤った対処法を案内しない
+/// こと）を検証する。
 #[sqlx::test]
 async fn unbalanced_entry_is_rejected_at_commit_by_deferred_trigger(
     pool_opts: PgPoolOptions,
@@ -209,7 +218,14 @@ async fn unbalanced_entry_is_rejected_at_commit_by_deferred_trigger(
 
     let result = tx.commit().await;
     let err = result.expect_err("借方1000/貸方500の不均衡な仕訳はコミットで拒否されるべき");
-    assert_eq!(sqlstate(&err).as_deref(), Some("P0001"));
+    let code = sqlstate(&err);
+    assert_eq!(code.as_deref(), Some("P0011"));
+    // append-only 違反（P0010。tests/append_only.rs）とは異なるコードであること。
+    assert_ne!(code.as_deref(), Some("P0010"));
+
+    let repo_err = kaikei_store::error::from_sqlx_error(err);
+    assert!(matches!(repo_err, RepoError::Corrupt { .. }));
+    assert!(!repo_err.to_string().contains("逆仕訳"));
 }
 
 /// 貸借が一致する仕訳は正常にコミットできる（上のテストの陽性対照）。

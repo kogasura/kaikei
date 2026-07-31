@@ -707,3 +707,171 @@ Sync>)` のような単一バリアントに永続化層のエラーをすべて
 
 **トレードオフ**: PR-5 の着手から PR-6 の並列開始までにわずかな直列区間が
 生まれる。共通基盤のブレを防ぐコストとして許容する。
+
+---
+
+## D-035 `TagSet` の JSONB 表現は `{"t": <型>, "v": <値>}`。`"v"` は常に文字列にする
+
+**決定**: `journal_lines.tags`（JSONB）は、`TagSet` を JSON オブジェクトとして
+表現する。キーはタグキー文字列（`TagKey::as_str()`）、値は
+`{"t": <型識別子>, "v": <値>}` という2フィールドのオブジェクトにする。
+`"t"` は `"code"` / `"text"` / `"decimal"` / `"date"` のいずれか
+（`TagValueType` の4バリアントに対応）。**`"v"` は型によらず常に JSON
+文字列にする**（`TagValue::Decimal` は `rust_decimal::Decimal` の
+`Display`/`FromStr` を経由した文字列、`TagValue::Date` は
+`AccountingDate::to_iso_string()`/`parse()` を経由した ISO 文字列）。
+
+```json
+{
+  "tax_category": {"t": "code", "v": "10"},
+  "business_ratio": {"t": "decimal", "v": "0.8"},
+  "memo_date": {"t": "date", "v": "2026-04-15"}
+}
+```
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `"v"` を型に応じて JSON の number/string を使い分ける（`Decimal` は number） | `DECISIONS.md` D-013「JSON では金額を文字列で扱う」と同じ理由で、IEEE754 の丸め誤差を経由する可能性がある。`business_ratio` のような按分比率は税額計算の入力になりうるため、number 化による精度劣化を避ける |
+| タグ全体を `[{"k": ..., "t": ..., "v": ...}, ...]` の配列にする | PR-6 の SQL（`l.tags -> k ->> 'v'`）がキーで直接オブジェクトを引けなくなり、`jsonb_array_elements` 経由の展開が必要になって集計 SQL が複雑化する |
+
+**理由**: `"v"` を常に文字列にすることで、PR-6 の read model が
+`l.tags -> k ->> 'v'`（`->` でキー `k` に対応する `{"t","v"}` オブジェクトを
+取り出し、`->>'v'` でその `"v"` フィールドをテキストとして取り出す）という
+型を意識しない素直な SQL でグルーピング用の値を取り出せる。`kaikei-store`
+の `tags.rs`（`tag_set_to_json`/`tag_set_from_json`）がこの表現の唯一の
+読み書き経路であり、想定外の形（オブジェクトでない、`"t"`/`"v"` が無い、
+未知の型タグ、パースできない小数・日付）は panic せず `RepoError::Corrupt`
+を返す。
+
+**トレードオフ**: `"t"` フィールドの分だけ JSONB のサイズがわずかに増える
+（1行あたり数バイト）。個人事業主規模のデータ量では無視できるコストと判断した。
+
+---
+
+## D-036 store 側は記帳時刻の丸めを行わない（`Timestamp` ⇄ `chrono::DateTime<Utc>`）
+
+**決定**: `kaikei-store::convert::timestamp_to_datetime` /
+`datetime_to_timestamp` は、`Timestamp`（ナノ秒精度）と
+`chrono::DateTime<Utc>` の間でナノ秒精度をそのまま保持して変換する
+（マイクロ秒への丸めをここでは行わない）。
+
+**却下した選択肢**: `timestamp_to_datetime` の内部でマイクロ秒未満を
+切り捨ててから `chrono::DateTime<Utc>` に変換する（DB 列の精度に合わせて
+store 側でも丸める）。
+
+**理由**: `kaikei-app::clock::SystemClock` が記帳時刻を生成する時点で
+既にマイクロ秒粒度に丸めているため（D-030）、通常の記帳経路でこの変換に
+渡される `Timestamp` は常にマイクロ秒境界に揃っている。したがって store
+側で重ねて丸める必要が無い。実際にマイクロ秒未満の端数が失われうるのは
+`sqlx` が `chrono::DateTime<Utc>` を `TIMESTAMPTZ` の実際のワイヤ形式へ
+エンコードする段階（`TIMESTAMPTZ` という DB 列の型そのものが持つ精度）で
+あり、そこは store の変換コードの責務の外にある。`convert.rs` 自身が
+丸めを行わないことで、往復同値性を検証する proptest（PR-5 本体
+`tests/round_trip.rs`）はマイクロ秒に揃った値を入力すればそのまま
+「ちょうど一致」を期待でき、丸めロジックの二重実装（`SystemClock` と
+`convert.rs` の両方）による不一致のリスクを避けられる。
+
+**トレードオフ**: `FixedClock` 等でマイクロ秒に揃っていない `Timestamp`
+を明示的に作り、これを実際に PostgreSQL へ保存して読み戻すと、
+マイクロ秒未満の端数は失われる（`convert.rs` の変換自体は保持するが、
+DB のワイヤ形式が保持できないため）。PR-5 本体の `tests/round_trip.rs` は
+この性質を踏まえ、マイクロ秒に揃った値のみを生成対象にすること。
+
+---
+
+## D-037 SQLSTATE `23502`/`23514`（not_null_violation/check_violation）は `RepoError::Corrupt` に写像する
+
+**決定**: `kaikei-store::sqlstate::map_sqlstate` は SQLSTATE `23502`
+（not_null_violation）と `23514`（check_violation）の両方を
+`RepoError::Corrupt` に写像する。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `RepoError::Conflict` に写像する | `Conflict` は一意制約違反（重複データ）を指す（`DECISIONS.md` D-032）。not_null/check 違反は意味が異なり、呼び出し側に誤った対応（重複解消）を促してしまう |
+| `RepoError::Backend`（その他扱い）に写像する | 「保存しようとしたデータの構造そのものが不正」という診断情報が、接続断等の無分類failureに埋もれて消えてしまう |
+
+**理由**: `insert_entry` 等に渡すデータは `kaikei_core::JournalEntry::new`
+/ `reverse` が既に検証済みのため、この2つの SQLSTATE が実際に発生するのは
+「store 層のマッピングコードがドメインの不変条件と食い違う行を組み立てた」
+場合にほぼ限られる。`RepoError::Corrupt` の doc コメントは主に「復元処理の
+直前に行う再検証で検出した不整合」を指すが、「永続化しようとしたデータが
+構造的な不変条件を満たさない」という点で性質が同じであり、既存の7
+バリアントの中ではこれが最も近い。
+
+**トレードオフ・既知の限界**: SQLSTATE `P0001`（raise_exception）は
+`migrations/0004_append_only_triggers.sql` の `reject_mutation`
+（append-only 違反）と `assert_entry_is_balanced`（貸借不一致検出）の
+両方が使う共通コードであり、`map_sqlstate` は現状どちらも
+`RepoError::AppendOnlyViolation` として扱う。後者が実際に発火するのは
+`JournalEntry::new` の検証を経ずに `journal_lines` へ書き込まれた場合
+（store 層のバグ）に限られ、通常運用では発生しない前提のため、メッセージ
+文字列による判別ロジックは本コミットのスコープでは追加しない。
+
+> **追記（この決定は覆した）**: 上記の「既知の限界として受容する」という
+> 判断は、`CLAUDE.md` §11（次の手が分かる文言にする）違反であり、
+> Phase 0 の循環参照バグ（無関係の科目を犯人として名指しし、破壊的で
+> 無駄な修正に誘導する）と同じ欠陥クラスであると判明したため、
+> **D-038 で覆した**。`P0001` は現在 `RepoError::Backend` に写像される
+> （`AppendOnlyViolation` ではない）。詳細は D-038 を参照。
+
+---
+
+## D-038 append-only 違反と貸借不一致の SQLSTATE を分離する（D-037 を覆す決定）
+
+**決定**: 新規マイグレーション `migrations/0008_distinct_error_codes.sql`
+（`CREATE OR REPLACE FUNCTION`。適用済みの `0004_append_only_triggers.sql`
+は編集しない）で、`reject_mutation()`（append-only 違反）と
+`assert_entry_is_balanced()`（貸借不一致検出）の2つのトリガ関数それぞれに
+`RAISE EXCEPTION ... USING ERRCODE = '...'` で異なる SQLSTATE を明示する。
+
+- `P0010`: `reject_mutation()`（append-only 違反）
+- `P0011`: `assert_entry_is_balanced()`（貸借不一致。store層のバグ検出）
+
+これに伴い `kaikei-store::sqlstate::map_sqlstate` を更新する。
+`P0010` → `RepoError::AppendOnlyViolation`、`P0011` → `RepoError::Corrupt`
+（`AppendOnlyViolation` ではない。「逆仕訳で訂正してください」とは案内
+しない）。`P0001` 自体は ERRCODE を指定しない汎用の `raise_exception` として
+残り、`RepoError::Backend` に写像する（どちらのトリガかを断定できない
+汎用コードから特定の対処法を案内するとかえって誤りうるため）。エラー
+メッセージ本文は変更しない。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `0004_append_only_triggers.sql` を直接編集して ERRCODE を追加する | `CLAUDE.md` §2 マイグレーションの掟（適用済みファイルを書き換えない）に反する。`sqlx` は `_sqlx_migrations` テーブルで各マイグレーションの checksum を検証しており、適用済みファイルを1バイトでも書き換えると次回の `migrate run` が checksum 不一致で失敗する（R11） |
+| `P0001` のままメッセージ文字列の内容で判別する（D-037 の「既知の限界」を維持する） | メッセージ文字列のパターンマッチはトリガの文言変更に対して壊れやすく、`kaikei-store::sqlstate` という「SQLSTATE を見て判断する」という設計方針（`DECISIONS.md` D-032）にも反する。ERRCODE そのものを分ける方が構造的に確実 |
+| `P0001` を維持しつつ `assert_entry_is_balanced()` だけ新しいコードに変える（`reject_mutation()` は `P0001` のまま） | `reject_mutation()` は append-only 違反という最も高頻度に発生しうる経路であり、これを汎用コード `P0001` に残したままにすると、将来 ERRCODE 未指定の別の `RAISE EXCEPTION` が追加されたときに再び判別不能になる。両方を専用コードへ移し、`P0001` 自体は「どちらでもない」ことを表す汎用コードとして空けておく方が将来の拡張に対して頑健 |
+
+**理由**: 当初（D-037）は「`P0001` の共有は起こりにくい状況（store層の
+バグでしか貸借不一致トリガは発火しない）なので、意図的に許容する」と
+判断していた。しかしこの判断は、`RepoError::AppendOnlyViolation` の
+Display（`kaikei-app::error::RepoError`）が常に「訂正は逆仕訳で行って
+ください」という文言を含むため、貸借不一致（store層のバグ、逆仕訳では
+直せない）が発生した場合に**完全に誤った対処法を案内する**ことを意味する。
+これは `CLAUDE.md` §11「次の手が分かる文言にする」に反し、Phase 0 で
+発見された循環参照バグ（`ChartOfAccounts::new` が循環に無関係な科目を
+犯人として名指しし、その科目を修正するという無駄で的外れな対応に
+誘導した）と同じ欠陥クラス（**誤った診断が誤った、時に破壊的な対応に
+誘導する**）である。SQLSTATE を実際に分離することで、`map_sqlstate`
+という1箇所の写像ロジックだけで正しい案内を機械的に保証できる。
+
+ERRCODE の選定は PostgreSQL のエラーコード一覧でクラス `P0`
+（PL/pgSQL Error Codes）を使う。このクラスの `P0000`〜`P0004`
+（`plpgsql_error` / `raise_exception` / `no_data_found` / `too_many_rows` /
+`assign_incompatible_datatypes`）は PL/pgSQL 本体の組み込み擬似エラーとして
+既に割り当て済みだが、`P0005` 以降はどの組み込みコードにも割り当てられて
+いない。将来 PostgreSQL 本体がこのクラスに新しい組み込みコードを追加する
+可能性に備えて `P0005`〜`P0009` を空けたうえで `P0010`/`P0011` を割り当てた
+（クラス自体は PL/pgSQL の `RAISE EXCEPTION` から生じるアプリケーション
+固有のエラーという意味で一致しており、既存の標準 SQLSTATE とは衝突しない）。
+
+**トレードオフ**: 新規マイグレーション1件が増える（`0004` を直接編集
+できないため）。また `P0001` を `Backend` に落とすことで、将来
+ERRCODE 未指定の `RAISE EXCEPTION` が別の意図で追加された場合、その
+エラーも「未分類」として扱われる（適切な専用 ERRCODE を都度割り当てる
+運用を続ける必要がある）。

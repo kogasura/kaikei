@@ -12,7 +12,7 @@ mod common;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 #[sqlx::test]
-async fn all_seven_migrations_are_recorded(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+async fn all_eight_migrations_are_recorded(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
     let roles = common::roles(pool_opts, conn_opts).await;
 
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
@@ -20,7 +20,9 @@ async fn all_seven_migrations_are_recorded(pool_opts: PgPoolOptions, conn_opts: 
         .await
         .unwrap();
 
-    assert_eq!(count, 7, "migrations/ の7ファイルが全て適用されていること");
+    // 0008_distinct_error_codes.sql（append-onlyトリガと貸借不一致トリガの
+    // ERRCODEを分離。DECISIONS.md D-038）を含めて8ファイル。
+    assert_eq!(count, 8, "migrations/ の8ファイルが全て適用されていること");
 }
 
 #[sqlx::test]
