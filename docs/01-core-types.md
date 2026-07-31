@@ -510,10 +510,10 @@ pub enum CoreError {
     #[error("未登録のタグキーです: {key}。kaikei-jp-data/tags.yaml に登録してください")]
     UnknownTagKey { key: String },
 
-    #[error("タグ {key} の型が不正です。期待={expected:?}")]
+    #[error("タグ {key} の型が不正です。期待={}", expected.label_ja())]
     TagTypeMismatch { key: String, expected: TagValueType },
 
-    #[error("タグ {key} は {account_type:?} の明細では必須です")]
+    #[error("タグ {key} は{}の明細では必須です", account_type.label_ja())]
     MissingRequiredTag { key: String, account_type: AccountType },
 
     #[error("取引日 {date} は会計年度 {fy}（{start}〜{end}）の範囲外です")]
@@ -540,6 +540,8 @@ pub enum CoreError {
 
 MCP 経由で AI が自己修正できる文言にする（`CLAUDE.md` §11）。
 差額や期待値を必ず含める。「次に何をすべきか」が読み取れること。
+列挙型をメッセージに埋め込む際は `{:?}`（英語のバリアント名がそのまま出る）ではなく、
+`AccountType::label_ja()` / `TagValueType::label_ja()` のような日本語ラベル関数を使う（`DECISIONS.md` D-019）。
 
 ---
 
