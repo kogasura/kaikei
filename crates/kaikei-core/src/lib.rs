@@ -3,8 +3,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod clock;
 mod error;
 mod money;
 
+pub use clock::*;
 pub use error::*;
 pub use money::*;
