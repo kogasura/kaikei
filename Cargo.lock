@@ -136,6 +136,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
@@ -699,8 +700,12 @@ dependencies = [
 name = "kaikei-store"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "kaikei-app",
  "kaikei-core",
+ "proptest",
+ "rust_decimal",
+ "serde_json",
  "sqlx",
  "thiserror",
  "uuid",

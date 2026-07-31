@@ -707,3 +707,106 @@ Sync>)` のような単一バリアントに永続化層のエラーをすべて
 
 **トレードオフ**: PR-5 の着手から PR-6 の並列開始までにわずかな直列区間が
 生まれる。共通基盤のブレを防ぐコストとして許容する。
+
+---
+
+## D-035 `TagSet` の JSONB 表現は `{"t": <型>, "v": <値>}`。`"v"` は常に文字列にする
+
+**決定**: `journal_lines.tags`（JSONB）は、`TagSet` を JSON オブジェクトとして
+表現する。キーはタグキー文字列（`TagKey::as_str()`）、値は
+`{"t": <型識別子>, "v": <値>}` という2フィールドのオブジェクトにする。
+`"t"` は `"code"` / `"text"` / `"decimal"` / `"date"` のいずれか
+（`TagValueType` の4バリアントに対応）。**`"v"` は型によらず常に JSON
+文字列にする**（`TagValue::Decimal` は `rust_decimal::Decimal` の
+`Display`/`FromStr` を経由した文字列、`TagValue::Date` は
+`AccountingDate::to_iso_string()`/`parse()` を経由した ISO 文字列）。
+
+```json
+{
+  "tax_category": {"t": "code", "v": "10"},
+  "business_ratio": {"t": "decimal", "v": "0.8"},
+  "memo_date": {"t": "date", "v": "2026-04-15"}
+}
+```
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `"v"` を型に応じて JSON の number/string を使い分ける（`Decimal` は number） | `DECISIONS.md` D-013「JSON では金額を文字列で扱う」と同じ理由で、IEEE754 の丸め誤差を経由する可能性がある。`business_ratio` のような按分比率は税額計算の入力になりうるため、number 化による精度劣化を避ける |
+| タグ全体を `[{"k": ..., "t": ..., "v": ...}, ...]` の配列にする | PR-6 の SQL（`l.tags -> k ->> 'v'`）がキーで直接オブジェクトを引けなくなり、`jsonb_array_elements` 経由の展開が必要になって集計 SQL が複雑化する |
+
+**理由**: `"v"` を常に文字列にすることで、PR-6 の read model が
+`l.tags -> k ->> 'v'`（`->` でキー `k` に対応する `{"t","v"}` オブジェクトを
+取り出し、`->>'v'` でその `"v"` フィールドをテキストとして取り出す）という
+型を意識しない素直な SQL でグルーピング用の値を取り出せる。`kaikei-store`
+の `tags.rs`（`tag_set_to_json`/`tag_set_from_json`）がこの表現の唯一の
+読み書き経路であり、想定外の形（オブジェクトでない、`"t"`/`"v"` が無い、
+未知の型タグ、パースできない小数・日付）は panic せず `RepoError::Corrupt`
+を返す。
+
+**トレードオフ**: `"t"` フィールドの分だけ JSONB のサイズがわずかに増える
+（1行あたり数バイト）。個人事業主規模のデータ量では無視できるコストと判断した。
+
+---
+
+## D-036 store 側は記帳時刻の丸めを行わない（`Timestamp` ⇄ `chrono::DateTime<Utc>`）
+
+**決定**: `kaikei-store::convert::timestamp_to_datetime` /
+`datetime_to_timestamp` は、`Timestamp`（ナノ秒精度）と
+`chrono::DateTime<Utc>` の間でナノ秒精度をそのまま保持して変換する
+（マイクロ秒への丸めをここでは行わない）。
+
+**却下した選択肢**: `timestamp_to_datetime` の内部でマイクロ秒未満を
+切り捨ててから `chrono::DateTime<Utc>` に変換する（DB 列の精度に合わせて
+store 側でも丸める）。
+
+**理由**: `kaikei-app::clock::SystemClock` が記帳時刻を生成する時点で
+既にマイクロ秒粒度に丸めているため（D-030）、通常の記帳経路でこの変換に
+渡される `Timestamp` は常にマイクロ秒境界に揃っている。したがって store
+側で重ねて丸める必要が無い。実際にマイクロ秒未満の端数が失われうるのは
+`sqlx` が `chrono::DateTime<Utc>` を `TIMESTAMPTZ` の実際のワイヤ形式へ
+エンコードする段階（`TIMESTAMPTZ` という DB 列の型そのものが持つ精度）で
+あり、そこは store の変換コードの責務の外にある。`convert.rs` 自身が
+丸めを行わないことで、往復同値性を検証する proptest（PR-5 本体
+`tests/round_trip.rs`）はマイクロ秒に揃った値を入力すればそのまま
+「ちょうど一致」を期待でき、丸めロジックの二重実装（`SystemClock` と
+`convert.rs` の両方）による不一致のリスクを避けられる。
+
+**トレードオフ**: `FixedClock` 等でマイクロ秒に揃っていない `Timestamp`
+を明示的に作り、これを実際に PostgreSQL へ保存して読み戻すと、
+マイクロ秒未満の端数は失われる（`convert.rs` の変換自体は保持するが、
+DB のワイヤ形式が保持できないため）。PR-5 本体の `tests/round_trip.rs` は
+この性質を踏まえ、マイクロ秒に揃った値のみを生成対象にすること。
+
+---
+
+## D-037 SQLSTATE `23502`/`23514`（not_null_violation/check_violation）は `RepoError::Corrupt` に写像する
+
+**決定**: `kaikei-store::sqlstate::map_sqlstate` は SQLSTATE `23502`
+（not_null_violation）と `23514`（check_violation）の両方を
+`RepoError::Corrupt` に写像する。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `RepoError::Conflict` に写像する | `Conflict` は一意制約違反（重複データ）を指す（`DECISIONS.md` D-032）。not_null/check 違反は意味が異なり、呼び出し側に誤った対応（重複解消）を促してしまう |
+| `RepoError::Backend`（その他扱い）に写像する | 「保存しようとしたデータの構造そのものが不正」という診断情報が、接続断等の無分類failureに埋もれて消えてしまう |
+
+**理由**: `insert_entry` 等に渡すデータは `kaikei_core::JournalEntry::new`
+/ `reverse` が既に検証済みのため、この2つの SQLSTATE が実際に発生するのは
+「store 層のマッピングコードがドメインの不変条件と食い違う行を組み立てた」
+場合にほぼ限られる。`RepoError::Corrupt` の doc コメントは主に「復元処理の
+直前に行う再検証で検出した不整合」を指すが、「永続化しようとしたデータが
+構造的な不変条件を満たさない」という点で性質が同じであり、既存の7
+バリアントの中ではこれが最も近い。
+
+**トレードオフ・既知の限界**: SQLSTATE `P0001`（raise_exception）は
+`migrations/0004_append_only_triggers.sql` の `reject_mutation`
+（append-only 違反）と `assert_entry_is_balanced`（貸借不一致検出）の
+両方が使う共通コードであり、`map_sqlstate` は現状どちらも
+`RepoError::AppendOnlyViolation` として扱う。後者が実際に発火するのは
+`JournalEntry::new` の検証を経ずに `journal_lines` へ書き込まれた場合
+（store 層のバグ）に限られ、通常運用では発生しない前提のため、メッセージ
+文字列による判別ロジックは本コミットのスコープでは追加しない。
