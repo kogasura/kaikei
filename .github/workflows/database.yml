@@ -1,0 +1,79 @@
+# .github/workflows/database.yml
+#
+# PostgreSQL を要するテスト専用のジョブ。`quality`（architecture.yml）は
+# SQLX_OFFLINE=true でコンパイルするだけなので、実際に DB へ接続して
+# マイグレーション・権限・トリガの実効性を検証するのはここだけ。
+#
+# ロール作成・権限付与は docker/postgres/init/01-roles.sql を docker-compose と
+# 共通で使う（真実の点を1つにする）。
+
+name: database
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  database:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: kaikei_root
+          POSTGRES_PASSWORD: kaikei_root_ci_password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-retries 30
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: kaikei_root
+      PGPASSWORD: kaikei_root_ci_password
+      KAIKEI_MIGRATOR_PASSWORD: kaikei_migrator_ci_password
+      KAIKEI_APP_PASSWORD: kaikei_app_ci_password
+      # `#[sqlx::test]` は DATABASE_URL を「データベースを作れる接続」として使う
+      # （kaikei_migrator の URL を渡す。kaikei_app のままだと権限不足で全滅する）。
+      DATABASE_URL: postgres://kaikei_migrator:kaikei_migrator_ci_password@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: postgresql-client をインストール
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends postgresql-client
+
+      - name: ロール作成と権限付与（docker-compose と同じファイルを流す）
+        run: psql -f docker/postgres/init/01-roles.sql
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-sqlx-cli-0.8.6
+
+      - name: sqlx-cli をインストール
+        run: |
+          cargo install sqlx-cli --version 0.8.6 \
+            --no-default-features --features postgres,rustls --locked
+
+      - name: .sqlx キャッシュが最新か検証
+        run: cargo sqlx prepare --workspace --check
+
+      - name: pg-tests を実行
+        run: cargo test -p kaikei-store --features pg-tests
+
+      - name: pg-tests 対象への clippy
+        # quality ジョブの clippy は --all-targets であって --all-features ではないため、
+        # feature ゲートした pg-tests のテストは対象外になる。ここで拾う。
+        run: cargo clippy -p kaikei-store --features pg-tests --all-targets -- -D warnings

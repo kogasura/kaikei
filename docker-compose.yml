@@ -1,0 +1,42 @@
+# docker-compose.yml
+#
+# ローカル開発用の PostgreSQL。詳細は docs/03-database.md §1、CLAUDE.md §2 参照。
+#
+# 使い方:
+#   1. `cp .env.example .env` してパスワードを埋める
+#   2. `docker compose up -d`
+#   3. `docker compose exec -T postgres pg_isready` で起動確認
+#
+# ロール作成・権限付与は docker/postgres/init/01-roles.sql が
+# 初回起動時（docker-entrypoint-initdb.d）に自動実行する。
+# CI (`.github/workflows/database.yml`) も同じファイルを流す（真実の点を1つにする）。
+#
+# 開発中に壊れたデータを直す場合は `docker compose down -v`
+# （named volume ごと作り直す。1行だけ UPDATE して直そうとしない。CLAUDE.md §2 掟3）。
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      # kaikei_root: コンテナ初期化用のスーパーユーザー（POSTGRES_USER）。
+      POSTGRES_USER: kaikei_root
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD を .env に設定してください（.env.example 参照）}
+      POSTGRES_DB: kaikei
+      # docker/postgres/init/01-roles.sql が読む（ロール作成時のパスワード）。
+      KAIKEI_MIGRATOR_PASSWORD: ${KAIKEI_MIGRATOR_PASSWORD:?KAIKEI_MIGRATOR_PASSWORD を .env に設定してください（.env.example 参照）}
+      KAIKEI_APP_PASSWORD: ${KAIKEI_APP_PASSWORD:?KAIKEI_APP_PASSWORD を .env に設定してください（.env.example 参照）}
+      TZ: UTC
+    ports:
+      # D-015: 認証未実装の Phase 1 では外部公開しない。127.0.0.1 のみに bind する。
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - kaikei_pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kaikei_root -d kaikei"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  kaikei_pgdata:

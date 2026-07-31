@@ -224,6 +224,7 @@ MCP 経由で AI が自己修正できる形にする。
 | `quality` | `architecture.yml` | fmt / clippy -D warnings / test |
 | `cargo-deny` | `supply-chain.yml` | 脆弱性・ライセンス・依存元 |
 | `no-ai-attribution` | `commit-hygiene.yml` | §12 の AI 帰属表示 |
+| `database` | `database.yml` | マイグレーション適用、`.sqlx` の陳腐化、append-only の権限・トリガ実効性（`pg-tests`） |
 
 ### 新しい CI ジョブを追加したときの掟
 

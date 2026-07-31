@@ -16,3 +16,36 @@ kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
 kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# pg-tests（下記 [[test]] の required-features）専用。テストが仕訳IDを組み立てるために使う。
+uuid = { workspace = true }
+
+[features]
+# 既定オフ。PostgreSQL を要するテストをゲートする（`#[ignore]` は使わない。
+# ローカルで無言にスキップされ、通っていないテストを通ったと錯覚するため）。
+# `.github/workflows/database.yml` の `database` ジョブが
+# `--features pg-tests` を付けて実行する。
+pg-tests = []
+
+# `tests/*.rs` を pg-tests 未指定時はコンパイル自体しない
+# （DB不在の `cargo test --workspace` を汚さない）。
+[[test]]
+name = "migrations"
+path = "tests/migrations.rs"
+required-features = ["pg-tests"]
+
+[[test]]
+name = "privileges"
+path = "tests/privileges.rs"
+required-features = ["pg-tests"]
+
+[[test]]
+name = "append_only"
+path = "tests/append_only.rs"
+required-features = ["pg-tests"]
+
+[[test]]
+name = "schema_constraints"
+path = "tests/schema_constraints.rs"
+required-features = ["pg-tests"]

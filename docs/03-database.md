@@ -8,19 +8,25 @@ DB は **PostgreSQL 固定**。JSONB、GIN インデックス、テーブル単�
 
 アプリのコードだけで守るのは不十分。
 
+> **Phase 1 での実装範囲の注記（F-1、人間承認済み）**: `documents` / `entry_documents`
+> は Phase 1 では作らない（Phase 4 の `kaikei-blob` と同時に設計する）。
+> 以下の例からも除外している。
+
 ```sql
--- ロール作成
-CREATE ROLE kaikei_migrator LOGIN PASSWORD '...';   -- マイグレーション専用
-CREATE ROLE kaikei_app      LOGIN PASSWORD '...';   -- アプリ実行用
+-- ロール作成・パスワード設定は docker/postgres/init/01-roles.sql に集約する
+-- （docker-compose と CI の両方から同一ファイルを流す。真実の点を1つにする）。
+-- kaikei_migrator: マイグレーション実行用ロール（テーブル/スキーマの所有者）。
+-- kaikei_app: アプリ実行用ロール。
 
--- 帳簿本体は INSERT と SELECT のみ
-GRANT SELECT, INSERT ON journal_entries, journal_lines, entry_documents TO kaikei_app;
-REVOKE UPDATE, DELETE ON journal_entries, journal_lines, entry_documents FROM kaikei_app;
+-- 帳簿本体は INSERT と SELECT のみ。TRUNCATE も明示的に禁止する
+-- （TRUNCATE は既定では非所有者に付与されない権限だが、意図を明示するため
+-- 明示的に REVOKE しておく）。
+GRANT SELECT, INSERT ON journal_entries, journal_lines TO kaikei_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON journal_entries, journal_lines FROM kaikei_app;
 
--- 可変テーブルは通常通り
-GRANT SELECT, INSERT, UPDATE, DELETE ON imported_transactions, journalize_rules TO kaikei_app;
+-- 可変テーブルは通常通り（DELETE は許可しない。物理削除ではなく active フラグで無効化する）
 GRANT SELECT, INSERT, UPDATE ON accounts, counterparties, entry_counters TO kaikei_app;
-GRANT SELECT, INSERT ON documents, period_snapshots TO kaikei_app;
+GRANT SELECT, INSERT ON period_snapshots TO kaikei_app;
 ```
 
 これで**バグでも AI でも帳簿を書き換えられない**。
@@ -28,6 +34,9 @@ GRANT SELECT, INSERT ON documents, period_snapshots TO kaikei_app;
 訂正削除履歴が残るシステムのいずれかが求められるが、この構造は後者に対応する。
 
 ### 補助的にトリガでも防ぐ（多層防御）
+
+`kaikei_migrator`（テーブル所有者）は REVOKE をバイパスできるため、
+トリガが所有者に対する最後の防御線になる。
 
 ```sql
 CREATE OR REPLACE FUNCTION reject_mutation() RETURNS trigger AS $$
@@ -44,6 +53,16 @@ CREATE TRIGGER no_update_journal_entries
 CREATE TRIGGER no_update_journal_lines
   BEFORE UPDATE OR DELETE ON journal_lines
   FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+
+-- TRUNCATE は行トリガ（FOR EACH ROW）を起動しない（空テーブルでも通ってしまう）。
+-- STATEMENT トリガを別途張る必要がある。
+CREATE TRIGGER no_truncate_journal_entries
+  BEFORE TRUNCATE ON journal_entries
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_mutation();
+
+CREATE TRIGGER no_truncate_journal_lines
+  BEFORE TRUNCATE ON journal_lines
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_mutation();
 ```
 
 ---
@@ -71,14 +90,15 @@ CREATE INDEX idx_entries_fy   ON journal_entries (fiscal_year, entry_no);
 CREATE INDEX idx_entries_rev  ON journal_entries (reverses) WHERE reverses IS NOT NULL;
 
 CREATE TABLE journal_lines (
-    entry_id     UUID    NOT NULL REFERENCES journal_entries(id),
-    line_no      SMALLINT NOT NULL,
-    account_code TEXT    NOT NULL,
-    side         SMALLINT NOT NULL CHECK (side IN (1, 2)),  -- 1=借方, 2=貸方
-    amount_minor BIGINT  NOT NULL CHECK (amount_minor > 0),
-    currency     CHAR(3) NOT NULL DEFAULT 'JPY',
-    tags         JSONB   NOT NULL DEFAULT '{}',
-    memo         TEXT,
+    entry_id            UUID     NOT NULL REFERENCES journal_entries(id),
+    line_no             SMALLINT NOT NULL,
+    account_code        TEXT     NOT NULL,
+    side                SMALLINT NOT NULL CHECK (side IN (1, 2)),  -- 1=借方, 2=貸方
+    amount_minor        BIGINT   NOT NULL CHECK (amount_minor > 0),
+    currency            CHAR(3)  NOT NULL,
+    currency_minor_unit SMALLINT NOT NULL CHECK (currency_minor_unit BETWEEN 0 AND 18),
+    tags                JSONB    NOT NULL DEFAULT '{}',
+    memo                TEXT,
     PRIMARY KEY (entry_id, line_no)
 );
 
@@ -91,6 +111,11 @@ CREATE INDEX idx_lines_tags    ON journal_lines USING GIN (tags);
 
 `amount_minor` は `BIGINT`。core は `i128` だが、実際の金額で 2^63 を超えることはない。
 保存時に範囲チェックしてエラーにする。
+
+**`currency` / `currency_minor_unit` に `DEFAULT` を付けない（人間承認済みの決定）。**
+`currency` だけ指定して `currency_minor_unit` が既定で 0 になると、
+本来 2 桁の通貨（USD 等）の金額が **100 倍ズレて保存されても CHECK に引っかからない**。
+上限 18 は `kaikei-core` の `Currency::MAX_MINOR_UNIT`（`DECISIONS.md` D-020）と一致させる。
 
 ### tags の JSONB 形式
 
@@ -141,16 +166,21 @@ CREATE TABLE entry_counters (
 
 ```sql
 CREATE TABLE period_snapshots (
-    fiscal_year  INTEGER NOT NULL,
-    period_end   DATE    NOT NULL,
-    closed_at    TIMESTAMPTZ NOT NULL,
-    balances     JSONB   NOT NULL,   -- 締め時点の全科目残高
-    entry_count  INTEGER NOT NULL,
-    last_entry_no INTEGER NOT NULL,
-    checksum     TEXT    NOT NULL,   -- 対象仕訳のハッシュ連鎖
+    fiscal_year         INTEGER NOT NULL,
+    period_end          DATE    NOT NULL,
+    closed_at           TIMESTAMPTZ NOT NULL,
+    balances            JSONB   NOT NULL,   -- 締め時点の全科目残高
+    currency            CHAR(3) NOT NULL,
+    currency_minor_unit SMALLINT NOT NULL CHECK (currency_minor_unit BETWEEN 0 AND 18),
+    entry_count         INTEGER NOT NULL,
+    last_entry_no       INTEGER NOT NULL,
+    checksum            TEXT    NOT NULL,   -- 対象仕訳のハッシュ連鎖
     PRIMARY KEY (fiscal_year, period_end)
 );
 ```
+
+`currency` / `currency_minor_unit` は `journal_lines` と同じ理由で `DEFAULT` を
+付けない。`balances` の金額をどの通貨・何桁の最小単位で解釈するかを明示する。
 
 性能のためではなく**意味のため**に作る。
 `checksum` があると、後から帳簿が改変されていないことを証明できる
@@ -220,29 +250,35 @@ group_by するキーは `TagSchema` で `aggregatable: true` のものだけ。
 
 ---
 
-## 4. 採番（R4 への対策）
+## 4. 採番
 
-連続番号（欠番なし）はトランザクションのロールバックと原理的に衝突する
-（Postgres のシーケンスは欠番が出る）。
+Postgres の `SEQUENCE` は（トランザクションのロールバックとは独立に値を払い出すため）
+ロールバックで欠番が出る。`entry_counters` を明細のカウンタ行として使い、
+**採番を仕訳の INSERT と同一トランザクションに置く**ことでこれを避ける。
 
 ```sql
--- カウンタ行をロックして取得
+-- カウンタ行をロックして取得（同一トランザクション内）
 BEGIN;
 SELECT next_no FROM entry_counters WHERE fiscal_year = $1 FOR UPDATE;
 UPDATE entry_counters SET next_no = next_no + 1 WHERE fiscal_year = $1;
--- 仕訳を INSERT
+-- 仕訳（journal_entries / journal_lines）を INSERT
 COMMIT;
 ```
 
 単一ユーザー前提なので競合しない。
 
-### 方針の明文化（README に書く）
+### 方針の明文化（README に書く。人間承認済み・G-1）
 
 > 仕訳番号は会計年度ごとの連番とする。
-> トランザクションが失敗した場合、その番号は使用されず欠番となる。
-> 欠番は `entry_counters.skipped` に理由とともに記録し、監査時に説明可能な状態を保つ。
+> 採番（`entry_counters` の更新）は仕訳の INSERT と同一トランザクションで行うため、
+> 検証失敗時はカウンタの増分も一緒に巻き戻り、**通常は欠番が発生しない**
+> （欠番が出るのは Postgres の `SEQUENCE` を別トランザクションで払い出す場合）。
+> `entry_counters.skipped` は、それでも**意図的に**番号を飛ばした場合の理由を
+> 記録するための専用フィールドであり、Phase 1 では書き込みを実装しない。
 
-曖昧にしておくと税務調査に耐えられない実装になる。ここは決めておく。
+過去の版（採番を別トランザクションで行う実装を前提とした記述）は
+「トランザクションが失敗した場合、その番号は使用されず欠番となる」としていたが、
+同一トランザクション採番の実装とは整合しないため、上記の通り改訂した。
 
 ---
 
@@ -266,16 +302,24 @@ append-only の帳簿には通常のマイグレーション常識が通用し�
 
 ```
 migrations/
-├── 0001_roles_and_grants.sql
+├── 0001_baseline_privileges.sql   -- ロール作成は行わない。前提条件の検証のみ
 ├── 0002_accounts.sql
 ├── 0003_journal.sql
 ├── 0004_append_only_triggers.sql
 ├── 0005_counterparties.sql
 ├── 0006_entry_counters.sql
-├── 0007_period_snapshots.sql
-├── 0008_documents.sql
-└── 0009_imported_transactions.sql
+└── 0007_period_snapshots.sql
 ```
+
+ロールの作成・パスワード設定は `docker/postgres/init/01-roles.sql` に集約する
+（マイグレーションには書かない）。ロールはクラスタ単位のオブジェクトであり、
+`#[sqlx::test]` はテストのたびに新しいデータベースを作成してマイグレーションを
+再実行するため、ロール作成をマイグレーションに書くと2件目以降のテストが
+全て失敗する。
+
+`0008_documents.sql` / `0009_imported_transactions.sql`（`documents` /
+`entry_documents` / `imported_transactions`）は Phase 1 では作らない
+（人間承認済み・F-1。Phase 4 の `kaikei-blob` / `kaikei-import` と同時に設計する）。
 
 ---
 
