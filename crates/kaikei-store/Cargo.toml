@@ -12,7 +12,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-kaikei-core = { path = "../kaikei-core" }
-kaikei-app = { path = "../kaikei-app" }
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
 sqlx = { workspace = true }
 thiserror = { workspace = true }

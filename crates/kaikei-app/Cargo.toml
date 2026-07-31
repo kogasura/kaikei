@@ -13,7 +13,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-kaikei-core = { path = "../kaikei-core" }
-kaikei-policy = { path = "../kaikei-policy" }
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+kaikei-policy = { path = "../kaikei-policy", version = "0.0.1" }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
