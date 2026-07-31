@@ -31,12 +31,31 @@ impl Currency {
         minor_unit: 2,
     };
 
-    /// 通貨を作る。コードは英大文字3文字でなければならない。
+    /// `minor_unit` に許容する最大値（18）。
+    ///
+    /// ISO 4217 の実在通貨で最大の小数桁数は 4 桁だが、`DOMAIN.md` は
+    /// 暗号資産（8桁以上）への対応を示唆しており、Ethereum の最小単位 Wei は
+    /// 18 桁である。これを許容範囲の上限とする。上限が無いと
+    /// `to_display_string` の `10u128.pow(minor_unit)` が桁あふれし、
+    /// 金額を無言に誤表示（release ビルド）または panic（debug ビルド）させる
+    /// （`DECISIONS.md` D-020）。
+    pub const MAX_MINOR_UNIT: u8 = 18;
+
+    /// 通貨を作る。コードは英大文字3文字、`minor_unit` は 0〜`MAX_MINOR_UNIT`
+    /// でなければならない。
     pub fn new(code: &str, minor_unit: u8) -> Result<Self, CoreError> {
         let bytes = code.as_bytes();
         if bytes.len() != 3 || !bytes.iter().all(u8::is_ascii_uppercase) {
             return Err(CoreError::InvalidValue {
                 reason: format!("通貨コードは英大文字3文字である必要があります: \"{code}\""),
+            });
+        }
+        if minor_unit > Self::MAX_MINOR_UNIT {
+            return Err(CoreError::InvalidValue {
+                reason: format!(
+                    "小数桁数は0〜{}である必要があります: {minor_unit}",
+                    Self::MAX_MINOR_UNIT
+                ),
             });
         }
         let mut array = [0u8; 3];
@@ -274,7 +293,12 @@ impl Money {
     /// （JPY は小数なし）。
     pub fn to_display_string(&self) -> String {
         let minor_unit = self.currency.minor_unit() as u32;
-        let scale = 10u128.pow(minor_unit);
+        // `Currency::new` が `minor_unit <= MAX_MINOR_UNIT` を保証するため、
+        // 通常この経路は `checked_pow` が必ず `Some` を返す。それでも
+        // `Currency` を直接構築できる経路が将来できた場合に備え、桁あふれで
+        // panic しないよう多層防御する（失敗時は現実的にありえない巨大な
+        // scale にフォールバックし、整数部と小数部の計算自体は破綻させない）。
+        let scale = 10u128.checked_pow(minor_unit).unwrap_or(u128::MAX);
         let magnitude = self.minor.unsigned_abs();
         let integer_part = magnitude / scale;
         let fractional_part = magnitude % scale;
@@ -497,6 +521,41 @@ mod tests {
         assert_eq!(m.minor(), 1234);
     }
 
+    // ---- Currency ----
+
+    // バグ[B]: 上限値ちょうど（MAX_MINOR_UNIT = 18）は許容する
+    #[test]
+    fn currency_new_at_max_minor_unit_succeeds() {
+        let c = Currency::new("XXX", Currency::MAX_MINOR_UNIT).unwrap();
+        assert_eq!(c.minor_unit(), 18);
+    }
+
+    // バグ[B]: 上限を1でも超えたら拒否する
+    #[test]
+    fn currency_new_above_max_minor_unit_is_error() {
+        assert!(matches!(
+            Currency::new("XXX", Currency::MAX_MINOR_UNIT + 1),
+            Err(CoreError::InvalidValue { .. })
+        ));
+    }
+
+    // バグ[B]: u8 の上限に近い極端な値も拒否する
+    #[test]
+    fn currency_new_extreme_minor_unit_is_error() {
+        assert!(matches!(
+            Currency::new("XXX", 255),
+            Err(CoreError::InvalidValue { .. })
+        ));
+    }
+
+    // バグ[B]: 既存の想定値（0/2/3）は引き続き作れる
+    #[test]
+    fn currency_new_common_minor_units_succeed() {
+        assert!(Currency::new("JPY", 0).is_ok());
+        assert!(Currency::new("USD", 2).is_ok());
+        assert!(Currency::new("KWD", 3).is_ok());
+    }
+
     // ---- 演算 ----
 
     // M-20
@@ -694,18 +753,28 @@ mod tests {
         ]
     }
 
+    /// PT-04 用。境界値を含む複数の `minor_unit`（0, 1, 2, 3, 4, `MAX_MINOR_UNIT`）を
+    /// 持つ通貨を生成する。かつては JPY/USD/KWD（0, 2, 3）の3値のみで、
+    /// `Currency::new` の `minor_unit` 上限検証（バグ[B]）の境界を
+    /// 機械的に踏めなかった。
+    fn any_currency() -> impl Strategy<Value = Currency> {
+        prop_oneof![
+            Just(Currency::JPY),
+            Just(Currency::USD),
+            Just(Currency::new("KWD", 3).unwrap()),
+            Just(Currency::new("ONE", 1).unwrap()),
+            Just(Currency::new("FOR", 4).unwrap()),
+            Just(Currency::new("MAX", Currency::MAX_MINOR_UNIT).unwrap()),
+        ]
+    }
+
     proptest! {
         // PT-04: Money::parse(m.to_display_string()) が元に戻る
         #[test]
         fn money_parse_display_round_trip(
             minor in any_minor(),
-            currency_idx in 0u8..3,
+            currency in any_currency(),
         ) {
-            let currency = match currency_idx {
-                0 => Currency::JPY,
-                1 => Currency::USD,
-                _ => Currency::new("KWD", 3).unwrap(),
-            };
             let original = Money::from_minor(minor, currency);
             let parsed = Money::parse(&original.to_display_string(), currency).unwrap();
             prop_assert_eq!(parsed.minor(), original.minor());

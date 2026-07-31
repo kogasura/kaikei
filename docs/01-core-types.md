@@ -19,6 +19,10 @@ impl Currency {
     pub const JPY: Currency = Currency { code: *b"JPY", minor_unit: 0 };
     pub const USD: Currency = Currency { code: *b"USD", minor_unit: 2 };
 
+    /// minor_unit に許容する最大値（18）。暗号資産（Wei は18桁）を上限とする
+    pub const MAX_MINOR_UNIT: u8 = 18;
+
+    /// コードは英大文字3文字、minor_unit は 0〜MAX_MINOR_UNIT でなければエラー
     pub fn new(code: &str, minor_unit: u8) -> Result<Self, CoreError>;
     pub fn code(&self) -> &str;
     pub fn minor_unit(&self) -> u8;
