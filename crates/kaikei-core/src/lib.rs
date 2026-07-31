@@ -8,9 +8,11 @@ mod clock;
 mod error;
 mod money;
 mod period;
+mod tag;
 
 pub use account::*;
 pub use clock::*;
 pub use error::*;
 pub use money::*;
 pub use period::*;
+pub use tag::*;
