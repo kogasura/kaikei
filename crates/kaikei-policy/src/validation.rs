@@ -15,6 +15,13 @@ pub trait EntryValidator: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    // このモジュールのダミー（`AlwaysValid`）は `testing.rs` の公開ダミーと
+    // 同名・同形になっている。これは重複ではなく意図的な分離:
+    // `testing.rs` は `test-doubles` feature 配下でのみコンパイルされるため、
+    // feature を付けない既定の `cargo test -p kaikei-policy` では存在しない。
+    // dyn 互換性（object safety）は feature の有無に関わらず常に保証したいので、
+    // ここに feature 非依存の最小ダミーを個別に用意している。
+    // trait のメソッドシグネチャを変更する際は両方の同期を忘れないこと。
     use super::*;
     use kaikei_core::{
         AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, FiscalYear,

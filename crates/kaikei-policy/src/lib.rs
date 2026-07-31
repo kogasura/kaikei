@@ -19,7 +19,11 @@
 //! これらを実装するだけでよい（`docs/04-jp-tax.md` §2）。
 //!
 //! - [`TaxPolicy`] — 税額計算と税区分の妥当性
-//! - [`ClosingPolicy`] — 決算振替仕訳の生成
+//! - [`ClosingPolicy`] — 決算振替仕訳の生成。**現状 [`TaxContext`] を取らない**
+//!   （`TrialBalance` の行が既に科目種別を持つため Phase 1 では不要と判断した）。
+//!   将来 `kaikei-jp` の実装で `TaxContext` 相当の情報が必要になった場合、
+//!   `closing_entries` / `opening_entries` にその引数を足すのはシグネチャ変更
+//!   ＝破壊的変更であることに注意
 //! - [`StatementPolicy`] — 財務諸表の様式
 //! - [`EntryValidator`] — 追加検証
 //! - [`Numbering`] — 仕訳番号の採番規則

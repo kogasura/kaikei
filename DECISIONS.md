@@ -363,3 +363,89 @@ counterparties }` の4項目（`AccountingDate` と core の型2つ、
 **トレードオフ**: 設定変更（税率改定・事業者区分の変更等）を反映するには
 `Arc<dyn TaxPolicy>` を作り直す必要がある。単一ユーザー・自己ホスト前提
 （D-015）なので、プロセス再起動で足りる。
+
+---
+
+## D-026 derive_tax_lines は確定後の明細一覧を返し、round は apply_ratio に置き換える
+
+**決定**: `TaxPolicy::derive_tax_lines` の戻り値は
+`TaxDerivation { lines: Vec<JournalLine>, notes: Vec<PolicyNote> }` とし、
+`lines` は入力の明細＋生成された税額行を含む**確定後の明細一覧**（追加行だけ
+ではない）とする。加えて `docs/04-jp-tax.md` 初期案にあった
+`round(&self, raw: Money) -> Money` は定義せず、
+`round_mode(&self, ctx: &TaxContext<'_>) -> RoundMode` と、それを使う既定実装
+付きの `apply_ratio(&self, ctx: &TaxContext<'_>, base: Money, ratio: Ratio)
+-> Result<Money, PolicyError>` に置き換える。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `derive_tax_lines` が追加行のみを返す（`docs/04-jp-tax.md` 初期案どおり） | 呼び出し側が「置き換えるべきか追加すべきか」を毎回判断する必要が生じる。誤って `extend` すると税額行が重複計上される事故が起きやすい。「確定後の一覧を返し置き換える」規約の方が呼び出し側の実装を単純化できる |
+| `TaxPolicy::round(&self, raw: Money) -> Money`（初期案どおり） | `Money` は最小通貨単位の整数（`i128`）で端数（小数）を保持できない。呼び出す時点で既に整数に丸められた値しか渡せないため、この形は事実上の恒等関数にしかならず、実際に必要な「金額×比率を丸める」という操作を表現できない |
+| `apply_ratio` が `-> Money`（`Result` を返さない） | `Money::mul_ratio` は D-018 により `Result` を返す（`rust_decimal` の表現上限超過時に `InvalidAmount`）。`apply_ratio` がそれをラップする以上、同じく `Result` にする必要がある |
+
+**理由**: `Money` の内部表現（`i128` の整数）と `TaxPolicy` の責務（端数処理を
+含む金額計算）を踏まえると、丸めは「金額×比率」を計算する瞬間にしか意味を
+持たない。また `derive_tax_lines` の戻り値を「確定後の一覧」にすることで、
+呼び出し側（`kaikei-app`）は常に `entry.lines = derivation.lines` という
+単純な置き換えで済み、`extend` によるやり直し不能な重複計上を構造的に避け
+られる。`notes: Vec<PolicyNote>` を持たせたのは、`CLAUDE.md` §10（提案系の
+機能は候補と根拠を返し確定は人間に残す）が求める「非適格の経過措置がある
+場合の扱い」等、断定を避けた注記を戻り値に含められるようにするため。
+
+**トレードオフ**: `TaxDerivation` という中間型が1つ増える（`Vec<JournalLine>`
+を直接返すより呼び出し側の型が1段増える）。`notes` の使い道が Phase 2 時点で
+まだ具体化していないため、当面は空の `Vec` を返すだけの実装が大半になる
+可能性がある。
+
+---
+
+## D-027 ClosingPolicy は ProposedEntry を返す（採番情報を持たない）
+
+**決定**: `ClosingPolicy::closing_entries` / `opening_entries` は
+`kaikei_core::NewEntry` ではなく `kaikei-policy::ProposedEntry`
+（`entry_date` / `description` / `lines` のみ）を返す。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `docs/04-jp-tax.md` 初期案どおり `Vec<NewEntry>` を返す | `NewEntry` は `id: EntryId` と `entry_no: EntryNumber` を要求するが、この2つの採番は store の I/O（`kaikei-app` が `tx.next_entry_no` 等で払い出す）。policy は I/O を行わないため、`NewEntry` を構築する時点で本来存在しないデータを要求することになり、trait を純関数に保てなくなる |
+| `ClosingPolicy` に `id`/`entry_no` をダミー値で埋めさせる | ダミー値を後から正しい採番で上書きし忘れる事故を誘発する。「採番前の状態」を型で表現する方が安全 |
+
+**理由**: 採番前の仕訳は「まだ確定していない提案」であり、`EntryId` /
+`EntryNumber` を持たない `ProposedEntry` という別の型で表現するのが自然。
+呼び出し側（`kaikei-app`）が採番したうえで `NewEntry` に詰め替え、
+`JournalEntry::new` で最終的な不変条件検証を行う。
+
+**トレードオフ**: `ProposedEntry` という中間型が増え、`kaikei-app` 側で
+`ProposedEntry` → `NewEntry` への変換コードが必要になる（採番と
+`JournalEntry::new` 呼び出しをまとめた小さなヘルパーで吸収できる想定）。
+
+---
+
+## D-028 Counterparty はインボイス関連フィールドを直接持つ（D-025 との整合の例外）
+
+**決定**: `kaikei-policy::Counterparty` は、取引先の識別情報として
+インボイス登録番号（`invoice_registration_no`）や適格請求書発行事業者かどうか
+（`is_qualified_invoice_issuer`）という**日本のインボイス制度固有の属性**を
+フィールドとして直接持つ。これは D-025 で `TaxCategoryTable` / `JpSettings`
+という国固有の型を `kaikei-policy` から排除したのとは扱いを変える例外である。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `Counterparty` を汎用の属性バッグ（例: `BTreeMap<String, String>`）にし、インボイス関連情報は `kaikei-jp` 側の別テーブルとして分離する | 汎用の属性バッグ機構を導入するコストが Phase 1 のスコープに対して過大。`TagSchema` に相当する検証機構を属性バッグにも別途用意しないと `CLAUDE.md` §4「ゴミ箱にしない」の規律が崩れる |
+| インボイス関連フィールドを削除し、`TaxPolicy` が必要な情報を都度取得できる別 trait を追加する | 抽象が1段増えるだけで、`docs/03-database.md` の `counterparties` テーブル定義（`invoice_reg_no` / `is_qualified` 列）と実質的に同じデータを扱うことになり、複雑化の見返りが薄い |
+
+**理由**: (a) `docs/03-database.md` の `counterparties` テーブル定義には、
+このPR以前から既に `invoice_reg_no` / `is_qualified` 列が存在しており、この
+PRが新たに持ち込んだ矛盾ではない。(b) 取引先マスタを完全に国非依存にするには
+汎用の属性バッグ機構が必要になり、Phase 1 で導入するには過剰である。
+
+**トレードオフ**: 将来、日本以外の国に対応する場合、これらのフィールドは
+その国の `TaxPolicy` 実装にとって意味を持たない（常に `None` になる）。
+他国対応が具体化した時点で、属性バッグ化（例: 汎用のキー・値フィールドへの
+置き換え）を検討する余地を残す。
