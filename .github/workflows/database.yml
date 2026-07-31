@@ -70,8 +70,19 @@ jobs:
 
       - name: sqlx-cli をインストール
         run: |
-          cargo install sqlx-cli --version 0.8.6 \
-            --no-default-features --features postgres,rustls --locked
+          set -euo pipefail
+          # 上の actions/cache が ~/.cargo/bin/ を復元するため、2回目以降は
+          # バイナリが既に存在する。cargo install は --force 無しだと
+          # 「binary `sqlx` already exists in destination」で exit 101 になるので、
+          # キャッシュヒット時はインストールを飛ばす。
+          # （--force を付けるとキャッシュがあっても毎回ビルドし直すことになり、
+          #   キャッシュを置いた意味が消える）
+          if command -v sqlx >/dev/null 2>&1 && sqlx --version | grep -q '0\.8\.6'; then
+            echo "キャッシュ済み: $(sqlx --version)"
+          else
+            cargo install sqlx-cli --version 0.8.6 \
+              --no-default-features --features postgres,rustls --locked
+          fi
 
       - name: .sqlx キャッシュが最新か検証
         run: cargo sqlx prepare --workspace --check
