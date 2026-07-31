@@ -111,6 +111,14 @@ pub trait JournalRepo: Send {
     /// 渡す `entry` は [`kaikei_core::JournalEntry::new`] または
     /// [`kaikei_core::JournalEntry::reverse`] を経て構築済みであること
     /// （不変条件の検証済みデータのみを渡す）。
+    ///
+    /// # Errors
+    ///
+    /// 既存の仕訳と `id`（仕訳ID）が重複する場合、または既存の仕訳と
+    /// `(fiscal_year, entry_no)` の組が重複する場合は
+    /// [`RepoError::Conflict`] を返す（採番は同一トランザクション内で
+    /// 行うため通常は起こらないが、実装（`PgTx` 等）は DB の一意制約
+    /// 違反として検出できる必要がある）。
     async fn insert_entry(&mut self, entry: &JournalEntry) -> Result<(), RepoError>;
 }
 
@@ -119,6 +127,13 @@ pub trait JournalRepo: Send {
 /// どちらも「その時点のスナップショット」を返す読み取り専用の操作であり、
 /// 書き込みメソッドは定義しない（勘定科目・取引先マスタの編集は本 crate の
 /// ユースケースの対象外）。
+///
+/// `CounterpartyIndex` は `kaikei-policy` の型だが、`kaikei-app`
+/// （このファイルの `lib.rs`）が再エクスポートしている。実装者
+/// （`kaikei-store` 等）は `kaikei_policy::CounterpartyIndex` を直接
+/// `use` せず、`kaikei_app::CounterpartyIndex`（同 `kaikei_app::Counterparty`）
+/// 経由で参照すること。`kaikei-store` から `kaikei-policy` への直接依存は
+/// CI（`.github/workflows/architecture.yml`）が禁じている。
 #[async_trait]
 pub trait ChartRepo: Send {
     /// 勘定科目表を読み込む。
@@ -161,6 +176,11 @@ pub trait NumberingRepo: Send {
 /// `Tx` を通さない（`CLAUDE.md` §6「read model は物理的に分離する」）。
 /// 書き込みはドメインモデル経由（[`JournalRepo`] 等）、読み取りは SQL 集計に
 /// 直行させ、両者を混ぜない。
+///
+/// 実装者（`kaikei-store`、PR-6）向けの申し送り: 金額の `SUM` を SQL で
+/// 集計する際の型の扱いは `DECISIONS.md` D-033 を参照（`SUM(amount_minor)`
+/// を `::BIGINT` へ明示キャストし、桁あふれは `RepoError::OutOfRange` に
+/// 写像する）。
 #[async_trait]
 pub trait TrialBalanceQuery: Send + Sync {
     /// `from`〜`to`（取引日、両端を含む）の仕訳明細を `group_by` で集計する。

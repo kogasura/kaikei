@@ -18,6 +18,26 @@ pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// トランザクションを開始し、`f` を実行し、成功したら commit・失敗したら
 /// rollback する。
 ///
+/// # クロージャに渡せるもの（必ず読むこと）
+///
+/// `f` は HRTB（`for<'a>`）で全称量化されているため、**`'static` でない
+/// 借用を一切キャプチャできない**。呼び出し側が依存（`&dyn TaxPolicy` や
+/// `&TagSchema` 等）を借用のまま `move` クロージャに persist させようとすると、
+/// `` `'1` must outlive `'static` `` や E0597 のようなエラーになる（`match` の
+/// スクルティニーが引き起こす下記の E0505 よりも、実際にはこちらの方が
+/// 高頻度で踏む罠である）。
+///
+/// 依存はすべて**所有値**にしてから `move` クロージャに入れること:
+/// - `Arc<dyn TaxPolicy>` / `Arc<dyn AppClock>` / `Arc<dyn IdGenerator>` の
+///   ように `Arc` で保持し、クロージャに渡す直前に `Arc::clone` する
+/// - `TagSchema`（`kaikei-jp-data` 相当。合成ルートが起動時に読み込む可変
+///   データ）も同様に `Arc<TagSchema>` として持ち回る。`context::BookSettings`
+///   に含めない設計（`context.rs` の doc を参照）と対になる規律であり、
+///   合成ルート側がこの形で保持する
+/// - `&[TagKey]` のようなスライス引数は `.to_vec()` で所有値化する
+///
+/// # トランザクションのネストと外部 I/O
+///
 /// `f` の中で `store.begin()` や別のトランザクションを開始しないこと
 /// （このトランザクションと二重にネストする必要が生じるユースケースは
 /// 現時点で想定していない）。また `f` の中では DB 以外の I/O

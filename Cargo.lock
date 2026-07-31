@@ -669,6 +669,7 @@ name = "kaikei-app"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "kaikei-app",
  "kaikei-core",
  "kaikei-policy",
  "thiserror",

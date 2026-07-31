@@ -9,7 +9,7 @@
 //! マッピング）が行い、この enum の適切なバリアントへ写像する
 //! （`DECISIONS.md` D-032）。
 
-use kaikei_core::CoreError;
+use kaikei_core::{CoreError, EntryNumber};
 use kaikei_policy::PolicyError;
 
 /// 永続化層（[`crate::ports::Store`] の実装。`kaikei-store` 等）が返すエラー。
@@ -37,14 +37,16 @@ pub enum RepoError {
         reason: String,
     },
 
-    /// 一意制約違反（重複データ）。
+    /// 一意制約違反（重複データ）。例えば同じ仕訳IDや `(fiscal_year,
+    /// entry_no)` の組を持つ仕訳を重ねて挿入しようとした場合に返す
+    /// （[`crate::ports::JournalRepo::insert_entry`] の `# Errors` を参照）。
     #[error("既に存在します: {reason}")]
     Conflict {
         /// 重複の詳細。
         reason: String,
     },
 
-    /// 保存されているデータが不正（`JournalEntry::rehydrate` の直前に行う
+    /// 保存されているデータが不正（永続化層からの復元処理の直前に行う
     /// 再検証で検出）。panic させず、この形で呼び出し側に返す。
     #[error("保存データが不正です: {reason}")]
     Corrupt {
@@ -78,11 +80,19 @@ pub enum RepoError {
 /// ユースケースが失敗したときに返すエラー。
 ///
 /// [`RepoError`] / [`PolicyError`] / [`CoreError`] をそのまま伝播できるように
-/// `#[from]` を用意する。ユースケース固有の業務ルール違反（例: 既に取消済みの
-/// 仕訳を再度取り消そうとした、集計軸に許可されていないタグキーを指定した等）は
-/// [`AppError::Rejected`] を使うか、必要になった時点でバリアントを追加する
-/// （ユースケース本体は本 PR の対象外であり、後続の PR が担う）。
+/// `#[from]` を用意する。
+///
+/// `#[non_exhaustive]` を付ける。`kaikei-policy::PolicyError` が意図的に
+/// `#[non_exhaustive]` を**付けない**選択をしているのとは逆の判断である
+/// （`kaikei-policy/src/error.rs` の doc を参照）。`PolicyError` の消費者は
+/// `kaikei-app` の中だけ（同一ワークスペース内で足並みを揃えて更新できる）
+/// だが、`AppError` の消費者は `kaikei-api` / `kaikei-mcp` のようなさらに
+/// 下流の crate になる。バリアント追加のたびにそれらの網羅的 `match` が
+/// 壊れるより、`_ => {}` の一手で追従できる方が実用上安全と判断した
+/// （後から `#[non_exhaustive]` を付けるのは破壊的変更になるため、最初から
+/// 付けておく）。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AppError {
     /// 永続化層のエラー。
     #[error(transparent)]
@@ -95,6 +105,38 @@ pub enum AppError {
     /// `kaikei-core` の不変条件違反。
     #[error(transparent)]
     Core(#[from] CoreError),
+
+    /// 既に赤伝（逆仕訳）済みの仕訳を再度取り消そうとした。
+    ///
+    /// 二重取消は既定で拒否する（誤操作・AI の暴走が帳簿の残高を静かに
+    /// 壊すことを防ぐ多層防御の一つ）。許可する運用（`allow_double_reversal`
+    /// をユースケース入力に明示した場合のみ許可）は、その入力型を持つ
+    /// ユースケース本体（後続の PR）が実装する。
+    #[error(
+        "仕訳 {} は既に取消（逆仕訳 {}）済みです。\
+         二重取消を許可する場合は allow_double_reversal を指定してください",
+        entry_no.as_u32(),
+        reversal_no.as_u32()
+    )]
+    AlreadyReversed {
+        /// 取り消そうとした仕訳の番号。
+        entry_no: EntryNumber,
+        /// 既存の逆仕訳の番号。
+        reversal_no: EntryNumber,
+    },
+
+    /// 試算表の検算に失敗した（借方合計 ≠ 貸方合計）。正しく記帳された
+    /// データからは発生しない。データ破損、または実装のバグを示す。
+    #[error(
+        "試算表の貸借が一致しません: 借方 {debit} / 貸方 {credit}。\
+         データが破損している可能性があります。管理者に連絡してください"
+    )]
+    Inconsistent {
+        /// 借方合計（表示用文字列）。
+        debit: String,
+        /// 貸方合計（表示用文字列）。
+        credit: String,
+    },
 
     /// 上記に分類できない業務ルール違反。次の手が分かる文言にすること
     /// （`CLAUDE.md` §11）。

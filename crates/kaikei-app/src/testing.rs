@@ -159,6 +159,42 @@ impl JournalRepo for InMemoryTx {
     }
 
     async fn insert_entry(&mut self, entry: &JournalEntry) -> Result<(), RepoError> {
+        // 実 DB では仕訳ID・`(fiscal_year, entry_no)` のいずれも一意制約
+        // 違反として拒否される（`crates/kaikei-store/migrations/0003_journal.sql`
+        // の `PRIMARY KEY` / `UNIQUE (fiscal_year, entry_no)`）。この fake が
+        // 重複を無言で上書きすると、実装が同じ状況で `RepoError::Conflict`
+        // を返す経路をテストで再現できなくなる（`JournalRepo::insert_entry`
+        // の `# Errors` を参照）。
+        let local_id_conflict = self.inserted_entries.iter().any(|e| e.id() == entry.id());
+        let local_fy_no_conflict = self
+            .inserted_entries
+            .iter()
+            .any(|e| e.fiscal_year() == entry.fiscal_year() && e.entry_no() == entry.entry_no());
+
+        let (shared_id_conflict, shared_fy_no_conflict) = {
+            let shared = self.lock_shared();
+            let id_conflict = shared.entries.contains_key(&entry.id().as_u128());
+            let fy_no_conflict = shared.entries.values().any(|e| {
+                e.fiscal_year() == entry.fiscal_year() && e.entry_no() == entry.entry_no()
+            });
+            (id_conflict, fy_no_conflict)
+        };
+
+        if local_id_conflict || shared_id_conflict {
+            return Err(RepoError::Conflict {
+                reason: format!("仕訳ID {} は既に存在します", entry.id().as_u128()),
+            });
+        }
+        if local_fy_no_conflict || shared_fy_no_conflict {
+            return Err(RepoError::Conflict {
+                reason: format!(
+                    "会計年度 {} の仕訳番号 {} は既に存在します",
+                    entry.fiscal_year(),
+                    entry.entry_no().as_u32()
+                ),
+            });
+        }
+
         self.inserted_entries.push(entry.clone());
         Ok(())
     }
@@ -312,6 +348,50 @@ mod tests {
 
         assert!(result.is_err());
         assert!(store.committed_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn insert_entry_rejects_duplicate_id_within_the_same_transaction() {
+        let store = InMemoryStore::new();
+        let mut tx = store.begin().await.unwrap();
+        let first = tests_support::sample_entry(1, 1);
+        tx.insert_entry(&first).await.unwrap();
+
+        // 同じトランザクション内でも、同じ仕訳IDを二重に挿入しようとすると
+        // 拒否される（DB の PRIMARY KEY 違反を模している）。
+        let duplicate_id = tests_support::sample_entry(1, 2);
+        let result = tx.insert_entry(&duplicate_id).await;
+        assert!(matches!(result, Err(RepoError::Conflict { .. })));
+    }
+
+    #[tokio::test]
+    async fn insert_entry_rejects_duplicate_id_after_commit() {
+        let store = InMemoryStore::new();
+        let entry = tests_support::sample_entry(1, 1);
+
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_entry(&entry).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = store.begin().await.unwrap();
+        let result = tx.insert_entry(&entry).await;
+        assert!(matches!(result, Err(RepoError::Conflict { .. })));
+    }
+
+    #[tokio::test]
+    async fn insert_entry_rejects_duplicate_fiscal_year_and_entry_no() {
+        let store = InMemoryStore::new();
+        let first = tests_support::sample_entry(1, 1);
+
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_entry(&first).await.unwrap();
+        tx.commit().await.unwrap();
+
+        // 別の仕訳ID・同じ (fiscal_year, entry_no) は UNIQUE 制約違反に相当する。
+        let second = tests_support::sample_entry(2, 1);
+        let mut tx = store.begin().await.unwrap();
+        let result = tx.insert_entry(&second).await;
+        assert!(matches!(result, Err(RepoError::Conflict { .. })));
     }
 
     #[test]

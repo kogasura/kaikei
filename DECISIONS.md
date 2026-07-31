@@ -569,6 +569,20 @@ PRが新たに持ち込んだ矛盾ではない。(b) 取引先マスタを完�
 と、エラーも警告も出ずに何も保存されない構造的リスクが残る（`with_tx` への
 一本化と `#[doc(hidden)]` で緩和するが、完全には防げない）。
 
+**合成ルート（axum の `State`）への実装指針**: 合成ルートでは `Arc<dyn
+Store<Tx = ..>>` のような trait object ではなく、**具象型 `Arc<PgStore>`**
+を `State` に積む。`Store` は関連型 `Tx` を持つため、trait object 化するには
+`dyn Store<Tx = 具象型>` のように `Tx` を dyn 化の時点で具象型に固定する必要が
+あり、その時点で「実装を差し替えられる」という抽象化の利点がほとんど残らない
+（本番で使う `Store` 実装は通常1つ、`kaikei-store::PgStore` だけである）。
+一方 `with_tx<S: Store>` はジェネリックのまま使えるため、具象型を渡しても
+呼び出し側のコードが実装の詳細を意識する必要はない。
+
+**これに伴い `ARCHITECTURE.md` §6 の記述（`Arc<dyn JournalRepository>` を
+`State` に入れる、という旧・案1相当の設計）は本決定と矛盾するため、
+古い記述のまま残っている。改訂は PR-8（結線 + E2E + ドキュメント改訂）で
+まとめて行う。**
+
 ---
 
 ## D-030 `SystemClock` は記帳時刻をマイクロ秒粒度に丸めて返す
@@ -645,3 +659,51 @@ Sync>)` のような単一バリアントに永続化層のエラーをすべて
 **トレードオフ**: `kaikei-store` 側で SQLSTATE からこの enum への写像コードを
 書く手間が生じる（`Box<dyn Error>` に包むだけの実装より初期コストが高い）。
 会計データにおいて「次の手が分かるエラー」の価値がこのコストに見合うと判断した。
+
+---
+
+## D-033 試算表の `SUM(amount_minor)` は SQL 側で `BIGINT` にキャストする（PR-6 への申し送り）
+
+**決定**: `kaikei-store::query::trial_balance`（PR-6）が発行する SQL は、
+`SUM(amount_minor)` をそのまま受けず `SUM(amount_minor)::BIGINT` のように
+明示的に `BIGINT` へキャストしたうえで `i64` として受け取る。桁あふれで
+発生する SQLSTATE `22003`（numeric_value_out_of_range）は
+`RepoError::OutOfRange` に写像する。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `SUM(amount_minor)` を `NUMERIC`/`Decimal` として受け取る | PostgreSQL の `SUM(bigint)` は規格上 `NUMERIC` を返すが、ワークスペースの sqlx feature（`Cargo.toml` の `[workspace.dependencies].sqlx`）に `NUMERIC` の decode 先（`rust_decimal` 等の feature）が無い。追加すると依存が増え、`kaikei-store` の許可された依存範囲を広げることになる |
+| `rust_decimal` feature を sqlx に追加する | 依存を増やさない方針（`CLAUDE.md` §1「依存を追加したくなったら設計を疑うべきサイン」）に反する。`amount_minor` は元々 `BIGINT` 列であり、`SUM` の結果が実務上 `i64` の範囲を超えることは通常無い |
+
+**理由**: `journal_lines.amount_minor` は `BIGINT`（`i64` 相当）の列であり、
+個人事業主規模の年間仕訳数を前提とする限り `SUM` の結果が `i64` の範囲を
+超えることは通常無い。SQL 側で明示的に `::BIGINT` へキャストして sqlx に
+`i64` として decode させれば、追加の依存無しに実装できる。桁あふれが
+万一発生した場合は `22003` を検出して `RepoError::OutOfRange` に写像し、
+`as i64` のような無検証キャストで無言に切り詰めない（R7 と同じ規律）。
+
+**トレードオフ**: 理論上 `i64::MAX` を超える合計金額（暗号資産等、極端な
+`minor_unit` を持つ通貨での大量取引）は表現できない。`DECISIONS.md` D-017
+（個人事業主のみをターゲットにする）のスコープでは現実的に発生しない。
+
+---
+
+## D-034 PR-5 は小さな先行コミットで骨組みを固めてから PR-6 と並列化する（申し送り）
+
+**決定**: `kaikei-store`（PR-5）は、まず `lib.rs` の骨組み・`sqlstate.rs`（SQLSTATE
+→ `RepoError` の写像）・`tags.rs`（`TagSet` ⇄ JSONB 表現）だけの小さな
+先行コミットを入れる。この3点が固まった後で PR-6（read model）を並列に
+開始する。
+
+**却下した選択肢**: PR-5 と PR-6 を最初から完全並列で始める。
+
+**理由**: `sqlstate.rs`（SQLSTATE の判別規則）と `tags.rs`（JSONB との
+相互変換規則）は、書き込み側（PR-5 本体）と read model 側（PR-6）の両方が
+参照する共通基盤である。この2点の規約が固まる前に両方が並走すると、
+どちらが正かの手戻りが発生しやすい。先に小さくマージすることで、
+後続の並列作業が共通基盤の上に乗る形になる。
+
+**トレードオフ**: PR-5 の着手から PR-6 の並列開始までにわずかな直列区間が
+生まれる。共通基盤のブレを防ぐコストとして許容する。

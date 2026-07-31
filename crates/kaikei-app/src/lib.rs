@@ -22,6 +22,16 @@
 //! `kaikei-store` / `kaikei-jp` / `kaikei-import` への依存は CI
 //! （`.github/workflows/architecture.yml`）が検査し、混入したら失敗する
 //! （`CLAUDE.md` §1）。
+//!
+//! # `kaikei-policy` 型の再エクスポート
+//!
+//! [`Counterparty`] / [`CounterpartyIndex`] は `kaikei-policy` の型だが、
+//! ポート（[`ports::ChartRepo::load_counterparties`]）のシグネチャに現れる
+//! ため、ここで再エクスポートする。`kaikei-store` 等の実装者は
+//! `kaikei_policy::` を直接 `use` せず、必ずこの再エクスポート経由で参照する
+//! こと（`kaikei-store` から `kaikei-policy` への直接依存は CI が禁じている。
+//! `.github/workflows/architecture.yml` の「kaikei-store は kaikei-jp /
+//! kaikei-policy に依存しない」ステップを参照）。
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,3 +48,5 @@ pub mod testing;
 pub mod tx;
 pub mod usecase;
 pub mod view;
+
+pub use kaikei_policy::{Counterparty, CounterpartyIndex};
