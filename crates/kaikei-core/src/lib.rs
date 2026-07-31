@@ -6,6 +6,7 @@
 mod account;
 mod clock;
 mod error;
+mod journal;
 mod money;
 mod period;
 mod tag;
@@ -13,6 +14,7 @@ mod tag;
 pub use account::*;
 pub use clock::*;
 pub use error::*;
+pub use journal::*;
 pub use money::*;
 pub use period::*;
 pub use tag::*;
