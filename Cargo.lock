@@ -688,6 +688,7 @@ name = "kaikei-policy"
 version = "0.0.1"
 dependencies = [
  "kaikei-core",
+ "proptest",
  "thiserror",
 ]
 

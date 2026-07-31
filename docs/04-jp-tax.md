@@ -11,40 +11,72 @@
 
 ## 2. policy trait（kaikei-policy）
 
+> **`TaxContext` は国非依存の4項目に限定する（`DECISIONS.md` D-025）。**
+> 年度別税区分マスタ（`TaxCategoryTable`）や事業者設定（`JpSettings`）は
+> `kaikei-jp` の型であり、`kaikei-policy` には一切含めない。そのまま含めると
+> policy → jp の循環依存になり、`kaikei-app` も jp の型を知る必要が生じて
+> `CLAUDE.md` §1 の依存方向が崩れる（`ARCHITECTURE.md` §7 参照）。
+
 ```rust
 /// 税額計算と税区分の妥当性
-pub trait TaxPolicy {
+pub trait TaxPolicy: Send + Sync {
     fn validate_tag(&self, ctx: &TaxContext<'_>, tags: &TagSet, account: &AccountDef)
         -> Result<(), PolicyError>;
 
-    /// 税抜経理での消費税行を自動生成する
+    /// 税抜経理での消費税行を導出する。戻り値は**確定後の明細一覧**
+    /// （入力＋税額行）であり、追加行だけではない。税額 0 の行は生成しない
+    /// （`JournalLine::new` が 0 円を拒否するため）。
     fn derive_tax_lines(&self, ctx: &TaxContext<'_>, lines: &[JournalLine])
-        -> Result<Vec<JournalLine>, PolicyError>;
+        -> Result<TaxDerivation, PolicyError>;
 
-    fn round(&self, raw: Money) -> Money;
+    fn round_mode(&self, ctx: &TaxContext<'_>) -> RoundMode;
+
+    /// 按分・税額計算に使う。既定実装は
+    /// `base.mul_ratio(ratio, self.round_mode(ctx))?`。`Money` は最小通貨単位の
+    /// 整数（`i128`）で端数を保持できないため、`round(Money) -> Money` という
+    /// 形は事実上の恒等関数にしかならず、この形に変えた（`DECISIONS.md` D-026）。
+    fn apply_ratio(&self, ctx: &TaxContext<'_>, base: Money, ratio: Ratio)
+        -> Result<Money, PolicyError> { /* 既定実装あり */ }
+}
+
+/// [`TaxPolicy::derive_tax_lines`] の戻り値。確定後の明細一覧に加え、
+/// 断定を避けた補足情報（`PolicyNote`）を持てる（`CLAUDE.md` §10）。
+pub struct TaxDerivation {
+    pub lines: Vec<JournalLine>,
+    pub notes: Vec<PolicyNote>,
 }
 
 /// 決算振替仕訳の生成
-pub trait ClosingPolicy {
+pub trait ClosingPolicy: Send + Sync {
+    /// `EntryId` / `EntryNumber` の採番は store の I/O のため、ここでは
+    /// 仕訳を提案する `ProposedEntry`（未採番）を返す（`DECISIONS.md` D-027）。
     fn closing_entries(&self, tb: &TrialBalance, fy: &FiscalYear)
-        -> Result<Vec<NewEntry>, PolicyError>;
+        -> Result<Vec<ProposedEntry>, PolicyError>;
+
+    /// 期首の振替仕訳（前年度繰越等）。個人事業主の元入金振替を当年度末と
+    /// 翌年期首のどちらに計上するかは未確定（§9、税理士確認事項）なので、
+    /// 既定実装では何も生成しない。
+    fn opening_entries(&self, tb: &TrialBalance, fy: &FiscalYear)
+        -> Result<Vec<ProposedEntry>, PolicyError> { Ok(Vec::new()) }
 }
 
 /// 財務諸表の様式
-pub trait StatementPolicy {
+pub trait StatementPolicy: Send + Sync {
     fn balance_sheet(&self, tb: &TrialBalance) -> Statement;
     fn income_statement(&self, tb: &TrialBalance) -> Statement;
 }
 
 /// 追加検証
-pub trait EntryValidator {
+pub trait EntryValidator: Send + Sync {
     fn validate(&self, ctx: &TaxContext<'_>, entry: &JournalEntry)
         -> Result<(), PolicyError>;
 }
 
 /// 採番
-pub trait Numbering {
-    fn peek(&self, fy: &FiscalYear) -> EntryNumber;
+pub trait Numbering: Send + Sync {
+    /// `issued` は直近で払い出し済みの番号（未払い出しなら `None`）。
+    fn peek(&self, fy: &FiscalYear, issued: Option<EntryNumber>)
+        -> Result<EntryNumber, PolicyError>;
 }
 ```
 
@@ -56,11 +88,25 @@ pub trait Numbering {
 I/O が必要なデータは呼び出し側が `TaxContext` に詰めて渡す。
 
 ```rust
+// kaikei-policy::TaxContext。国非依存の4項目のみ（DECISIONS.md D-025）。
 pub struct TaxContext<'a> {
     pub as_of: AccountingDate,
-    pub categories: &'a TaxCategoryTable,        // 年度別YAMLから
+    pub chart: &'a ChartOfAccounts,
+    pub tag_schema: &'a TagSchema,
     pub counterparties: &'a CounterpartyIndex,   // DBから引いたスナップショット
-    pub settings: &'a JpSettings,
+}
+```
+
+年度別税区分マスタ（`TaxCategoryTable`）と事業者設定（`JpSettings`）は
+`kaikei-jp` 側の型であり、`TaxContext` には含めない。`JpTaxPolicy`
+（`kaikei-jp` の `TaxPolicy` 実装）が**構築時**に保持し、年度の選択は
+`TaxContext::as_of`（取引日）で行う。
+
+```rust
+// kaikei-jp::tax::policy 内部の状態。TaxContext には現れない。
+pub struct JpTaxPolicy {
+    rulesets: BTreeMap<i32, TaxCategoryTable>,   // 年度ラベル → 年度別YAMLから読んだマスタ
+    settings: JpSettings,
 }
 
 pub struct JpSettings {
@@ -70,6 +116,11 @@ pub struct JpSettings {
     pub simplified_taxation: bool,       // 簡易課税か
 }
 ```
+
+YAML の読み込みは合成ルートの起動時 I/O であり、`TaxPolicy` の各メソッド自体は
+引き続き同期の純関数のままになる。設定変更（税率改定・事業者区分の変更等）を
+反映するには `Arc<dyn TaxPolicy>` を作り直す（単一ユーザー・自己ホスト前提
+なのでプロセス再起動で足りる）。
 
 ---
 
@@ -177,7 +228,7 @@ impl InvoiceRegistrationNo {
 ### 処理
 
 1. `direction: sales` かつ `rate` を持つ明細を抽出
-2. `税額 = round(本体 × rate)`
+2. `税額 = apply_ratio(本体, rate)`（端数処理込み。`TaxPolicy::apply_ratio` 相当）
 3. 反対側（貸方）に `tax_account` の明細を追加
 
 ### 出力
@@ -252,6 +303,12 @@ pub fn household_split(
 - 青色申告特別控除（65万/55万/10万）は**帳簿科目ではない**。申告書上の控除
   → `kaikei-report` の決算書出力で扱う。仕訳を作らない
 - 減価償却費、家事按分の年次調整、棚卸は Phase 5 の検討事項
+- `ClosingPolicy::closing_entries` / `opening_entries` は `kaikei-policy::TaxContext`
+  を引数に取らない（`kaikei-policy` の trait 定義を参照）。元入金・事業主貸・
+  事業主借の**科目コードは `JpSoleProprietorClosingPolicy` が構築時に保持する**。
+  年度別税区分マスタ・事業者設定を `JpTaxPolicy` が構築時に保持するのと同じ
+  パターン（`DECISIONS.md` D-025）であり、科目コード体系が変わった場合は
+  実装を作り直す（再起動する）ことで追従する
 
 ---
 
