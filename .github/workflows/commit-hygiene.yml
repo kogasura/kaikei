@@ -1,0 +1,47 @@
+# .github/workflows/commit-hygiene.yml
+#
+# コミットメッセージ・PR本文にAI帰属表示（Co-Authored-By: Claude 等）が
+# 含まれていないことを検査する。マージ前にmainの履歴をクリーンに保つため。
+
+name: commit-hygiene
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  no-ai-attribution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: コミットメッセージにAI帰属表示が含まれていないか
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          PATTERN='Co-Authored-By:.*Claude|noreply@anthropic\.com|Generated with.*Claude Code|claude\.com/claude-code'
+          BAD=$(git log --format=%B "$BASE_SHA".."$HEAD_SHA" | grep -inE "$PATTERN" || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::コミットメッセージにAI帰属表示が含まれています:"
+            echo "$BAD"
+            echo ""
+            echo "対象コミットのメッセージからAI帰属表示（Co-Authored-By: Claude 等）を取り除いてください。"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: PR本文にAI帰属表示が含まれていないか
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          PATTERN='Co-Authored-By:.*Claude|noreply@anthropic\.com|Generated with.*Claude Code|claude\.com/claude-code'
+          if printf '%s' "$PR_BODY" | grep -inE "$PATTERN"; then
+            echo "::error::PR本文にAI帰属表示が含まれています。PRの説明文から取り除いてください。"
+            exit 1
+          fi
+          echo "OK"

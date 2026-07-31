@@ -189,3 +189,18 @@ MCP 経由で AI が自己修正できる形にする。
 ```
 
 次の手が分かる文言にすること。これは MCP サーバーの品質を左右する。
+
+---
+
+## 12. コミット・PR に AI 帰属表示を含めない
+
+このリポジトリでは、コミットメッセージや PR 本文に以下のような AI 帰属表示を含めない:
+
+- `Co-Authored-By: Claude ...` トレーラー
+- `🤖 Generated with Claude Code` 等のフッター
+- `noreply@anthropic.com`
+- `claude.com/claude-code` へのリンク
+
+`.github/workflows/commit-hygiene.yml` が PR のコミットメッセージと本文を検査し、
+該当パターンがあれば CI を失敗させる（マージ不可になる）。コミットする際は
+このトレーラー・フッターを付けないこと。
