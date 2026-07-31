@@ -131,20 +131,34 @@ impl ChartOfAccounts {
 
         for def in accounts.values() {
             let mut visited = BTreeSet::new();
+            // `def` から親をたどった経路を順序付きで保持する。循環を検出した際に
+            // 「どこから辿り始めたか」（`def`）ではなく「実際に循環を構成する
+            // 科目」を特定するために使う。外側ループの起点 `def` は循環に
+            // 至るまでの尻尾（循環の外側の枝）にいることがあり、その場合
+            // `def` 自身は犯人ではない。
+            let mut path: Vec<&AccountCode> = vec![&def.code];
             let mut current = def;
             visited.insert(&current.code);
             while let Some(parent_code) = &current.parent {
                 if visited.contains(parent_code) {
+                    let cycle_start = path
+                        .iter()
+                        .position(|code| *code == parent_code)
+                        .expect("visited にあるコードは必ず path 内に存在する");
+                    let mut cycle: Vec<&str> =
+                        path[cycle_start..].iter().map(|c| c.as_str()).collect();
+                    cycle.push(parent_code.as_str());
                     return Err(CoreError::InvalidChart {
                         reason: format!(
-                            "循環参照があります: {} から辿ると自身に戻ります",
-                            def.code.as_str()
+                            "循環参照があります: {}。いずれかの親科目の指定を外してください",
+                            cycle.join(" → ")
                         ),
                     });
                 }
                 let parent = accounts
                     .get(parent_code)
                     .expect("直前のループで親の存在は検証済み");
+                path.push(&parent.code);
                 visited.insert(&parent.code);
                 current = parent;
             }
@@ -304,6 +318,48 @@ mod tests {
             ChartOfAccounts::new(defs),
             Err(CoreError::InvalidChart { .. })
         ));
+    }
+
+    // バグ[C]: 循環に入る前の「尻尾」（100→110）を持つ循環（110↔120）では、
+    // 循環に参加していない 100 を犯人として名指ししない。
+    // `BTreeMap::values()` はコード昇順で辿るため、尻尾のコードが循環側より
+    // 小さいと外側ループの起点が循環外の 100 になる。この場合でもエラー
+    // メッセージには実際の循環の構成科目（110・120）のみが含まれるべきで、
+    // 100 は含まれてはならない。
+    #[test]
+    fn chart_of_accounts_new_cycle_with_tail_does_not_blame_uninvolved_account() {
+        let defs = vec![
+            account("100", AccountType::Asset, Some("110"), true),
+            account("110", AccountType::Asset, Some("120"), true),
+            account("120", AccountType::Asset, Some("110"), true),
+        ];
+        let err = ChartOfAccounts::new(defs).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("110"), "message = {message}");
+        assert!(message.contains("120"), "message = {message}");
+        assert!(!message.contains("100"), "message = {message}");
+    }
+
+    // バグ[C]: 独立した複数の循環が同時に存在する場合でも検出漏れが無く、
+    // かつメッセージが無関係な科目同士を混在させて名指ししない
+    // （A・B の循環と X・Y の循環が混ざって報告されない）。
+    #[test]
+    fn chart_of_accounts_new_multiple_independent_cycles_is_error() {
+        let defs = vec![
+            account("A", AccountType::Asset, Some("B"), true),
+            account("B", AccountType::Asset, Some("A"), true),
+            account("X", AccountType::Asset, Some("Y"), true),
+            account("Y", AccountType::Asset, Some("X"), true),
+        ];
+        let err = ChartOfAccounts::new(defs).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidChart { .. }));
+        let message = err.to_string();
+        let mentions_ab = message.contains('A') && message.contains('B');
+        let mentions_xy = message.contains('X') && message.contains('Y');
+        assert!(
+            mentions_ab ^ mentions_xy,
+            "message should identify exactly one real cycle: {message}"
+        );
     }
 
     // A-12
