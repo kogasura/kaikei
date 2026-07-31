@@ -4,11 +4,9 @@
 //! 差額や期待値を必ず含め、「次に何をすべきか」が読み取れるメッセージにすること。
 
 use crate::account::AccountType;
+use crate::tag::TagValueType;
 
 /// `kaikei-core` の操作が失敗したときに返すエラー。
-///
-/// `TagTypeMismatch`（`expected: TagValueType` を持つ）は `TagValueType`
-/// （`tag.rs`、未実装）に依存するため未実装。理由は enum 内のコメントを参照。
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     /// 貸借が一致しない。
@@ -66,8 +64,15 @@ pub enum CoreError {
         key: String,
     },
 
-    // TagTypeMismatch { key: String, expected: TagValueType } は
-    // TagValueType（tag.rs、未実装）に依存するため Phase 0 後続PRで追加する。
+    /// タグの値がスキーマで定義された型と一致しない。
+    #[error("タグ {key} の型が不正です。期待={}", expected.label_ja())]
+    TagTypeMismatch {
+        /// 型が不正なタグキー。
+        key: String,
+        /// スキーマ上期待される値の型。
+        expected: TagValueType,
+    },
+
     /// タグスキーマ上、その科目種別の明細では必須のタグが欠落している。
     #[error("タグ {key} は{}の明細では必須です", account_type.label_ja())]
     MissingRequiredTag {
