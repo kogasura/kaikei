@@ -1,0 +1,18 @@
+# crates/kaikei-store/Cargo.toml
+#
+# 永続化層（PostgreSQL）。kaikei-app のポート（trait）を実装する。
+# kaikei-policy / kaikei-jp には依存しない（app が注入する。CI が検査する）。
+
+[package]
+name = "kaikei-store"
+version = "0.0.1"
+description = "永続化層。PostgreSQL に対する Data Mapper と read model"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kaikei-core = { path = "../kaikei-core" }
+kaikei-app = { path = "../kaikei-app" }
+sqlx = { workspace = true }
+thiserror = { workspace = true }

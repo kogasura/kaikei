@@ -5,16 +5,16 @@
 resolver = "2"
 members = [
     "crates/kaikei-core",
+    "crates/kaikei-policy",
+    "crates/kaikei-store",
+    "crates/kaikei-app",
     # Phase 1 以降で追加
-    # "crates/kaikei-policy",
     # "crates/kaikei-jp",
     # "crates/kaikei-jp-data",
-    # "crates/kaikei-store",
     # "crates/kaikei-blob",
     # "crates/kaikei-import",
     # "crates/kaikei-import-data",
     # "crates/kaikei-report",
-    # "crates/kaikei-app",
     # "crates/kaikei-api",
     # "crates/kaikei-mcp",
 ]
@@ -33,7 +33,7 @@ thiserror = "2"
 
 # ---- Phase 1 以降。core には絶対に入れない ----
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "macros", "migrate"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
