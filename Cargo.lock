@@ -673,6 +673,7 @@ dependencies = [
  "kaikei-app",
  "kaikei-core",
  "kaikei-policy",
+ "proptest",
  "thiserror",
  "tokio",
  "uuid",
