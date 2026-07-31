@@ -22,10 +22,16 @@ chrono = { workspace = true }
 serde_json = { workspace = true }
 # tags.rs: TagValue::Decimal の文字列⇄Decimal変換（D-013と同じ理由で浮動小数点を経由しない）
 rust_decimal = { workspace = true }
+# journal/row.rs: id 列（UUID）⇄ kaikei_core::EntryId（kaikei_app::id 経由）
+uuid = { workspace = true }
+# PgTx の Drop: commit/rollback 忘れを tracing::warn! で知らせる（phase1計画 R10）
+tracing = { workspace = true }
+# store.rs / journal.rs / chart.rs / period.rs / numbering.rs の #[async_trait] 実装用
+async-trait = { workspace = true }
+# bin/kaikei-migrate.rs 専用（#[tokio::main]）
+tokio = { workspace = true }
 
 [dev-dependencies]
-# pg-tests（下記 [[test]] の required-features）専用。テストが仕訳IDを組み立てるために使う。
-uuid = { workspace = true }
 # convert.rs / tags.rs の境界値プロパティテスト用。
 proptest = { workspace = true }
 
@@ -56,4 +62,9 @@ required-features = ["pg-tests"]
 [[test]]
 name = "schema_constraints"
 path = "tests/schema_constraints.rs"
+required-features = ["pg-tests"]
+
+[[test]]
+name = "round_trip"
+path = "tests/round_trip.rs"
 required-features = ["pg-tests"]

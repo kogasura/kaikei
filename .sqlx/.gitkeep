@@ -1,0 +1,14 @@
+このディレクトリは `cargo sqlx prepare --workspace` の出力先。
+
+現時点（PR-5）では `kaikei-store` が `sqlx::query!` / `query_as!` /
+`query_scalar!`（コンパイル時にSQLを検証するマクロ形式）を一切使わず、
+実行時にのみ検証される関数形式（`sqlx::query()` 等）のみを使っているため、
+`cargo sqlx prepare` はキャッシュファイルを1つも生成しない
+（`warning: no queries found`）。
+
+このディレクトリ自体は空でも `SQLX_OFFLINE=true` でのビルドを妨げない
+（マクロ形式を使っていないため）が、CI の `database` ジョブが実行する
+`cargo sqlx prepare --workspace --check` の対象ディレクトリとして存在を
+維持するため、このプレースホルダーを置く。後続 PR がマクロ形式のクエリを
+追加した場合は、このファイルを削除して `cargo sqlx prepare --workspace`
+を再実行し、生成されたキャッシュファイルをコミットすること。

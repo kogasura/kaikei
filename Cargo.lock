@@ -701,6 +701,7 @@ dependencies = [
 name = "kaikei-store"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "chrono",
  "kaikei-app",
  "kaikei-core",
@@ -709,6 +710,8 @@ dependencies = [
  "serde_json",
  "sqlx",
  "thiserror",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
