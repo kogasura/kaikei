@@ -39,6 +39,10 @@ kaikei/
     └── architecture.yml          依存方向をCIで検査
 ```
 
+これは**最終形**。Phase 1 完了時点で実在するのは `kaikei-core` / `kaikei-policy` /
+`kaikei-app` / `kaikei-store` と、データのみの `kaikei-jp-data` / `kaikei-import-data`
+（進捗は `README.md`）。
+
 ### DDD 層との対応
 
 | DDD の層 | crate |
@@ -148,68 +152,98 @@ journal/
 
 ## 5. application 層は縦に切る
 
+`(P2+)` は Phase 2 以降で追加するもの。それ以外は Phase 1 完了時点で存在する。
+
 ```
 kaikei-app/src/
-├── lib.rs
-├── context.rs              TaxContext等の組み立て
-├── ports.rs                Repository trait（domainが要求する穴）
-├── error.rs                AppError
+├── lib.rs                  kaikei-policy 型の再エクスポート（D-047）
+├── context.rs              BookSettings / 会計年度の決定 / PostingContext の組み立て
+├── ports.rs                Store / TxOps / 各 Repo trait（domainが要求する穴）
+├── tx.rs                   with_tx（commit/rollback の取りこぼしを型で防ぐ）
+├── error.rs                AppError / RepoError
+├── clock.rs                SystemClock（AppClock: Clock + Send + Sync）
+├── id.rs                   UuidV7IdGenerator
+├── currency.rs             帳簿通貨の決定
+├── period_guard.rs         ClosedPeriodGuard（core の PeriodGuard 実装）
+├── view.rs                 read model の DTO（BalanceRowView / TrialBalanceView）
+├── testing.rs              InMemoryStore 等の fake（testing feature 配下）
 └── usecase/
     ├── post_entry.rs       仕訳を起こす
     ├── reverse_entry.rs    赤伝を起こす
-    ├── import_csv.rs       CSV取込
-    ├── journalize.rs       取込明細を仕訳化（★コンテキスト間の翻訳層）
-    ├── attach_document.rs  証憑を紐付ける
-    ├── close_period.rs     期間を締める
-    └── report.rs           試算表・決算書
+    ├── report.rs           試算表
+    ├── import_csv.rs       CSV取込                        (P2+)
+    ├── journalize.rs       取込明細を仕訳化（★翻訳層）    (P2+)
+    ├── attach_document.rs  証憑を紐付ける                 (P2+)
+    └── close_period.rs     期間を締める                   (P2+)
 ```
 
 **ユースケース1つ = 1ファイル = 1関数。**
 `AccountingService` のような巨大構造体を作らない（定番の崩壊パターン）。
 
 ```rust
-// usecase/post_entry.rs
-pub struct PostEntryInput { /* ... */ }
-pub struct PostEntryOutput { pub entry_id: EntryId, pub entry_no: EntryNumber }
+// usecase/post_entry.rs（実物）
+pub struct PostEntryInput {
+    pub entry_date: AccountingDate,
+    pub description: String,
+    pub lines: Vec<JournalLine>,
+    pub auto_tax_lines: bool,
+}
 
-pub async fn execute<R, T>(
-    repo: &R,
-    tax: &T,
-    clock: &dyn Clock,
+pub async fn execute<Tx>(
+    tx: &mut Tx,
+    tax: &dyn TaxPolicy,
+    tag_schema: &TagSchema,
+    id_gen: &dyn IdGenerator,
+    clock: &dyn AppClock,
+    settings: &BookSettings,
     input: PostEntryInput,
-) -> Result<PostEntryOutput, AppError>
+) -> Result<JournalEntry, AppError>
 where
-    R: JournalRepository,
-    T: TaxPolicy,
+    Tx: TxOps,
 {
-    // 1. I/O: 必要なデータをロード（policyは純関数なので事前に集める）
-    // 2. policy: 消費税行を導出
-    // 3. domain: JournalEntry::new で不変条件を検証
-    // 4. I/O: 保存
+    // 1. I/O   : 会計年度・勘定科目表・締め状態・取引先索引をロード
+    // 2. 純関数: タグ検証（税額行の導出より前、元の明細に対して）
+    // 3. 純関数: 消費税行を導出（1回だけ。戻り値は確定後の明細一覧）
+    // 4. I/O   : 採番（失敗しうる検証を全て終えた直後・INSERT の直前）
+    // 5. domain: JournalEntry::new で不変条件を検証（これ以降 lines に触らない）
+    // 6. I/O   : 保存
 }
 ```
 
 構造体のメソッドではなく**関数**にすることで、依存が引数に全部現れる。
+依存を `PostEntryDeps` のような構造体にまとめない理由は `DECISIONS.md` D-045。
+
+I/O とドメイン検証の**順序**が重要。採番（4）を検証（2・3・5）より後に置くことで、
+検証失敗が採番を消費しない（同一トランザクションなので巻き戻る）。
+`JournalEntry::new`（5）より後で `lines` に触ると貸借一致の検証を迂回できてしまう。
 
 ---
 
 ## 6. store 層
 
+Phase 1 完了時点の実物（`ledger.rs` / `search.rs` / 取込・証憑の Repository は
+Phase 2 以降）:
+
 ```
 kaikei-store/src/
 ├── lib.rs
-├── pool.rs
-├── journal_repository.rs      JournalRepository実装
-├── chart_repository.rs
-├── counterparty_repository.rs
-├── imported_tx_repository.rs
-├── document_repository.rs
-├── numbering.rs               採番（カウンタ行をFOR UPDATE）
+├── pool.rs                    PgStore（Store 実装）と接続確立ヘルパ
+├── store.rs                   PgTx（TxScope / TxOps 実装）
+├── journal/                   ★ 集約1つ = 1モジュール（CLAUDE.md §6）
+│   ├── mod.rs                 JournalRepo 実装（insert_entry / find_entry）
+│   ├── row.rs                 永続化専用の Row 型
+│   └── mapper.rs              Row → JournalEntry（rehydrate を呼ぶ唯一の場所）
+├── chart.rs                   ChartRepo 実装
+├── period.rs                  PeriodRepo 実装（締めスナップショット）
+├── numbering.rs               NumberingRepo 実装（採番）
+├── convert.rs                 core の値オブジェクト ⇄ DB 表現
+├── tags.rs                    TagSet ⇄ JSONB
+├── sqlstate.rs                SQLSTATE → RepoError（DB 接続なしでテスト可能）
+├── error.rs                   sqlx::Error → RepoError の入口
+├── bin/kaikei-migrate.rs      マイグレーション実行バイナリ
 ├── query/                     ★ read model（Repositoryを通さない）
-│   ├── trial_balance.rs       SQL集計 → DTO直行
-│   ├── ledger.rs
-│   └── search.rs
-└── migrations/
+│   └── trial_balance.rs       SQL集計 → DTO直行
+└── ../migrations/
 ```
 
 `query/` の分離が重要。**書き込みはドメインモデル経由、読み取りは SQL 集計。**
@@ -217,18 +251,41 @@ kaikei-store/src/
 
 ### Repository のシグネチャ
 
+トランザクションは `&mut Tx` として**引数で引き回す**（`DECISIONS.md` D-029）。
+Repository を `Arc<dyn Repo>` として持ち回り、その内側でトランザクションを
+開始する形は採らない。「複数の Repository をまたぐ操作を1つのトランザクションに
+収める」ことがシグネチャから読めなくなるため。
+
 ```rust
-// kaikei-app/src/ports.rs
+// kaikei-app/src/ports.rs（実物）
 #[async_trait]
-pub trait JournalRepository: Send + Sync {
-    async fn find(&self, id: &EntryId) -> Result<Option<JournalEntry>, RepoError>;
-    async fn save(&self, entry: &JournalEntry) -> Result<(), RepoError>;
-    // update / delete は定義しない
+pub trait JournalRepo: Send {
+    async fn find_entry(&mut self, id: EntryId) -> Result<Option<JournalEntry>, RepoError>;
+    async fn find_reversal_of(&mut self, id: EntryId)
+        -> Result<Option<(EntryId, EntryNumber)>, RepoError>;
+    async fn insert_entry(&mut self, entry: &JournalEntry) -> Result<(), RepoError>;
+    // update / delete は定義しない（CLAUDE.md §2）
 }
+
+/// 1つのトランザクションで使える操作の総体。ユースケースはこれを `&mut Tx` で受け取る。
+pub trait TxOps: JournalRepo + ChartRepo + PeriodRepo + NumberingRepo + Send {}
 ```
 
-`Arc<dyn JournalRepository>` を `State` に入れる。
-Router の State をジェネリックにすると型が爆発するため、trait object を選ぶ。
+`&self` ではなく `&mut self` なのは、`PgTx` が
+`sqlx::Transaction` を排他的に借りるため（同一トランザクション上で2つの
+リポジトリ操作を同時に走らせることは原理的にできない）。この制約を
+`Arc<Mutex<..>>` で隠さず型に出すことで、借用チェッカが
+「トランザクションを跨いだ並行アクセス」をコンパイル時に禁じる。
+
+### 合成ルート（axum の `State`）
+
+`Arc<dyn Store<Tx = ..>>` のような trait object ではなく、**具象型
+`Arc<PgStore>`** を `State` に積む。`Store` は関連型 `Tx` を持つため、
+trait object 化するには `Tx` を dyn 化の時点で具象型に固定する必要があり、
+その時点で「実装を差し替えられる」という抽象化の利点がほとんど残らない
+（本番で使う `Store` 実装は `kaikei-store::PgStore` の1つだけ）。
+一方 `with_tx<S: Store>` はジェネリックのまま使えるため、具象型を渡しても
+呼び出し側が実装の詳細を意識する必要はない。詳細は `DECISIONS.md` D-029。
 
 ---
 
