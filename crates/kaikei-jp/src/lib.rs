@@ -21,6 +21,10 @@
 //! - [`household_split`][]: 家事按分ヘルパー（[`household_split::household_split`]）。
 //!   `kaikei-policy::TaxPolicy` の実装ではなく単独の関数（`docs/04-jp-tax.md`
 //!   §8。PR-6）
+//! - [`closing`][]: 決算振替仕訳（[`closing::JpSoleProprietorClosingPolicy`]。
+//!   `kaikei-policy::ClosingPolicy` の実装。`docs/04-jp-tax.md` §9。PR-7）
+//! - [`statement`][]: 財務諸表の様式（[`statement::JpStatementPolicy`]。
+//!   `kaikei-policy::StatementPolicy` の実装。`docs/04-jp-tax.md` §9・§10。PR-7）
 //!
 //! # ローダの命名規約
 //!
@@ -65,9 +69,11 @@
 // ここでは fmt に任せる。
 mod account_type;
 pub mod chart;
+pub mod closing;
 pub mod error;
 pub mod household_split;
 pub mod invoice;
+pub mod statement;
 pub mod tags;
 pub mod tax;
 #[cfg(test)]

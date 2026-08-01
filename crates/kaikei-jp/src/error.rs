@@ -188,4 +188,22 @@ pub enum JpError {
     /// `JournalLine::new` 等）が失敗した。
     #[error(transparent)]
     Core(#[from] kaikei_core::CoreError),
+
+    /// 決算処理（[`crate::closing::JpSoleProprietorClosingPolicy`]）に必要な科目
+    /// （元入金・事業主貸・事業主借のいずれか）が、構築時に渡された
+    /// `ChartOfAccounts` に存在しない。
+    ///
+    /// 決算処理の実行時ではなく**構築時**に検出することで、記帳作業の途中で
+    /// 決算処理だけが失敗する事態を避ける（`docs/04-jp-tax.md` §9）。
+    #[error(
+        "決算処理に必要な科目（{role}）が勘定科目表に見つかりません: \"{code}\"。\
+         勘定科目表にこの科目を追加するか、正しい科目コードを\
+         JpSoleProprietorClosingPolicy::new に指定してください"
+    )]
+    MissingClosingAccount {
+        /// 見つからなかった科目の役割（例: "元入金"）。
+        role: String,
+        /// 見つからなかった科目コード。
+        code: String,
+    },
 }
