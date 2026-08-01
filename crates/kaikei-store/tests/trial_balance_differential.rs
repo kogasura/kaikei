@@ -481,7 +481,7 @@ async fn trial_balance_rejects_mixed_currencies_like_core_does(
     insert_entry(&roles.migrator, &jpy_entry).await.unwrap();
     insert_entry(&roles.migrator, &usd_entry).await.unwrap();
 
-    let entries = vec![jpy_entry, usd_entry];
+    let entries = [jpy_entry, usd_entry];
     let core_result = TrialBalance::from_entries(entries.iter(), &chart, &schema, &[]);
     assert!(matches!(
         core_result,

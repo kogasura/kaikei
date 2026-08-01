@@ -1,0 +1,15 @@
+# ツールチェーンを固定する。
+#
+# これが無いと CI は `dtolnay/rust-toolchain@stable` で常に最新 stable を引く一方、
+# ローカルは `rustup update` を打つまで古いままになり、**ローカルで緑なのに CI だけ
+# clippy で落ちる**という状態が起きる（実際に Phase 1 で発生した。ローカル 1.89 /
+# CI 1.97 のズレにより、1.97 で追加された `clippy::useless_vec` を踏んだ）。
+#
+# 更新するときは、このファイルを変えた PR で `cargo clippy --workspace --all-targets
+# -- -D warnings` が緑になることを確認してから上げること（新しい lint が増えるため）。
+#
+# `Cargo.toml` の `rust-version`（MSRV = 1.80）とは別物。あちらは「この crate を
+# ビルドできる最低バージョン」の宣言で、こちらは「開発と CI で実際に使うバージョン」。
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
