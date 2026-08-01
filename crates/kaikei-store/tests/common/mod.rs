@@ -70,19 +70,29 @@ pub async fn roles(pool_opts: PgPoolOptions, migrator_opts: PgConnectOptions) ->
         .await
         .expect("kaikei_migrator ロールでの接続に失敗しました");
 
+    let app = app_pool(migrator_opts).await;
+
+    Roles { migrator, app }
+}
+
+/// `#[sqlx::test]` から渡された migrator 用の接続情報を使い、同一テストDBに対する
+/// **kaikei_app ロールのプールだけ**を張る。
+///
+/// [`roles`] は migrator と app の2本を張るが、「アプリロールで接続し直して
+/// 読めるか」を見たいだけのテスト（`e2e_usecase.rs` の E2E-01）では migrator 側が
+/// 使われないまま接続を消費する。そのようなケース向けの軽量版。
+pub async fn app_pool(migrator_opts: PgConnectOptions) -> PgPool {
     let app_opts = migrator_opts
         .username("kaikei_app")
         .password(&app_password());
-    let app = PgPoolOptions::new()
+    PgPoolOptions::new()
         .max_connections(2)
         .connect_with(app_opts)
         .await
         .expect(
             "kaikei_app ロールでの接続に失敗しました。\
              docker/postgres/init/01-roles.sql が適用されているか確認してください。",
-        );
-
-    Roles { migrator, app }
+        )
 }
 
 /// `sqlx::Error` から SQLSTATE（5桁のエラーコード）を取り出す。

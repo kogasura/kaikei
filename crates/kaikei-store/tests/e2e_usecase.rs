@@ -30,8 +30,8 @@
 //! |---|---|---|
 //! | 1 | 再起動してもデータが残る | `posted_entry_is_readable_from_a_freshly_reconnected_pool`（E2E-01。別プールから読めることによる代理検証。docker volume 自体の永続性は README 参照） |
 //! | 2 | `kaikei_app` ロールで UPDATE を試みると失敗する | `tests/append_only.rs` が既に担保。ここでは重複させない |
-//! | 3 | 逆仕訳が正しく記録される | `reversed_entry_offsets_original_in_trial_balance_and_persists_reversal_fields`（E2E-03） |
-//! | 4 | 試算表が SQL 集計で出る | E2E-02・E2E-03 |
+//! | 3 | 逆仕訳が正しく記録される | `reversed_entry_offsets_original_in_trial_balance_and_persists_reversal_fields`（E2E-03）・`double_reversal_is_rejected_and_leaves_no_second_reversal_in_db`（E2E-04） |
+//! | 4 | 試算表が SQL 集計で出る | E2E-02・E2E-03・E2E-09 |
 //! | 5 | `UnitOfWork`（`&mut Tx`）と借用チェッカとの相性評価 | `with_tx_rolls_back_journal_and_numbering_together`（E2E-10） |
 
 #![cfg(feature = "pg-tests")]
@@ -56,14 +56,19 @@ use kaikei_store::pool::PgStore;
 use kaikei_store::query::PgTrialBalanceQuery;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ---- ローカルのテストダブル ----
 //
-// `kaikei_policy::testing` の `NoTaxPolicy`/`FlatRateTaxPolicy` と、
-// `kaikei_app::testing` の `SequentialIdGenerator` とほぼ同じ考え方の
-// 最小実装だが、`kaikei-store` からそれぞれの crate へ依存を追加しないために
-// ここへ個別に定義する（モジュールdocの「`kaikei-policy` への非依存」を参照）。
+// `kaikei-store` からは `kaikei-policy` / `kaikei_app::testing` へ依存を足せない
+// ため（モジュールdocの「`kaikei-policy` への非依存」を参照）、必要なテスト
+// ダブルはここに定義する。
+//
+// 名前は `kaikei_policy::testing` / `kaikei_app::testing` の同種の fake と
+// 揃えてあるが、**それらと挙動を一致させる義務は無い**。このファイルの
+// テストを駆動するためだけの独立したフィクスチャであり、本家が変わっても
+// 追随する必要はない（追随すべき対象なら、そもそも依存を足せない時点で
+// 破綻している）。
 
 /// 消費税行を一切生成しない `TaxPolicy`。
 #[derive(Debug, Clone, Copy, Default)]
@@ -277,7 +282,7 @@ async fn run_post_entry<P>(
     store: &PgStore,
     tax: P,
     schema: TagSchema,
-    id_gen: SequentialIdGenerator,
+    id_gen: Arc<SequentialIdGenerator>,
     input: PostEntryInput,
 ) -> Result<JournalEntry, AppError>
 where
@@ -287,7 +292,7 @@ where
     let settings = settings();
     with_tx(store, |tx| {
         Box::pin(async move {
-            post_entry::execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await
+            post_entry::execute(tx, &tax, &schema, &*id_gen, &clock, &settings, input).await
         })
     })
     .await
@@ -297,14 +302,14 @@ where
 async fn run_reverse_entry(
     store: &PgStore,
     schema: TagSchema,
-    id_gen: SequentialIdGenerator,
+    id_gen: Arc<SequentialIdGenerator>,
     input: ReverseEntryInput,
 ) -> Result<JournalEntry, AppError> {
     let clock = clock();
     let settings = settings();
     with_tx(store, |tx| {
         Box::pin(async move {
-            reverse_entry::execute(tx, &schema, &id_gen, &clock, &settings, input).await
+            reverse_entry::execute(tx, &schema, &*id_gen, &clock, &settings, input).await
         })
     })
     .await
@@ -315,19 +320,22 @@ async fn run_reverse_entry(
 /// E2E-01 / 完了条件1（再起動してもデータが残る）の代理検証。
 ///
 /// `post_entry::execute` で記帳した直後の `store`（`roles.app` に基づくプール）
-/// ではなく、**新規に張り直した別プール**（`common::roles` を再度呼んで得る
-/// 別コネクション）から `find_entry` で読めることを確認する。同一プールの
-/// メモリキャッシュではなく実際にDBへ保存されていることの証明であり、
-/// docker volume 自体の永続性（コンテナ再起動）は本テストの対象外
-/// （`README.md`「ローカル開発環境」を参照）。
+/// ではなく、**新規に張り直した別プール**（`common::app_pool` で得る別コネクション）
+/// から `find_entry` で読めることを確認する。同一プールのメモリキャッシュでは
+/// なく実際にDBへ保存されていることの証明であり、docker volume 自体の永続性
+/// （コンテナ再起動）は本テストの対象外（`README.md`「ローカル開発環境」を参照）。
 #[sqlx::test]
 async fn posted_entry_is_readable_from_a_freshly_reconnected_pool(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
-    let roles = common::roles(pool_opts.clone(), conn_opts.clone()).await;
+    let roles = common::roles(pool_opts, conn_opts.clone()).await;
     seed_basic_accounts(&roles.migrator).await;
     let store = PgStore::new(roles.app);
+    // 仕訳IDは1つのジェネレータを全呼び出しで共有する。呼び出しごとに新しい
+    // ジェネレータを作ると、成功した記帳が同じIDを引いて journal_entries_pkey の
+    // 一意制約違反になる（レビューで実際に踏んだ）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
 
     let input = PostEntryInput {
         entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
@@ -335,25 +343,26 @@ async fn posted_entry_is_readable_from_a_freshly_reconnected_pool(
         lines: balanced_lines(10_000),
         auto_tax_lines: false,
     };
-    let posted = run_post_entry(
-        &store,
-        NoTaxPolicy,
-        TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
-        input,
-    )
-    .await
-    .unwrap();
+    let posted = run_post_entry(&store, NoTaxPolicy, TagSchema::empty(), ids.clone(), input)
+        .await
+        .unwrap();
 
-    // ここで `store`/`roles.app` を一切使わず、新しいプールを張り直す。
-    let fresh_roles = common::roles(pool_opts, conn_opts).await;
-    let fresh_store = PgStore::new(fresh_roles.app);
+    // ここで `store`/`roles.app` を一切使わず、appロールのプールだけを張り直す。
+    let fresh_store = PgStore::new(common::app_pool(conn_opts).await);
 
     let found = find_entry(&fresh_store, posted.id())
         .await
         .expect("新しく張り直したプールからも保存済みの仕訳が読めること");
-    assert_eq!(found.id(), posted.id());
-    assert_eq!(found.entry_no().as_u32(), 1);
+    assert_eq!(
+        found.id(),
+        posted.id(),
+        "張り直したプールから読んだ仕訳のIDが記帳時と異なる"
+    );
+    assert_eq!(
+        found.entry_no().as_u32(),
+        1,
+        "張り直したプールから読んだ仕訳の entry_no が1でない: {found:?}"
+    );
 }
 
 // ---- E2E-02 ----
@@ -369,6 +378,10 @@ async fn posted_entry_appears_in_trial_balance_with_matching_totals(
     let roles = common::roles(pool_opts, conn_opts).await;
     seed_basic_accounts(&roles.migrator).await;
     let store = PgStore::new(roles.app.clone());
+    // 仕訳IDは1つのジェネレータを全呼び出しで共有する。呼び出しごとに新しい
+    // ジェネレータを作ると、成功した記帳が同じIDを引いて journal_entries_pkey の
+    // 一意制約違反になる（レビューで実際に踏んだ）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
 
     let input = PostEntryInput {
         entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
@@ -376,15 +389,9 @@ async fn posted_entry_appears_in_trial_balance_with_matching_totals(
         lines: balanced_lines(50_000),
         auto_tax_lines: false,
     };
-    run_post_entry(
-        &store,
-        NoTaxPolicy,
-        TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
-        input,
-    )
-    .await
-    .unwrap();
+    run_post_entry(&store, NoTaxPolicy, TagSchema::empty(), ids.clone(), input)
+        .await
+        .unwrap();
 
     let query = PgTrialBalanceQuery::new(roles.app);
     let report_input = ReportInput {
@@ -415,6 +422,10 @@ async fn reversed_entry_offsets_original_in_trial_balance_and_persists_reversal_
     let roles = common::roles(pool_opts, conn_opts).await;
     seed_basic_accounts(&roles.migrator).await;
     let store = PgStore::new(roles.app.clone());
+    // 仕訳IDは1つのジェネレータを全呼び出しで共有する。呼び出しごとに新しい
+    // ジェネレータを作ると、成功した記帳が同じIDを引いて journal_entries_pkey の
+    // 一意制約違反になる（レビューで実際に踏んだ）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
 
     let post_input = PostEntryInput {
         entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
@@ -426,7 +437,7 @@ async fn reversed_entry_offsets_original_in_trial_balance_and_persists_reversal_
         &store,
         NoTaxPolicy,
         TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
+        ids.clone(),
         post_input,
     )
     .await
@@ -438,14 +449,9 @@ async fn reversed_entry_offsets_original_in_trial_balance_and_persists_reversal_
         reason: "入力誤りのため取消".to_string(),
         allow_double_reversal: false,
     };
-    let reversal = run_reverse_entry(
-        &store,
-        TagSchema::empty(),
-        SequentialIdGenerator::starting_at(2),
-        reverse_input,
-    )
-    .await
-    .unwrap();
+    let reversal = run_reverse_entry(&store, TagSchema::empty(), ids.clone(), reverse_input)
+        .await
+        .unwrap();
 
     // 逆仕訳の reverses/reverse_reason がDBに保存され、読み戻せること。
     let found_reversal = find_entry(&store, reversal.id())
@@ -493,6 +499,10 @@ async fn double_reversal_is_rejected_and_leaves_no_second_reversal_in_db(
     let roles = common::roles(pool_opts, conn_opts).await;
     seed_basic_accounts(&roles.migrator).await;
     let store = PgStore::new(roles.app.clone());
+    // 仕訳IDは1つのジェネレータを全呼び出しで共有する。呼び出しごとに新しい
+    // ジェネレータを作ると、成功した記帳が同じIDを引いて journal_entries_pkey の
+    // 一意制約違反になる（レビューで実際に踏んだ）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
 
     let post_input = PostEntryInput {
         entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
@@ -504,7 +514,7 @@ async fn double_reversal_is_rejected_and_leaves_no_second_reversal_in_db(
         &store,
         NoTaxPolicy,
         TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
+        ids.clone(),
         post_input,
     )
     .await
@@ -516,14 +526,9 @@ async fn double_reversal_is_rejected_and_leaves_no_second_reversal_in_db(
         reason: "1回目の取消".to_string(),
         allow_double_reversal: false,
     };
-    run_reverse_entry(
-        &store,
-        TagSchema::empty(),
-        SequentialIdGenerator::starting_at(2),
-        first_reverse,
-    )
-    .await
-    .unwrap();
+    run_reverse_entry(&store, TagSchema::empty(), ids.clone(), first_reverse)
+        .await
+        .unwrap();
     assert_eq!(count_journal_entries(&roles.app).await, 2);
 
     let second_reverse = ReverseEntryInput {
@@ -532,13 +537,8 @@ async fn double_reversal_is_rejected_and_leaves_no_second_reversal_in_db(
         reason: "2回目の取消".to_string(),
         allow_double_reversal: false,
     };
-    let second_result = run_reverse_entry(
-        &store,
-        TagSchema::empty(),
-        SequentialIdGenerator::starting_at(3),
-        second_reverse,
-    )
-    .await;
+    let second_result =
+        run_reverse_entry(&store, TagSchema::empty(), ids.clone(), second_reverse).await;
 
     match &second_result {
         Err(AppError::AlreadyReversed { .. }) => {}
@@ -569,6 +569,10 @@ async fn auto_tax_lines_generates_balanced_tax_line_and_persists_it(
     seed_basic_accounts(&roles.migrator).await;
     seed_tax_account(&roles.migrator).await;
     let store = PgStore::new(roles.app);
+    // 仕訳IDは1つのジェネレータを全呼び出しで共有する。呼び出しごとに新しい
+    // ジェネレータを作ると、成功した記帳が同じIDを引いて journal_entries_pkey の
+    // 一意制約違反になる（レビューで実際に踏んだ）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
 
     let tax = FlatRateTaxPolicy {
         rate: Ratio::parse_rate("0.10").unwrap(),
@@ -580,15 +584,9 @@ async fn auto_tax_lines_generates_balanced_tax_line_and_persists_it(
         lines: balanced_lines(100_000),
         auto_tax_lines: true,
     };
-    let posted = run_post_entry(
-        &store,
-        tax,
-        TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
-        input,
-    )
-    .await
-    .unwrap();
+    let posted = run_post_entry(&store, tax, TagSchema::empty(), ids.clone(), input)
+        .await
+        .unwrap();
 
     assert_eq!(posted.lines().len(), 4);
     assert_eq!(posted.debit_total().minor(), posted.credit_total().minor());
@@ -617,6 +615,10 @@ async fn posting_into_a_closed_period_is_rejected_and_writes_nothing(
     seed_basic_accounts(&roles.migrator).await;
     close_period(&roles.migrator, 2026, "2026-03-31").await;
     let store = PgStore::new(roles.app.clone());
+    // 仕訳IDは1つのジェネレータを全呼び出しで共有する。呼び出しごとに新しい
+    // ジェネレータを作ると、成功した記帳が同じIDを引いて journal_entries_pkey の
+    // 一意制約違反になる（レビューで実際に踏んだ）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
 
     let input = PostEntryInput {
         entry_date: AccountingDate::new(2026, 1, 15).unwrap(),
@@ -624,20 +626,17 @@ async fn posting_into_a_closed_period_is_rejected_and_writes_nothing(
         lines: balanced_lines(1_000),
         auto_tax_lines: false,
     };
-    let result = run_post_entry(
-        &store,
-        NoTaxPolicy,
-        TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
-        input,
-    )
-    .await;
+    let result = run_post_entry(&store, NoTaxPolicy, TagSchema::empty(), ids.clone(), input).await;
 
     assert!(matches!(
         result,
         Err(AppError::Core(CoreError::PeriodClosed { .. }))
     ));
-    assert_eq!(count_journal_entries(&roles.app).await, 0);
+    assert_eq!(
+        count_journal_entries(&roles.app).await,
+        0,
+        "拒否された記帳が journal_entries に行を残している"
+    );
 }
 
 // ---- E2E-07 ----
@@ -655,6 +654,10 @@ async fn unbalanced_input_is_rejected_by_core_and_writes_nothing(
     let roles = common::roles(pool_opts, conn_opts).await;
     seed_basic_accounts(&roles.migrator).await;
     let store = PgStore::new(roles.app.clone());
+    // 仕訳IDは1つのジェネレータを全呼び出しで共有する。呼び出しごとに新しい
+    // ジェネレータを作ると、成功した記帳が同じIDを引いて journal_entries_pkey の
+    // 一意制約違反になる（レビューで実際に踏んだ）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
 
     let unbalanced = vec![
         JournalLine::new(
@@ -680,14 +683,7 @@ async fn unbalanced_input_is_rejected_by_core_and_writes_nothing(
         lines: unbalanced,
         auto_tax_lines: false,
     };
-    let result = run_post_entry(
-        &store,
-        NoTaxPolicy,
-        TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
-        input,
-    )
-    .await;
+    let result = run_post_entry(&store, NoTaxPolicy, TagSchema::empty(), ids.clone(), input).await;
 
     match &result {
         Err(AppError::Core(CoreError::Unbalanced {
@@ -701,7 +697,11 @@ async fn unbalanced_input_is_rejected_by_core_and_writes_nothing(
         }
         other => panic!("CoreError::Unbalanced を期待しましたが: {other:?}"),
     }
-    assert_eq!(count_journal_entries(&roles.app).await, 0);
+    assert_eq!(
+        count_journal_entries(&roles.app).await,
+        0,
+        "拒否された記帳が journal_entries に行を残している"
+    );
 }
 
 // ---- E2E-08 ----
@@ -719,18 +719,19 @@ async fn entry_numbers_are_contiguous_and_failed_postings_do_not_consume_numbers
     seed_basic_accounts(&roles.migrator).await;
     close_period(&roles.migrator, 2026, "2026-01-31").await;
     let store = PgStore::new(roles.app);
+    // 仕訳IDは1つのジェネレータを全呼び出しで共有する。呼び出しごとに新しい
+    // ジェネレータを作ると、成功した記帳が同じIDを引いて journal_entries_pkey の
+    // 一意制約違反になる（レビューで実際に踏んだ）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
 
-    // 以降の `SequentialIdGenerator::starting_at(1)` はすべて開始値 1 で揃える。
-    // `run_post_entry` は呼び出しごとに新しいインスタンスを作るため、
-    // 開始値は呼び出しをまたいで意味を持たない（仕訳IDは検証対象でもない）。
-    // ここで検証したいのは `entry_no`（DB側の採番）の連続性だけ。
+    // 検証したいのは `entry_no`（DB側の採番）の連続性であって仕訳IDではない。
 
     // 1件目（成功）: entry_no = 1。
     let first = run_post_entry(
         &store,
         NoTaxPolicy,
         TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
+        ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
             description: "1件目".to_string(),
@@ -740,14 +741,14 @@ async fn entry_numbers_are_contiguous_and_failed_postings_do_not_consume_numbers
     )
     .await
     .unwrap();
-    assert_eq!(first.entry_no().as_u32(), 1);
+    assert_eq!(first.entry_no().as_u32(), 1, "1件目の entry_no が1でない");
 
     // 失敗1: 締め済み期間（同じ会計年度2026だが、採番を消費しないはず）。
     let closed_attempt = run_post_entry(
         &store,
         NoTaxPolicy,
         TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
+        ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 1, 15).unwrap(),
             description: "締め後".to_string(),
@@ -766,7 +767,7 @@ async fn entry_numbers_are_contiguous_and_failed_postings_do_not_consume_numbers
         &store,
         NoTaxPolicy,
         TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
+        ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 4, 2).unwrap(),
             description: "不一致".to_string(),
@@ -803,7 +804,7 @@ async fn entry_numbers_are_contiguous_and_failed_postings_do_not_consume_numbers
         &store,
         NoTaxPolicy,
         TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
+        ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 4, 3).unwrap(),
             description: "2件目".to_string(),
@@ -813,14 +814,18 @@ async fn entry_numbers_are_contiguous_and_failed_postings_do_not_consume_numbers
     )
     .await
     .unwrap();
-    assert_eq!(second.entry_no().as_u32(), 2);
+    assert_eq!(
+        second.entry_no().as_u32(),
+        2,
+        "失敗した記帳2件が採番を消費している（2件目の entry_no が2でない）"
+    );
 
     // 3件目（成功）: entry_no = 3。
     let third = run_post_entry(
         &store,
         NoTaxPolicy,
         TagSchema::empty(),
-        SequentialIdGenerator::starting_at(1),
+        ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 4, 4).unwrap(),
             description: "3件目".to_string(),
@@ -830,20 +835,31 @@ async fn entry_numbers_are_contiguous_and_failed_postings_do_not_consume_numbers
     )
     .await
     .unwrap();
-    assert_eq!(third.entry_no().as_u32(), 3);
+    assert_eq!(third.entry_no().as_u32(), 3, "3件目の entry_no が3でない");
 }
 
 // ---- E2E-09 ----
 
 /// E2E-09: `report::execute` の `group_by` に集計不可（`aggregatable: false`）
 /// のタグキーを渡すと `CoreError::NotAggregatable` でSQL到達前に弾かれる。
-#[sqlx::test]
-async fn report_rejects_non_aggregatable_group_by_before_reaching_sql(
-    pool_opts: PgPoolOptions,
-    conn_opts: PgConnectOptions,
-) {
-    let roles = common::roles(pool_opts, conn_opts).await;
-    let query = PgTrialBalanceQuery::new(roles.app);
+///
+/// **接続できないDBを指す `PgTrialBalanceQuery` を渡す**ことで「SQLに到達しない」
+/// ことを証明する。もし検証が SQL の後に回っていれば、`NotAggregatable` ではなく
+/// 接続エラー（`RepoError::Backend`）が返るため、このテストは失敗する。
+/// `#[sqlx::test]` を使わないのは、使い捨てDBの作成とマイグレーション適用の
+/// コストを払っても**このテストは一度もDBに触れない**ため（レビュー指摘）。
+/// `sqlx` の遅延接続（`connect_lazy_with`）は最初のクエリまで接続を張らない。
+#[tokio::test]
+async fn report_rejects_non_aggregatable_group_by_before_reaching_sql() {
+    // ポート1・存在しないDB名・存在しないロール。実際に繋ぎに行けば必ず失敗する。
+    let unreachable: PgConnectOptions = "postgres://nobody:nobody@127.0.0.1:1/nonexistent"
+        .parse()
+        .expect("接続文字列のパースは成功すること");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy_with(unreachable);
+    let query = PgTrialBalanceQuery::new(pool);
+
     let schema = TagSchema::new(vec![(
         TagKey::parse("business_ratio").unwrap(),
         TagDef {
@@ -861,10 +877,13 @@ async fn report_rejects_non_aggregatable_group_by_before_reaching_sql(
 
     let result = report::execute(&query, &schema, input).await;
 
-    assert!(matches!(
-        result,
-        Err(AppError::Core(CoreError::NotAggregatable { .. }))
-    ));
+    assert!(
+        matches!(
+            result,
+            Err(AppError::Core(CoreError::NotAggregatable { .. }))
+        ),
+        "SQL到達前に NotAggregatable で弾かれること（接続エラーが返るなら検証の順序が誤っている）: {result:?}"
+    );
 }
 
 // ---- E2E-10 ----
@@ -884,10 +903,14 @@ async fn with_tx_rolls_back_journal_and_numbering_together(
     let roles = common::roles(pool_opts, conn_opts).await;
     seed_basic_accounts(&roles.migrator).await;
     let store = PgStore::new(roles.app.clone());
+    // 仕訳IDは1つのジェネレータを全呼び出しで共有する。呼び出しごとに新しい
+    // ジェネレータを作ると、成功した記帳が同じIDを引いて journal_entries_pkey の
+    // 一意制約違反になる（レビューで実際に踏んだ）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
 
     let tax = NoTaxPolicy;
     let schema = TagSchema::empty();
-    let id_gen = SequentialIdGenerator::starting_at(1);
+    let id_gen = Arc::clone(&ids);
     let clock = clock();
     let settings = settings();
     let input = PostEntryInput {
@@ -900,7 +923,7 @@ async fn with_tx_rolls_back_journal_and_numbering_together(
     let result: Result<(), AppError> = with_tx(&store, |tx| {
         Box::pin(async move {
             let entry =
-                post_entry::execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await?;
+                post_entry::execute(tx, &tax, &schema, &*id_gen, &clock, &settings, input).await?;
             // 複数リポジトリを跨ぐ呼び出し（JournalRepo::find_entry /
             // ChartRepo::load_chart）が同じ `&mut Tx` に対して続けて書けることの確認。
             let _ = tx.find_entry(entry.id()).await?;
@@ -914,14 +937,18 @@ async fn with_tx_rolls_back_journal_and_numbering_together(
     assert!(result.is_err());
 
     // 仕訳がロールバックされている（DBに1件も残らない）。
-    assert_eq!(count_journal_entries(&roles.app).await, 0);
+    assert_eq!(
+        count_journal_entries(&roles.app).await,
+        0,
+        "拒否された記帳が journal_entries に行を残している"
+    );
 
     // 採番カウンタもロールバックされている（次の記帳は entry_no = 1 になる）。
     let retried = run_post_entry(
         &store,
         NoTaxPolicy,
         TagSchema::empty(),
-        SequentialIdGenerator::starting_at(2),
+        ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
             description: "ロールバック後の記帳".to_string(),
@@ -931,5 +958,9 @@ async fn with_tx_rolls_back_journal_and_numbering_together(
     )
     .await
     .unwrap();
-    assert_eq!(retried.entry_no().as_u32(), 1);
+    assert_eq!(
+        retried.entry_no().as_u32(),
+        1,
+        "ロールバック後の記帳で採番カウンタが巻き戻っていない"
+    );
 }
