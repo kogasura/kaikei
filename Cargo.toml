@@ -8,9 +8,9 @@ members = [
     "crates/kaikei-policy",
     "crates/kaikei-store",
     "crates/kaikei-app",
+    "crates/kaikei-jp",
+    "crates/kaikei-jp-data",
     # Phase 1 以降で追加
-    # "crates/kaikei-jp",
-    # "crates/kaikei-jp-data",
     # "crates/kaikei-blob",
     # "crates/kaikei-import",
     # "crates/kaikei-import-data",
@@ -39,7 +39,11 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# serde_yaml (dtolnay) は 2024 年にアーカイブされ、作者自身が別ライブラリへの
+# 移行を勧めている。serde_yaml 0.9 の直系フォーク（API互換）である serde_norway
+# に置き換える。7年保存の会計データを扱う基盤に、保守されていないYAMLパーサを
+# 置かない（DECISIONS.md D-049）
+serde_norway = "0.9"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 csv = "1"

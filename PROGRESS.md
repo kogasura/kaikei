@@ -66,6 +66,10 @@ Phase 0 完了後の横断監査で発覚した欠陥への対応。
   一致させているが、`kaikei-jp-data` が現時点でワークスペースメンバーでないため
   （ルート `Cargo.toml` の `members` に未登録）、両者の乖離を機械的に検出する仕組みが無い。
   `kaikei-jp-data` をワークスペースに組み込む Phase で検討する。
+  → **Phase 2 PR-1 で消化**。`kaikei-jp-data` をワークスペースに組み込んだうえで、
+  `crates/kaikei-jp/tests/chart_drift.rs` に乖離検出テストを追加した
+  （`kaikei-core` は依存を増やせないため、検出は `kaikei-jp` 側でのみ行える。
+  `DECISIONS.md` D-051）。
 - **(c) 逆仕訳の `document_refs` は「常に空」で確定させた**: `JournalEntry::reverse` は
   証憑への参照を複製しない設計にしている。訂正の根拠となる証憑が元仕訳と別に
   用意されることが多いという想定によるものだが、`kaikei-app` で逆仕訳のユースケース

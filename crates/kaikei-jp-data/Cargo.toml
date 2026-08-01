@@ -1,0 +1,14 @@
+# crates/kaikei-jp-data/Cargo.toml
+#
+# データのみの crate。ロジックを一切持たない（依存はゼロ）。
+# YAML の解釈（デシリアライズ・バリデーション）は kaikei-jp が行う。
+
+[package]
+name = "kaikei-jp-data"
+version = "0.0.1"
+description = "年度別YAML（税区分/科目/タグスキーマ）を埋め込みデータとして公開する"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
