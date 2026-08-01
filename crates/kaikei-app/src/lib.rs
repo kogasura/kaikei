@@ -25,13 +25,24 @@
 //!
 //! # `kaikei-policy` 型の再エクスポート
 //!
-//! [`Counterparty`] / [`CounterpartyIndex`] は `kaikei-policy` の型だが、
-//! ポート（[`ports::ChartRepo::load_counterparties`]）のシグネチャに現れる
-//! ため、ここで再エクスポートする。`kaikei-store` 等の実装者は
+//! この crate の**公開シグネチャに現れる** `kaikei-policy` の型は、すべて
+//! ここで再エクスポートする。`kaikei-store` 等の実装者・呼び出し側は
 //! `kaikei_policy::` を直接 `use` せず、必ずこの再エクスポート経由で参照する
 //! こと（`kaikei-store` から `kaikei-policy` への直接依存は CI が禁じている。
 //! `.github/workflows/architecture.yml` の「kaikei-store は kaikei-jp /
 //! kaikei-policy に依存しない」ステップを参照）。
+//!
+//! | 型 | 現れる場所 |
+//! |---|---|
+//! | [`Counterparty`] / [`CounterpartyIndex`] | [`ports::ChartRepo::load_counterparties`] の戻り値 |
+//! | [`PolicyError`] | [`error::AppError::Policy`] の中身 |
+//! | [`TaxPolicy`] | [`usecase::post_entry::execute`] の引数（`&dyn TaxPolicy`） |
+//! | [`TaxContext`] / [`TaxDerivation`] | [`TaxPolicy`] を実装するために必要 |
+//!
+//! 再エクスポートが足りないと、呼び出し側は「`kaikei-app` の関数を呼びたい
+//! だけなのに `kaikei-policy` にも依存しなければならない」状態になる
+//! （`DECISIONS.md` D-047）。新しい policy 型を公開シグネチャに出すときは、
+//! この表と `pub use` の両方に足すこと。
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -51,4 +62,6 @@ pub mod tx;
 pub mod usecase;
 pub mod view;
 
-pub use kaikei_policy::{Counterparty, CounterpartyIndex};
+pub use kaikei_policy::{
+    Counterparty, CounterpartyIndex, PolicyError, TaxContext, TaxDerivation, TaxPolicy,
+};

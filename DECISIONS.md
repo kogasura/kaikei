@@ -644,6 +644,11 @@ DTO を無くせる可能性があるが、core の変更は人間の承認事�
 持つ enum として定義する。SQLSTATE（`42501` = 権限拒否 / `P0001` = トリガ /
 `23505` = 一意制約 等）の判別・写像は実装側（`kaikei-store`）が行う。
 
+> 【後日の訂正】ここでの「`P0001` = トリガ」は D-038 で覆した。append-only 違反は
+> `P0010`、貸借不一致は `P0011` という専用 ERRCODE に分離してあり、汎用の
+> `P0001` は「どちらのトリガか断定できない」を意味する `RepoError::Backend`
+> に写像される。本決定（enum を分ける方針そのもの）は有効。
+
 **却下した選択肢**: `RepoError::Backend(Box<dyn std::error::Error + Send +
 Sync>)` のような単一バリアントに永続化層のエラーをすべて包む。
 
@@ -1181,3 +1186,35 @@ Phase 1 を完了することの承認を得た。
 数百ミリ秒〜秒オーダーになりうる）。実際に体感できる遅さとして
 顕在化した段階で、`journal_lines` への `entry_date` 非正規化、または
 `fiscal_year` によるパーティショニングを検討する。
+
+---
+
+## D-047 `kaikei-app` の公開シグネチャに現れる `kaikei-policy` の型はすべて再エクスポートする
+
+**決定**: `kaikei-app` の公開 API に現れる `kaikei-policy` の型
+（`PolicyError` / `TaxPolicy` / `TaxContext` / `TaxDerivation`）を
+`kaikei-app` の crate ルートから再エクスポートする。`Counterparty` /
+`CounterpartyIndex`（PR-4 で既に再エクスポート済み）と同じ扱いに揃える。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 呼び出し側が `kaikei-policy` に直接依存する | `post_entry::execute` を呼ぶだけの crate（E2E テスト、Phase 3 の MCP サーバー）が `kaikei-policy` を `Cargo.toml` に書く必要が出る。とくに `kaikei-store` は「`kaikei-policy` に依存しない」ことを CI で機械的に検査しているため、E2E テストのために dev-dependency を足すと、その CI ステップが守っている境界の意味が読み手に伝わらなくなる（`--edges normal` は dev-dependency を見ないので機械的には通ってしまう分、かえって悪い） |
+| `TaxPolicy` を `kaikei-app` 側で再定義し、`kaikei-policy` の trait とブランケット実装で繋ぐ | trait が2つに増え、どちらを実装すべきかが実装者から見て曖昧になる。`CLAUDE.md` §1 の「policy は trait 定義のみ」という役割分担も崩れる |
+
+**理由**: PR-4（契約凍結点）のレビューで「`kaikei-store` が
+`CounterpartyIndex` を名指しできない」という E0433 を実際に踏んだのと
+**まったく同じ穴**が、`TaxPolicy` と `PolicyError` にも残っていた。
+`post_entry::execute` の引数 `tax: &dyn TaxPolicy` と
+`AppError::Policy(PolicyError)` は公開 API の一部なのに、呼び出し側が
+その型を名指しする手段が `kaikei-app` 経由では存在しなかった。
+
+漏れが1件ずつ発覚する形を繰り返さないため、`lib.rs` の doc に
+「型 → 現れる場所」の対応表を置き、**公開シグネチャに policy 型を出すときは
+表と `pub use` の両方に足す**ことを明文化した。
+
+**トレードオフ**: `kaikei-app` の名前空間に policy の型が並ぶため、
+「この型はどの crate のものか」がインポート文からは分からなくなる。
+その代わり、下位層・呼び出し側から見た依存は `kaikei-app` + `kaikei-core`
+の2つだけで閉じる。層の境界を守ることを優先する。

@@ -4,10 +4,11 @@
 //! ドメイン語彙の enum にする（`Box<dyn Error>` 一本にしない）。永続化層が
 //! `Box<dyn Error>` 一本を返す設計だと、append-only 違反（DB権限・トリガによる
 //! 拒否）が「ただの DB エラー」の1バリアントに潰れてしまい、この方針を
-//! 満たせなくなる。SQLSTATE（`42501` = 権限拒否 / `P0001` = トリガ /
-//! `23505` = 一意制約 等）の判別は実装側（`kaikei-store` の sqlstate
-//! マッピング）が行い、この enum の適切なバリアントへ写像する
-//! （`DECISIONS.md` D-032）。
+//! 満たせなくなる。SQLSTATE（`42501` = 権限拒否 / `P0010` = append-only 違反の
+//! トリガ / `P0011` = 貸借不一致のトリガ / `23505` = 一意制約 等）の判別は
+//! 実装側（`kaikei-store` の sqlstate マッピング）が行い、この enum の適切な
+//! バリアントへ写像する（`DECISIONS.md` D-032、および `P0010`/`P0011` を
+//! 汎用の `P0001` から分離した D-038）。
 
 use kaikei_core::{CoreError, EntryNumber};
 use kaikei_policy::PolicyError;
