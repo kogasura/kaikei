@@ -5,7 +5,7 @@
 //! この module は `kaikei-jp-data/tax/jp/{year}.yaml` に**書かれた値をそのまま
 //! 解釈するだけ**の機構である。税額計算そのもの（消費税行の自動生成）は
 //! `kaikei-policy::TaxPolicy::derive_tax_lines` の `kaikei-jp` 側実装
-//! （`JpTaxPolicy`。別 PR）のスコープであり、ここには含めない。
+//! （[`JpTaxPolicy`]。PR-4）が担う。
 //!
 //! # 適用期間による選択（`CLAUDE.md` §7）
 //!
@@ -25,10 +25,11 @@
 //!
 //! - [`category`][]: 税区分1件（[`TaxCategory`] / [`TaxDirection`]）
 //! - [`settings`][]: `settings_defaults` に対応する既定値（[`TaxMode`] / [`RoundingUnit`] /
-//!   [`TaxSettingsDefaults`]）。事業者ごとの実設定（`JpSettings`）は
-//!   `JpTaxPolicy` 側（別 PR）のスコープ
+//!   [`TaxSettingsDefaults`]）。事業者ごとの実設定は [`JpSettings`] が持つ
 //! - [`table`][]: 1つの適用期間ぶんのマスタ（[`TaxCategoryTable`]）
 //! - [`rule_sets`][]: 適用期間の異なる複数マスタの集合（[`TaxRuleSets`]）
+//! - [`policy`][]: `kaikei-policy::TaxPolicy` の実装（[`JpTaxPolicy`] /
+//!   [`JpSettings`] / [`JpSettingsOverrides`]）
 //!
 //! # 免責
 //!
@@ -36,11 +37,13 @@
 //! 税務上の正しさを保証しない（crate ルートの doc、`docs/04-jp-tax.md` §11 を参照）。
 
 mod category;
+mod policy;
 mod rule_sets;
 mod settings;
 mod table;
 
 pub use category::{TaxCategory, TaxDirection};
+pub use policy::{JpSettings, JpSettingsOverrides, JpTaxPolicy};
 pub use rule_sets::TaxRuleSets;
 pub use settings::{RoundingUnit, TaxMode, TaxSettingsDefaults};
 pub use table::TaxCategoryTable;

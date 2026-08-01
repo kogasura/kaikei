@@ -10,11 +10,12 @@
 //! - [`invoice`][]: [`invoice::InvoiceRegistrationNo`]（`T` + 13桁の形式検証・
 //!   チェックデジット検証。実在確認・適格性の判定は行わない。
 //!   `docs/04-jp-tax.md` §6・`docs/08-compliance.md` §6。PR-2）
-//! - [`tax`][]: 税区分マスタ（[`tax::TaxCategoryTable`]）と、取引日による
-//!   適用マスタの選択（[`tax::TaxRuleSets`]。PR-3）
+//! - [`tax`][]: 税区分マスタ（[`tax::TaxCategoryTable`]）、取引日による
+//!   適用マスタの選択（[`tax::TaxRuleSets`]。PR-3）、および
+//!   `kaikei-policy::TaxPolicy` の実装（[`tax::JpTaxPolicy`] /
+//!   [`tax::JpSettings`]。PR-4）
 //!
-//! `JpTaxPolicy`（`kaikei-policy::TaxPolicy` の実装。PR-4）・科目表 /
-//! `TagSchema` のロード（PR-5）は、いずれもまだ実装していない。
+//! 科目表 / `TagSchema` のロード（PR-5）はまだ実装していない。
 //!
 //! # 依存方向
 //!
