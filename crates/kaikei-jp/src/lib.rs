@@ -1,18 +1,17 @@
 //! Phase 2: 日本・個人事業主アダプタ。`kaikei-policy` の trait を実装する層。
 //!
-//! # この PR（PR-1）のスコープ
+//! # モジュール構成
 //!
-//! ワークスペース組込みと YAML ローダの共通基盤のみ。
-//!
-//! - [`yaml`]: YAML 文字列 → `T: DeserializeOwned` の共通ローダ
+//! - [`yaml`][]: YAML 文字列 → `T: DeserializeOwned` の共通ローダ
 //!   （姉妹 crate `kaikei-jp-data` の再エクスポートではない。名前が紛らわしい
 //!   ため `data` ではなく `yaml` にしてある）
-//!   （埋め込みデータ / 任意パスの両方に対応）
-//! - [`error`][]: [`error::JpError`]（`thiserror`）
+//!   （埋め込みデータ / 任意パスの両方に対応。PR-1）
+//! - [`error`][]: [`error::JpError`]（`thiserror`。PR-1）
+//! - [`tax`][]: 税区分マスタ（[`tax::TaxCategoryTable`]）と、取引日による
+//!   適用マスタの選択（[`tax::TaxRuleSets`]。PR-3）
 //!
-//! 税区分マスタの解釈（PR-3）・`JpTaxPolicy`（`kaikei-policy::TaxPolicy` の実装。
-//! PR-4）・科目表 / `TagSchema` のロード（PR-5）は、いずれもこの PR では
-//! 実装しない。
+//! `JpTaxPolicy`（`kaikei-policy::TaxPolicy` の実装。PR-4）・科目表 /
+//! `TagSchema` のロード（PR-5）は、いずれもこの PR では実装しない。
 //!
 //! # 依存方向
 //!
@@ -39,4 +38,5 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod tax;
 pub mod yaml;
