@@ -113,6 +113,35 @@ pub enum JpError {
         second_range: String,
     },
 
+    /// 勘定科目テンプレート（[`crate::chart`]）1ファイル分の内容が不正。
+    ///
+    /// YAML の構文自体は正しいが、`version`/`type`/科目コード等の値が期待する
+    /// 形式・範囲に収まっていない場合（`InvalidTaxCategoryTable` と同じ扱い）、
+    /// または `kaikei_core::ChartOfAccounts::new` が検証する不変条件（親科目の
+    /// 不在・循環参照・コード重複）に違反する場合に返す。後者は
+    /// `kaikei_core::CoreError` の `Display` をそのまま `reason` に含めるため、
+    /// 元の理由は失われない。
+    #[error("勘定科目テンプレート \"{label}\" が不正です: {reason}")]
+    InvalidChart {
+        /// 読み込み元の識別子（埋め込みYAMLの名称、またはファイルパス）。
+        label: String,
+        /// 不正の理由（次に何を直せばよいか分かる文言。`CLAUDE.md` §11）。
+        reason: String,
+    },
+
+    /// タグスキーマ（[`crate::tags`]）1ファイル分の内容が不正。
+    ///
+    /// YAML の構文自体は正しいが、`version`/`value_type`/`required_for`
+    /// 等の値が期待する形式・範囲に収まっていない場合、またはタグキーが
+    /// 重複している場合に返す（`InvalidTaxCategoryTable` と同じ扱い）。
+    #[error("タグスキーマ \"{label}\" が不正です: {reason}")]
+    InvalidTagSchema {
+        /// 読み込み元の識別子（埋め込みYAMLの名称、またはファイルパス）。
+        label: String,
+        /// 不正の理由（次に何を直せばよいか分かる文言。`CLAUDE.md` §11）。
+        reason: String,
+    },
+
     /// 税区分コードが、指定したマスタに存在しない。
     #[error(
         "税区分コード \"{code}\" は \"{table_label}\"（適用開始 {applies_from}）に存在しません\

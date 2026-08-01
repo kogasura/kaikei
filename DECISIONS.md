@@ -1723,3 +1723,103 @@ AccountType::Asset, true),` の形の行から (コード, 名称, 種別, 記�
 といった、本来なら機械的に検出できたかもしれない誤りの一部を通してしまう
 可能性がある。将来、税務ドメインの知見をもとに「明らかに誤りと言える
 組み合わせ」の一覧が定まった時点で、別 PR として追加を検討する。
+
+---
+
+## D-061 勘定科目テンプレートの `postable`/`parent`/`sort` の扱い（`kaikei-jp::chart`）
+
+**決定**: `kaikei-jp-data/chart/*.yaml` → `kaikei_core::ChartOfAccounts` の
+ロード（`kaikei-jp::chart`）で、YAML の生の形（`AccountRaw`）は以下のように扱う。
+
+1. `postable`（`kaikei_core::AccountDef::postable`）: **省略可能**（`#[serde(default)]`）。
+   省略時は `true`（記帳可能）。同梱の `sole_proprietor.yaml` には1件も
+   書かれていないが、YAML 自身の先頭コメントが「`postable: false` なら
+   見出し科目」と明記しているため、フィールド自体は受理し、明示すれば
+   効くようにする
+2. `parent`（`kaikei_core::AccountDef::parent`）: **省略可能**（`#[serde(default)]`）。
+   省略時は `None`。同梱データは階層を持たないフラットな科目表だが、
+   ユーザーが差し替える科目表（`kaikei-jp::chart::load_from_path`）で
+   見出し科目の配下に明細科目をぶら下げたい場合に使える
+3. `sort`（YAML にはあるが `kaikei_core::AccountDef` に対応するフィールドが
+   無い）: **ドメイン変換では破棄する**。`deny_unknown_fields` による
+   スキーマ完全性検証のためだけに受け取り、値そのものは使わない
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `postable`/`parent` を必須フィールドにする（省略を許さない） | 同梱データが実際に両方とも省略しており、必須にすると同梱データ自体が読めなくなる。また「ほとんどの科目は記帳可能・親を持たない」が実態であり、都度書かせるのは YAML の可読性を落とすだけで得るものが無い |
+| `sort` を `kaikei_core::AccountDef` に新しいフィールドとして追加し、表示順を保持する | `kaikei-core` の型変更は本 PR のスコープ外（`ChartOfAccounts`/`AccountDef` を使う既存コード全体に影響する）。かつ、実際にその順序を使う画面・帳票がまだ存在しない時点で追加するのは YAGNI。同梱テンプレートは科目コードが固定桁数の数字文字列であるため、`ChartOfAccounts::iter()`（`BTreeMap` 由来でコード昇順）の並びが偶然 `sort` の意図と一致しており、当面はそれで足りる |
+| `sort` を YAML から削除する（同梱データを編集する） | `kaikei-jp-data` の YAML を編集しないことがこの PR の制約（担当外の変更を持ち込まない） |
+
+**理由**: `kaikei_core::AccountDef` の形に対して YAML が省略している情報は、
+「省略時の既定値が自明で、かつ既定値のままで同梱データが要求を満たす」
+（`postable`/`parent`）か、「ドメインモデルに対応する置き場が無く、
+今使う見込みも無い」（`sort`）かのどちらかに分類できたため、前者は
+`#[serde(default)]` で受理し、後者は明示的に破棄することにした。
+どちらも「捨てる/使わない」ことを doc コメントと本エントリで明示し、
+無言の仕様にしない。
+
+**トレードオフ**: `sort` を破棄したことで、科目コードの桁数が不揃いな
+科目表（例: `"9"` と `"10"` が混在する体系）を書いた場合、
+`ChartOfAccounts::iter()` の並びが人間の意図する表示順と一致しなくなる
+可能性がある。表示順を厳密に扱う画面・帳票が出てきた時点で、
+`kaikei-core` 側の変更として改めて検討する。
+
+**関連**: `crates/kaikei-jp/tests/chart_drift.rs`（`test_chart()` と
+`sole_proprietor.yaml` の乖離検出）は、本 PR で `kaikei-jp::chart::load_embedded`
+を直接使うように書き換えた。以前はこのテストファイルだけが独自の
+`AccountYaml`/`ChartYaml` スキーマ型を持っていたが、正式なローダができた
+ことで併存させる理由が無くなったため（2つのパース経路が乖離しうる状態を
+残さない。既存7テストは変更後も全て通ることを確認済み）。
+
+---
+
+## D-062 タグスキーマの `description` の破棄と、重複タグキー検出のための独自デシリアライザ（`kaikei-jp::tags`）
+
+**決定**: `kaikei-jp-data/tags.yaml` → `kaikei_core::TagSchema` のロード
+（`kaikei-jp::tags`）で以下を決定した。
+
+1. `description`（`kaikei_core::TagDef` に対応するフィールドが無い）:
+   **ドメイン変換では破棄する**。`deny_unknown_fields` によるスキーマ
+   完全性検証のためだけに受け取る
+2. `tags:` マッピング（キー = タグキー）は、`BTreeMap<String, TagDefRaw>`
+   のような `serde` 標準のマップ型ではなく、`MapAccess` を直接読む
+   独自の `deserialize_with`（`ordered_pairs`）で `Vec<(String, TagDefRaw)>`
+   （出現順・**重複を保持**したペア列）として受け取り、`from_raw` 側で
+   明示的に重複キーを検出して `JpError::InvalidTagSchema` を返す
+
+**検証した事実**（`serde_norway` 0.9.42、`crates/kaikei-jp/src/tags.rs` 実装前に
+一時テストで確認。実装には残していない一過性の確認）:
+
+- `serde_norway::from_str::<BTreeMap<String, i32>>("a: 1\nb: 2\na: 3\n")` は
+  **エラーにならず** `{"a": 3, "b": 2}` を返す（`a` の最初の定義は
+  エラーも警告も無く消える。後勝ちで上書きされる）
+- `MapAccess::next_entry` をループで読む独自 `Visitor` を使うと、
+  重複キーを含む全エントリが `Vec<(String, V)>` として**出現順のまま**
+  得られる（`"zeta: 1\nalpha: 2\nmid: 3\nalpha: 9\n"` →
+  `[("zeta", 1), ("alpha", 2), ("mid", 3), ("alpha", 9)]`）。
+  つまり `MapAccess` 自体は YAML のドキュメント順を保っており、
+  順序を失う・重複を失うのは「どの Rust の型に集約するか」の選択に依る
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `tags: BTreeMap<String, TagDefRaw>` にする（素直な実装） | 上記の検証どおり、`tags.yaml` に重複キーがあってもエラーにならず1件が黙って消える。`tags.yaml` は「任意パスからの差し替え」（`kaikei-jp::tags::load_from_path`）でユーザー自身が編集するファイルでもあり、コピペミスによる重複キーが記帳可能なタグ定義を1件まるごと黙って失わせるのは `CLAUDE.md` §4「TagSet はゴミ箱ではない」の精神に反する |
+| `tags: HashMap<String, TagDefRaw>` にする | `BTreeMap` と同じく重複キーを検出できない。加えて `TagSchema::new` に渡す `Vec` の順序が `HashMap` の反復順（プロセスごとに変わりうる）に依存してしまう。最終的な `TagSchema` は内部で `BTreeMap` に詰め直されるため挙動には影響しないが、順序に依存する将来のコード（例えばエラーメッセージで「最初に見つかった問題」を報告する処理）が追加されたときに再現性の無いバグを生みかねない |
+| `description` を `kaikei_core::TagDef` に追加して保持する | `kaikei-core` の型変更は本 PR のスコープ外。現時点で `TagSchema`/`TagDef` の利用側（`kaikei_core::JournalEntry::new` のタグ検証等）がこれを必要としていない（YAGNI）。将来 MCP 経由でタグの意味を AI に説明する用途が生じたら、`kaikei_core::TagDef` への追加を別途検討する |
+
+**理由**: 重複タグキーの検出は「YAML の生の形をどう Rust の型に落とすか」
+という一見小さな選択で結果が変わってしまう（マップ型を選んだ時点で
+重複情報が失われ、検出しようがなくなる）ことが実測で分かったため、
+検出したいなら重複を保持できる形（`Vec`）で読むしかない、という
+機構上の制約に従った。`description` の破棄は D-061 の `sort` と同じ理由
+（対応する置き場が無く、今使う見込みも無い）。
+
+**トレードオフ**: `MapAccess` を直接読む `Visitor` は標準の `#[derive(Deserialize)]`
+より複雑で、YAML デシリアライズの詳細（`serde` の `Deserializer`/`Visitor` API）に
+触れるコードをこの crate に持ち込むことになる。`tags.yaml` の `tags:` 以外の
+マッピング型フィールドで同様の要求が出た場合、この `ordered_pairs` は
+`TagDefRaw` に固定されておらず `V: Deserialize<'de>` でジェネリックにしてあるため、
+そのまま再利用できる。

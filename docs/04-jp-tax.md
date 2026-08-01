@@ -176,6 +176,11 @@ categories:
 
 新しいタグキーを使う前に必ずここへ登録する。core が未登録キーを拒否する。
 
+`kaikei-jp::tags`（PR-5）が YAML → `kaikei_core::TagSchema` のロードを行う。
+埋め込みデータ（`kaikei_jp_data::TAGS`）と任意パスからの差し替えの両方に対応する。
+各タグ定義が持つ `description` は `kaikei_core::TagDef` に対応するフィールドが
+無いため、ロード時に破棄する（`DECISIONS.md` D-062）。
+
 ---
 
 ## 5. 勘定科目テンプレート
@@ -191,6 +196,14 @@ categories:
 | 400 | 元入金 | Equity | 年に1回だけ動く |
 | 410 | 事業主貸 | Equity | 期首でゼロにリセット |
 | 420 | 事業主借 | Equity | 期首でゼロにリセット |
+
+### ローダ（PR-5）
+
+`kaikei-jp::chart` が YAML → `kaikei_core::ChartOfAccounts` のロードを行う。
+埋め込みデータ（`kaikei_jp_data::CHART_SOLE_PROPRIETOR`）と任意パスからの
+差し替えの両方に対応する。`postable`・`parent` は省略可能（省略時はそれぞれ
+`true`・`None`）。`sort` は `kaikei_core::AccountDef` に対応するフィールドが
+無いためロード時に破棄する（`DECISIONS.md` D-061）。
 
 ---
 

@@ -14,8 +14,10 @@
 //!   適用マスタの選択（[`tax::TaxRuleSets`]。PR-3）、および
 //!   `kaikei-policy::TaxPolicy` の実装（[`tax::JpTaxPolicy`] /
 //!   [`tax::JpSettings`]。PR-4）
-//!
-//! 科目表 / `TagSchema` のロード（PR-5）はまだ実装していない。
+//! - [`chart`][]: 勘定科目テンプレート（`kaikei-jp-data/chart/*.yaml`）→
+//!   `kaikei_core::ChartOfAccounts`（`docs/04-jp-tax.md` §5。PR-5）
+//! - [`tags`][]: タグスキーマ（`kaikei-jp-data/tags.yaml`）→
+//!   `kaikei_core::TagSchema`（`docs/04-jp-tax.md` §4。PR-5）
 //!
 //! # 依存方向
 //!
@@ -41,9 +43,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-// モジュール doc の説明順（土台 → その上に乗るもの）と揃える。
-// アルファベット順ではないのは、読み手が doc の順にファイルを辿れるようにするため。
+// `mod` の並びは `cargo fmt`（`reorder_modules`）がアルファベット順に強制する。
+// 読み手向けの解説順（土台 → その上に乗るもの）は上の「モジュール構成」に譲り、
+// ここでは fmt に任せる。
+pub mod chart;
 pub mod error;
 pub mod invoice;
+pub mod tags;
 pub mod tax;
 pub mod yaml;
