@@ -45,6 +45,9 @@ jobs:
       # `#[sqlx::test]` は DATABASE_URL を「データベースを作れる接続」として使う
       # （kaikei_migrator の URL を渡す。kaikei_app のままだと権限不足で全滅する）。
       DATABASE_URL: postgres://kaikei_migrator:kaikei_migrator_ci_password@localhost:5432/postgres
+      # `sqlx prepare --check` は `.sqlx/` に無いクエリを実DBに問い合わせて検証するため、
+      # DATABASE_URL が指すのと同じDBにマイグレーションを適用しておく必要がある。
+      MIGRATOR_DATABASE_URL: postgres://kaikei_migrator:kaikei_migrator_ci_password@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -83,6 +86,18 @@ jobs:
             cargo install sqlx-cli --version 0.8.6 \
               --no-default-features --features postgres,rustls --locked
           fi
+
+      - name: マイグレーションを適用
+        # 次の `sqlx prepare --check` は `.sqlx/` に無いクエリを実DBに問い合わせて
+        # 検証するため、先にテーブルが存在している必要がある。
+        # （`#[sqlx::test]` は各テストが自前のテストDBを作るのでこの適用とは独立だが、
+        #   prepare --check は DATABASE_URL が指すDBそのものを見る）
+        #
+        # sqlx-cli の `migrate run` を使う（`kaikei-migrate` バイナリではなく）。
+        # バイナリだと「ビルドするために kaikei-store のコンパイルが必要 →
+        # そのコンパイルに sqlx::query! マクロの検証（テーブルの存在）が必要」
+        # という鶏と卵になる。
+        run: sqlx migrate run --source crates/kaikei-store/migrations
 
       - name: .sqlx キャッシュが最新か検証
         run: cargo sqlx prepare --workspace --check

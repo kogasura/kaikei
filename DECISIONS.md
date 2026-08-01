@@ -878,6 +878,244 @@ ERRCODE 未指定の `RAISE EXCEPTION` が別の意図で追加された場合�
 
 ---
 
+## D-039 `PgTx<'c>` は `Option<Transaction<'c, Postgres>>` を保持し、`Drop` は `Option` の状態だけで commit 忘れを判定する
+
+**決定**: `kaikei-store::store::PgTx<'c>` は `sqlx::Transaction<'c, Postgres>` を
+直接ではなく `Option<Transaction<'c, Postgres>>` として保持する。
+`TxScope::commit`/`rollback`（いずれも `self` を値で取る）は
+`Option::take()` で中身を取り出してから `sqlx::Transaction::commit`/
+`rollback` に渡す。`Drop::drop` は「`tx` フィールドがまだ `Some` のまま
+破棄された」ことだけを見て `tracing::warn!` する（`committed: bool` の
+ような別フラグは持たない）。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `tx: Transaction<'c, Postgres>`（`Option` で包まない）＋ `committed: bool` フラグ | `PgTx` が `Drop` を実装した時点で、`commit`/`rollback` 内から `self.tx`（フィールド）を直接ムーブして `Transaction::commit(self.tx)` を呼ぶことができない（E0509: 型が `Drop` を実装している場合、そのフィールドを部分的にムーブできない）。実測でこのエラーを確認した |
+| `committed: bool` フラグを `Option` と併用する | `Option::take()` 後は `tx` が必ず `None` になるため、`committed` フラグは常に `tx.is_none()` と同じ値になり、状態を二重に持つだけで一方が他方の劣化コピーになる。片方を更新し忘れるバグの余地を残すだけで得るものが無い |
+
+**理由**: `Option::take()` は `&mut self` を取るメソッドであり、`Drop` を
+実装した型に対しても問題なく呼べる（部分ムーブと違い、`Option` 自体を
+その場で `None` に差し替えるだけで所有権の移動を型システムの外から
+安全に行える、`Option` 型に用意された標準的な回避パターン）。これにより
+`committed` の追加フィールド無しで、「`tx` が `Some` のまま `Drop` された
+＝ `with_tx`（`crates/kaikei-app/src/tx.rs`）を経由せず commit/rollback を
+呼び忘れた」ことを1フィールドだけで判定できる（phase1計画 G5 / R10）。
+
+**トレードオフ**: `conn()`（各 repo 実装がクエリ発行に使う接続を返す
+メソッド）は `self.tx.as_mut().expect(...)` という一段の間接参照を経る。
+`commit`/`rollback` 後にこのメソッドを呼び出すコードは存在しない
+（`TxScope::commit`/`rollback` が `self` を消費するため型で防がれる）ので
+`expect` が実際に失敗することは無いが、理論上のパニック経路が1つ増える
+（呼び出し側のバグでのみ到達する）。
+
+---
+
+## D-040 採番は `RETURNING next_no - 1` の1文 upsert、明細の一括 INSERT は `UNNEST` にする
+
+**決定**: `kaikei-store::numbering::PgTx::next_entry_no` は以下の1文で
+採番する。
+
+```sql
+INSERT INTO entry_counters (fiscal_year, next_no) VALUES ($1, 2)
+ON CONFLICT (fiscal_year) DO UPDATE SET next_no = entry_counters.next_no + 1
+RETURNING next_no - 1
+```
+
+`entry_counters.next_no` は「次に払い出す仕訳番号」を表す。初回
+（該当年度の行が無い）は `next_no = 2` で `INSERT` し、`RETURNING
+next_no - 1` で `1`（今回払い出す番号）を返す。2回目以降は既存行を
+`+1` した上で、更新後の `next_no - 1`（＝更新前の `next_no`。今回
+払い出す番号）を返す。
+
+また `kaikei-store::journal::PgTx::insert_entry` の明細一括 INSERT は
+`UNNEST` で1文にまとめる。
+
+```sql
+INSERT INTO journal_lines (entry_id, line_no, account_code, side, amount_minor,
+                            currency, currency_minor_unit, tags, memo)
+SELECT $1, u.line_no, u.account_code, u.side, u.amount_minor, u.currency,
+       u.currency_minor_unit, u.tags, u.memo
+FROM UNNEST($2::smallint[], $3::text[], $4::smallint[], $5::bigint[],
+            $6::text[], $7::smallint[], $8::jsonb[], $9::text[])
+     AS u(line_no, account_code, side, amount_minor, currency,
+          currency_minor_unit, tags, memo)
+```
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 採番: `SELECT next_no FROM entry_counters WHERE fiscal_year = $1 FOR UPDATE` の後に別途 `UPDATE`（2文） | 往復が増えるだけでなく、「行が無い場合（その年度で最初の仕訳）」を別途 `INSERT ... ON CONFLICT DO NOTHING` で分岐する必要があり、競合時に再試行ロジックが要る。1文の `ON CONFLICT DO UPDATE` なら初回・2回目以降が同じ1文で閉じ、行ロックの取得からカウンタ更新までが単一のアトミックな操作になる |
+| 明細 INSERT: `entry.lines()` をループして1行ずつ `INSERT`（`n` 回の往復） | 明細数が増えるほど往復回数が線形に増える。`UNNEST` なら明細数によらず常に2回の往復（仕訳ヘッダ1回＋明細一括1回）に収まる（phase1計画 G7） |
+
+**理由**: 採番と仕訳 INSERT を同一トランザクションで行うため、検証
+失敗時はカウンタの増分も一緒に巻き戻り、欠番は原理的に発生しない
+（`migrations/0006_entry_counters.sql` のコメント、D-023 相当の決定と
+整合）。`UNNEST` への配列バインドは `Vec<T>`（`T` が `PgHasArrayType` を
+実装する型。`i16`/`i64`/`String`/`serde_json::Value`/`Option<String>` は
+いずれも sqlx-postgres が実装済み）をそのまま `.bind()` に渡すだけで済み、
+`&Vec<T>` のような参照を経由する必要は無い（実装時に `Vec<T>` を直接
+渡す形で確認済み）。
+
+**トレードオフ**: `RETURNING next_no - 1` という引き算は、列名
+`next_no`（「次に払い出す番号」）と実際に返す値（「今回払い出した番号」）
+の間に1つ間接がある。可読性はコメントに委ねる。
+
+---
+
+## D-041 `mapper.rs` の検証テストは `tests/` の統合テストではなく `#[cfg(test)] mod tests` として同一ファイルに置く。書き込み時の追加防御（`document_refs` 非対応・NULバイト摘要の拒否）を `insert_entry` に実装する
+
+**決定その1（テスト配置）**: `journal/row.rs` の `JournalEntryRow` /
+`JournalLineRow` / `EntryRows` は `pub(crate)` のまま維持し（store crate
+内部の実装詳細を外部に公開しない設計）、`mapper.rs` の
+`TryFrom<EntryRows> for JournalEntry` の9項目の検証を確認するテストは、
+`crates/kaikei-store/tests/mapper_guard.rs` のような別クレートとしての
+統合テストではなく、`mapper.rs` 自身の `#[cfg(test)] mod tests` として
+実装する。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `tests/mapper_guard.rs` を作り、`JournalEntryRow` 等を `pub`（`pub(crate)` ではなく）にする | Rust の可視性規則上、`tests/*.rs` は当該クレートを外部依存として参照する別クレートであり、`pub(crate)` 項目には到達できない（実測で `E0603` 相当の非公開エラーになることを確認）。到達可能にするには `pub` にする必要があるが、それは「DB行の生表現は crate 内部の実装詳細」という設計意図（`row.rs` のモジュール doc）を、テストの都合だけのために崩すことになる |
+
+**理由**: `convert.rs` / `tags.rs` / `sqlstate.rs` は元々すべて
+`#[cfg(test)] mod tests` を同一ファイルの末尾に置く配置をこの crate で
+既に確立しており、`mapper.rs` もこの規約に揃える方が一貫性が高い。
+9項目の検証は「壊れた `Row` を渡したときに panic せず
+`RepoError::Corrupt` になること」を確認できれば目的を達成し、
+`#[should_panic]` を使わず素直に `Result` を検査するだけで良い
+（呼び出し側から見た「panic しないことの検証」は、通常の `#[test] fn`
+がテスト自体をパニックさせずに完走することで自然に満たされる）。
+
+**決定その2（書き込み側の追加防御）**: `journal::PgTx::insert_entry` は
+`JournalEntry::rehydrate` 側の検証とは別に、書き込み前の2点を明示的に
+検証する。
+
+1. `entry.document_refs()` が非空なら `RepoError::Unsupported` を返す
+   （F-1・人間承認済み。逆仕訳・証憑紐付けは Phase 4 の
+   `attach_document` ユースケースに送る。core の `JournalEntry::reverse`
+   は `document_refs` を複製しないため、この制約は `reverse_entry` の
+   実装（PR-7）には影響しない）
+2. `entry.description()` が U+0000（NUL）を含むなら `RepoError::Corrupt`
+   を返す（phase1計画 R12。PostgreSQL の `text` は NUL を格納できないが、
+   `JournalEntry::new` の摘要検証は `trim().is_empty()` のみで NUL を
+   拒否しないため、ドメイン検証を通過したデータが保存段階で分かりにくい
+   DB エラーとして落ちる経路を塞ぐ）
+
+**却下した選択肢**: 検証を行わずそのまま SQL に渡し、Postgres 側の
+エラー（`document_refs` は列が無いため静かに欠落、NUL は
+`invalid_byte_sequence` 系のエラー）に委ねる。
+
+**理由**: 「保存できないものを静かに落とさない」という会計データの
+正しい振る舞いのため。`document_refs` は保存先の列自体が存在しないため
+検証しなければ**エラーにもならず単に消える**（最悪の失敗モード）。
+NUL バイトは Postgres 側のエラーメッセージが「なぜ拒否されたか」を
+`CLAUDE.md` §11 が求める水準で説明しないため、店側で意味のある
+`RepoError` に変換する。
+
+**トレードオフ**: core（`kaikei-core::JournalEntry`）の摘要検証に
+制御文字拒否を足すべきかは未解決のまま残る（core は不変層であり変更は
+人間の承認事項。`CLAUDE.md` §9）。この疑問は `docs/` へ書き出す判断を
+人間に委ねる（Phase 1 の他の申し送りと同様の扱い）。
+## D-042 試算表read modelは集計対象全体で通貨が単一であることを要求する
+
+**決定**: `kaikei-store::query::trial_balance`（PR-6）は、集計結果に
+2種類以上の `(currency, currency_minor_unit)` の組が現れた場合、
+`RepoError::Unsupported` を返す。`journal_lines` は行ごとに
+`currency`/`currency_minor_unit` を持つため理論上は同一期間・同一科目に
+複数通貨が混在しうるが、判定の粒度は科目単位ではなく**集計対象全体**とする。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 科目単位で通貨が一致していればよいとする（`GROUP BY` に通貨を含め、科目ごとに異なる通貨の行を許容する） | `kaikei_core::TrialBalance::from_entries` は対象の仕訳集合**全体**で通貨が単一であることを要求し（`CoreError::CurrencyMismatch`）、科目単位の判定ではない。read model側だけ緩い基準にすると、同じデータに対してcoreとSQL集計で異なる成功/失敗の結果になり、差分テスト（`tests/trial_balance_differential.rs`）で対照できなくなる |
+| 複数通貨をそのまま複数行として返す（呼び出し側に通貨ごとの合算を委ねる） | Phase 1は個人事業主のJPY単一通貨を前提としており（`README.md`）、呼び出し側（app層、PR-7）に複数通貨対応の合算ロジックを要求するのはスコープ外の先取り実装になる（YAGNI）。外貨対応は`DECISIONS.md` D-016で明示的に将来課題とされている |
+
+**理由**: `kaikei_core::TrialBalance::from_entries` と同じ粒度で失敗させることで、
+「SQL集計とcoreの`from_entries`が一致する」という差分テストの前提
+（`tests/trial_balance_differential.rs::trial_balance_rejects_mixed_currencies_like_core_does`）
+が成立する。エラー種別は`RepoError::CurrencyMismatch`のような専用バリアントを
+`kaikei-app::error::RepoError`に追加するのではなく、既存の`Unsupported`
+（「現在の実装ではサポートしていない操作」）を使う。複数通貨のデータ自体は
+不正ではなく（`journal_lines`のスキーマ上正当なデータ）、単に Phase 1 の
+read modelがそれを表示する手段を持たないだけなので、`Corrupt`（データが
+不正）ではなく`Unsupported`（機能未対応）が意味的に正しい。
+
+**トレードオフ**: `RepoError`に新しいバリアントを追加する余地は今回は
+使わない。`Unsupported`は元々「逆仕訳への証憑紐付け」等の別の意味でも
+使われており、`reason`文字列を読まないと具体的に何が未対応なのか
+分からない。次の手が分かる文言（`CLAUDE.md` §11）は`reason`側で担保する
+（「期間や科目を絞り込んで再実行してください」という具体的な対処法を含める）。
+
+---
+
+## D-043 差分テストは`group_by`空のケースを主戦場にし、`group_by`ありは科目単位のロールアップで間接検証する
+
+**決定**: `tests/trial_balance_differential.rs`は、`group_by = &[]`
+（グループ化なし）のケースを主戦場にして、SQL集計とcoreの
+`TrialBalance::from_entries`の結果を行単位で完全に比較する
+（`trial_balance_matches_core_for_empty_group_by`。5科目種別すべての
+残高の向きもここで検証する）。`group_by`ありのケースは、SQL側の結果を
+科目ごとにロールアップして`TrialBalance::balance_of`と突き合わせ、
+かつ各グループの内容（`GroupKeyView`）はテストが構築した既知のタグ
+割り当てに対する期待値と直接比較する
+（`trial_balance_group_by_rolls_up_to_the_same_balance_as_core`）。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `kaikei_core::GroupKey`にアクセサ（`iter()`等）を追加し、SQL側の`GroupKeyView`と直接比較する | phase1計画 §0-7/R9で確認済みのとおり、`GroupKey`は現在`impl`ブロックを1つも持たない不変層（`kaikei-core`）の型であり、変更は人間の承認事項（`CLAUDE.md` §9）。Phase 1のスコープでは変更しない。必要と判断されたらPhase 2以降に人間の承認を得て提案する |
+| `group_by`ありのケースを丸ごとテストしない（`group_by = &[]`のみで済ませる） | `group_by`はこのPRの完了条件の一部（`kaikei_app::ports::TrialBalanceQuery`のシグネチャに含まれる主要な引数）であり、SQL側の実装（`unnest`+`jsonb_object_agg`によるグルーピング）を全く検証しないのは欠陥を見逃すリスクが高い |
+
+**理由**: `GroupKey`を直接比較できないという制約の下で、実務上十分な
+検証強度を得るために2段構えにした。「主戦場」（`group_by`なし）は
+最も基本的なケースであり、残高の向き・SUMの正しさ・LEFT JOINの正しさ
+など、grouping以外の全てのロジックを完全な行単位一致で検証する。
+「間接検証」（`group_by`あり）は、coreが提供する唯一の公開API
+（`balance_of`。科目単位で全グループを合算する）を使ってロールアップの
+整合性を検証しつつ、グルーピングの分割そのものが正しいことは、
+テストが構築した既知の入力データに対する直接的な期待値比較で担保する。
+
+**トレードオフ**: 「SQL側が生成した`GroupKeyView`の集合とcoreの
+`GroupKey`の集合が完全に同型である」ことを機械的に証明してはいない
+（テストデータに対する期待値ベースの検証にとどまる）。`GroupKey`に
+アクセサが追加されれば、より強い自動的な差分比較に置き換えられる。
+
+---
+
+## D-044 `journal_lines.account_code`に対応する`accounts`行が無い場合は`RepoError::Corrupt`にする（`accounts`へのJOINは`LEFT JOIN`）
+
+**決定**: `kaikei-store::query::trial_balance`は`accounts`へ`LEFT JOIN`する
+（`INNER JOIN`にしない）。対応する科目が見つからない
+（`account_type`が`NULL`）行が集計結果に含まれる場合、その行を黙って
+除外せず`RepoError::Corrupt`を返す。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `accounts`へ`INNER JOIN`する | `journal_lines.account_code`に`accounts.code`への外部キー制約は無い（`docs/03-database.md` §2、`crates/kaikei-store/tests/common/mod.rs`のコメント）。`INNER JOIN`にすると、対応する科目が存在しない行が**黙って**試算表の集計から除外される。これは「借方合計と貸方合計が一致しない試算表を返す」という、CLAUDE.md §2・§11が最も嫌う「気づかれない静かなデータ破損」を生む |
+| 科目が見つからない場合は`account_type`不明のまま行を返す（呼び出し側に判断を委ねる） | `kaikei_app::view::BalanceRowView::account_type`は`Option`ではなく必須フィールドであり、契約（`kaikei-app/src/view.rs`、★凍結済み）を変更する必要がある。PR-6の権限内では契約を変更しない |
+
+**理由**: phase1計画 R4「無検証APIの危険面積を減らす」と同じ規律
+（`journal/mapper.rs`の9項目再検証と同種）を、read model側にも適用した。
+`accounts`はマスタ（可変）であり、`journal_lines`は帳簿（append-only）
+なので、両者の整合性はDBの制約だけでは保証されない
+（`docs/03-database.md` §2「過去の仕訳が参照しているため物理削除しない」
+という運用上の前提はあるが、DBのCHECK/FKとして強制されてはいない）。
+「保存できないものを静かに落とさない」という規律を、書き込み側
+（`journal/mapper.rs`、PR-5）だけでなく読み取り側（read model、PR-6）にも
+一貫して適用する。
+
+**トレードオフ**: 通常運用（マスタと帳簿が整合している）では
+`LEFT JOIN`と`INNER JOIN`の実行結果に差は無く、`LEFT JOIN`によるJOIN
+コストのわずかな増加のみがトレードオフになる（個人事業主規模の
+仕訳件数では無視できる）。
 ## D-045 ユースケース関数は依存を素の引数として受け取る（`PostEntryDeps` のような集約構造体を導入しない）
 
 **決定**: `kaikei-app::usecase::{post_entry, reverse_entry, report}::execute`
@@ -902,3 +1140,44 @@ clippy 違反も発生しない。
 すべての呼び出し側（PR-8 の合成ルート、Phase 3 の MCP サーバー等）の
 書き換えのどちらかを迫られる。**その時点で初めて `PostEntryDeps` の導入を
 検討する**方針とし、今は導入しない（YAGNI。今必要ないものは作らない）。
+
+---
+
+## D-046 試算表read modelは`journal_lines`全件走査の現在の形のままPhase 1を完了とする（人間承認済み）
+
+**決定**: `kaikei-store::query::trial_balance`（試算表の SQL 集計）は、
+`journal_lines` に対して集計対象期間だけを絞り込むインデックスを持たない
+現在のスキーマのまま Phase 1 を完了とする。`journal_entries` 側は
+`idx_entries_date` により取引日で絞り込めるが、`journal_lines` 自体には
+日付列が無く `journal_entries` との JOIN 経由でしか絞り込めないため、
+累積データが増えるほど「直近1年だけの試算表」であっても `journal_lines`
+の全行を毎回スキャンする（実行計画は `journal_lines` に対する Seq Scan）。
+
+**実測値**（2回目レビュアーによる実DB計測）:
+
+| データ量 | クエリ内容 | 所要時間 | 備考 |
+|---|---|---|---|
+| 2026年のみ: 2万仕訳/4万明細 | 「2026年通期」の集計 | 41ms | 対象期間＝全データ |
+| 2018〜2026の9年分: 18万仕訳/36万明細 | 同じ「2026年通期のみ」（全体の約11%） | 90ms | `journal_lines` を36万行全件 Seq Scan |
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `journal_lines` に `entry_date` を非正規化して持たせる（`journal_entries` からコピー） | `journal_entries.entry_date` と `journal_lines.entry_date` の2箇所が食い違わない保証という新たな負債を生む。append-only なテーブル同士とはいえ、コピー元とコピー先の整合性は `insert_entry` の実装が正しく2箇所へ同じ値を書くことに依存し続けることになり、スキーマの二重管理が発生する |
+| `fiscal_year` によるテーブルパーティショニング | Phase 1 の想定規模（個人事業主、単年数千〜数万仕訳）に対しては明らかにオーバーエンジニアリング。パーティション管理・マイグレーション・バックアップ運用の複雑さが実際の性能問題を解決する前から先取りで発生する |
+
+**理由**: 単年数千〜数万仕訳という Phase 1 の想定規模では 41ms は十分実用的であり、
+9年分累積時点でも 90ms は許容範囲内である。YAGNI（今必要ないものは作らない）
+を優先し、実際にボトルネックとして顕在化した時点で対処する方が、
+非正規化やパーティショニングが生む複雑さ・新たな整合性負債を先取りで
+背負うより合理的である。ユーザーに実測値を提示のうえ、この方針で
+Phase 1 を完了することの承認を得た。
+
+**トレードオフ**: **コストは「集計対象期間の長さ」ではなく「`journal_lines`
+の累積総行数」に比例する**。複数年にわたって運用が続くと、たとえ
+毎回「直近1年だけ」を集計する場合でも所要時間は線形に悪化する
+（実測: 9年で約90ms。単純な比例計算では50年相当の累積データでは
+数百ミリ秒〜秒オーダーになりうる）。実際に体感できる遅さとして
+顕在化した段階で、`journal_lines` への `entry_date` 非正規化、または
+`fiscal_year` によるパーティショニングを検討する。
