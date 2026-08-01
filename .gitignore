@@ -4,3 +4,9 @@
 *.sqlite3
 .DS_Store
 .claude/scheduled_tasks.lock
+
+# AI エージェントが並列実装に使う一時的な git worktree。
+# リポジトリ内に作られるため、git add -A で誤ってコミットされる
+# （実際に一度踏んだ）。worktree の中身は元リポジトリのクローンなので
+# 追跡する意味が無い。
+.claude/worktrees/
