@@ -138,7 +138,7 @@ PR-1 ワークスペース + CI 拡張
 | #13 | Phase 1 PR-5先行: kaikei-store の共有基盤（sqlstate / tags / convert） | +1461/-9 |
 | #14 | Phase 1 PR-7: kaikei-app のユースケース3本 | +1578/-31 |
 | #15 | Phase 1 PR-5本体+PR-6: kaikei-store の書き込み側と read model | +3324/-11 |
-| #16 | Phase 1 PR-8: 結線と E2E、設計ドキュメントの改訂 | TBD |
+| #16 | Phase 1 PR-8: 結線と E2E、設計ドキュメントの改訂 | +1603/-127 |
 
 ### ROADMAP 完了条件の充足
 
