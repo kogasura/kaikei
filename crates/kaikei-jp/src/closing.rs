@@ -65,6 +65,15 @@
 //! チェックになる（未登録キー・型不一致も同時に検出でき、`closing_entries`
 //! が生成する明細が実際にスキーマを満たすことを直接保証する）。
 //!
+//! # 前提: 集計軸なし（`group_by = []`）の試算表を渡すこと
+//!
+//! `closing_entries` は `TrialBalance` の各行を1科目1残高として扱う。
+//! `TrialBalance::from_entries` に `group_by` を与えて作った試算表を渡すと、
+//! **同一科目がグループごとに複数行に分かれ、その科目に対して複数本の
+//! ゼロ化明細が生成される**。貸借は数学的に必ず一致するので壊れはしないが、
+//! グループを識別していた元のタグは引き継がれないため、意図した集計単位が
+//! 失われる。決算処理には集計軸なしの試算表を渡すこと。
+//!
 //! # 貸借が一致する理由
 //!
 //! 収益・費用の各行を「反対側」に立ててゼロにすると、生成される明細群だけでは
@@ -74,13 +83,30 @@
 //! `verify_balanced` はこれを実行時に検算する最後の砦。
 
 use kaikei_core::{
-    sum_money, AccountCode, AccountType, ChartOfAccounts, CoreError, Currency, FiscalYear,
-    JournalLine, Money, Side, TagKey, TagSchema, TagSet, TagValue, TrialBalance,
+    sum_money, AccountCode, AccountDef, AccountType, ChartOfAccounts, CoreError, Currency,
+    FiscalYear, JournalLine, Money, Side, TagKey, TagSchema, TagSet, TagValue, TrialBalance,
 };
 use kaikei_policy::{ClosingPolicy, PolicyError, ProposedEntry};
 use std::sync::OnceLock;
 
 use crate::error::JpError;
+
+/// 決算処理に使う3科目の科目コード。
+///
+/// **位置引数で並べて渡さない。** どれも `AccountCode` 型なので、順序を
+/// 取り違えても型検査を通ってしまい、所得が事業主貸に振り替えられる
+/// といった会計上の誤りが無言で成立する（レビューで実際に再現された）。
+/// 構造体リテラルはフィールド名を必須にするため、この形なら取り違えが起きない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosingAccounts {
+    /// 元入金。所得の振替先。
+    pub capital: AccountCode,
+    /// 事業主貸。現時点の `closing_entries` では使わないが、
+    /// `opening_entries` を実装する際に必要（`DECISIONS.md` D-065/D-066）。
+    pub owner_drawings: AccountCode,
+    /// 事業主借。同上。
+    pub owner_contributions: AccountCode,
+}
 
 /// 個人事業主（青色申告）向けの決算振替仕訳を生成する `ClosingPolicy` 実装。
 ///
@@ -118,14 +144,39 @@ impl JpSoleProprietorClosingPolicy {
     pub fn new(
         chart: &ChartOfAccounts,
         schema: &TagSchema,
-        capital_account: AccountCode,
-        owner_drawings_account: AccountCode,
-        owner_contributions_account: AccountCode,
+        accounts: ClosingAccounts,
         tax_category: Option<String>,
     ) -> Result<Self, JpError> {
-        require_account(chart, &capital_account, "元入金")?;
+        let ClosingAccounts {
+            capital: capital_account,
+            owner_drawings: owner_drawings_account,
+            owner_contributions: owner_contributions_account,
+        } = accounts;
+
+        let capital_def = require_account(chart, &capital_account, "元入金")?;
         require_account(chart, &owner_drawings_account, "事業主貸")?;
         require_account(chart, &owner_contributions_account, "事業主借")?;
+
+        // 3科目は定義上すべて別の科目。同じコードを渡すのは設定ミスであり、
+        // 放置すると決算振替が意図しない科目に載る。
+        require_distinct(
+            &capital_account,
+            &owner_drawings_account,
+            "元入金",
+            "事業主貸",
+        )?;
+        require_distinct(
+            &capital_account,
+            &owner_contributions_account,
+            "元入金",
+            "事業主借",
+        )?;
+        require_distinct(
+            &owner_drawings_account,
+            &owner_contributions_account,
+            "事業主貸",
+            "事業主借",
+        )?;
 
         // 生成する明細と**同じ形の `TagSet`** をスキーマに通して、構築時に
         // 「決算処理を走らせたら記帳できない」状態を検出する。
@@ -135,16 +186,22 @@ impl JpSoleProprietorClosingPolicy {
         // 実際に渡す `TagSet` をそのまま検証する方が未登録キー・型不一致も
         // 同時に拾えて強いため。
         //
-        // 収益・費用のゼロ化明細と、元入金（Equity）の明細では**付けるタグが違う**
+        // 収益・費用のゼロ化明細と、元入金の明細では**付けるタグが違う**
         // （後者は常に空）ので、両方を対応する科目種別で検証する。同梱の
-        // `tags.yaml` は Equity に必須タグを課していないが、ユーザーが差し替えた
+        // `tags.yaml` は純資産に必須タグを課していないが、ユーザーが差し替えた
         // スキーマで課していた場合、ここで検証しないと決算処理の実行時まで発覚しない。
+        //
+        // 元入金の科目種別は `AccountType::Equity` を決め打ちせず、**勘定科目表に
+        // 実際に登録されている種別**（`capital_def.account_type`）を使う。
+        // 記帳時に `JournalEntry::new` がタグを検証するときに使うのはそちらであり、
+        // 決め打ちすると「構築時は通ったのに記帳時に落ちる」食い違いが生まれる
+        // （レビューで実際に再現された）。
         let zeroing_tags = build_zeroing_tags(tax_category.as_deref());
         let capital_tags = TagSet::new();
         for (account_type, tags) in [
             (AccountType::Revenue, &zeroing_tags),
             (AccountType::Expense, &zeroing_tags),
-            (AccountType::Equity, &capital_tags),
+            (capital_def.account_type, &capital_tags),
         ] {
             schema.validate(tags, account_type).map_err(|source| {
                 JpError::ClosingTagSchemaMismatch {
@@ -183,11 +240,50 @@ impl JpSoleProprietorClosingPolicy {
     }
 }
 
-fn require_account(chart: &ChartOfAccounts, code: &AccountCode, role: &str) -> Result<(), JpError> {
-    if chart.get(code).is_none() {
-        return Err(JpError::MissingClosingAccount {
+/// 決算科目が「存在し」「記帳可能」であることを構築時に検証し、
+/// 実際に登録されている定義を返す。
+///
+/// `postable` を見るのは、見出し科目（`postable: false`）を指定されると
+/// `closing_entries` は明細を作れてしまう一方、それを
+/// `kaikei_core::JournalEntry::new` に通した瞬間に `CoreError::NotPostable` で
+/// 拒否されるため。決算処理の実行時ではなく構築時に落とす（`DECISIONS.md` D-066）。
+///
+/// 戻り値の `AccountDef` は、タグスキーマ検証で**実際に登録されている科目種別**を
+/// 使うために必要（決め打ちすると、記帳時に使われる種別と食い違いうる）。
+fn require_account<'a>(
+    chart: &'a ChartOfAccounts,
+    code: &AccountCode,
+    role: &str,
+) -> Result<&'a AccountDef, JpError> {
+    let def = chart
+        .get(code)
+        .ok_or_else(|| JpError::MissingClosingAccount {
             role: role.to_string(),
             code: code.as_str().to_string(),
+        })?;
+
+    if !def.postable {
+        return Err(JpError::NotPostableClosingAccount {
+            role: role.to_string(),
+            code: code.as_str().to_string(),
+        });
+    }
+
+    Ok(def)
+}
+
+/// 決算科目どうしが別の科目コードであることを検証する。
+fn require_distinct(
+    a: &AccountCode,
+    b: &AccountCode,
+    role_a: &str,
+    role_b: &str,
+) -> Result<(), JpError> {
+    if a == b {
+        return Err(JpError::DuplicateClosingAccount {
+            role_a: role_a.to_string(),
+            role_b: role_b.to_string(),
+            code: a.as_str().to_string(),
         });
     }
     Ok(())
@@ -396,9 +492,11 @@ mod tests {
         JpSoleProprietorClosingPolicy::new(
             chart,
             &schema(),
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             None,
         )
         .unwrap()
@@ -644,9 +742,11 @@ mod tests {
         let err = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema(),
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             None,
         )
         .unwrap_err();
@@ -669,9 +769,11 @@ mod tests {
         let err = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema(),
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             None,
         )
         .unwrap_err();
@@ -694,9 +796,11 @@ mod tests {
         let err = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema(),
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             None,
         )
         .unwrap_err();
@@ -734,6 +838,147 @@ mod tests {
                 required_for: vec![AccountType::Revenue, AccountType::Expense],
             },
         )])
+    }
+
+    /// 決算科目に同じ科目コードを渡したら構築時に弾かれること。
+    ///
+    /// 3科目は定義上すべて別の科目。同じコードを許すと決算振替が意図しない
+    /// 科目に載る（`opening_entries` を実装したときに顕在化する）。
+    #[test]
+    fn new_rejects_duplicate_closing_account_codes() {
+        let chart = test_chart();
+
+        let result = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &TagSchema::empty(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("400").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
+            None,
+        );
+
+        match result {
+            Err(JpError::DuplicateClosingAccount {
+                role_a,
+                role_b,
+                code,
+            }) => {
+                assert_eq!(role_a, "元入金");
+                assert_eq!(role_b, "事業主貸");
+                assert_eq!(code, "400");
+            }
+            other => panic!("同じ科目コードの重複は構築時に弾くべき: {other:?}"),
+        }
+    }
+
+    /// 決算科目が見出し科目（`postable: false`）なら構築時に弾かれること。
+    ///
+    /// 見出し科目には記帳できないため、構築を許すと `closing_entries` は
+    /// 明細を作れる一方、それを `JournalEntry::new` に通した瞬間に
+    /// `CoreError::NotPostable` で落ちる。tax_category と同じ
+    /// 「構築時は通るが記帳時に落ちる」穴（レビューで再現された）。
+    #[test]
+    fn new_rejects_a_closing_account_that_is_not_postable() {
+        let chart = ChartOfAccounts::new(vec![
+            AccountDef {
+                code: AccountCode::parse("400").unwrap(),
+                name: "元入金（見出し）".to_string(),
+                account_type: AccountType::Equity,
+                parent: None,
+                postable: false,
+            },
+            account("410", "事業主貸", AccountType::Equity),
+            account("420", "事業主借", AccountType::Equity),
+            account("500", "売上高", AccountType::Revenue),
+            account("600", "仕入高", AccountType::Expense),
+        ])
+        .unwrap();
+
+        let result = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &TagSchema::empty(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
+            None,
+        );
+
+        match result {
+            Err(JpError::NotPostableClosingAccount { role, code }) => {
+                assert_eq!(role, "元入金");
+                assert_eq!(code, "400");
+            }
+            other => panic!("見出し科目は構築時に弾くべき: {other:?}"),
+        }
+    }
+
+    /// 元入金が `Equity` 以外として登録されていても、**実際の種別**で
+    /// タグ検証されること。
+    ///
+    /// `AccountType::Equity` を決め打ちすると、記帳時に使われる種別
+    /// （勘定科目表の登録内容）と食い違い、「構築時は通ったのに記帳時に
+    /// 落ちる」状態になる（レビューで再現された）。
+    #[test]
+    fn new_validates_capital_line_tags_against_the_registered_account_type() {
+        // 元入金を誤って Asset として登録した勘定科目表。
+        let chart = ChartOfAccounts::new(vec![
+            account("400", "元入金", AccountType::Asset),
+            account("410", "事業主貸", AccountType::Equity),
+            account("420", "事業主借", AccountType::Equity),
+            account("500", "売上高", AccountType::Revenue),
+            account("600", "仕入高", AccountType::Expense),
+        ])
+        .unwrap();
+
+        // Asset に必須タグを課すスキーマ。元入金の明細は常にタグ無しなので、
+        // 実際の種別（Asset）で検証すればここで弾ける。
+        let schema = TagSchema::new(vec![
+            (
+                TagKey::parse("tax_category").unwrap(),
+                kaikei_core::TagDef {
+                    value_type: kaikei_core::TagValueType::Code,
+                    aggregatable: true,
+                    required_for: vec![],
+                },
+            ),
+            (
+                TagKey::parse("project").unwrap(),
+                kaikei_core::TagDef {
+                    value_type: kaikei_core::TagValueType::Code,
+                    aggregatable: true,
+                    required_for: vec![AccountType::Asset],
+                },
+            ),
+        ]);
+
+        let result = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &schema,
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
+            Some("NOT_APPLICABLE".to_string()),
+        );
+
+        match result {
+            Err(JpError::ClosingTagSchemaMismatch {
+                account_type_label,
+                reason,
+            }) => {
+                assert_eq!(
+                    account_type_label, "資産",
+                    "決め打ちの「純資産」ではなく、登録されている種別で検証すること"
+                );
+                assert!(reason.contains("project"), "reason = {reason}");
+            }
+            other => panic!("登録種別（資産）で検証して弾くべき: {other:?}"),
+        }
     }
 
     /// `Equity` に必須タグを課すスキーマ（ユーザーが差し替えた場合を模す）。
@@ -776,9 +1021,11 @@ mod tests {
         let result = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema,
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             Some("NOT_APPLICABLE".to_string()),
         );
 
@@ -807,9 +1054,11 @@ mod tests {
         let policy = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema,
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             Some("NOT_APPLICABLE".to_string()),
         )
         .unwrap();
@@ -876,9 +1125,11 @@ mod tests {
         let err = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema,
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             None,
         )
         .unwrap_err();
@@ -914,9 +1165,11 @@ mod tests {
         let policy = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema,
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             None,
         )
         .unwrap();
@@ -931,9 +1184,11 @@ mod tests {
         let err = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema,
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             Some("NOT_APPLICABLE".to_string()),
         )
         .unwrap_err();
@@ -958,9 +1213,11 @@ mod tests {
         let err = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema,
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             None,
         )
         .unwrap_err();
@@ -973,9 +1230,11 @@ mod tests {
         let policy = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema,
-            AccountCode::parse("400").unwrap(),
-            AccountCode::parse("410").unwrap(),
-            AccountCode::parse("420").unwrap(),
+            ClosingAccounts {
+                capital: AccountCode::parse("400").unwrap(),
+                owner_drawings: AccountCode::parse("410").unwrap(),
+                owner_contributions: AccountCode::parse("420").unwrap(),
+            },
             Some("NOT_APPLICABLE".to_string()),
         )
         .unwrap();

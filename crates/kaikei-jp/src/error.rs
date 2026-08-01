@@ -207,6 +207,37 @@ pub enum JpError {
         code: String,
     },
 
+    /// 決算科目が見出し科目（`postable: false`）として登録されている。
+    ///
+    /// 見出し科目には記帳できない（`kaikei_core::JournalEntry::new` が
+    /// `CoreError::NotPostable` で拒否する）ため、決算処理を走らせた瞬間に
+    /// 失敗する。`MissingClosingAccount` と同じ理由で構築時に弾く。
+    #[error(
+        "決算科目「{role}」に指定された科目コード \"{code}\" は見出し科目（postable: false）です。         見出し科目には記帳できないため決算振替仕訳を作れません。         記帳可能な科目コードを指定するか、勘定科目表の postable を見直してください"
+    )]
+    NotPostableClosingAccount {
+        /// 対象の科目の役割（例: "元入金"）。
+        role: String,
+        /// 対象の科目コード。
+        code: String,
+    },
+
+    /// 決算科目に同じ科目コードが重複して指定されている。
+    ///
+    /// 元入金・事業主貸・事業主借は定義上すべて別の科目であり、同じコードを
+    /// 指定するのは設定ミス。放置すると決算振替が意図しない科目に載る。
+    #[error(
+        "決算科目「{role_a}」と「{role_b}」に同じ科目コード \"{code}\" が指定されています。         これらは別の科目である必要があります"
+    )]
+    DuplicateClosingAccount {
+        /// 一方の役割。
+        role_a: String,
+        /// もう一方の役割。
+        role_b: String,
+        /// 重複した科目コード。
+        code: String,
+    },
+
     /// 決算処理（[`crate::closing::JpSoleProprietorClosingPolicy`]）が生成する
     /// 収益・費用のゼロ化明細のタグが、構築時に渡された `TagSchema` の要件を
     /// 満たさない。

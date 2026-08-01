@@ -122,7 +122,9 @@ impl StatementPolicy for JpStatementPolicy {
             self.section("負債", AccountType::Liability, tb),
             self.section("純資産", AccountType::Equity, tb),
         ];
-        let total = tb.total_by_type(AccountType::Asset);
+        // 資産セクションの小計をそのまま使う（`total_by_type` を2度呼ばない）。
+        // 「total は資産の小計と必ず一致する」という不変条件をコードで表す。
+        let total = sections[0].subtotal;
         Statement {
             title: "貸借対照表".to_string(),
             sections,
@@ -142,8 +144,9 @@ impl StatementPolicy for JpStatementPolicy {
             self.section("収益", AccountType::Revenue, tb),
             self.section("費用", AccountType::Expense, tb),
         ];
-        let revenue_total = tb.total_by_type(AccountType::Revenue);
-        let expense_total = tb.total_by_type(AccountType::Expense);
+        // 各セクションの小計をそのまま使う（`total_by_type` を2度呼ばない）。
+        let revenue_total = sections[0].subtotal;
+        let expense_total = sections[1].subtotal;
         let total = revenue_total.sub(&expense_total).expect(
             "収益合計・費用合計は同一 TrialBalance 由来で通貨が一致することが保証されている \
              （TrialBalance::total_by_type の doc）ため、i128 の表現上限を超えない限り失敗しない \
