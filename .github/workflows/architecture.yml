@@ -174,8 +174,20 @@ jobs:
           # より広く見る（normal依存として混入した場合は kaikei-e2e が
           # kaikei-store に依存しているため循環依存となり、この時点で
           # 到達する前に `cargo tree` 自体がエラー終了して検出される）。
-          DEPENDENTS=$(cargo tree --invert kaikei-e2e --prefix none 2>&1 \
-                       | grep -v '^kaikei-e2e v' || true)
+          #
+          # stderr を stdout に混ぜない（`2>&1` にしない）。cargo は依存の
+          # ダウンロード進捗（`Downloaded quick-error v1.2.3` 等）を stderr に
+          # 出すため、混ぜると「kaikei-e2e に依存している crate」として
+          # 誤検知する。ローカルは依存がキャッシュ済みで進捗が出ないため
+          # 再現せず、**CI でだけ落ちる**（実際に踏んだ）。
+          #
+          # `cargo tree` 自体の失敗（normal 依存で混入した場合の循環依存など）は
+          # 終了コードで別に判定する。
+          if ! TREE=$(cargo tree --invert kaikei-e2e --prefix none); then
+            echo "::error::cargo tree が失敗しました（kaikei-e2e への循環依存の可能性）"
+            exit 1
+          fi
+          DEPENDENTS=$(echo "$TREE" | grep -v '^kaikei-e2e v' || true)
           if [ -n "$DEPENDENTS" ]; then
             echo "$DEPENDENTS"
             echo "::error::kaikei-e2e に依存している crate が見つかりました"
