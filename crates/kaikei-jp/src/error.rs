@@ -113,6 +113,35 @@ pub enum JpError {
         second_range: String,
     },
 
+    /// 勘定科目テンプレート（[`crate::chart`]）1ファイル分の内容が不正。
+    ///
+    /// YAML の構文自体は正しいが、`version`/`type`/科目コード等の値が期待する
+    /// 形式・範囲に収まっていない場合（`InvalidTaxCategoryTable` と同じ扱い）、
+    /// または `kaikei_core::ChartOfAccounts::new` が検証する不変条件（親科目の
+    /// 不在・循環参照・コード重複）に違反する場合に返す。後者は
+    /// `kaikei_core::CoreError` の `Display` をそのまま `reason` に含めるため、
+    /// 元の理由は失われない。
+    #[error("勘定科目テンプレート \"{label}\" が不正です: {reason}")]
+    InvalidChart {
+        /// 読み込み元の識別子（埋め込みYAMLの名称、またはファイルパス）。
+        label: String,
+        /// 不正の理由（次に何を直せばよいか分かる文言。`CLAUDE.md` §11）。
+        reason: String,
+    },
+
+    /// タグスキーマ（[`crate::tags`]）1ファイル分の内容が不正。
+    ///
+    /// YAML の構文自体は正しいが、`version`/`value_type`/`required_for`
+    /// 等の値が期待する形式・範囲に収まっていない場合、またはタグキーが
+    /// 重複している場合に返す（`InvalidTaxCategoryTable` と同じ扱い）。
+    #[error("タグスキーマ \"{label}\" が不正です: {reason}")]
+    InvalidTagSchema {
+        /// 読み込み元の識別子（埋め込みYAMLの名称、またはファイルパス）。
+        label: String,
+        /// 不正の理由（次に何を直せばよいか分かる文言。`CLAUDE.md` §11）。
+        reason: String,
+    },
+
     /// 税区分コードが、指定したマスタに存在しない。
     #[error(
         "税区分コード \"{code}\" は \"{table_label}\"（適用開始 {applies_from}）に存在しません\
@@ -128,4 +157,35 @@ pub enum JpError {
         /// そのマスタに存在する有効な税区分コード一覧（表示用に整形済み）。
         available: String,
     },
+
+    /// 家事按分（[`crate::household_split::household_split`]）の事業割合が
+    /// 0 以上 1 以下の範囲外。
+    ///
+    /// `kaikei_core::Ratio` 型自体は 0〜1 に制約されていない
+    /// （`Ratio::parse_rate` 経由なら 1 を超える値も、`Ratio::parse_fraction`
+    /// 経由なら 0〜1 の範囲に収まる値のみが構築できる。呼び出し側がどちらで
+    /// 構築したかを型からは区別できないため、ここで実行時に検証する）。
+    #[error(
+        "家事按分の事業割合は0以上1以下である必要があります: {ratio}。\
+         0%〜100%の範囲で指定してください"
+    )]
+    InvalidBusinessRatio {
+        /// 範囲外だった比率（表示用の10進文字列）。
+        ratio: String,
+    },
+
+    /// 家事按分（[`crate::household_split::household_split`]）の対象金額が0以下。
+    #[error(
+        "家事按分の対象金額は正の値である必要があります: {total}。\
+         0円または負の金額は按分できません"
+    )]
+    InvalidHouseholdSplitTotal {
+        /// 不正だった金額（表示用）。
+        total: String,
+    },
+
+    /// `kaikei-core` の演算（`Money::mul_ratio` / `Money::sub` /
+    /// `JournalLine::new` 等）が失敗した。
+    #[error(transparent)]
+    Core(#[from] kaikei_core::CoreError),
 }

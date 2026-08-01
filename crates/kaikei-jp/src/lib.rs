@@ -14,8 +14,27 @@
 //!   適用マスタの選択（[`tax::TaxRuleSets`]。PR-3）、および
 //!   `kaikei-policy::TaxPolicy` の実装（[`tax::JpTaxPolicy`] /
 //!   [`tax::JpSettings`]。PR-4）
+//! - [`chart`][]: 勘定科目テンプレート（`kaikei-jp-data/chart/*.yaml`）→
+//!   `kaikei_core::ChartOfAccounts`（`docs/04-jp-tax.md` §5。PR-5）
+//! - [`tags`][]: タグスキーマ（`kaikei-jp-data/tags.yaml`）→
+//!   `kaikei_core::TagSchema`（`docs/04-jp-tax.md` §4。PR-5）
+//! - [`household_split`][]: 家事按分ヘルパー（[`household_split::household_split`]）。
+//!   `kaikei-policy::TaxPolicy` の実装ではなく単独の関数（`docs/04-jp-tax.md`
+//!   §8。PR-6）
 //!
-//! 科目表 / `TagSchema` のロード（PR-5）はまだ実装していない。
+//! # ローダの命名規約
+//!
+//! YAML を読む入口は2種類あり、**名前でどちらかが分かる**ようにしてある。
+//!
+//! | 形 | 命名 | 例 |
+//! |---|---|---|
+//! | 自由関数（返す型が `kaikei-core` のもので、孤児則によりメソッドを生やせない） | `load_*` | [`chart::load_embedded`] / [`tags::load_from_path`] |
+//! | 関連関数（返す型が `kaikei-jp` 自身のもの＝コンストラクタ） | `Type::from_*` | [`tax::TaxCategoryTable::from_embedded`] |
+//!
+//! `load_` と `from_` が混在しているのは統一漏れではなく、
+//! **`Type::from_x` が Rust の慣用的なコンストラクタ名**であるのに対し、
+//! 自由関数側は「何を返すか」が名前から分からないため動詞を残している、という区別。
+//! 新しいローダを足すときはこの表に従うこと。
 //!
 //! # 依存方向
 //!
@@ -41,9 +60,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-// モジュール doc の説明順（土台 → その上に乗るもの）と揃える。
-// アルファベット順ではないのは、読み手が doc の順にファイルを辿れるようにするため。
+// `mod` の並びは `cargo fmt`（`reorder_modules`）がアルファベット順に強制する。
+// 読み手向けの解説順（土台 → その上に乗るもの）は上の「モジュール構成」に譲り、
+// ここでは fmt に任せる。
+mod account_type;
+pub mod chart;
 pub mod error;
+pub mod household_split;
 pub mod invoice;
+pub mod tags;
 pub mod tax;
+#[cfg(test)]
+mod test_support;
 pub mod yaml;

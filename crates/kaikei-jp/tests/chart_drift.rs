@@ -18,33 +18,24 @@
 //! そこで、`test_chart()` の**ソースそのもの**を読んで科目定義を抽出する。
 //! `kaikei-core` の当該ファイルはリポジトリ内に実在するので、
 //! `CARGO_MANIFEST_DIR` からの相対パスで読める（crate 依存は発生しない）。
+//!
+//! # `sole_proprietor.yaml` 側は本番ローダ（`kaikei_jp::chart`）で読む
+//!
+//! この PR（Phase 2 PR-5）より前は、`sole_proprietor.yaml` を読むための
+//! 独自の `AccountYaml`/`ChartYaml` スキーマ型をこのテストファイルだけが
+//! 持っていた。本 PR で `kaikei_jp::chart` という正式なローダができたため、
+//! それをそのまま使うように書き換えた。独自スキーマ型を残して2つの
+//! パース経路を併存させると、`kaikei_jp::chart` 側だけがフィールドを
+//! 追加・変更したときにこのテストが追随せず気づけない
+//! （`deny_unknown_fields` はスキーマの**形**の齟齬しか検出できず、
+//! 「本番ローダが実際に返すドメイン値」との齟齬は検出できない）。
+//! 本番ローダを直接使うことで、このテストは「乖離検出」に加えて
+//! 「本番ローダが実データを読める」ことも同時に検証する
+//! （`kaikei_jp::chart` 自身の単体テストと重複はあるが、実データに対する
+//! 検証は多重に行われていても害はない）。
 
-use kaikei_jp::yaml::load_embedded;
-use serde::Deserialize;
+use kaikei_core::ChartOfAccounts;
 use std::path::PathBuf;
-
-/// `sole_proprietor.yaml` の科目1件分のスキーマ。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AccountYaml {
-    code: String,
-    name: String,
-    #[serde(rename = "type")]
-    account_type: String,
-    #[allow(dead_code)] // 比較には使わないが deny_unknown_fields のため受け取る
-    sort: i64,
-}
-
-/// `sole_proprietor.yaml` 全体のスキーマ。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChartYaml {
-    #[allow(dead_code)]
-    version: u32,
-    #[allow(dead_code)]
-    name: String,
-    accounts: Vec<AccountYaml>,
-}
 
 /// `test_chart()` のソースから抽出した科目1件。
 #[derive(Debug, PartialEq)]
@@ -239,9 +230,16 @@ fn unquote(s: &str) -> Option<&str> {
     s.strip_prefix('"')?.strip_suffix('"')
 }
 
-fn load_chart_yaml() -> ChartYaml {
-    load_embedded(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+fn load_chart_yaml() -> ChartOfAccounts {
+    kaikei_jp::chart::load_embedded(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
         .expect("sole_proprietor.yaml は常にパース可能であるべき")
+}
+
+/// `kaikei_core::AccountType` を `test_chart()` の抽出結果（`AccountType::Asset`
+/// の `Asset` 部分）と同じ表記の文字列にする。`AccountType` はフィールドを
+/// 持たない列挙型で `Debug` はバリアント名をそのまま返すため、これで一致する。
+fn account_type_label(account_type: kaikei_core::AccountType) -> String {
+    format!("{account_type:?}")
 }
 
 #[test]
@@ -256,7 +254,10 @@ fn test_chart_matches_sole_proprietor_yaml() {
             continue;
         }
 
-        match chart.accounts.iter().find(|a| a.code == account.code) {
+        let code = kaikei_core::AccountCode::parse(&account.code)
+            .unwrap_or_else(|e| panic!("test_chart() の科目コードが不正です: {e}"));
+
+        match chart.get(&code) {
             None => {
                 mismatches.push(format!(
                     "{}: test_chart() には存在しますが sole_proprietor.yaml に存在しません",
@@ -271,10 +272,11 @@ fn test_chart_matches_sole_proprietor_yaml() {
                         account.code, account.name, found.name
                     ));
                 }
-                if found.account_type != account.account_type {
+                let found_type = account_type_label(found.account_type);
+                if found_type != account.account_type {
                     mismatches.push(format!(
                         "{}: 種別が不一致です（test_chart()={} / sole_proprietor.yaml={}）",
-                        account.code, account.account_type, found.account_type
+                        account.code, account.account_type, found_type
                     ));
                 }
             }
@@ -297,9 +299,10 @@ fn test_chart_matches_sole_proprietor_yaml() {
 #[test]
 fn code_999_is_intentionally_absent_from_yaml() {
     let chart = load_chart_yaml();
+    let code_999 = kaikei_core::AccountCode::parse("999").unwrap();
 
     assert!(
-        chart.accounts.iter().all(|a| a.code != "999"),
+        chart.get(&code_999).is_none(),
         "\"999\" は test_chart() 専用のダミー科目のはずですが、\
          sole_proprietor.yaml に実在しています。EXCLUDED_FROM_YAML の除外理由を見直してください"
     );

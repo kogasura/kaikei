@@ -176,6 +176,11 @@ categories:
 
 新しいタグキーを使う前に必ずここへ登録する。core が未登録キーを拒否する。
 
+`kaikei-jp::tags`（PR-5）が YAML → `kaikei_core::TagSchema` のロードを行う。
+埋め込みデータ（`kaikei_jp_data::TAGS`）と任意パスからの差し替えの両方に対応する。
+各タグ定義が持つ `description` は `kaikei_core::TagDef` に対応するフィールドが
+無いため、ロード時に破棄する（`DECISIONS.md` D-062）。
+
 ---
 
 ## 5. 勘定科目テンプレート
@@ -191,6 +196,14 @@ categories:
 | 400 | 元入金 | Equity | 年に1回だけ動く |
 | 410 | 事業主貸 | Equity | 期首でゼロにリセット |
 | 420 | 事業主借 | Equity | 期首でゼロにリセット |
+
+### ローダ（PR-5）
+
+`kaikei-jp::chart` が YAML → `kaikei_core::ChartOfAccounts` のロードを行う。
+埋め込みデータ（`kaikei_jp_data::CHART_SOLE_PROPRIETOR`）と任意パスからの
+差し替えの両方に対応する。`postable`・`parent` は省略可能（省略時はそれぞれ
+`true`・`None`）。`sort` は `kaikei_core::AccountDef` に対応するフィールドが
+無いためロード時に破棄する（`DECISIONS.md` D-061）。
 
 ---
 
@@ -287,13 +300,14 @@ impl InvoiceRegistrationNo {
 ## 8. 家事按分
 
 ```rust
+// crates/kaikei-jp/src/household_split.rs（実装済み）
 pub struct HouseholdSplitInput {
     pub total: Money,
     pub business_ratio: Ratio,
     pub expense_account: AccountCode,   // 地代家賃など
     pub owner_account: AccountCode,     // 事業主貸
     pub payment_account: AccountCode,   // 現金・預金
-    pub tax_category: Option<TaxCategoryCode>,
+    pub tax_category: Option<String>,   // 税区分コード。実在確認はここではしない
 }
 
 /// 按分後の明細を生成する。按分率は tags に残す
@@ -302,6 +316,18 @@ pub fn household_split(
     settings: &JpSettings,
 ) -> Result<Vec<JournalLine>, JpError>;
 ```
+
+`tax_category` は `TaxCategoryCode` のような専用型にしない。この関数は
+税区分マスタ（`TaxRuleSets`）も取引日も持たないため、渡された文字列が実在する
+区分かを検証できない。実在確認は記帳時に `TaxPolicy::validate_tag` が行う
+（`DECISIONS.md` D-064）。
+
+**`tax_category` は型の上では `Option` だが、実質的にはほぼ必須。**
+`tags.yaml` の `tax_category` は `required_for: [Revenue, Expense]` であり、
+`expense_account` に費用科目（地代家賃など）を指定する限り、`None` のまま
+`JournalEntry::new` に渡すと `MissingRequiredTag` で弾かれる。
+`household_split` 自身が弾かないのは、`ChartOfAccounts` を持たず科目種別を
+判定できないため（ユーザーが差し替えた科目表では分類が違いうる）。
 
 ### 出力例（家賃 100,000 / 事業割合 30%）
 
