@@ -17,22 +17,20 @@
 
 mod common;
 
+use common::AllOpen;
+use kaikei_app::error::{AppError, RepoError};
 use kaikei_app::ports::JournalRepo;
 use kaikei_app::tx::with_tx;
 use kaikei_core::{
-    AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, Currency, EntryId,
-    EntryNumber, FiscalYear, FixedClock, JournalEntry, JournalLine, Money, NewEntry, PeriodGuard,
-    PeriodStatus, Side, TagKey, TagSchema, TagSet, TagValue, Timestamp,
+    AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, Currency, DocumentRef,
+    EntryId, EntryNumber, FiscalYear, FixedClock, JournalEntry, JournalLine, Money, NewEntry, Side,
+    TagDef, TagKey, TagSchema, TagSet, TagValue, TagValueType, Timestamp,
 };
 use kaikei_store::pool::PgStore;
+use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-
-struct AllOpen;
-impl PeriodGuard for AllOpen {
-    fn status(&self, _date: AccountingDate) -> PeriodStatus {
-        PeriodStatus::Open
-    }
-}
 
 fn chart() -> ChartOfAccounts {
     ChartOfAccounts::new(vec![
@@ -61,16 +59,46 @@ fn chart() -> ChartOfAccounts {
     .unwrap()
 }
 
-/// `business_ratio`（decimal）タグを集計軸として登録した最小限のスキーマ。
+/// `TagValue` の4バリアントそれぞれに対応するタグキーを登録したスキーマ
+/// （`business_ratio`=Decimal, `memo_text`=Text, `tax_code`=Code,
+/// `memo_date`=Date）。いずれも集計要件の都合ではなく、NULバイト拒否
+/// （`journal::reject_nul`）や proptest がタグの4バリアントを組み合わせて
+/// 生成できるようにするためのテスト専用スキーマ。
 fn schema() -> TagSchema {
-    TagSchema::new(vec![(
-        TagKey::parse("business_ratio").unwrap(),
-        kaikei_core::TagDef {
-            value_type: kaikei_core::TagValueType::Decimal,
-            aggregatable: true,
-            required_for: Vec::new(),
-        },
-    )])
+    TagSchema::new(vec![
+        (
+            TagKey::parse("business_ratio").unwrap(),
+            TagDef {
+                value_type: TagValueType::Decimal,
+                aggregatable: true,
+                required_for: Vec::new(),
+            },
+        ),
+        (
+            TagKey::parse("memo_text").unwrap(),
+            TagDef {
+                value_type: TagValueType::Text,
+                aggregatable: false,
+                required_for: Vec::new(),
+            },
+        ),
+        (
+            TagKey::parse("tax_code").unwrap(),
+            TagDef {
+                value_type: TagValueType::Code,
+                aggregatable: true,
+                required_for: Vec::new(),
+            },
+        ),
+        (
+            TagKey::parse("memo_date").unwrap(),
+            TagDef {
+                value_type: TagValueType::Date,
+                aggregatable: false,
+                required_for: Vec::new(),
+            },
+        ),
+    ])
 }
 
 fn build_entry(
@@ -467,4 +495,480 @@ async fn round_trip_preserves_multiple_lines_and_memo(
     let found = found.unwrap();
     assert_eq!(found.lines().len(), 3);
     assert_entries_equal(&entry, &found);
+}
+
+// ---- insert_entry の書き込み時防御（document_refs非対応・NULバイト拒否）----
+//
+// `journal::PgTx::insert_entry` は F-1（document_refs非対応）と R12（NULバイト
+// 摘要の拒否）の2つを検証しているが、修正前はどちらもテストから一度も実行
+// されていなかった。ここで両方の防御を、拡張された適用範囲（摘要・明細メモ・
+// 逆仕訳理由・タグのText/Code値）を含めて検証する。
+
+#[sqlx::test]
+async fn insert_entry_rejects_non_empty_document_refs(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let store = store_for(pool_opts, conn_opts).await;
+
+    let fy = FiscalYear::calendar_year(2026);
+    let clock = FixedClock(Timestamp::from_unix_nanos(1_700_000_000_000_000));
+    let entry = JournalEntry::new(
+        NewEntry {
+            id: EntryId::new(900),
+            entry_no: EntryNumber::new(1),
+            entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
+            description: "証憑付き仕訳".to_string(),
+            lines: vec![
+                line("100", Side::Debit, 1_000, Currency::JPY),
+                line("500", Side::Credit, 1_000, Currency::JPY),
+            ],
+            document_refs: vec![DocumentRef {
+                document_id: 1,
+                label: "領収書".to_string(),
+            }],
+        },
+        &fy,
+        &chart(),
+        &schema(),
+        &AllOpen,
+        &clock,
+    )
+    .unwrap();
+
+    let result: Result<(), AppError> = with_tx(&store, |tx| {
+        let entry = entry.clone();
+        Box::pin(async move {
+            tx.insert_entry(&entry).await?;
+            Ok(())
+        })
+    })
+    .await;
+
+    match result {
+        Err(AppError::Repo(RepoError::Unsupported { .. })) => {}
+        other => panic!("RepoError::Unsupported を期待しましたが {other:?} でした"),
+    }
+}
+
+#[sqlx::test]
+async fn insert_entry_rejects_description_with_nul_byte(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let store = store_for(pool_opts, conn_opts).await;
+
+    // JournalEntry::new の摘要検証は trim().is_empty() のみで NUL を拒否しない
+    // ため、構築自体は成功する。insert_entry 側の防御を検証する。
+    let entry = build_entry(
+        901,
+        1,
+        AccountingDate::new(2026, 4, 1).unwrap(),
+        2026,
+        "テスト\0仕訳",
+        vec![
+            line("100", Side::Debit, 1_000, Currency::JPY),
+            line("500", Side::Credit, 1_000, Currency::JPY),
+        ],
+        1_700_000_000_000_000,
+    );
+
+    let result: Result<(), AppError> = with_tx(&store, |tx| {
+        let entry = entry.clone();
+        Box::pin(async move {
+            tx.insert_entry(&entry).await?;
+            Ok(())
+        })
+    })
+    .await;
+
+    match result {
+        Err(AppError::Repo(RepoError::Corrupt { .. })) => {}
+        other => panic!("RepoError::Corrupt を期待しましたが {other:?} でした"),
+    }
+}
+
+#[sqlx::test]
+async fn insert_entry_rejects_memo_with_nul_byte(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let store = store_for(pool_opts, conn_opts).await;
+
+    let debit_line = JournalLine::new(
+        AccountCode::parse("100").unwrap(),
+        Side::Debit,
+        Money::from_minor(1_000, Currency::JPY),
+        TagSet::new(),
+        Some("メモ\0".to_string()),
+    )
+    .unwrap();
+    let credit_line = line("500", Side::Credit, 1_000, Currency::JPY);
+
+    let entry = build_entry(
+        902,
+        1,
+        AccountingDate::new(2026, 4, 1).unwrap(),
+        2026,
+        "テスト仕訳",
+        vec![debit_line, credit_line],
+        1_700_000_000_000_000,
+    );
+
+    let result: Result<(), AppError> = with_tx(&store, |tx| {
+        let entry = entry.clone();
+        Box::pin(async move {
+            tx.insert_entry(&entry).await?;
+            Ok(())
+        })
+    })
+    .await;
+
+    match result {
+        Err(AppError::Repo(RepoError::Corrupt { .. })) => {}
+        other => panic!("RepoError::Corrupt を期待しましたが {other:?} でした"),
+    }
+}
+
+#[sqlx::test]
+async fn insert_entry_rejects_reverse_reason_with_nul_byte(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let store = store_for(pool_opts, conn_opts).await;
+
+    let original = build_entry(
+        903,
+        1,
+        AccountingDate::new(2026, 4, 1).unwrap(),
+        2026,
+        "元の仕訳",
+        vec![
+            line("100", Side::Debit, 1_000, Currency::JPY),
+            line("500", Side::Credit, 1_000, Currency::JPY),
+        ],
+        1_700_000_000_000_000,
+    );
+
+    let fy = FiscalYear::calendar_year(2026);
+    let clock = FixedClock(Timestamp::from_unix_nanos(1_700_000_100_000_000));
+    let reversal = original
+        .reverse(
+            EntryId::new(904),
+            EntryNumber::new(2),
+            AccountingDate::new(2026, 4, 2).unwrap(),
+            "理由\0".to_string(),
+            &fy,
+            &chart(),
+            &schema(),
+            &AllOpen,
+            &clock,
+        )
+        .unwrap();
+
+    // NULバイトの検出はSQL発行前のRust側で行われるため、元仕訳が実際に
+    // DBへ保存されているかどうかに関わらずここで拒否される。
+    let result: Result<(), AppError> = with_tx(&store, |tx| {
+        let reversal = reversal.clone();
+        Box::pin(async move {
+            tx.insert_entry(&reversal).await?;
+            Ok(())
+        })
+    })
+    .await;
+
+    match result {
+        Err(AppError::Repo(RepoError::Corrupt { .. })) => {}
+        other => panic!("RepoError::Corrupt を期待しましたが {other:?} でした"),
+    }
+}
+
+#[sqlx::test]
+async fn insert_entry_rejects_tag_text_value_with_nul_byte(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let store = store_for(pool_opts, conn_opts).await;
+
+    let mut tags = TagSet::new();
+    tags.insert(
+        TagKey::parse("memo_text").unwrap(),
+        TagValue::Text("備考\0".to_string()),
+    );
+    let debit_line = JournalLine::new(
+        AccountCode::parse("100").unwrap(),
+        Side::Debit,
+        Money::from_minor(1_000, Currency::JPY),
+        tags,
+        None,
+    )
+    .unwrap();
+    let credit_line = line("500", Side::Credit, 1_000, Currency::JPY);
+
+    let entry = build_entry(
+        905,
+        1,
+        AccountingDate::new(2026, 4, 1).unwrap(),
+        2026,
+        "テスト仕訳",
+        vec![debit_line, credit_line],
+        1_700_000_000_000_000,
+    );
+
+    let result: Result<(), AppError> = with_tx(&store, |tx| {
+        let entry = entry.clone();
+        Box::pin(async move {
+            tx.insert_entry(&entry).await?;
+            Ok(())
+        })
+    })
+    .await;
+
+    match result {
+        Err(AppError::Repo(RepoError::Corrupt { .. })) => {}
+        other => panic!("RepoError::Corrupt を期待しましたが {other:?} でした"),
+    }
+}
+
+#[sqlx::test]
+async fn insert_entry_rejects_tag_code_value_with_nul_byte(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let store = store_for(pool_opts, conn_opts).await;
+
+    let mut tags = TagSet::new();
+    tags.insert(
+        TagKey::parse("tax_code").unwrap(),
+        TagValue::Code("A\0".to_string()),
+    );
+    let debit_line = JournalLine::new(
+        AccountCode::parse("100").unwrap(),
+        Side::Debit,
+        Money::from_minor(1_000, Currency::JPY),
+        tags,
+        None,
+    )
+    .unwrap();
+    let credit_line = line("500", Side::Credit, 1_000, Currency::JPY);
+
+    let entry = build_entry(
+        906,
+        1,
+        AccountingDate::new(2026, 4, 1).unwrap(),
+        2026,
+        "テスト仕訳",
+        vec![debit_line, credit_line],
+        1_700_000_000_000_000,
+    );
+
+    let result: Result<(), AppError> = with_tx(&store, |tx| {
+        let entry = entry.clone();
+        Box::pin(async move {
+            tx.insert_entry(&entry).await?;
+            Ok(())
+        })
+    })
+    .await;
+
+    match result {
+        Err(AppError::Repo(RepoError::Corrupt { .. })) => {}
+        other => panic!("RepoError::Corrupt を期待しましたが {other:?} でした"),
+    }
+}
+
+// ---- proptest: save→find の全フィールド一致を明細本数・金額・タグ・メモの
+//      組み合わせにわたって検証する ----
+//
+// `proptest!` マクロは同期関数のみを対象にするため、そのままでは非同期の
+// DBアクセス（`#[sqlx::test]` が提供する接続）と組み合わせられない
+// （`#[sqlx::test]` は current-thread の tokio ランタイム上で実行されるため、
+// マクロ内から別ランタイムをネストして `block_on` すると
+// "Cannot start a runtime from within a runtime" になる）。そのため、
+// `proptest::strategy::Strategy::new_tree` / `TestRunner` を直接使い、
+// 生成した値をそのまま `.await` する（`proptest!` マクロが内部で行っている
+// ことと同じ生成処理を、非同期コンテキストの中で手動に行うだけ）。
+
+/// 仕訳明細1組（貸方・借方が同額になるペア）の生成仕様。
+#[derive(Debug, Clone)]
+struct PairSpec {
+    amount: i128,
+    debit_account: &'static str,
+    credit_account: &'static str,
+    debit_memo: Option<String>,
+    credit_memo: Option<String>,
+    debit_tags: TagSet,
+    credit_tags: TagSet,
+}
+
+fn any_amount() -> impl Strategy<Value = i128> {
+    // 明細は最大50行（25組）まで生成されうるため、貸借判定の遅延制約トリガ
+    // （`assert_entry_is_balanced`、`journal_lines.amount_minor` は `BIGINT`）が
+    // `SUM` でオーバーフローしない範囲に上限を抑える。i64::MAX そのものの
+    // 境界（明細2行）は `round_trip_preserves_amount_at_bigint_upper_boundary`
+    // で別途検証済みなので、ここでは「i64::MAX に近い大きな値」を明示的に
+    // 含める（Phase 0の教訓: 生成器のレンジを実務的な値に狭めない）。
+    let large = i128::from(i64::MAX) / 64;
+    prop_oneof![
+        6 => 1i128..=1_000_000_000i128,
+        2 => 1i128..=large,
+        1 => Just(large),
+        1 => Just(1i128),
+    ]
+}
+
+fn any_account() -> impl Strategy<Value = &'static str> {
+    prop_oneof![Just("100"), Just("500"), Just("600")]
+}
+
+fn any_memo() -> impl Strategy<Value = Option<String>> {
+    prop_oneof![
+        3 => Just(None),
+        1 => "[a-zA-Z0-9 ぁ-んァ-ヶ一-龠]{0,16}".prop_map(Some),
+    ]
+}
+
+/// `TagValue` の4バリアントのいずれか1つ（または「タグ無し」）を生成する。
+fn any_tag_entry() -> impl Strategy<Value = Option<(TagKey, TagValue)>> {
+    prop_oneof![
+        3 => Just(None),
+        1 => (0i64..=999_999i64, 0u32..=6u32).prop_map(|(mantissa, scale)| {
+            Some((
+                TagKey::parse("business_ratio").unwrap(),
+                TagValue::Decimal(rust_decimal::Decimal::new(mantissa, scale)),
+            ))
+        }),
+        1 => "[a-zA-Zぁ-んー0-9 ]{0,16}".prop_map(|s| {
+            Some((TagKey::parse("memo_text").unwrap(), TagValue::Text(s)))
+        }),
+        1 => "[A-Z]{1,4}[0-9]{0,4}".prop_map(|s| {
+            Some((TagKey::parse("tax_code").unwrap(), TagValue::Code(s)))
+        }),
+        1 => (2000i32..=2100i32, 1u8..=12u8, 1u8..=28u8).prop_map(|(y, m, d)| {
+            Some((
+                TagKey::parse("memo_date").unwrap(),
+                TagValue::Date(AccountingDate::new(y, m, d).unwrap()),
+            ))
+        }),
+    ]
+}
+
+/// 0〜2個のタグを組み合わせる（複数バリアントの同時使用をカバーする）。
+fn any_tags() -> impl Strategy<Value = TagSet> {
+    proptest::collection::vec(any_tag_entry(), 0..=2).prop_map(|picked| {
+        let mut tags = TagSet::new();
+        for tag in picked.into_iter().flatten() {
+            tags.insert(tag.0, tag.1);
+        }
+        tags
+    })
+}
+
+fn any_pair() -> impl Strategy<Value = PairSpec> {
+    (
+        any_amount(),
+        any_account(),
+        any_account(),
+        any_memo(),
+        any_memo(),
+        any_tags(),
+        any_tags(),
+    )
+        .prop_map(
+            |(
+                amount,
+                debit_account,
+                credit_account,
+                debit_memo,
+                credit_memo,
+                debit_tags,
+                credit_tags,
+            )| {
+                PairSpec {
+                    amount,
+                    debit_account,
+                    credit_account,
+                    debit_memo,
+                    credit_memo,
+                    debit_tags,
+                    credit_tags,
+                }
+            },
+        )
+}
+
+/// 明細本数2〜50行（1〜25組）を生成する。
+fn any_entry_spec() -> impl Strategy<Value = Vec<PairSpec>> {
+    proptest::collection::vec(any_pair(), 1..=25)
+}
+
+fn build_lines_from_pairs(pairs: &[PairSpec]) -> Vec<JournalLine> {
+    let mut lines = Vec::with_capacity(pairs.len() * 2);
+    for pair in pairs {
+        lines.push(
+            JournalLine::new(
+                AccountCode::parse(pair.debit_account).unwrap(),
+                Side::Debit,
+                Money::from_minor(pair.amount, Currency::JPY),
+                pair.debit_tags.clone(),
+                pair.debit_memo.clone(),
+            )
+            .unwrap(),
+        );
+        lines.push(
+            JournalLine::new(
+                AccountCode::parse(pair.credit_account).unwrap(),
+                Side::Credit,
+                Money::from_minor(pair.amount, Currency::JPY),
+                pair.credit_tags.clone(),
+                pair.credit_memo.clone(),
+            )
+            .unwrap(),
+        );
+    }
+    lines
+}
+
+#[sqlx::test]
+async fn round_trip_property_preserves_arbitrary_valid_entries(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let store = store_for(pool_opts, conn_opts).await;
+
+    let strategy = any_entry_spec();
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(40));
+
+    for case in 0u32..40 {
+        let pairs = strategy
+            .new_tree(&mut runner)
+            .expect("proptest: 値の生成に失敗しました")
+            .current();
+        let lines = build_lines_from_pairs(&pairs);
+
+        let entry = build_entry(
+            2_000_000 + u128::from(case),
+            case + 1,
+            AccountingDate::new(2026, 4, 1).unwrap(),
+            2026,
+            "proptestで生成した仕訳",
+            lines,
+            1_700_000_000_000_000,
+        );
+
+        let found: Option<JournalEntry> = with_tx(&store, |tx| {
+            let entry = entry.clone();
+            Box::pin(async move {
+                tx.insert_entry(&entry).await?;
+                Ok(tx.find_entry(entry.id()).await?)
+            })
+        })
+        .await
+        .unwrap_or_else(|e| panic!("case={case} pairs={pairs:?}: with_tx が失敗しました: {e}"));
+
+        let found = found.unwrap_or_else(|| {
+            panic!("case={case} pairs={pairs:?}: 保存した仕訳が見つかりませんでした")
+        });
+        assert_entries_equal(&entry, &found);
+    }
 }

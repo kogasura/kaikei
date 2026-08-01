@@ -19,8 +19,23 @@
 
 #![allow(dead_code)]
 
+use kaikei_core::{AccountingDate, PeriodGuard, PeriodStatus};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+
+/// 常に `Open` を返す `PeriodGuard`（テスト用）。
+///
+/// `round_trip.rs` と `trial_balance_differential.rs` の双方が同一の定義を
+/// 個別に持っていた重複を解消するため、ここに1つだけ定義する
+/// （`kaikei_app::period_guard` には依存しない。`kaikei-store` は app 層の
+/// テスト用 fake ではなく core 型のみを使う）。
+pub struct AllOpen;
+
+impl PeriodGuard for AllOpen {
+    fn status(&self, _date: AccountingDate) -> PeriodStatus {
+        PeriodStatus::Open
+    }
+}
 
 /// `KAIKEI_APP_PASSWORD` を環境変数から読む。未設定なら明示的に panic する。
 ///

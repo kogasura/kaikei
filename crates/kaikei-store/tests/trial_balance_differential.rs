@@ -30,14 +30,14 @@
 
 mod common;
 
+use common::AllOpen;
 use kaikei_app::error::RepoError;
 use kaikei_app::ports::TrialBalanceQuery;
 use kaikei_app::view::GroupKeyView;
 use kaikei_core::{
     AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, CoreError, Currency,
-    EntryId, EntryNumber, FiscalYear, FixedClock, JournalEntry, JournalLine, Money, NewEntry,
-    PeriodGuard, PeriodStatus, Side, TagDef, TagKey, TagSchema, TagSet, TagValue, TagValueType,
-    Timestamp, TrialBalance,
+    EntryId, EntryNumber, FiscalYear, FixedClock, JournalEntry, JournalLine, Money, NewEntry, Side,
+    TagDef, TagKey, TagSchema, TagSet, TagValue, TagValueType, Timestamp, TrialBalance,
 };
 use kaikei_store::convert::{
     account_type_to_i16, accounting_date_to_naive_date, entry_no_to_i32, money_to_columns,
@@ -48,16 +48,6 @@ use kaikei_store::tags::tag_set_to_json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use uuid::Uuid;
-
-/// 常にOpenを返す`PeriodGuard`（テスト用。`kaikei_app::period_guard`には
-/// 依存しない。`kaikei-store`はapp層のtesting fakeではなくcore型のみを使う）。
-struct AllOpen;
-
-impl PeriodGuard for AllOpen {
-    fn status(&self, _date: AccountingDate) -> PeriodStatus {
-        PeriodStatus::Open
-    }
-}
 
 fn code(s: &str) -> AccountCode {
     AccountCode::parse(s).unwrap()

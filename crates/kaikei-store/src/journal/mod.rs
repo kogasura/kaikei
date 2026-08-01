@@ -19,8 +19,26 @@ use async_trait::async_trait;
 use kaikei_app::error::RepoError;
 use kaikei_app::id::{entry_id_from_uuid, entry_id_to_uuid};
 use kaikei_app::ports::JournalRepo;
-use kaikei_core::{EntryId, EntryNumber, JournalEntry};
+use kaikei_core::{EntryId, EntryNumber, JournalEntry, TagValue};
 use row::{EntryRows, JournalEntryRow, JournalLineRow};
+
+/// PostgreSQL の `text`/`jsonb` は U+0000（NUL）を格納できない。
+///
+/// `JournalEntry::new` の摘要検証は `trim().is_empty()` のみで NUL を拒否せず、
+/// `JournalLine::new` も明細メモ・タグの `Text`/`Code` 値に対して同様の検証を
+/// 行わない（phase1計画 R12）。ドメイン検証を通過したデータが保存段階で
+/// 分かりにくい DB エラーとして落ちるのを避けるため、`insert_entry` が
+/// 摘要・明細メモ・逆仕訳理由・タグの `Text`/`Code` 値のすべてに対してこの
+/// 関数で明示的に検出する（`DECISIONS.md` D-041 の適用範囲を拡張）。
+fn reject_nul(s: &str) -> Result<(), RepoError> {
+    if s.contains('\0') {
+        return Err(RepoError::Corrupt {
+            reason: "保存しようとした文字列に制御文字（NUL）が含まれているため保存できません"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
 
 #[async_trait]
 impl JournalRepo for PgTx<'_> {
@@ -92,15 +110,26 @@ impl JournalRepo for PgTx<'_> {
             });
         }
 
-        // phase1計画 R12（人間確認事項）: PostgreSQL の text は U+0000（NUL）を
-        // 格納できないが、`JournalEntry::new` の摘要検証は `trim().is_empty()`
-        // のみで NUL を拒否しない。ドメイン検証を通過したデータが保存段階で
-        // 分かりにくい DB エラーとして落ちるのを避けるため、ここで明示的に
-        // 検出して意味のある RepoError::Corrupt を返す。
-        if entry.description().contains('\0') {
-            return Err(RepoError::Corrupt {
-                reason: "摘要に制御文字（NUL）が含まれているため保存できません".to_string(),
-            });
+        // phase1計画 R12（人間確認事項）: 摘要・明細メモ・逆仕訳理由・タグの
+        // Text/Code 値のすべてに NUL バイト拒否を適用する（`reject_nul` の doc
+        // を参照。修正前は摘要のみに適用されており、memo/reverse_reason/タグ
+        // 値が素通りしていた）。
+        reject_nul(entry.description())?;
+        if let Some(reason) = entry.reverse_reason() {
+            reject_nul(reason)?;
+        }
+        for line in entry.lines() {
+            if let Some(memo) = line.memo() {
+                reject_nul(memo)?;
+            }
+            for (_, value) in line.tags().iter() {
+                match value {
+                    TagValue::Text(s) | TagValue::Code(s) => reject_nul(s)?,
+                    // Decimal/Date は構造化された値であり、そのシリアライズ表現
+                    // （数字・ISO日付文字列）に NUL が混入する経路が無い。
+                    TagValue::Decimal(_) | TagValue::Date(_) => {}
+                }
+            }
         }
 
         let id = entry_id_to_uuid(entry.id());

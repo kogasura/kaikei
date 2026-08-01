@@ -74,3 +74,8 @@ required-features = ["pg-tests"]
 name = "trial_balance_differential"
 path = "tests/trial_balance_differential.rs"
 required-features = ["pg-tests"]
+
+[[test]]
+name = "numbering"
+path = "tests/numbering.rs"
+required-features = ["pg-tests"]

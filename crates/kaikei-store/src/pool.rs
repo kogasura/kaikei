@@ -3,6 +3,18 @@
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+/// アプリ実行用プールの最大接続数。
+///
+/// アプリ経路は axum のハンドラ等から並行に呼ばれることを前提とするため、
+/// 複数の同時接続を許容する。
+const APP_POOL_MAX_CONNECTIONS: u32 = 10;
+
+/// マイグレーション実行用プールの最大接続数。
+///
+/// `bin/kaikei-migrate.rs` はマイグレーション適用のためだけに単発で使う接続
+/// であり、並行アクセスは想定しない。
+const MIGRATOR_POOL_MAX_CONNECTIONS: u32 = 1;
+
 /// アプリ実行用ロール（`kaikei_app`）で PostgreSQL に接続するプールを作る。
 ///
 /// `docs/03-database.md` §1 のとおり、帳簿本体（`journal_entries`/
@@ -14,7 +26,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 /// 接続に失敗した場合は `sqlx::Error` を返す。
 pub async fn connect_app(database_url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(APP_POOL_MAX_CONNECTIONS)
         .connect(database_url)
         .await
 }
@@ -32,7 +44,7 @@ pub async fn connect_app(database_url: &str) -> Result<PgPool, sqlx::Error> {
 /// 接続に失敗した場合は `sqlx::Error` を返す。
 pub async fn connect_migrator(database_url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(MIGRATOR_POOL_MAX_CONNECTIONS)
         .connect(database_url)
         .await
 }
