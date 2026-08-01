@@ -40,6 +40,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+// モジュール doc の説明順（土台 → その上に乗るもの）と揃える。
+// アルファベット順ではないのは、読み手が doc の順にファイルを辿れるようにするため。
 pub mod error;
 pub mod invoice;
 pub mod tax;

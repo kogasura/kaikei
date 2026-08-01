@@ -77,6 +77,21 @@ impl TaxCategory {
         if raw.code.trim().is_empty() {
             return Err("code が空です".to_string());
         }
+        // 前後の空白はトリムせず拒否する（`InvoiceRegistrationNo::parse` の
+        // D-052、および `kaikei_core::AccountCode::parse` と同じ方針）。
+        //
+        // トリムして受理すると YAML 側の値とコード上の値が食い違う。黙って
+        // 受理した場合はさらに悪く、`code: " SALES_10"` が
+        // 「税区分コード "SALES_10" は存在しません（利用可能な区分: SALES_10）」
+        // という**見た目が同一の**エラーになり、原因の特定が極めて難しくなる
+        // （半角スペースは端末やログでほぼ判別できない）。
+        if raw.code != raw.code.trim() {
+            return Err(format!(
+                "code の前後に空白を含めることはできません: \"{}\"。\
+                 YAML の値から空白を取り除いてください",
+                raw.code
+            ));
+        }
         let code = raw.code;
 
         let direction = TaxDirection::parse(&raw.direction)
@@ -217,6 +232,25 @@ mod tests {
     fn from_raw_empty_code_is_error() {
         let err = TaxCategory::from_raw(raw("", "sales", Some("0.10"))).unwrap_err();
         assert!(err.contains("code"));
+    }
+
+    /// 前後に空白を含む `code` は、トリムして受理せず拒否する。
+    ///
+    /// 受理すると `code: " SALES_10"` が
+    /// 「税区分コード "SALES_10" は存在しません（利用可能な区分: SALES_10）」という
+    /// **見た目が同一の**エラーになり、原因を特定できなくなる（レビュー指摘）。
+    #[test]
+    fn from_raw_code_with_surrounding_whitespace_is_rejected_not_trimmed() {
+        for code in [" SALES_10", "SALES_10 ", " SALES_10 ", "\tSALES_10"] {
+            let result = TaxCategory::from_raw(raw(code, "sales", Some("0.10")));
+            let err = result.expect_err(&format!(
+                "code=\"{code}\" は空白を含むので拒否されるべきですが受理されました"
+            ));
+            assert!(
+                err.contains("空白"),
+                "code=\"{code}\" は空白を理由に拒否されるべき: {err}"
+            );
+        }
     }
 
     #[test]

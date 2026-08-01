@@ -168,6 +168,40 @@ mod tests {
         assert!(TaxRuleSets::new(vec![a, b]).is_ok());
     }
 
+    /// 3件以上あるとき、**隣接していないペア**の重なりも検出すること。
+    ///
+    /// 総当たり（`for i, for j in i+1..`）でなく隣接ペアだけを見る実装に
+    /// 退化したら、このテストが落ちる（レビュー指摘）。
+    #[test]
+    fn new_rejects_overlap_between_non_adjacent_tables() {
+        let a = table("A", date(2024, 1, 1), Some(date(2024, 12, 31)));
+        let b = table("B", date(2025, 1, 1), Some(date(2025, 12, 31))); // A/C と重ならない
+        let c = table("C", date(2024, 6, 1), Some(date(2024, 12, 31))); // A とのみ重なる
+
+        let err = TaxRuleSets::new(vec![a, b, c])
+            .expect_err("A と C の重なりを検出すべき（隣接していないペア）");
+        let message = err.to_string();
+        assert!(
+            message.contains("\"A\"") && message.contains("\"C\""),
+            "重なっている当事者（A と C）を名指しすること: {message}"
+        );
+    }
+
+    /// `applies_to: null`（無期限）のマスタが2つあれば必ず重なる。
+    ///
+    /// 「無期限 × 無期限」は、どちらも終端を持たない以上どこかで必ず重なる。
+    /// 片方だけ無期限のケース（`new_rejects_open_ended_period_overlapping_a_later_finite_period`）
+    /// とは別に、両方無期限の組み合わせを直接押さえる（レビュー指摘）。
+    #[test]
+    fn new_rejects_two_open_ended_periods() {
+        let a = table("A", date(2026, 1, 1), None);
+        let b = table("B", date(2030, 1, 1), None);
+        assert!(
+            TaxRuleSets::new(vec![a, b]).is_err(),
+            "無期限のマスタが2つあれば必ず重なるので拒否すべき"
+        );
+    }
+
     #[test]
     fn overlap_error_message_names_both_labels_and_ranges() {
         let a = table("kaikei-jp-data/tax/jp/2026a.yaml", date(2026, 1, 1), None);

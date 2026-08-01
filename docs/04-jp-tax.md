@@ -97,25 +97,41 @@ pub struct TaxContext<'a> {
 }
 ```
 
-年度別税区分マスタ（`TaxCategoryTable`）と事業者設定（`JpSettings`）は
+税区分マスタ（`TaxCategoryTable`）と事業者設定（`JpSettings`）は
 `kaikei-jp` 側の型であり、`TaxContext` には含めない。`JpTaxPolicy`
-（`kaikei-jp` の `TaxPolicy` 実装）が**構築時**に保持し、年度の選択は
+（`kaikei-jp` の `TaxPolicy` 実装）が**構築時**に保持し、マスタの選択は
 `TaxContext::as_of`（取引日）で行う。
 
 ```rust
-// kaikei-jp::tax::policy 内部の状態。TaxContext には現れない。
+// kaikei-jp::tax 内部の状態。TaxContext には現れない。
 pub struct JpTaxPolicy {
-    rulesets: BTreeMap<i32, TaxCategoryTable>,   // 年度ラベル → 年度別YAMLから読んだマスタ
+    rule_sets: TaxRuleSets,   // 適用期間の異なるマスタ群。取引日で引く
     settings: JpSettings,
 }
 
 pub struct JpSettings {
     pub tax_mode: TaxMode,               // Exclusive（税抜） / Inclusive（税込）
-    pub rounding: RoundMode,             // 端数処理
+    pub rounding: RoundMode,             // 端数処理の方式
+    pub rounding_unit: RoundingUnit,     // 端数処理の単位（Line / Document。§7）
     pub is_taxable_business: bool,       // 課税事業者か免税事業者か
     pub simplified_taxation: bool,       // 簡易課税か
 }
 ```
+
+**マスタの保持は「暦年 → マスタ1件」の写像にしない**（`DECISIONS.md` D-050）。
+日本の消費税率改正は年度途中に起きるのが通例で（2019年10月の軽減税率導入など）、
+暦年会計の個人事業主にとっては**1つの暦年に2つのマスタが適用される期間が
+実際に生じる**ため、暦年をキーにすると表現できなくなる。
+
+`TaxRuleSets`（実装済み。`crates/kaikei-jp/src/tax/rule_sets.rs`）が
+各マスタの `applies_from` / `applies_to` を見て取引日から選ぶ。適用期間が
+重なるマスタ群は構築時に拒否される（D-054）。該当するマスタが無い取引日に
+対しては `for_date` が `None` を返すので、`JpTaxPolicy` 側で
+`PolicyError::NoApplicableRuleSet { as_of }` に写像する（D-055）。
+
+`JpSettings` はマスタ側の `settings_defaults`（`TaxSettingsDefaults`）を
+既定値として、事業者ごとの設定で上書きする形になる。両者の合成規則は
+`JpTaxPolicy` の実装時に決める。
 
 YAML の読み込みは合成ルートの起動時 I/O であり、`TaxPolicy` の各メソッド自体は
 引き続き同期の純関数のままになる。設定変更（税率改定・事業者区分の変更等）を
