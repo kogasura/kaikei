@@ -206,9 +206,18 @@ jobs:
           # src/journal.rs と、その挙動を直接検証する tests/journal.rs）と、検証を
           # 経由してから呼ぶ唯一の外部呼び出し元 kaikei-store/src/journal/mapper.rs
           # 以外からの呼び出しを禁止する。
+          #
+          # コメント行（`//` `///` `//!` `*` で始まる行）は除外する。
+          # 「この API は CI が禁じているので使わない」と**説明している doc コメント**が
+          # 検査に引っかかって落ちる、という誤検知を実際に2度踏んだ
+          # （PR-4 の kaikei-app/src/error.rs、PR-7 の kaikei-jp/src/test_support.rs）。
+          # 呼び出しはコメント行には書けないので、除外しても検出力は落ちない
+          # （行頭が `//` の行だけを除くので、`foo(); // rehydrate` のような
+          #   コード + 行末コメントは引き続き検出される）。
           HITS=$(grep -rn 'rehydrate' crates/ --include='*.rs' \
                  | grep -v '^crates/kaikei-core/' \
-                 | grep -v '^crates/kaikei-store/src/journal/mapper.rs' || true)
+                 | grep -v '^crates/kaikei-store/src/journal/mapper.rs' \
+                 | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' || true)
           if [ -n "$HITS" ]; then
             echo "$HITS"
             echo "::error::rehydrate の呼び出しが許可された箇所以外に存在します"
