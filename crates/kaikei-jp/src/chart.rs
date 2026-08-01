@@ -29,8 +29,9 @@
 //!   判断しない（YAGNI。必要になったら `kaikei-core` 側の変更として
 //!   別途レビューする）
 
+use crate::account_type::parse_account_type;
 use crate::error::JpError;
-use kaikei_core::{AccountCode, AccountDef, AccountType, ChartOfAccounts};
+use kaikei_core::{AccountCode, AccountDef, ChartOfAccounts};
 use kaikei_jp_data::EmbeddedYaml;
 use serde::Deserialize;
 use std::path::Path;
@@ -111,24 +112,6 @@ fn account_def_from_raw(raw: AccountRaw) -> Result<AccountDef, String> {
     })
 }
 
-/// `Asset` | `Liability` | `Equity` | `Revenue` | `Expense` の5値を
-/// `kaikei_core::AccountType` に写像する。`tags.rs` の `required_for` 要素の
-/// 解釈にも使う（`pub(crate)`）ため、フィールド名をエラーメッセージに含める
-/// 呼び出し側（`field_name`。`chart.rs` では `"type"`、`tags.rs` では
-/// `"required_for"`）に渡してもらう。
-pub(crate) fn parse_account_type(field_name: &str, s: &str) -> Result<AccountType, String> {
-    match s {
-        "Asset" => Ok(AccountType::Asset),
-        "Liability" => Ok(AccountType::Liability),
-        "Equity" => Ok(AccountType::Equity),
-        "Revenue" => Ok(AccountType::Revenue),
-        "Expense" => Ok(AccountType::Expense),
-        other => Err(format!(
-            "{field_name} の値が不正です: \"{other}\"（有効な値: Asset, Liability, Equity, Revenue, Expense）"
-        )),
-    }
-}
-
 fn default_postable() -> bool {
     true
 }
@@ -164,12 +147,19 @@ struct AccountRaw {
     /// フィールド自体は `deny_unknown_fields` によるスキーマ完全性検証のため
     /// 受け取る。
     #[allow(dead_code)]
-    sort: i64,
+    /// 表示順のヒント。ドメイン変換では破棄する（`DECISIONS.md` D-061）。
+    ///
+    /// **値を使わない以上、必須にする理由が無い**ので省略可能にしてある
+    /// （`tags.yaml` の `description` と同じ扱い。書いても何も起きず、
+    /// 書き忘れると YAML 全体がパースエラーになる、という非対称を避ける）。
+    #[serde(default)]
+    sort: Option<i64>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempFile;
 
     const VALID_YAML: &str = r#"
 version: 1
@@ -336,11 +326,12 @@ accounts:
     /// 埋め込みと差し替えで検証の強さが変わらないこと。
     #[test]
     fn load_from_path_rejects_unknown_fields_just_like_embedded() {
-        let path =
-            std::env::temp_dir().join(format!("kaikei_jp_chart_test_{}.yaml", std::process::id()));
-        std::fs::write(&path, format!("{VALID_YAML}\nextra_field: true\n")).unwrap();
-        let err = load_from_path(&path).unwrap_err();
-        let _ = std::fs::remove_file(&path);
+        let file = TempFile::with_contents(&format!(
+            "{VALID_YAML}
+extra_field: true
+"
+        ));
+        let err = load_from_path(file.path()).unwrap_err();
         assert!(matches!(err, JpError::YamlParse { .. }));
     }
 

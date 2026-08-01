@@ -74,45 +74,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempFile;
     use serde::Deserialize;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug, Deserialize, PartialEq)]
     #[serde(deny_unknown_fields)]
     struct Sample {
         name: String,
         value: i32,
-    }
-
-    /// スコープを抜けたら必ず消える一時ファイル。
-    ///
-    /// 素朴に「書く → 使う → `remove_file`」と並べると、途中の `unwrap()` が
-    /// panic した時点で削除に到達せず、一時ディレクトリにゴミが残る。
-    struct TempFile(PathBuf);
-
-    impl TempFile {
-        fn with_contents(contents: &str) -> Self {
-            // プロセスIDだけだと、同一プロセス内で並列に走る別テストと衝突しうる。
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "kaikei_jp_yaml_test_{}_{n}.yaml",
-                std::process::id()
-            ));
-            std::fs::write(&path, contents).expect("一時ファイルへの書き込みに失敗");
-            TempFile(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
     }
 
     #[test]

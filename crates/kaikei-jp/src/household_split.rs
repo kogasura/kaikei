@@ -69,6 +69,7 @@ use rust_decimal::Decimal;
 use std::sync::OnceLock;
 
 /// [`household_split`] への入力。
+#[derive(Debug, Clone)]
 pub struct HouseholdSplitInput {
     /// 按分対象の総額。正の値でなければならない（0円・負の金額はエラー）。
     pub total: Money,

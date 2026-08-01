@@ -41,7 +41,7 @@
 //! （`validate` / `is_aggregatable`）には影響しない。並び順を保存する
 //! 理由は重複検出のためだけである。
 
-use crate::chart::parse_account_type;
+use crate::account_type::parse_account_type;
 use crate::error::JpError;
 use kaikei_core::{TagDef, TagKey, TagSchema, TagValueType};
 use kaikei_jp_data::EmbeddedYaml;
@@ -199,6 +199,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempFile;
     use kaikei_core::{AccountType, TagSet, TagValue};
 
     const VALID_YAML: &str = r#"
@@ -346,11 +347,12 @@ tags:
     /// 埋め込みと差し替えで検証の強さが変わらないこと。
     #[test]
     fn load_from_path_rejects_unknown_fields_just_like_embedded() {
-        let path =
-            std::env::temp_dir().join(format!("kaikei_jp_tags_test_{}.yaml", std::process::id()));
-        std::fs::write(&path, format!("{VALID_YAML}\nextra_field: true\n")).unwrap();
-        let err = load_from_path(&path).unwrap_err();
-        let _ = std::fs::remove_file(&path);
+        let file = TempFile::with_contents(&format!(
+            "{VALID_YAML}
+extra_field: true
+"
+        ));
+        let err = load_from_path(file.path()).unwrap_err();
         assert!(matches!(err, JpError::YamlParse { .. }));
     }
 

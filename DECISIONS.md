@@ -1742,7 +1742,11 @@ AccountType::Asset, true),` の形の行から (コード, 名称, 種別, 記�
    見出し科目の配下に明細科目をぶら下げたい場合に使える
 3. `sort`（YAML にはあるが `kaikei_core::AccountDef` に対応するフィールドが
    無い）: **ドメイン変換では破棄する**。`deny_unknown_fields` による
-   スキーマ完全性検証のためだけに受け取り、値そのものは使わない
+   スキーマ完全性検証のためだけに受け取り、値そのものは使わない。
+   **省略可能**（`#[serde(default)]`、`Option<i64>`）にする。値を使わない以上、
+   必須にすると「書いても何も起きないのに、書き忘れると YAML 全体が
+   パースエラーになる」という一方通行の罰則になる。`tags.yaml` の
+   `description` を省略可能にしたのと同じ扱いに揃える（レビュー指摘）
 
 **却下した選択肢**:
 
@@ -1879,14 +1883,21 @@ AccountType::Asset, true),` の形の行から (コード, 名称, 種別, 記�
 `kaikei-jp` 自身の型であり、`kaikei-jp` の中の関数がこれを直接受け取ることは
 `CLAUDE.md` §1 の依存方向にも抵触しない。
 
-**トレードオフ**: `household_split` は `TaxPolicy` の一部として `Arc<dyn
-TaxPolicy>` 経由で呼び出すことができず、呼び出し側（`kaikei-app`）は
-`kaikei-jp::household_split` を直接 import する必要がある。これは
-`kaikei-app` が `kaikei-jp`（`policy` の実装 crate）に直接依存しないという
+**トレードオフと、呼び出し経路の制約**: `household_split` は `TaxPolicy` の
+一部ではないため `Arc<dyn TaxPolicy>` 経由では呼べない。では誰が呼ぶのか。
+
+**`kaikei-app` から `kaikei-jp::household_split` を直接 import してはいけない。**
 `CLAUDE.md` §1 の依存方向（`kaikei-app` は `policy` の trait にのみ依存し、
-`jp` は注入される）と表面上ずれて見えるが、`household_split` は税制判断
-（`TaxPolicy`）ではなく「3行仕訳の組み立て」という記帳前処理のヘルパーであり、
-`kaikei-app` の呼び出し元（合成ルートに近い層）が具体的な実装（`JpSettings`
-の値）を知って呼ぶこと自体は許容範囲と判断した。trait 越しに差し替え可能に
-すべき対象（税額計算・税区分検証）と、事業者が選んだ具体的な按分方法を
-組み立てるだけのヘルパーとを同列に扱わない。
+`jp` は注入される）に反し、`.github/workflows/architecture.yml` の
+「kaikei-app は infra を知らない」ステップが**機械的に落とす**。
+
+正しい経路は**合成ルート**（Phase 3 の MCP サーバー等、`kaikei-app` と
+`kaikei-jp` の両方を知ってよい最上位の層）が `household_split` を呼んで
+`Vec<JournalLine>` を組み立て、それを `kaikei-app` の
+`post_entry::execute` に**入力として渡す**形。`household_split` の戻り値は
+`kaikei_core::JournalLine` の列であり、`kaikei-jp` の型は一切含まないため、
+この受け渡しで層の境界は崩れない。
+
+> 【訂正】この決定の初版は「`kaikei-app` が直接 import することは許容範囲」と
+> 書いていたが、**誤り**。CI が禁止しており、そのとおりに実装すればビルドが
+> 通らない。レビューで指摘されて上記のとおり改めた。
