@@ -1,22 +1,20 @@
 //! Phase 2: 日本・個人事業主アダプタ。`kaikei-policy` の trait を実装する層。
 //!
-//! # この PR（PR-2）のスコープ
+//! # モジュール構成
 //!
-//! PR-1（ワークスペース組込みと YAML ローダの共通基盤）に加えて、
-//! インボイス登録番号の形式検証を追加する。
-//!
-//! - [`yaml`]: YAML 文字列 → `T: DeserializeOwned` の共通ローダ
+//! - [`yaml`][]: YAML 文字列 → `T: DeserializeOwned` の共通ローダ
 //!   （姉妹 crate `kaikei-jp-data` の再エクスポートではない。名前が紛らわしい
 //!   ため `data` ではなく `yaml` にしてある）
-//!   （埋め込みデータ / 任意パスの両方に対応）
-//! - [`error`][]: [`error::JpError`]（`thiserror`）
-//! - [`invoice`]: [`invoice::InvoiceRegistrationNo`]（`T` + 13桁の形式検証・
+//!   （埋め込みデータ / 任意パスの両方に対応。PR-1）
+//! - [`error`][]: [`error::JpError`]（`thiserror`。PR-1）
+//! - [`invoice`][]: [`invoice::InvoiceRegistrationNo`]（`T` + 13桁の形式検証・
 //!   チェックデジット検証。実在確認・適格性の判定は行わない。
-//!   `docs/04-jp-tax.md` §6・`docs/08-compliance.md` §6）
+//!   `docs/04-jp-tax.md` §6・`docs/08-compliance.md` §6。PR-2）
+//! - [`tax`][]: 税区分マスタ（[`tax::TaxCategoryTable`]）と、取引日による
+//!   適用マスタの選択（[`tax::TaxRuleSets`]。PR-3）
 //!
-//! 税区分マスタの解釈（PR-3）・`JpTaxPolicy`（`kaikei-policy::TaxPolicy` の実装。
-//! PR-4）・科目表 / `TagSchema` のロード（PR-5）は、いずれもこの PR では
-//! 実装しない。
+//! `JpTaxPolicy`（`kaikei-policy::TaxPolicy` の実装。PR-4）・科目表 /
+//! `TagSchema` のロード（PR-5）は、いずれもまだ実装していない。
 //!
 //! # 依存方向
 //!
@@ -44,4 +42,5 @@
 
 pub mod error;
 pub mod invoice;
+pub mod tax;
 pub mod yaml;

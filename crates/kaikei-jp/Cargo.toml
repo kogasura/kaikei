@@ -2,6 +2,7 @@
 #
 # 日本・個人事業主アダプタ。kaikei-policy の trait を実装する（Phase 2）。
 # PR-1: ローダの共通基盤とエラー型。PR-2: インボイス登録番号の形式検証。
+# PR-3: 税区分マスタと適用期間による選択。
 # sqlx / tokio / kaikei-app / kaikei-store / kaikei-import には依存しない
 # （CI (architecture.yml) が検査する）。
 
@@ -21,7 +22,6 @@ serde = { workspace = true }
 # YAML パーサ。serde_yaml の後継フォーク（DECISIONS.md D-049）
 serde_norway = { workspace = true }
 # tax/jp/{year}.yaml の rate: "0.10" のような文字列を Decimal に変換する
-# （後続 PR で使用。この PR では data.rs のローダ基盤のみ）
 rust_decimal = { workspace = true }
 thiserror = { workspace = true }
 
