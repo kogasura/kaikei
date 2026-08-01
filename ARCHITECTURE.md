@@ -39,9 +39,14 @@ kaikei/
     └── architecture.yml          依存方向をCIで検査
 ```
 
-これは**最終形**。Phase 1 完了時点で実在するのは `kaikei-core` / `kaikei-policy` /
-`kaikei-app` / `kaikei-store` と、データのみの `kaikei-jp-data` / `kaikei-import-data`
-（進捗は `README.md`）。
+これは**最終形**。Phase 2 完了時点で実在するのは `kaikei-core` / `kaikei-policy` /
+`kaikei-app` / `kaikei-store` / `kaikei-jp` / `kaikei-jp-data`（進捗は `README.md`）。
+
+このほか、`kaikei-store` と `kaikei-jp` が互いを知れないという依存方向の制約
+（本節末尾の図）を守ったまま両者を実際に PostgreSQL に繋いで検証するための
+テスト専用 crate `kaikei-e2e` が Phase 2 で追加されている。**この最終形の図には
+含めない**（本番の合成ルートではなく、テストの置き場として存在する。
+`DECISIONS.md` D-068）。
 
 ### DDD 層との対応
 
@@ -291,24 +296,44 @@ trait object 化するには `Tx` を dyn 化の時点で具象型に固定す�
 
 ## 7. jp 層
 
+Phase 2 完了時点の実物（当初案の `sole_proprietor/` サブフォルダは採らなかった。
+理由は下記）:
+
 ```
 kaikei-jp/src/
 ├── lib.rs
-├── tax/
-│   ├── category.rs       TaxCategoryCode, TaxCategoryTable
-│   ├── policy.rs         TaxPolicy実装
-│   ├── rounding.rs       端数処理
-│   └── invoice_no.rs     InvoiceRegistrationNo（チェックデジット検証）
-├── sole_proprietor/      ★ 個人事業主固有
-│   ├── closing.rs        元入金振替のClosingPolicy
-│   ├── household.rs      家事按分
-│   └── statement.rs      青色申告決算書の様式
-├── chart.rs              勘定科目テンプレート読み込み
-└── tags.rs               TagSchema提供
+├── yaml.rs                YAML文字列 → T: DeserializeOwned の共通ローダ
+├── error.rs                JpError
+├── invoice.rs               InvoiceRegistrationNo（チェックデジット検証）
+├── chart.rs                 勘定科目テンプレート読み込み → ChartOfAccounts
+├── tags.rs                  タグスキーマ読み込み → TagSchema
+├── household_split.rs       家事按分（TaxPolicyの実装ではなく独立関数。D-064）
+├── closing.rs                JpSoleProprietorClosingPolicy（ClosingPolicy実装）
+├── statement.rs             JpStatementPolicy（StatementPolicy実装）
+├── account_type.rs          AccountType の文字列パース共通処理
+├── test_support.rs          #[cfg(test)] 専用の共通ヘルパ
+└── tax/
+    ├── mod.rs
+    ├── category.rs          TaxCategory, TaxDirection（1区分ぶん）
+    ├── table.rs              TaxCategoryTable（1適用期間ぶんのマスタ集合）
+    ├── rule_sets.rs          TaxRuleSets（複数マスタ・取引日による選択）
+    ├── settings.rs           TaxSettingsDefaults, TaxMode, RoundingUnit
+    └── policy.rs             JpTaxPolicy（TaxPolicy実装）, JpSettings
 ```
 
-`sole_proprietor/` と切ることで、将来法人対応するときに `corporation/` が並ぶだけになる。
-**拡張の形が構造に見えている**状態を保つ。
+**当初案の `sole_proprietor/` サブフォルダは採らなかった。**
+個人事業主固有のファイル（`closing.rs` / `household_split.rs` / `statement.rs`）
+は `kaikei-jp` 自体が個人事業主専用の crate（`DECISIONS.md` D-017）であるため、
+crate 内でさらにサブフォルダへ切っても新たな情報が増えなかった。将来法人対応が
+具体化した段階で `kaikei-jp/src/corporation/` を追加する形で拡張する
+（`DECISIONS.md` D-017 の「拡張の余地」）。
+
+**`TaxCategoryCode` という専用型も作らなかった。** 税区分コードは
+`TaxCategory::code`（`String`）としてマスタが保持し、`TagValue::Code` に
+そのまま格納する。`household_split` はマスタ（`TaxRuleSets`）を保持しないため
+文字列の実在確認をその場ではできず、newtype 化しても検証を前倒しできない
+（`kaikei-jp/src/household_split.rs` モジュール doc「`tax_category` を独自の
+型にしない」を参照）。実在確認は記帳時に `TaxPolicy::validate_tag` が行う。
 
 ---
 

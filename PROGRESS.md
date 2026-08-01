@@ -284,7 +284,183 @@ Phase 2（`kaikei-jp`）で確認が必要になる論点として、`docs/04-jp
 
 ## Phase 2 — kaikei-jp
 
-未着手。
+### 完了日
+
+2026-08-01
+
+### 見積との差
+
+`ROADMAP.md` の見積は「2〜3週間」。実際には 2026-08-01 08:14Z（PR-1 マージ）〜
+2026-08-01（本 PR-8 マージ）の1日で完了した。Phase 0・Phase 1 と同じく
+AI エージェントによる並列実装によるもので、見積との差が Phase を重ねても
+縮まっていないこと自体を、以降の Phase の見積もり精度を疑う材料として
+正直に記録しておく。
+
+Phase 2 は「ここが最も泥臭い」（`ROADMAP.md`）と明記されていた Phase だが、
+体感の泥臭さは実装速度よりも**設計書と実装の整合を保つコスト**（教訓を参照）
+に現れた。
+
+マージ済み PR（`gh pr list --state merged`）:
+
+| # | タイトル |
+|---|---|
+| #18 | Phase 2 PR-1: kaikei-jp / kaikei-jp-data の骨組みと YAML ローダ基盤 |
+| #19 | Phase 2 PR-2+PR-3: インボイス登録番号と税区分マスタ（適用期間による選択） |
+| #20 | Phase 2 PR-4: JpTaxPolicy（消費税行の自動生成） |
+| #21 | Phase 2 PR-5+PR-6: 科目表/TagSchema のロードと家事按分 |
+| #22 | Phase 2 PR-7: 決算振替仕訳と財務諸表（ClosingPolicy / StatementPolicy） |
+| （本PR） | Phase 2 PR-8: 結線 + E2E + PROGRESS |
+
+### ROADMAP 完了条件の充足
+
+証跡は `crates/kaikei-e2e/tests/e2e_jp.rs`（PR-8 で新設。`kaikei-store` と
+`kaikei-jp` は互いを知れないため、両方を知ってよい合成ルートを模した専用
+crate を作った。`DECISIONS.md` D-068）の各テスト関数。すべて `JpTaxPolicy` /
+`JpSoleProprietorClosingPolicy` を実際に `post_entry::execute` /
+`report::execute` へ注入し、実 PostgreSQL に対して記帳・読み戻し・SQL集計を
+行うことで検証している（コード内で組み立てた `TrialBalance` に対する
+ユニットテストではない）。
+
+| 完了条件 | 証跡 |
+|---|---|
+| 税抜経理で消費税行が自動生成される | `condition_1_exclusive_accounting_generates_tax_line_on_taxable_sale`（10%課税売上を記帳し、仮受消費税(330)の行がDBに保存・読み戻せることを確認） |
+| 8% 軽減税率、非課税、不課税が扱える | `condition_2_reduced_rate_tax_free_and_out_of_scope_categories_are_handled`（10%・8%・非課税・不課税を1仕訳に混在させ、税額行が10%分・8%分の2行のみ生成されることを確認） |
+| 非適格の経過措置が YAML で表現できている | `condition_3_non_qualified_transitional_measure_is_expressed_in_yaml`（`PURCHASE_10_NON_QUALIFIED`の`deduction_ratio: "0.80"`がYAMLから読み込まれ、記帳では`rate`のみで計算されつつ`PolicyNote`で断定せず伝えられることを確認） |
+| 家事按分の 3 行仕訳が生成される | `condition_4_household_split_produces_a_three_line_entry`（`household_split`の出力をそのまま`post_entry::execute`へ入力として渡し、3行がDBに保存されることを確認） |
+| 年度別 YAML の切り替えが取引日で行われる | `condition_5_yearly_master_switch_is_based_on_entry_date`（同一の税区分コードでも取引日により異なるマスタ・異なる税率が適用され、実際に異なる税額でDBへ記帳されることを確認） |
+
+加えて `phase2_end_to_end_scenario_posts_and_closes_the_books` が、Phase 2 の
+実装が**通しで動く**ことを示す（**決算振替仕訳が実際に記帳できることの実証。
+PR-8 の最大の価値**）: 科目表をDBに投入 → 課税売上・課税仕入・家事按分を
+記帳 → `report::execute` で試算表を出す → DBから読み戻した仕訳から
+`kaikei_core::TrialBalance` を組み立てて `closing_entries` に決算振替仕訳を
+提案させる → **その `ProposedEntry` を `post_entry::execute` で実際に記帳する**
+→ 決算後の試算表で収益・費用の残高が0になることを確認 → `JpStatementPolicy`
+でBS/PLを組み立てる。PR-7 で「構築は通るが記帳できない」欠陥を3件踏んでいた
+ため、この一連の記帳が実際に成功することが Phase 2 の実質的なゴールだった。
+
+### 設計変更（`DECISIONS.md` 参照）
+
+D-049〜D-069。とくに後続 Phase に影響するもの:
+
+- **D-050**（税区分マスタは「暦年 → マスタ1件」ではなく適用期間で選ぶ全件リスト）:
+  日本の消費税率改正が年度途中に起きる（2019年10月の軽減税率導入等）ため、
+  暦年会計の個人事業主には1つの暦年に2つのマスタが適用される期間が実際に
+  生じる。データが1件しかないうちに直しておかないと、複数年度が並んだ後の
+  キー型変更は全ファイルのリネームを伴う。
+- **D-054/D-055**（適用期間の重なりはロード時エラー、`for_date`は`None`を
+  返すのみでエラーにしない）: 「一意に決まらない」を静かに解決しない方針。
+- **D-057**（`JpSettings`は構築時に一度だけ合成し、`ctx.as_of`で再合成しない）:
+  事業者設定は「その事業者が今どう記帳したいか」であり、年度マスタの
+  `settings_defaults`はあくまで初期値の提案に留める。
+- **D-059**（非適格の経過措置は税額計算に反映せず`PolicyNote`に留める）:
+  控除できない部分の帳簿処理は税務判断そのもの。税理士確認前に実装で
+  既成事実化しない。
+- **D-064**（`household_split`は`TaxPolicy`のメソッドにせず独立関数にし、
+  合成ルート経由でのみ呼べる）: 初版の`DECISIONS.md`が「`kaikei-app`が直接
+  importすることは許容範囲」と誤って書いており、CIが実際に落とすことが
+  レビューで発覚して訂正した（教訓を参照）。
+- **D-065/D-066**（`opening_entries`は実装しない。決算科目3つの実在・
+  記帳可否・タグスキーマ適合を構築時に検証する）: 「構築は通るが記帳
+  できない」欠陥3件（教訓を参照）を踏まえた最終形。
+- **D-068**（`kaikei-e2e`を新設）: `kaikei-store`も`kaikei-jp`も互いを知れない
+  ため、両方を知ってよい最上位の層をテスト専用crateとして用意した。
+- **D-069**（`JpStatementPolicy`の`chart`は決算書生成の直前に都度読み直した
+  ものから構築し、起動時に長期保持しない）: `JpTaxPolicy`/
+  `JpSoleProprietorClosingPolicy`と異なり`chart`はDBから頻繁に読み直される
+  可変データであるため、同じ「構築時保持」パターンを機械的に適用すると
+  「科目名を変更したのに決算書には古い名前が出る」というバグになる。
+  PR-7のレビューで積み残された論点を PR-8 で決めた。
+
+### 次 Phase への申し送り
+
+- **`PolicyNote`（`TaxDerivation.notes`）が永続化されない**。
+  `post_entry::execute`は`tax.derive_tax_lines(...)?.lines`のみを使い、
+  `.notes`を捨てている。経過措置・簡易課税の注記（D-059）は現状、記帳した
+  仕訳をDBから読み戻しても再現できない。MCP経由でAIに「この記帳には確認
+  すべき注記がある」と伝えるには、Phase 3 で`notes`をどこかに保存する
+  （監査ログ、または仕訳への付帯情報として）設計が必要。**未着手**であり、
+  Phase 2 時点ではテスト内で`derive_tax_lines`を直接呼んで確認するに留めた
+  （`crates/kaikei-e2e/tests/e2e_jp.rs`の`condition_3_*`を参照）。
+- **`opening_entries`（期首の振替）は未実装のまま**（D-065）。事業主貸・
+  事業主借の期首リセット方式が税理士確認事項として未解決のため。
+- **簡易課税のみなし仕入率による計算は未実装**（設定を保持するのみ）。
+- **`kaikei-e2e`は「他のどのcrateからも依存されない」制約を今後も維持する
+  こと**。Phase 3 の`kaikei-mcp`（本番の合成ルート）を実装する際、
+  `kaikei-e2e`のコードを流用・依存させたくなる誘惑が起きうるが、それは
+  この制約の存在意義を壊す（`DECISIONS.md` D-068）。
+- **`JpStatementPolicy`の`chart`は呼び出し都度構築する方針（D-069）を
+  Phase 3以降の合成ルート実装でも守ること**。`Composition`のような
+  長期保持する構造体に`JpStatementPolicy`を含めない。
+
+### 教訓
+
+Phase 2 で実際に起きたことを、脚色せずに記録する。
+
+**1. 設計書が却下済みの設計を指示したままになる事故が3回起きた。**
+`docs/04-jp-tax.md`は実装が進むたびにレビューで確定した決定と食い違って
+いく傾向があり、後続PRの実装者が「設計書だけを見て却下済みの設計を
+再実装しかねない」状態を3回作った。
+
+- PR-19: §2 が「暦年 → マスタ1件」（D-050 が明示的に却下した設計）の
+  ままだった
+- PR-20: §7 が非適格の経過措置について「仮払消費税を減らして本体に足す」
+  （D-059 が却下した処理方針）を指示したままだった
+- PR-21: §8 の擬似コードが `tax_category: Option<TaxCategoryCode>` の
+  ままで、`TaxCategoryCode` という型はどこにも存在しなかった（D-064 の
+  実装が採用したのは `Option<String>`）
+
+3回とも「レビューで発覚 → 該当箇所を実態に合わせて書き換え」で対処した。
+**設計書は一度書いたら終わりではなく、決定が変わるたびに直さないと
+「却下済みの設計を指示する文書」に劣化する。**
+
+**2. 「構築は通るが記帳できない」欠陥が PR-7 で3件出た。**
+`JpSoleProprietorClosingPolicy::new`は「決算処理の実行時ではなく構築時に
+検出する」ことを設計目標に掲げていたが、その未達部分が3件、いずれも
+**実際に`JournalEntry::new`に通してみて初めて**発覚した。
+
+1. 生成した収益・費用のゼロ化明細に`tax_category`タグを付けられず、
+   同梱`tags.yaml`の`required_for`制約で`MissingRequiredTag`になった
+2. 見出し科目（`postable: false`）を決算科目に指定できてしまい、
+   `closing_entries`は明細を作れる一方`CoreError::NotPostable`で落ちた
+3. 元入金のタグ検証が`AccountType::Equity`決め打ちで、元入金を誤って
+   別種別で登録した科目表では構築時は通るのに記帳時に落ちた
+   （**これは1の修正で自分が作り込んだバグ**）
+
+**「構築時に検証する」と謳うコードは、実際にその構築物を最後まで
+使い切ってみるテスト（`JournalEntry::new`に通す・記帳する）を用意しない
+限り、検証漏れに自分で気づけない。** PR-8 の E2E テスト
+（`phase2_end_to_end_scenario_posts_and_closes_the_books`）が「決算振替
+仕訳が実際に記帳できる」ことを最大の価値としているのは、この教訓への
+直接の回答である。
+
+**3. CI の grep がコメント中の記述で誤検知する事故が Phase 0/1 から
+数えて2回目、再発した。**
+`rehydrate`の呼び出しを1箇所に限定するCIチェックが、「このAPIはCIが
+禁じているので使わない」と**説明しているdocコメント**に反応して落ちる、
+という同型の誤検知を再び踏んだ（1回目はPhase 1 PR-4の
+`kaikei-app/src/error.rs`、2回目がPhase 2 PR-7の
+`kaikei-jp/src/test_support.rs`）。1回目は該当箇所の文言を書き換えて
+個別に回避しただけで、検査側の根本原因（コメント行を除外していない）を
+直していなかったため、Phase 2 で同じ構造の別ファイルにまた当たった。
+2回目でようやく検査側を構造的に直した（行頭が`//`/`///`/`//!`/`*`の行を
+除外する。`.github/workflows/architecture.yml`）。**「次に同じ形の
+コードを書いたら再発する」個別対処ではなく、検査ロジック自体を直すこと
+を優先すべきだった。**
+
+### 税理士に確認すべき事項
+
+`docs/08-compliance.md` §9 の質問リスト（1〜7）に加えて、Phase 2 の実装で
+新たに8〜14が追加されている（一覧は同ファイルを参照）。PR-8 では新しい
+論点は見つからなかったが、既存の未解決事項のうち2件を E2E テストで
+実際に踏んで再確認した:
+
+- 項目8・9（`condition_3_non_qualified_transitional_measure_is_expressed_in_yaml`
+  で確認）: `PURCHASE_10_NON_QUALIFIED`の`deduction_ratio: "0.80"`は
+  引き続き**未確認の値**のまま。実装は`rate`のみで税額を計算し、
+  控除できない部分の処理は行っていないことを`PolicyNote`で伝えるに
+  留めている（値そのものの正しさ・控除できない部分の帳簿処理方法は
+  依然として税理士確認が必要）
 
 ---
 

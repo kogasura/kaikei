@@ -56,7 +56,7 @@ pub trait BlobStore: Send + Sync {
 
 ### 実装
 
-- `LocalBlobStore` — ローカルファイルシステム（Phase 2）
+- `LocalBlobStore` — ローカルファイルシステム（Phase 4。`ROADMAP.md` の成果物一覧を参照）
 - `S3BlobStore` — S3 互換オブジェクトストレージ（Phase 5 以降）
 
 書き込みは `tmp/` に書いてから `rename` する（原子性の確保）。

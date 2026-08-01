@@ -10,6 +10,9 @@ members = [
     "crates/kaikei-app",
     "crates/kaikei-jp",
     "crates/kaikei-jp-data",
+    # Phase 2 PR-8: 合成ルートを模したE2Eテスト専用crate（DECISIONS.md D-068）。
+    # 他のどのcrateからも依存されない（architecture.yml が検査する）。
+    "crates/kaikei-e2e",
     # Phase 1 以降で追加
     # "crates/kaikei-blob",
     # "crates/kaikei-import",

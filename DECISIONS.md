@@ -2073,3 +2073,93 @@ trait の既定実装（何もしない）に委ねる。
 オーバーフローが実際に発生した場合は `Statement` を返せず panic するため、
 呼び出し側（将来の `kaikei-app`/`kaikei-mcp` 統合）はこの前提が現実的に
 許容できるかを再検討する余地を残す。
+
+---
+
+## D-068 E2E テストの置き場として `kaikei-e2e` を新設する（合成ルートを模した層）
+
+**決定**: `crates/kaikei-e2e` を新設し、Phase 2 の実装が実 PostgreSQL を
+通しで動くことを検証する E2E テストをここに置く。`publish = false` の
+テスト専用 crate とし、`kaikei-core` / `kaikei-policy` / `kaikei-jp` /
+`kaikei-jp-data` / `kaikei-app` / `kaikei-store` / `sqlx` / `tokio` に依存する。
+`src/lib.rs` は合成ルートが起動時に一度だけ行う組み立て（YAMLロード →
+policy 構築。[`compose`]）のヘルパのみを持ち、業務ロジックは置かない。
+`.github/workflows/architecture.yml` に「kaikei-e2e は誰からも依存されない」
+検査を追加し、他のどの crate の `Cargo.toml`（`dev-dependencies` を含む）にも
+`kaikei-e2e` が現れないことを機械的に検査する。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `kaikei-store/tests/` に置く（Phase 1 の `e2e_usecase.rs` と同じ場所） | `kaikei-store` は `kaikei-jp`/`kaikei-policy` に依存しないことを CI が検査している（`CLAUDE.md` §1）。`JpTaxPolicy` を実際に注入するテストを書くには `kaikei-jp` への依存が必要になり、`--edges normal` を見ない dev-dependency 経由で追加すれば機械的には通ってしまうが、それは D-047 が指摘した「CI の意味が消える」抜け道そのものになる |
+| `kaikei-jp/tests/` に置く | `kaikei-jp` は `sqlx`/`tokio`/`kaikei-store` を知らない（`CLAUDE.md` §1）。実 DB に接続するテストを書くには `kaikei-store` への依存が必要で、`kaikei-store` 側と対称の問題が起きる |
+| Phase 3 の `kaikei-mcp` を先取りしてこの PR で作り、その中に E2E テストを置く | 本来の目的（MCP ツール・監査ログ等）に対して過大な実装を Phase 2 の PR に持ち込むことになり YAGNI に反する。「両方を知ってよい最上位の層が必要」という要求だけを満たす最小の形が、テスト専用 crate の新設だった |
+| `#[cfg(test)]` を使わず、`kaikei-app` の統合テスト（`kaikei-app/tests/`）に `kaikei-jp`/`kaikei-store` の両方を dev-dependency として追加する | `kaikei-app` はユースケース層であり、実装（`kaikei-jp`/`kaikei-store`）を知らないことがこの crate の存在意義そのもの（`CLAUDE.md` §1「jp は注入される」）。テストのためだけにこの原則を緩めると、本体コードと同じ crate に「知ってはいけないものを知っているコード」が混在する |
+
+**理由**: `kaikei-store` は `kaikei-jp`（および `kaikei-policy`）を知らず、
+`kaikei-jp` も `kaikei-store`（DB・sqlx・tokio）を知らない
+（`.github/workflows/architecture.yml` の「kaikei-store は kaikei-jp /
+kaikei-policy に依存しない」「kaikei-jp は infra を知らない」の各ステップが
+それぞれ機械的に検査する）。「税抜経理の消費税行が実際に PostgreSQL へ記帳
+できる」ことを検証するテストは、原理的に両方を知ってよい層でしか書けない。
+本番の合成ルート（Phase 3 の `kaikei-mcp`、または Phase 4 の `kaikei-api`）を
+先取りするのは時期尚早（YAGNI）なので、テスト専用の最小の合成ルートとして
+`kaikei-e2e` を新設した。
+
+**トレードオフ**: ワークスペースの member が1つ増え、CI（`architecture.yml`/
+`database.yml`）に専用の検査・実行ステップが必要になる。また「他のどの
+crate からも依存されない」という制約自体を CI で守り続ける必要があり、
+守らなければこの crate の存在意義（テスト専用であること）が崩れる。
+
+---
+
+
+> 【訂正】この決定の初版は、合成ルートの組み立てヘルパ `compose()` も
+> `kaikei-e2e` に置いていた。**誤り。** `compose()` が使うのは
+> `kaikei-core` / `kaikei-jp` / `kaikei-jp-data` だけで、`kaikei-app` も
+> `kaikei-store` も使わない。つまり「両方を知ってよい層」でなければ
+> 書けないコードではなく、`kaikei-jp` 単体で閉じている。
+>
+> テスト専用 crate に置いたままだと、Phase 3（`kaikei-mcp`）と
+> Phase 4（`kaikei-api`）の合成ルートが再利用できず、**同じ組み立てが
+> 3箇所に複製される**（D-047「手で維持する複製は腐る」と同型）。
+> レビュー指摘を受けて `kaikei-jp::compose` へ移した。
+>
+> `kaikei-e2e` に残るのは**実 DB に繋ぐ E2E テストだけ**。そちらは
+> `kaikei-store` を知る必要があるため `kaikei-jp` には置けず、
+> この crate を新設した理由はそこにある（本決定の趣旨自体は変わらない）。
+
+## D-069 `JpStatementPolicy` の `chart` は決算書生成の直前に都度読み直したもので構築する（起動時に長期保持しない）
+
+**決定**: `kaikei-e2e::compose` が返す `Composition` に `JpStatementPolicy` を
+含めない。`JpStatementPolicy::new(chart)` は、決算書（BS/PL）を組み立てる
+直前に、その時点で読み込んだ `ChartOfAccounts` から**都度**呼び出すこと、と
+`kaikei-e2e/src/lib.rs` のクレート doc に方針として明記する。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `JpTaxPolicy`/`JpSoleProprietorClosingPolicy` と同様に、起動時に一度構築して `Composition` に含め長期保持する | `JpStatementPolicy` が保持する `chart` は、`JpTaxPolicy` の年度別マスタ（YAML由来、`DECISIONS.md` D-025/D-057）や `JpSoleProprietorClosingPolicy` の決算科目コード（構築時に実在検証、D-066）とは性質が異なる。マスタ・決算科目コードは「変更にはプロセス再起動を要する」という前提が既に D-025/D-057 で明示的に許容されているが、`ChartOfAccounts` は `kaikei-app/src/context.rs` の `load_posting_context` が**記帳のたびに** `tx.load_chart()` で読み直している、ユーザーが日常的に編集しうる可変データである。長期保持すると、科目名を変更した直後に決算書を出しても古い名前のまま表示される、という「表示される科目名が古い」バグになる |
+| `Composition` に `JpStatementPolicy` を含め、決算書生成のたびに `chart` フィールドだけ差し替える（`with_chart` のような更新メソッドを生やす） | `JpStatementPolicy` は `chart: ChartOfAccounts` を1フィールドだけ持つ薄いラッパであり、可変にするメリットがない。新しい `chart` を受け取るたびに `JpStatementPolicy::new(chart)` で作り直す方が単純（`JpStatementPolicy::new` は YAML 解釈や構築時検証を一切行わないため、作り直しのコストは無視できる） |
+| 折衷案として、起動時に構築した `JpStatementPolicy` を保持しつつ、一定時間ごとに再構築する（TTLキャッシュ） | 個人事業主・単一ユーザー・自己ホスト前提（`DECISIONS.md` D-015）の規模で、キャッシュの複雑さに見合う性能上の必要性が無い。`JpStatementPolicy::new` のコストが無視できる以上、「都度作る」方がキャッシュ無効化のバグを構造的に排除できて安全 |
+
+**理由**: `JpTaxPolicy` や `JpSoleProprietorClosingPolicy` が構築時にデータを
+保持して問題にならないのは、それらが保持するデータ（年度別マスタ、決算科目
+コード）が「変わるとしても稀で、変わったら再起動すればよい」という前提を
+明示的に選んでいるため（D-025/D-057/D-066）。`JpStatementPolicy` の `chart`
+はこの前提が成り立たない（ユーザーが科目表を編集する経路が通常の運用として
+存在する）ため、同じパターンを機械的に適用すると「表示される科目名が古い」
+という別のバグ類を生む。`kaikei-e2e/tests/e2e_jp.rs` の
+`phase2_end_to_end_scenario_posts_and_closes_the_books` は、決算書生成の
+直前に読み直した `chart` から `JpStatementPolicy::new(chart)` する形で
+このテストを実装している。
+
+**トレードオフ**: `JpStatementPolicy` を `Composition` から除外したことで、
+呼び出し側（合成ルート）は「決算書を生成するタイミングで `chart` を読み直し、
+その場で `JpStatementPolicy::new` する」という一手間を明示的に書く必要が
+ある。起動時に一度だけ組み立てて済ませたい場合と比べるとコードは長くなるが、
+「表示される科目名が古い」という誤診に近いバグ（`CLAUDE.md` §11・
+`PROGRESS.md` Phase 1 の教訓「誤診は誤値と同じ実害を持つ」）を構造的に
+避けられる利点の方が大きいと判断した。

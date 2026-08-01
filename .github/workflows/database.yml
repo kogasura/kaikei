@@ -108,3 +108,13 @@ jobs:
         # quality ジョブの clippy は --all-targets であって --all-features ではないため、
         # feature ゲートした pg-tests のテストは対象外になる。ここで拾う。
         run: cargo clippy -p kaikei-store --features pg-tests --all-targets -- -D warnings
+
+      - name: kaikei-e2e の pg-tests を実行
+        # Phase 2 PR-8: kaikei-jp（JpTaxPolicy 等）を実際に注入して記帳する
+        # E2Eテスト（crates/kaikei-e2e）。kaikei-store とは別crateだが、同じ
+        # マイグレーション（crates/kaikei-store/migrations）を使う
+        # （#[sqlx::test(migrations = "...")] で相対パス指定。DECISIONS.md D-068）。
+        run: cargo test -p kaikei-e2e --features pg-tests
+
+      - name: kaikei-e2e の pg-tests 対象への clippy
+        run: cargo clippy -p kaikei-e2e --features pg-tests --all-targets -- -D warnings
