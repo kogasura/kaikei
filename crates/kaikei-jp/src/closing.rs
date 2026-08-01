@@ -27,22 +27,43 @@
 //!   （申告書上の控除。`kaikei-report` の決算書出力の領域）
 //! - **減価償却費の年次調整・家事按分の年次調整・棚卸**は Phase 5 の検討事項
 //!
-//! # `tax_category` タグを付与しない（未解決の設計上の制約）
+//! # `tax_category` タグの扱い（`DECISIONS.md` D-066）
 //!
-//! `kaikei-jp-data/tags.yaml` は `tax_category` を `required_for: [Revenue,
-//! Expense]` としている。一方 `kaikei-policy::ClosingPolicy::closing_entries`
-//! は `TagSchema`（および `tax_category` の候補を判定する材料になる
-//! `TaxCategoryTable`）を一切受け取らない trait シグネチャになっている
-//! （`kaikei-policy` は凍結層のため本 PR では変更しない）。そのため、ここで
-//! 生成する収益・費用のゼロ化明細には `tax_category` タグを付けられない。
+//! `kaikei-jp-data/tags.yaml`（同梱の既定タグスキーマ）は `tax_category` を
+//! `required_for: [Revenue, Expense]` としている。`closing_entries` が生成する
+//! 収益・費用のゼロ化明細もこの制約を受けるため、`tax_category` タグを
+//! 付けないまま `kaikei_core::JournalEntry::new` に通すと
+//! `CoreError::MissingRequiredTag` で拒否される（実際に踏んだ不具合）。
 //!
-//! この `ProposedEntry` を最終的に `kaikei_core::JournalEntry::new` に通す際
-//! （`DECISIONS.md` D-027 のとおり `kaikei-app` が担う）、実運用の `TagSchema`
-//! が `tax_category` を必須にしていると `CoreError::MissingRequiredTag` で
-//! 拒否される可能性がある。決算振替仕訳は売上・仕入といった消費税の課税取引
-//! ではないため `tax_category` を要求すること自体が適切かどうかを含め、
-//! この PR のスコープでは判断せず、次工程（`kaikei-app` で `ClosingPolicy` を
-//! 呼び出す実装）への申し送り事項として報告する。
+//! `kaikei-policy::ClosingPolicy::closing_entries` は `TagSchema` も
+//! `TaxCategoryTable` も引数に取らない trait シグネチャのため（凍結層のため
+//! 変更しない）、`JpSoleProprietorClosingPolicy` は**構築時**に
+//!
+//! - `tax_category: Option<String>` — 収益・費用のゼロ化明細に付与する
+//!   消費税区分コード。**どの区分コードを使うかはここにハードコードしない**
+//!   （`CLAUDE.md` §1・§10）。同梱の税区分マスタ（`kaikei-jp-data/tax/jp/2026.yaml`）
+//!   の `NOT_APPLICABLE`（「対象外」。注記に「資産・負債の振替など、消費税と
+//!   無関係な取引に使う」とある）が候補になりうるが、それを選ぶかどうかは
+//!   呼び出し側（合成ルート）の判断に委ねる
+//! - `schema: &TagSchema` — 実際に使われるタグスキーマ。構築時に、
+//!   `tax_category` の有無によって収益・費用の明細が本当にこのスキーマへ
+//!   適合するかを検証する
+//!
+//! を受け取る。元入金（Equity）の明細には `tax_category` を付けない
+//! （`required_for` の対象外のため）。
+//!
+//! ## 構築時検証の実装方法（`kaikei-core` に手を加えない）
+//!
+//! `kaikei_core::TagSchema` は `required_for` を読み出す専用の getter を
+//! 公開していない（`defs` は非公開、`is_aggregatable` は無関係）。
+//! `kaikei-core` は凍結層であり本 PR では変更しない。そこで、`required_for`
+//! を読み出す代わりに、`closing_entries` が実際に生成するのと**全く同じ
+//! `TagSet`**（`tax_category` が `Some` ならその1タグのみ、`None` なら空）を
+//! 構築時に組み立て、`TagSchema::validate`（既存の公開 API）に
+//! `AccountType::Revenue` / `AccountType::Expense` の両方で通す。
+//! これは「`required_for` に含まれるか」を間接的に問い合わせるより強い
+//! チェックになる（未登録キー・型不一致も同時に検出でき、`closing_entries`
+//! が生成する明細が実際にスキーマを満たすことを直接保証する）。
 //!
 //! # 貸借が一致する理由
 //!
@@ -54,9 +75,10 @@
 
 use kaikei_core::{
     sum_money, AccountCode, AccountType, ChartOfAccounts, CoreError, Currency, FiscalYear,
-    JournalLine, Money, Side, TagSet, TrialBalance,
+    JournalLine, Money, Side, TagKey, TagSchema, TagSet, TagValue, TrialBalance,
 };
 use kaikei_policy::{ClosingPolicy, PolicyError, ProposedEntry};
+use std::sync::OnceLock;
 
 use crate::error::JpError;
 
@@ -68,34 +90,58 @@ use crate::error::JpError;
 /// `closing_entries`（手順1・2・3の当年度末分）では使わないが、
 /// [`ClosingPolicy::opening_entries`] を将来実装する際に必要になるため
 /// 構築時にまとめて検証・保持する（`DECISIONS.md` D-066）。
+///
+/// `tax_category` は収益・費用のゼロ化明細に付与する消費税区分コード
+/// （モジュール doc「`tax_category` タグの扱い」を参照。`DECISIONS.md` D-066）。
 #[derive(Debug, Clone)]
 pub struct JpSoleProprietorClosingPolicy {
     capital_account: AccountCode,
     owner_drawings_account: AccountCode,
     owner_contributions_account: AccountCode,
+    tax_category: Option<String>,
 }
 
 impl JpSoleProprietorClosingPolicy {
-    /// 決算科目（元入金・事業主貸・事業主借）の科目コードと勘定科目表から構築する。
+    /// 決算科目（元入金・事業主貸・事業主借）の科目コード、`tax_category` に
+    /// 使う消費税区分コード、勘定科目表、タグスキーマから構築する。
     ///
-    /// 3科目それぞれが `chart` に存在することを構築時に検証する。存在しなければ
-    /// `JpError::MissingClosingAccount`（どの科目コードが見つからなかったかを
-    /// 含む）を返す。実行時（決算処理の最中）ではなく構築時に失敗させることで、
-    /// 記帳作業の途中で決算処理だけが失敗する事態を避ける。
+    /// 次の2つを構築時に検証する。実行時（決算処理の最中）ではなく構築時に
+    /// 失敗させることで、記帳作業の途中で決算処理だけが失敗する事態を避ける。
+    ///
+    /// 1. 決算科目3つ（元入金・事業主貸・事業主借）が `chart` に存在すること。
+    ///    存在しなければ `JpError::MissingClosingAccount`
+    ///    （見つからなかった科目コードを含む）
+    /// 2. `closing_entries` が実際に生成する収益・費用の明細のタグ
+    ///    （`tax_category` が `Some` ならその1タグ、`None` なら空）が
+    ///    `schema` に適合すること。適合しなければ
+    ///    `JpError::ClosingTagSchemaMismatch`
     pub fn new(
         chart: &ChartOfAccounts,
+        schema: &TagSchema,
         capital_account: AccountCode,
         owner_drawings_account: AccountCode,
         owner_contributions_account: AccountCode,
+        tax_category: Option<String>,
     ) -> Result<Self, JpError> {
         require_account(chart, &capital_account, "元入金")?;
         require_account(chart, &owner_drawings_account, "事業主貸")?;
         require_account(chart, &owner_contributions_account, "事業主借")?;
 
+        let zeroing_tags = build_zeroing_tags(tax_category.as_deref());
+        for account_type in [AccountType::Revenue, AccountType::Expense] {
+            schema
+                .validate(&zeroing_tags, account_type)
+                .map_err(|source| JpError::ClosingTagSchemaMismatch {
+                    account_type_label: account_type.label_ja().to_string(),
+                    reason: source.to_string(),
+                })?;
+        }
+
         Ok(JpSoleProprietorClosingPolicy {
             capital_account,
             owner_drawings_account,
             owner_contributions_account,
+            tax_category,
         })
     }
 
@@ -113,6 +159,11 @@ impl JpSoleProprietorClosingPolicy {
     pub fn owner_contributions_account(&self) -> &AccountCode {
         &self.owner_contributions_account
     }
+
+    /// 収益・費用のゼロ化明細に付与する消費税区分コードを返す。
+    pub fn tax_category(&self) -> Option<&str> {
+        self.tax_category.as_deref()
+    }
 }
 
 fn require_account(chart: &ChartOfAccounts, code: &AccountCode, role: &str) -> Result<(), JpError> {
@@ -123,6 +174,32 @@ fn require_account(chart: &ChartOfAccounts, code: &AccountCode, role: &str) -> R
         });
     }
     Ok(())
+}
+
+/// `tax_category_key()` は固定文字列であり、呼び出しのたびにパース・
+/// アロケーションし直す必要はない（`crate::tax::policy` の
+/// `tax_category_key` と同じ意図。モジュールが異なるため個別に保持する）。
+fn tax_category_key() -> &'static TagKey {
+    static KEY: OnceLock<TagKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        TagKey::parse("tax_category")
+            .expect("\"tax_category\" は tags.yaml に登録された既知のタグキー")
+    })
+}
+
+/// 収益・費用のゼロ化明細に付けるタグを組み立てる。`tax_category` が
+/// `Some` ならその1タグのみを持つ `TagSet`、`None` なら空の `TagSet`。
+///
+/// `closing_entries`（実際の明細生成）と `new`（構築時の `TagSchema::validate`
+/// による検証）の両方から呼ばれる。**両者が同じタグを組み立てることが
+/// 検証の前提**であり、片方だけを変更すると検証が実際の生成結果と
+/// 食い違ってしまう。
+fn build_zeroing_tags(tax_category: Option<&str>) -> TagSet {
+    let mut tags = TagSet::new();
+    if let Some(code) = tax_category {
+        tags.insert(tax_category_key().clone(), TagValue::Code(code.to_string()));
+    }
+    tags
 }
 
 impl ClosingPolicy for JpSoleProprietorClosingPolicy {
@@ -156,7 +233,7 @@ impl ClosingPolicy for JpSoleProprietorClosingPolicy {
                 row.account.clone(),
                 zeroing_side(row.account_type, &row.balance),
                 row.balance.abs(),
-                TagSet::new(),
+                build_zeroing_tags(self.tax_category.as_deref()),
                 None,
             )?);
         }
@@ -292,18 +369,20 @@ mod tests {
     }
 
     fn schema() -> TagSchema {
-        // `TagSchema::empty()` を使う理由はモジュール doc「tax_category タグを
-        // 付与しない」を参照。closing_entries 自体のロジック（貸借計算）を
-        // 実運用のタグ要件から切り離してテストする。
+        // `tax_category` を含め何も必須にしないスキーマ。closing_entries
+        // 自体のロジック（貸借計算）を実運用のタグ要件から切り離してテストする
+        // （`tax_category` の要件そのものを検証するテストは別に用意する）。
         TagSchema::empty()
     }
 
     fn policy(chart: &ChartOfAccounts) -> JpSoleProprietorClosingPolicy {
         JpSoleProprietorClosingPolicy::new(
             chart,
+            &schema(),
             AccountCode::parse("400").unwrap(),
             AccountCode::parse("410").unwrap(),
             AccountCode::parse("420").unwrap(),
+            None,
         )
         .unwrap()
     }
@@ -547,9 +626,11 @@ mod tests {
         .unwrap();
         let err = JpSoleProprietorClosingPolicy::new(
             &chart,
+            &schema(),
             AccountCode::parse("400").unwrap(),
             AccountCode::parse("410").unwrap(),
             AccountCode::parse("420").unwrap(),
+            None,
         )
         .unwrap_err();
         match err {
@@ -570,9 +651,11 @@ mod tests {
         .unwrap();
         let err = JpSoleProprietorClosingPolicy::new(
             &chart,
+            &schema(),
             AccountCode::parse("400").unwrap(),
             AccountCode::parse("410").unwrap(),
             AccountCode::parse("420").unwrap(),
+            None,
         )
         .unwrap_err();
         match err {
@@ -593,9 +676,11 @@ mod tests {
         .unwrap();
         let err = JpSoleProprietorClosingPolicy::new(
             &chart,
+            &schema(),
             AccountCode::parse("400").unwrap(),
             AccountCode::parse("410").unwrap(),
             AccountCode::parse("420").unwrap(),
+            None,
         )
         .unwrap_err();
         match err {
@@ -614,6 +699,292 @@ mod tests {
         assert_eq!(policy.capital_account().as_str(), "400");
         assert_eq!(policy.owner_drawings_account().as_str(), "410");
         assert_eq!(policy.owner_contributions_account().as_str(), "420");
+    }
+
+    // ---- tax_category タグの扱い ----
+    //
+    // これらのテストが、実際に踏んだ不具合（同梱 tags.yaml のままでは
+    // closing_entries が生成する ProposedEntry を JournalEntry::new に
+    // 通せない）の再現・修正確認になる。
+
+    /// `tax_category` を `Revenue`/`Expense` に必須とするスキーマ。
+    fn schema_requiring_tax_category_for_revenue_and_expense() -> TagSchema {
+        TagSchema::new(vec![(
+            TagKey::parse("tax_category").unwrap(),
+            kaikei_core::TagDef {
+                value_type: kaikei_core::TagValueType::Code,
+                aggregatable: true,
+                required_for: vec![AccountType::Revenue, AccountType::Expense],
+            },
+        )])
+    }
+
+    #[test]
+    fn new_with_tax_category_attaches_tag_to_revenue_and_expense_lines_but_not_capital() {
+        let chart = test_chart();
+        let schema = schema_requiring_tax_category_for_revenue_and_expense();
+        let policy = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &schema,
+            AccountCode::parse("400").unwrap(),
+            AccountCode::parse("410").unwrap(),
+            AccountCode::parse("420").unwrap(),
+            Some("NOT_APPLICABLE".to_string()),
+        )
+        .unwrap();
+        assert_eq!(policy.tax_category(), Some("NOT_APPLICABLE"));
+
+        // 取引明細（試算表を作るための元仕訳）自体は `tax_category` を必須と
+        // しない空スキーマで組み立てる。ここでの目的は `closing_entries` が
+        // 「生成」する明細に `tax_category` が付くかどうかであり、取引明細を
+        // 実運用のスキーマで記帳できるかは別の関心事
+        // （下の `closing_entries_output_is_postable_against_bundled_chart_and_tags`
+        // で実データを使って別途検証する）。
+        let empty_schema = TagSchema::empty();
+        let entries = [
+            cash_entry(
+                &chart,
+                &empty_schema,
+                &fy(),
+                1,
+                "500",
+                Side::Credit,
+                1_000_000,
+            ),
+            cash_entry(&chart, &empty_schema, &fy(), 2, "600", Side::Debit, 400_000),
+        ];
+        let tb = TrialBalance::from_entries(entries.iter(), &chart, &empty_schema, &[]).unwrap();
+
+        let proposed = policy.closing_entries(&tb, &fy()).unwrap();
+        let entry = &proposed[0];
+
+        let category_key = TagKey::parse("tax_category").unwrap();
+        let revenue_line = entry
+            .lines
+            .iter()
+            .find(|l| l.account().as_str() == "500")
+            .unwrap();
+        assert_eq!(
+            revenue_line.tags().get(&category_key),
+            Some(&TagValue::Code("NOT_APPLICABLE".to_string()))
+        );
+        let expense_line = entry
+            .lines
+            .iter()
+            .find(|l| l.account().as_str() == "600")
+            .unwrap();
+        assert_eq!(
+            expense_line.tags().get(&category_key),
+            Some(&TagValue::Code("NOT_APPLICABLE".to_string()))
+        );
+        let capital_line = entry
+            .lines
+            .iter()
+            .find(|l| l.account().as_str() == "400")
+            .unwrap();
+        assert!(
+            capital_line.tags().is_empty(),
+            "元入金の明細には tax_category を含むいかなるタグも付かないはず"
+        );
+    }
+
+    #[test]
+    fn new_rejects_none_tax_category_when_schema_requires_it_for_revenue_or_expense() {
+        let chart = test_chart();
+        let schema = schema_requiring_tax_category_for_revenue_and_expense();
+        let err = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &schema,
+            AccountCode::parse("400").unwrap(),
+            AccountCode::parse("410").unwrap(),
+            AccountCode::parse("420").unwrap(),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            JpError::ClosingTagSchemaMismatch {
+                account_type_label,
+                reason,
+            } => {
+                // 収益・費用のどちらを先に検証するかは実装の走査順に依存するが、
+                // どちらであっても account_type_label は "収益" か "費用"。
+                assert!(
+                    account_type_label == "収益" || account_type_label == "費用",
+                    "account_type_label = {account_type_label}"
+                );
+                assert!(reason.contains("tax_category"), "reason = {reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_succeeds_with_none_tax_category_when_schema_does_not_require_it() {
+        let chart = test_chart();
+        // tax_category キー自体は登録されているが、required_for が空。
+        let schema = TagSchema::new(vec![(
+            TagKey::parse("tax_category").unwrap(),
+            kaikei_core::TagDef {
+                value_type: kaikei_core::TagValueType::Code,
+                aggregatable: true,
+                required_for: vec![],
+            },
+        )]);
+        let policy = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &schema,
+            AccountCode::parse("400").unwrap(),
+            AccountCode::parse("410").unwrap(),
+            AccountCode::parse("420").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(policy.tax_category(), None);
+    }
+
+    #[test]
+    fn new_rejects_tax_category_when_schema_does_not_register_the_key() {
+        let chart = test_chart();
+        // `tax_category` キー自体が登録されていないスキーマ。
+        let schema = TagSchema::empty();
+        let err = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &schema,
+            AccountCode::parse("400").unwrap(),
+            AccountCode::parse("410").unwrap(),
+            AccountCode::parse("420").unwrap(),
+            Some("NOT_APPLICABLE".to_string()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, JpError::ClosingTagSchemaMismatch { .. }));
+    }
+
+    /// **本丸**: 同梱の実データ（`kaikei_jp_data::CHART_SOLE_PROPRIETOR` /
+    /// `kaikei_jp_data::TAGS`）で構築した `ChartOfAccounts` / `TagSchema` に対し、
+    /// `closing_entries` が生成する `ProposedEntry` が実際に
+    /// `JournalEntry::new` を通ること（コーディネーターが再現した不具合の
+    /// 逆再現）。`tags.yaml` は `tax_category` を `required_for: [Revenue,
+    /// Expense]` としているため、`tax_category` を指定せずに構築しようとすると
+    /// この時点で `ClosingTagSchemaMismatch` になる（構築時検証そのものの確認）。
+    #[test]
+    fn closing_entries_output_is_postable_against_bundled_chart_and_tags() {
+        let chart = crate::chart::load_embedded(kaikei_jp_data::CHART_SOLE_PROPRIETOR).unwrap();
+        let schema = crate::tags::load_embedded(kaikei_jp_data::TAGS).unwrap();
+        let fy = fy();
+
+        // tax_category を指定しない構築は、同梱スキーマでは失敗する
+        // （実際に踏んだ不具合の再現）。
+        let err = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &schema,
+            AccountCode::parse("400").unwrap(),
+            AccountCode::parse("410").unwrap(),
+            AccountCode::parse("420").unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, JpError::ClosingTagSchemaMismatch { .. }));
+
+        // 候補として挙げられている "NOT_APPLICABLE"（対象外。docs/04-jp-tax.md
+        // §9 のモジュール doc、`kaikei-jp-data/tax/jp/2026.yaml` の注記を参照）を
+        // 指定すると構築できる。どの区分を使うかは利用者の判断であり、この値の
+        // 選択自体をこの実装が断定しているわけではない（テストの都合上の選択）。
+        let policy = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &schema,
+            AccountCode::parse("400").unwrap(),
+            AccountCode::parse("410").unwrap(),
+            AccountCode::parse("420").unwrap(),
+            Some("NOT_APPLICABLE".to_string()),
+        )
+        .unwrap();
+
+        // 通常の取引仕訳（売上・仕入）を実データのスキーマで記帳する。
+        let category_key = TagKey::parse("tax_category").unwrap();
+        let mut sales_tags = TagSet::new();
+        sales_tags.insert(category_key.clone(), TagValue::Code("SALES_10".to_string()));
+        let mut purchase_tags = TagSet::new();
+        purchase_tags.insert(
+            category_key.clone(),
+            TagValue::Code("PURCHASE_10_QUALIFIED".to_string()),
+        );
+
+        let sales_lines = vec![
+            JournalLine::new(
+                AccountCode::parse("100").unwrap(),
+                Side::Debit,
+                Money::from_minor(1_000_000, Currency::JPY),
+                TagSet::new(),
+                None,
+            )
+            .unwrap(),
+            JournalLine::new(
+                AccountCode::parse("500").unwrap(),
+                Side::Credit,
+                Money::from_minor(1_000_000, Currency::JPY),
+                sales_tags,
+                None,
+            )
+            .unwrap(),
+        ];
+        let purchase_lines = vec![
+            JournalLine::new(
+                AccountCode::parse("555").unwrap(),
+                Side::Debit,
+                Money::from_minor(400_000, Currency::JPY),
+                purchase_tags,
+                None,
+            )
+            .unwrap(),
+            JournalLine::new(
+                AccountCode::parse("100").unwrap(),
+                Side::Credit,
+                Money::from_minor(400_000, Currency::JPY),
+                TagSet::new(),
+                None,
+            )
+            .unwrap(),
+        ];
+        let entries = [
+            new_entry(1, 1, &fy, &chart, &schema, fy.start(), "売上", sales_lines),
+            new_entry(
+                2,
+                2,
+                &fy,
+                &chart,
+                &schema,
+                fy.start(),
+                "仕入",
+                purchase_lines,
+            ),
+        ];
+        let tb = TrialBalance::from_entries(entries.iter(), &chart, &schema, &[]).unwrap();
+
+        let proposed = policy.closing_entries(&tb, &fy).unwrap();
+        assert_eq!(proposed.len(), 1);
+
+        // 本丸: 生成された明細一式が、実データのスキーマで JournalEntry::new を
+        // 通ること。`new_entry` 内部の `.expect(...)` が失敗すればテストが
+        // 落ちる（コーディネーターが再現したのと同じ拒否が再発していないか）。
+        for (i, p) in proposed.into_iter().enumerate() {
+            let closing_entry = new_entry(
+                1_000 + i as u128,
+                1_000 + i as u32,
+                &fy,
+                &chart,
+                &schema,
+                p.entry_date,
+                &p.description,
+                p.lines,
+            );
+            // 元入金（Equity）の明細にはタグが付かないことも合わせて確認する。
+            let capital_line = closing_entry
+                .lines()
+                .iter()
+                .find(|l| l.account().as_str() == "400")
+                .unwrap();
+            assert!(capital_line.tags().is_empty());
+        }
     }
 
     // ---- 出力順の決定性 ----

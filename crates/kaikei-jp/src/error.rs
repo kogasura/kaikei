@@ -206,4 +206,25 @@ pub enum JpError {
         /// 見つからなかった科目コード。
         code: String,
     },
+
+    /// 決算処理（[`crate::closing::JpSoleProprietorClosingPolicy`]）が生成する
+    /// 収益・費用のゼロ化明細のタグが、構築時に渡された `TagSchema` の要件を
+    /// 満たさない。
+    ///
+    /// 典型的には、スキーマが `tax_category` を収益・費用の明細で必須として
+    /// いるのに `JpSoleProprietorClosingPolicy::new` の `tax_category` 引数が
+    /// `None` の場合に起きる。決算処理の実行時ではなく**構築時**に検出する
+    /// （`MissingClosingAccount` と同じ理由）。
+    #[error(
+        "決算振替仕訳の明細（{account_type_label}）が勘定科目表のタグスキーマの要件を\
+         満たせません: {reason}。JpSoleProprietorClosingPolicy::new の tax_category \
+         引数に、収益・費用の明細へ付与する消費税区分コードを指定するか、\
+         タグスキーマ側で tax_category を必須から外してください"
+    )]
+    ClosingTagSchemaMismatch {
+        /// 検証に失敗した科目種別の日本語ラベル（"収益" または "費用"）。
+        account_type_label: String,
+        /// 元の検証エラーの理由（`kaikei_core::CoreError` の `Display`）。
+        reason: String,
+    },
 }

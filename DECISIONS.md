@@ -1964,6 +1964,55 @@ trait の既定実装（何もしない）に委ねる。
 決算科目3つを一括りの構築時データとして扱う方が「決算に必要な科目一式」という
 まとまりが分かりやすく、後から1つずつ追加するより認知負荷が低いと判断した。
 
+### 追記: `tax_category` タグの扱いと構築時検証（実際に踏んだ不具合への対応）
+
+**決定**: `JpSoleProprietorClosingPolicy::new` に `schema: &TagSchema` と
+`tax_category: Option<String>` を追加する。`tax_category` が `Some` なら、
+`closing_entries` が生成する収益・費用のゼロ化明細（元入金の明細は含まない）に
+`tax_category` タグとして付与する。**どの区分コードを使うかはここに
+ハードコードしない**（呼び出し側が決める）。構築時に、`closing_entries` が
+実際に生成するのと全く同じ `TagSet`（`tax_category` が `Some` ならその1タグ、
+`None` なら空）を `schema.validate(..., AccountType::Revenue)` /
+`schema.validate(..., AccountType::Expense)` の両方に通し、失敗すれば
+`JpError::ClosingTagSchemaMismatch` で構築を失敗させる。
+
+同梱の `kaikei-jp-data/tags.yaml` は `tax_category` を
+`required_for: [Revenue, Expense]` としているため、`tax_category` を
+指定せずに構築した `JpSoleProprietorClosingPolicy` が生成する
+`ProposedEntry` を、そのタグスキーマの下で `kaikei_core::JournalEntry::new`
+に通すと `CoreError::MissingRequiredTag` で拒否される。**これは PR-7 の
+初版で実際に踏んだ不具合**（レビューでの再現テストにより発覚）であり、
+この追記はその修正である。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| どの税区分コードを使うか（例: `"NOT_APPLICABLE"`）を `JpSoleProprietorClosingPolicy` にハードコードする | `docs/04-jp-tax.md` §1「税率も控除割合もコードに書かない」・`CLAUDE.md` §10「税務判断を断定するメッセージを出さない」に反する。決算振替仕訳にどの消費税区分を充てるべきかは会計上の判断であり、`kaikei-jp` の実装が決めてよいことではない。同梱の税区分マスタ（`kaikei-jp-data/tax/jp/2026.yaml`）の `NOT_APPLICABLE`（「対象外」。注記に「資産・負債の振替など、消費税と無関係な取引に使う」とある）は doc 上の**候補**として言及するに留め、既定値としては埋め込まない |
+| `kaikei_core::TagSchema` に `required_for` を読み出す getter（例: `is_required_for(key, account_type) -> bool`）を追加する | `kaikei-core` は本 PR で変更しない凍結層。加えて、`required_for` を読み出せたとしても「読み出した情報をもとに `tax_category` の型・存在を自前で再検証するロジック」を別途書く必要があり、`TagSchema::validate` が既にそれを正しく行っている（未登録キー・型不一致も含めて）ことの車輪の再発明になる |
+| `closing_entries` の呼び出し時にタグスキーマ適合を検証する | D-066 本文の「`closing_entries` の呼び出し時に科目の存在を検証する」を却下した理由と同型。決算処理は年に一度しか実行されないため、記帳作業を進めた後で初めて分かるのは手戻りが大きい |
+
+**理由**: `kaikei_core::TagSchema` は `required_for` を読み出す専用の
+公開 API を持たない（`defs` フィールドは非公開、`is_aggregatable` は
+無関係）。`kaikei-core` を変更せずにこの不具合を修正する方法を検討した結果、
+「`required_for` を間接的に問い合わせる」のではなく、**`closing_entries` が
+実際に生成するのと同一の `TagSet` を `TagSchema::validate`（既存の公開 API）に
+通す**という形にたどり着いた。これは `required_for` の中身を読むより強い
+チェックになる（未登録キー・型不一致も同時に検出でき、「`closing_entries` が
+生成する明細が実際にこのスキーマを満たすか」を直接保証する。「必須かどうか」を
+間接的に判定してから改めて型や存在を確認する二度手間が要らない）。
+
+**トレードオフ**: `schema.validate` は与えられた `TagSet` に対する最初の
+違反しか報告しない設計（`kaikei_core::tag.rs` の doc）だが、この用途では
+`closing_entries` が生成する `TagSet` は常に「空」または「`tax_category` の
+1タグのみ」であるため、複数タグが絡む曖昧さは生じない。一方で、元入金
+（`Equity`）の明細は常に空の `TagSet` のままであり、構築時にはこちらを
+`AccountType::Equity` に対して検証していない。同梱のタグスキーマは `Equity`
+に対して必須のタグを持たないため実害は無いが、`Equity` に必須タグを課す
+カスタムスキーマを使った場合はこの経路が構築時に検出されず、決算処理の
+実行時（`JournalEntry::new` の段階）まで発覚しない。この残存ギャップは
+今回のスコープ外として記録するに留める。
+
 ---
 
 ## D-067 `JpStatementPolicy` は `Result` を返せない制約に対し、科目名解決はフォールバック、金額計算は既存の `.expect()` 前提を踏襲する
