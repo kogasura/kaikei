@@ -69,7 +69,7 @@ READMEおよびドキュメントでの表現は
 |---|---|---|
 | Phase 0 | `kaikei-core`（貸借不一致の仕訳がプログラム上に存在できない簿記エンジン） | ✅ 完了 |
 | Phase 1 | `kaikei-policy`（trait）/ `kaikei-store`（PostgreSQL）/ `kaikei-app`（ユースケース3本） | ✅ 完了 |
-| Phase 2 | `kaikei-jp`（消費税・勘定科目・青色申告） | 未着手 |
+| Phase 2 | `kaikei-jp`（消費税・勘定科目・青色申告） | ✅ 完了 |
 | Phase 3〜5 | MCP サーバー / CSV 取込 / 帳票 | 未着手 |
 
 各 Phase の実績・設計変更・申し送りは `PROGRESS.md`、設計判断の記録は

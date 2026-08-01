@@ -154,7 +154,9 @@
 事業主貸  70,000                              /
 ```
 
-`kaikei-jp::sole_proprietor::household` がこの仕訳生成を担う。
+`kaikei-jp::household_split::household_split` がこの仕訳生成を担う
+（`sole_proprietor::household` という当初案のモジュール階層は採らなかった。
+`ARCHITECTURE.md` §7 を参照）。
 
 ---
 

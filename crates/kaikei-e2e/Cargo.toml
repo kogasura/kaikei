@@ -1,0 +1,40 @@
+# crates/kaikei-e2e/Cargo.toml
+#
+# PR-8: 合成ルートを模したE2Eテスト専用crate。ビジネスロジックを持たない。
+# kaikei-store は kaikei-jp/kaikei-policy を知らず、kaikei-jp も
+# kaikei-store（infra）を知らない（CLAUDE.md §1）。両方を知ってよい
+# 最上位の層としてこのcrateを新設した（DECISIONS.md D-068）。
+# 他のどのcrateからも依存されないことを CI（architecture.yml）が検査する。
+
+[package]
+name = "kaikei-e2e"
+version = "0.0.1"
+description = "合成ルートを模したE2Eテスト専用crate（他のどのcrateからも依存されない）"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+kaikei-policy = { path = "../kaikei-policy", version = "0.0.1" }
+kaikei-jp = { path = "../kaikei-jp", version = "0.0.1" }
+kaikei-jp-data = { path = "../kaikei-jp-data", version = "0.0.1" }
+kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
+kaikei-store = { path = "../kaikei-store", version = "0.0.1" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+# 既定オフ。PostgreSQL を要する E2E テストをゲートする（kaikei-store と同じ
+# 方式。`#[ignore]` は使わない。ローカルで無言にスキップされ、通っていない
+# テストを通ったと錯覚することを防ぐため）。
+pg-tests = []
+
+# `tests/*.rs` を pg-tests 未指定時はコンパイル自体しない
+# （DB不在の `cargo test --workspace` を汚さない）。
+[[test]]
+name = "e2e_jp"
+path = "tests/e2e_jp.rs"
+required-features = ["pg-tests"]

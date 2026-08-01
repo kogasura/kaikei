@@ -154,6 +154,37 @@ jobs:
           fi
           echo "OK: 依存ゼロ"
 
+      - name: kaikei-e2e は誰からも依存されない
+        run: |
+          set -euo pipefail
+          # kaikei-e2e は合成ルートを模したE2Eテスト専用crate（DECISIONS.md D-068）。
+          # kaikei-store も kaikei-jp も互いを知れないため、両方を知ってよい
+          # 最上位の層として新設したが、依存される側に回った瞬間この位置づけが
+          # 崩れる。存在しない場合（このPR以前のチェックアウト等）はスキップする。
+          if [ ! -d crates/kaikei-e2e ]; then
+            echo "OK: crates/kaikei-e2e が存在しません"
+            exit 0
+          fi
+          # --edges を指定しない既定値（normal, build, dev）で見る。他の依存
+          # 方向ステップは --edges normal のみを見ており、dev-dependency 経由の
+          # 混入を検出できない（D-047 の「--edges normal は dev-dependency を
+          # 見ない」注記と同型の抜け道）。kaikei-e2e はテスト専用crateであるため
+          # 「テストフィクスチャを再利用したい」という誘惑が起きやすく、まさに
+          # dev-dependency 経由で紛れ込みやすい。ここでは意図的に normal 依存
+          # より広く見る（normal依存として混入した場合は kaikei-e2e が
+          # kaikei-store に依存しているため循環依存となり、この時点で
+          # 到達する前に `cargo tree` 自体がエラー終了して検出される）。
+          DEPENDENTS=$(cargo tree --invert kaikei-e2e --prefix none 2>&1 \
+                       | grep -v '^kaikei-e2e v' || true)
+          if [ -n "$DEPENDENTS" ]; then
+            echo "$DEPENDENTS"
+            echo "::error::kaikei-e2e に依存している crate が見つかりました"
+            echo "kaikei-e2e はE2Eテスト専用crateであり、他のどのcrateからも"
+            echo "依存されてはいけません（normal依存だけでなくdev-dependencyも含む）"
+            exit 1
+          fi
+          echo "OK"
+
       - name: kaikei-app は infra を知らない
         run: |
           set -euo pipefail

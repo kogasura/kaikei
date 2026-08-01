@@ -689,6 +689,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaikei-e2e"
+version = "0.0.1"
+dependencies = [
+ "kaikei-app",
+ "kaikei-core",
+ "kaikei-jp",
+ "kaikei-jp-data",
+ "kaikei-policy",
+ "kaikei-store",
+ "sqlx",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "kaikei-jp"
 version = "0.0.1"
 dependencies = [
