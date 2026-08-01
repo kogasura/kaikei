@@ -80,11 +80,29 @@ READMEおよびドキュメントでの表現は
 Phase 1 以降は PostgreSQL が必要（`docs/03-database.md`、`DECISIONS.md` D-010）。
 
 ```sh
-cp .env.example .env   # パスワードを埋める
-docker compose up -d   # postgres:17-alpine が起動し、ロール作成が自動実行される
-sqlx migrate run --source crates/kaikei-store/migrations \
-  --database-url "$MIGRATOR_DATABASE_URL"
+cp .env.example .env       # パスワードを埋める
+docker compose up -d       # postgres:17-alpine が起動し、ロール作成が自動実行される
+
+set -a; . ./.env; set +a   # cargo は .env を読まないのでシェルに流し込む
+cargo run -p kaikei-store --bin kaikei-migrate   # MIGRATOR_DATABASE_URL を読む
 ```
+
+### PostgreSQL を要するテスト（pg-tests）
+
+`#[sqlx::test]` はテストごとに使い捨てのデータベースを作るため、**`DATABASE_URL` は
+`kaikei_migrator`（CREATE DATABASE 権限を持つロール）を指している必要がある**。
+`.env.example` はそのように設定してある。`kaikei_app` を指していると
+`permission denied for database kaikei`（SQLSTATE 42501）で全滅する。
+
+```sh
+set -a; . ./.env; set +a
+cargo test -p kaikei-store --features pg-tests
+```
+
+`pg-tests` を付けない `cargo test --workspace` は DB を必要としない
+（`SQLX_OFFLINE=true` と `.sqlx/` のオフラインキャッシュでコンパイルする）。
+`#[ignore]` による無言スキップは使っていない。ローカルで実行されないまま
+「通った」と錯覚することを防ぐため、feature で明示的に切り替える。
 
 **開発中に壊れたデータを直す場合は `docker compose down -v`。**
 1行だけ `UPDATE` して直そうとしない（`CLAUDE.md` §2 掟3。append-only は

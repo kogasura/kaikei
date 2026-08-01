@@ -417,6 +417,17 @@ debug ビルドでは `panic!`、release ビルド（`overflow-checks` 既定で
 書き込みを別途実装する必要がある。→ Phase 1 のスコープ外とし、必要になった時点で
 追加する（欠番はロールバックで消えるため、記録には別トランザクションが要る。
 監査ログ基盤を入れる Phase 3 に合わせるのが自然）。
+
+---
+
+## D-024 （欠番）
+
+Phase 1 の PR-2 と PR-3 を並列で進めた際、両方が同じ番号を採ってしまい、
+片方を採番し直した際に生じた欠番。内容のある決定は存在しない。
+以降は並列作業の開始前に D 番号のレンジを事前割当する運用にしている。
+
+---
+
 ## D-025 TaxContext は国非依存の4項目に限定する
 
 **決定**: `kaikei-policy::TaxContext<'a>` は `{ as_of, chart, tag_schema,
@@ -1192,9 +1203,14 @@ Phase 1 を完了することの承認を得た。
 ## D-047 `kaikei-app` の公開シグネチャに現れる `kaikei-policy` の型はすべて再エクスポートする
 
 **決定**: `kaikei-app` の公開 API に現れる `kaikei-policy` の型
-（`PolicyError` / `TaxPolicy` / `TaxContext` / `TaxDerivation`）を
-`kaikei-app` の crate ルートから再エクスポートする。`Counterparty` /
-`CounterpartyIndex`（PR-4 で既に再エクスポート済み）と同じ扱いに揃える。
+（`PolicyError` / `TaxPolicy` / `TaxContext` / `TaxDerivation` /
+`PolicyNote` / `NoteSeverity`）を `kaikei-app` の crate ルートから
+再エクスポートする。`Counterparty` / `CounterpartyIndex`（PR-4 で既に
+再エクスポート済み）と同じ扱いに揃える。
+
+**あわせて `pub mod policy { pub use kaikei_policy::*; }` を置く**
+（`kaikei-policy` の公開型すべてへの経路）。ルートの明示リストは
+**手で維持している以上いずれ漏れる**ことが確定しているため、その受け皿。
 
 **却下した選択肢**:
 
@@ -1202,6 +1218,7 @@ Phase 1 を完了することの承認を得た。
 |---|---|
 | 呼び出し側が `kaikei-policy` に直接依存する | `post_entry::execute` を呼ぶだけの crate（E2E テスト、Phase 3 の MCP サーバー）が `kaikei-policy` を `Cargo.toml` に書く必要が出る。とくに `kaikei-store` は「`kaikei-policy` に依存しない」ことを CI で機械的に検査しているため、E2E テストのために dev-dependency を足すと、その CI ステップが守っている境界の意味が読み手に伝わらなくなる（`--edges normal` は dev-dependency を見ないので機械的には通ってしまう分、かえって悪い） |
 | `TaxPolicy` を `kaikei-app` 側で再定義し、`kaikei-policy` の trait とブランケット実装で繋ぐ | trait が2つに増え、どちらを実装すべきかが実装者から見て曖昧になる。`CLAUDE.md` §1 の「policy は trait 定義のみ」という役割分担も崩れる |
+| `pub use kaikei_policy::*;` をクレートルートに撒く（`policy` モジュールを作らない） | `kaikei-app` 自身の型と名前が衝突したとき、glob 側が**黙って負ける**（コンパイルエラーにならない）。気づかないうちに別の型を指す事故になりうる。モジュールに閉じれば衝突自体が起きない |
 
 **理由**: PR-4（契約凍結点）のレビューで「`kaikei-store` が
 `CounterpartyIndex` を名指しできない」という E0433 を実際に踏んだのと
@@ -1210,11 +1227,58 @@ Phase 1 を完了することの承認を得た。
 `AppError::Policy(PolicyError)` は公開 API の一部なのに、呼び出し側が
 その型を名指しする手段が `kaikei-app` 経由では存在しなかった。
 
-漏れが1件ずつ発覚する形を繰り返さないため、`lib.rs` の doc に
-「型 → 現れる場所」の対応表を置き、**公開シグネチャに policy 型を出すときは
-表と `pub use` の両方に足す**ことを明文化した。
+当初はこれを「`lib.rs` の doc に『型 → 現れる場所』の対応表を置き、
+公開シグネチャに policy 型を出すときは表と `pub use` の両方に足す」という
+**運用ルール**で防ごうとした。しかし**その対応表を書いたコミット自身が
+`PolicyNote` / `NoteSeverity`（`TaxDerivation::notes` の要素型と
+そのフィールド型）を落としており**、同じ PR のレビューで実際のコンパイル
+エラーとして検出された。同じ穴を3回踏んだことになる。
 
-**トレードオフ**: `kaikei-app` の名前空間に policy の型が並ぶため、
-「この型はどの crate のものか」がインポート文からは分からなくなる。
-その代わり、下位層・呼び出し側から見た依存は `kaikei-app` + `kaikei-core`
-の2つだけで閉じる。層の境界を守ることを優先する。
+**運用ルールでは防げないと判断し、`pub mod policy` という構造で塞いだ。**
+表に載っていない policy の型が必要になっても `kaikei_app::policy::` から
+取れるため、表の更新漏れが「下位層が `kaikei-policy` に依存せざるを得ない」
+状態に化けることはない。ルートの明示リストを残すのは、**どの型が
+`kaikei-app` の契約の一部か**を読み手に示すため（`policy` からすべて
+取れることと、`ClosingPolicy` 等が `kaikei-app` の契約に含まれることは別）。
+
+**トレードオフ**: 参照経路が2つになる（`kaikei_app::TaxPolicy` と
+`kaikei_app::policy::TaxPolicy` はどちらも同じ型を指す）。どちらを使うべきか
+迷う余地が生まれるが、「漏れたら下位層が層の境界を越えるしかなくなる」という
+失敗の重さに対しては安い代償と判断した。
+
+---
+
+## D-048 `DATABASE_URL` は sqlx ツール専用（`kaikei_migrator`）とし、アプリの接続は `APP_DATABASE_URL` に分ける
+
+**決定**: 環境変数の役割を1つずつに分ける。
+
+| 変数 | ロール | 誰が読むか |
+|---|---|---|
+| `DATABASE_URL` | `kaikei_migrator` | sqlx のツール群（`#[sqlx::test]` / `cargo sqlx prepare` / `sqlx migrate run` / `sqlx::query!` のコンパイル時検証） |
+| `MIGRATOR_DATABASE_URL` | `kaikei_migrator` | `kaikei-store` の `kaikei-migrate` バイナリ |
+| `APP_DATABASE_URL` | `kaikei_app` | アプリの合成ルート（Phase 3 以降） |
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `DATABASE_URL` をアプリ用（`kaikei_app`）のままにし、pg-tests 実行時だけ呼び出し側が上書きする | まさにこの状態が壊れていた。`#[sqlx::test]` は変数名 `DATABASE_URL` を sqlx 側で固定しており変更できないため、`.env.example` どおりに設定した開発者は `cargo test --features pg-tests` を叩いた瞬間に10本全滅する。しかも失敗は sqlx-core の奥（`testing/mod.rs`）で起きる生の panic で、`permission denied for database kaikei` からロールの向き先の問題だと辿るのは難しい |
+| `DATABASE_URL` を廃止して `SQLX_DATABASE_URL` 等に改名する | sqlx が名前を固定しているので不可能 |
+
+**理由**: `.env.example` は `DATABASE_URL` を `kaikei_app` に向けたうえで、
+コメントに「`DATABASE_URL`（kaikei_app）のままテストを実行すると権限不足で
+全滅する」と**問題を記述だけして解決していなかった**。一方 CI
+（`database.yml`）は `DATABASE_URL` に migrator を入れており、
+`tests/common/mod.rs` の doc も「migrator の URL を想定」と書いている。
+**同じ変数について3箇所が違うことを言っている状態**で、CI だけが通り
+ローカルは通らないという最悪の組み合わせになっていた（PR-8 の E2E テストを
+実際に `.env.example` どおりの設定で走らせて発覚）。
+
+sqlx が名前を固定している以上、`DATABASE_URL` は「sqlx ツールのもの」と割り切り、
+アプリの接続には別名を与えるのが唯一の整合する形。
+
+**トレードオフ**: `DATABASE_URL` と `MIGRATOR_DATABASE_URL` の値が同一になり、
+一見冗長に見える。それでも分けるのは、`kaikei-migrate` バイナリが
+「所有者ロールで行う操作」であることを呼び出し側に明示させるため
+（`DATABASE_URL` を別の向き先にした環境でもマイグレーションが誤ったロールで
+走らない）。

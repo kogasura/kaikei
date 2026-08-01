@@ -42,12 +42,11 @@ jobs:
       PGDATABASE: postgres
       KAIKEI_MIGRATOR_PASSWORD: kaikei_migrator_ci_password
       KAIKEI_APP_PASSWORD: kaikei_app_ci_password
-      # `#[sqlx::test]` は DATABASE_URL を「データベースを作れる接続」として使う
-      # （kaikei_migrator の URL を渡す。kaikei_app のままだと権限不足で全滅する）。
+      # sqlx のツール群（`#[sqlx::test]` / `cargo sqlx prepare` / `sqlx migrate run`）
+      # がこの名前で読む接続。テスト用DBを作れる必要があるため kaikei_migrator を
+      # 渡す（kaikei_app のままだと `permission denied for database`（42501）で
+      # pg-tests が全滅する）。`.env.example` も同じ向きに揃えてある。
       DATABASE_URL: postgres://kaikei_migrator:kaikei_migrator_ci_password@localhost:5432/postgres
-      # `sqlx prepare --check` は `.sqlx/` に無いクエリを実DBに問い合わせて検証するため、
-      # DATABASE_URL が指すのと同じDBにマイグレーションを適用しておく必要がある。
-      MIGRATOR_DATABASE_URL: postgres://kaikei_migrator:kaikei_migrator_ci_password@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

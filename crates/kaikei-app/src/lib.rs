@@ -25,12 +25,17 @@
 //!
 //! # `kaikei-policy` 型の再エクスポート
 //!
-//! この crate の**公開シグネチャに現れる** `kaikei-policy` の型は、すべて
-//! ここで再エクスポートする。`kaikei-store` 等の実装者・呼び出し側は
-//! `kaikei_policy::` を直接 `use` せず、必ずこの再エクスポート経由で参照する
-//! こと（`kaikei-store` から `kaikei-policy` への直接依存は CI が禁じている。
+//! `kaikei-store` 等の実装者・呼び出し側は `kaikei_policy::` を直接 `use`
+//! せず、必ずこの crate 経由で参照すること（`kaikei-store` から
+//! `kaikei-policy` への直接依存は CI が禁じている。
 //! `.github/workflows/architecture.yml` の「kaikei-store は kaikei-jp /
-//! kaikei-policy に依存しない」ステップを参照）。
+//! kaikei-policy に依存しない」ステップを参照）。再エクスポートが足りないと、
+//! 呼び出し側は「`kaikei-app` の関数を呼びたいだけなのに `kaikei-policy` にも
+//! 依存しなければならない」状態になる（`DECISIONS.md` D-047）。
+//!
+//! 参照経路は2つある。
+//!
+//! ## 1. クレートルート（公開シグネチャに直接現れる型）
 //!
 //! | 型 | 現れる場所 |
 //! |---|---|
@@ -38,11 +43,20 @@
 //! | [`PolicyError`] | [`error::AppError::Policy`] の中身 |
 //! | [`TaxPolicy`] | [`usecase::post_entry::execute`] の引数（`&dyn TaxPolicy`） |
 //! | [`TaxContext`] / [`TaxDerivation`] | [`TaxPolicy`] を実装するために必要 |
+//! | [`PolicyNote`] / [`NoteSeverity`] | [`TaxDerivation::notes`] の要素型とそのフィールド型 |
 //!
-//! 再エクスポートが足りないと、呼び出し側は「`kaikei-app` の関数を呼びたい
-//! だけなのに `kaikei-policy` にも依存しなければならない」状態になる
-//! （`DECISIONS.md` D-047）。新しい policy 型を公開シグネチャに出すときは、
-//! この表と `pub use` の両方に足すこと。
+//! ## 2. [`policy`] モジュール（`kaikei-policy` の公開型すべて）
+//!
+//! 上の表は**手で維持している以上いずれ漏れる**。実際、D-047 を追加した
+//! コミット自身が `PolicyNote` / `NoteSeverity`（[`TaxDerivation::notes`] の
+//! 要素型）を落としており、レビューで実際のコンパイルエラーとして検出された。
+//! 表に載っていない policy の型が必要になったら [`policy`] から取れば、
+//! 表の更新漏れがそのまま「下位層が `kaikei-policy` に依存せざるを得ない」
+//! 状態に化けることはない。
+//!
+//! ルート側の再エクスポートを残すのは、**どの型がこの crate の契約の一部か**
+//! を読み手に示すため（`policy` からすべて取れるからといって、
+//! `ClosingPolicy` 等が `kaikei-app` の契約に含まれるわけではない）。
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -63,5 +77,19 @@ pub mod usecase;
 pub mod view;
 
 pub use kaikei_policy::{
-    Counterparty, CounterpartyIndex, PolicyError, TaxContext, TaxDerivation, TaxPolicy,
+    Counterparty, CounterpartyIndex, NoteSeverity, PolicyError, PolicyNote, TaxContext,
+    TaxDerivation, TaxPolicy,
 };
+
+/// `kaikei-policy` の公開型すべてへの経路。
+///
+/// クレートルートの再エクスポート（この crate の公開シグネチャに直接現れる型）
+/// から漏れた型が必要になったときの受け皿。詳細はクレート doc の
+/// 「`kaikei-policy` 型の再エクスポート」を参照。
+///
+/// `kaikei-app` 自身の型と名前が衝突しないよう、ルートに glob で撒くのではなく
+/// このモジュールに閉じている（衝突は glob 側が黙って負けるため、
+/// 気づかないうちに別の型を指す事故になりうる）。
+pub mod policy {
+    pub use kaikei_policy::*;
+}
