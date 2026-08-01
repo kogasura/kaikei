@@ -36,6 +36,7 @@ use kaikei_policy::{
 };
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 /// 事業者ごとの実設定の上書き。`None` のフィールドは、合成時に渡された
 /// [`TaxSettingsDefaults`] の値を使う（[`JpSettings::compose`]）。
@@ -154,7 +155,7 @@ impl TaxPolicy for JpTaxPolicy {
         tags: &TagSet,
         account: &AccountDef,
     ) -> Result<(), PolicyError> {
-        let Some(TagValue::Code(code)) = tags.get(&tax_category_key()) else {
+        let Some(TagValue::Code(code)) = tags.get(tax_category_key()) else {
             // タグが無い、またはコード以外の型（型不一致は core の責務）。
             // ここでは検証すべき対象が無いので何もしない。
             return Ok(());
@@ -166,7 +167,7 @@ impl TaxPolicy for JpTaxPolicy {
             .map_err(|source| unknown_category_error(source, ctx.as_of))?;
 
         if category.requires_qualified_invoice {
-            if let Some(TagValue::Code(counterparty_code)) = tags.get(&counterparty_key()) {
+            if let Some(TagValue::Code(counterparty_code)) = tags.get(counterparty_key()) {
                 if let Some(counterparty) = ctx.counterparties.get(counterparty_code) {
                     // `Some(false)`（明示的に非適格と記録されている）のみ拒否する。
                     // `None`（未確認）はユーザーがまだ調べていないだけかもしれず、
@@ -216,7 +217,7 @@ impl TaxPolicy for JpTaxPolicy {
         let mut contributions: Vec<Contribution<'_>> = Vec::new();
 
         for line in lines {
-            let Some(TagValue::Code(code)) = line.tags().get(&category_key) else {
+            let Some(TagValue::Code(code)) = line.tags().get(category_key) else {
                 continue;
             };
             let category = table
@@ -289,22 +290,21 @@ impl TaxPolicy for JpTaxPolicy {
             // 合算してから1回丸めた結果をそのまま1行として計上する方が
             // 単純かつ安全。
             RoundingUnit::Document => {
-                let mut groups: BTreeMap<(String, bool, AccountCode), Money> = BTreeMap::new();
+                // グループの値に `rate` も一緒に持たせる。`table.category(&code)` を
+                // 引き直して `rate.expect(..)` するより、contribution の時点で
+                // `Some` が確定している値をそのまま運ぶ方が panic 経路が1つ減る
+                // （レビュー指摘）。同じ税区分コードなら `rate` も必ず同じ。
+                let mut groups: BTreeMap<(String, bool, AccountCode), (Money, Ratio)> =
+                    BTreeMap::new();
                 for c in &contributions {
                     let is_debit = matches!(c.side, Side::Debit);
                     let group_key = (c.category_code.to_string(), is_debit, c.tax_account.clone());
-                    let base = groups
+                    let entry = groups
                         .entry(group_key)
-                        .or_insert_with(|| Money::zero(c.amount.currency()));
-                    *base = base.add(&c.amount)?;
+                        .or_insert_with(|| (Money::zero(c.amount.currency()), c.rate));
+                    entry.0 = entry.0.add(&c.amount)?;
                 }
-                for ((code, is_debit, tax_account), base_total) in groups {
-                    let category = table
-                        .category(&code)
-                        .map_err(|source| unknown_category_error(source, ctx.as_of))?;
-                    let rate = category.rate.expect(
-                        "このグループは rate.is_some() を満たす contribution からのみ構成される",
-                    );
+                for ((code, is_debit, tax_account), (base_total, rate)) in groups {
                     let tax_amount = self.apply_ratio(ctx, base_total, rate)?;
                     if tax_amount.is_zero() {
                         continue;
@@ -335,12 +335,23 @@ struct Contribution<'a> {
     amount: Money,
 }
 
-fn tax_category_key() -> TagKey {
-    TagKey::parse("tax_category").expect("\"tax_category\" は tags.yaml に登録された既知のタグキー")
+/// `validate_tag` は `post_entry` から**明細ごとに**呼ばれる
+/// （`kaikei-app/src/usecase/post_entry.rs`）。固定文字列の `TagKey` を
+/// 毎回パース・アロケーションしないよう一度だけ作って使い回す（レビュー指摘）。
+fn tax_category_key() -> &'static TagKey {
+    static KEY: OnceLock<TagKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        TagKey::parse("tax_category")
+            .expect("\"tax_category\" は tags.yaml に登録された既知のタグキー")
+    })
 }
 
-fn counterparty_key() -> TagKey {
-    TagKey::parse("counterparty").expect("\"counterparty\" は tags.yaml に登録された既知のタグキー")
+fn counterparty_key() -> &'static TagKey {
+    static KEY: OnceLock<TagKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        TagKey::parse("counterparty")
+            .expect("\"counterparty\" は tags.yaml に登録された既知のタグキー")
+    })
 }
 
 /// 生成した税額行を作る。元の `tax_category` タグを付ける（集計のため。
@@ -353,7 +364,7 @@ fn new_tax_line(
 ) -> Result<JournalLine, PolicyError> {
     let mut tags = TagSet::new();
     tags.insert(
-        tax_category_key(),
+        tax_category_key().clone(),
         TagValue::Code(category_code.to_string()),
     );
     Ok(JournalLine::new(account, side, amount, tags, None)?)
@@ -498,14 +509,14 @@ mod tests {
 
     fn tags_with_category(code: &str) -> TagSet {
         let mut tags = TagSet::new();
-        tags.insert(tax_category_key(), TagValue::Code(code.to_string()));
+        tags.insert(tax_category_key().clone(), TagValue::Code(code.to_string()));
         tags
     }
 
     fn tags_with_category_and_counterparty(code: &str, counterparty_code: &str) -> TagSet {
         let mut tags = tags_with_category(code);
         tags.insert(
-            counterparty_key(),
+            counterparty_key().clone(),
             TagValue::Code(counterparty_code.to_string()),
         );
         tags
@@ -572,7 +583,7 @@ mod tests {
         assert_eq!(generated.side(), Side::Credit);
         assert_eq!(generated.amount().minor(), 10_000);
         assert_eq!(
-            generated.tags().get(&tax_category_key()),
+            generated.tags().get(tax_category_key()),
             Some(&TagValue::Code("SALES_10".to_string()))
         );
 
@@ -769,6 +780,162 @@ mod tests {
         assert_eq!(document_tax_lines[0].amount().minor(), 3);
 
         assert_ne!(line_total, document_tax_lines[0].amount().minor());
+    }
+
+    /// 売上区分（貸方）と仕入区分（借方）が同一仕訳に混在しても、
+    /// それぞれ独立した税額行になること。
+    ///
+    /// `Document` 丸めのグルーピングキーは（税区分, 側, 税額科目）なので、
+    /// side を含めていないと売上と仕入が同じグループに落ちて相殺されうる。
+    /// 2回目レビューが検証のために手で書いたケースを恒久テストにした。
+    #[test]
+    fn derive_tax_lines_separates_sales_and_purchase_in_the_same_entry() {
+        let settings = JpSettings {
+            rounding_unit: RoundingUnit::Document,
+            ..default_settings()
+        };
+        let policy = policy_from_embedded(settings);
+        let chart = empty_chart();
+        let schema = empty_schema();
+        let counterparties = CounterpartyIndex::empty();
+        let ctx = embedded_context!(chart, schema, counterparties);
+
+        let input = vec![
+            // 売上 100,000（貸, 10%） → 仮受消費税 10,000（貸, 330）
+            line("500", Side::Credit, 100_000, tags_with_category("SALES_10")),
+            // 仕入 50,000（借, 10%適格） → 仮払消費税 5,000（借, 180）
+            line(
+                "600",
+                Side::Debit,
+                50_000,
+                tags_with_category("PURCHASE_10_QUALIFIED"),
+            ),
+        ];
+
+        let derivation = policy.derive_tax_lines(&ctx, &input).unwrap();
+
+        let sales_tax = derivation
+            .lines
+            .iter()
+            .find(|l| l.account().as_str() == "330")
+            .expect("仮受消費税(330)が生成されるはず");
+        assert_eq!(sales_tax.side(), Side::Credit);
+        assert_eq!(sales_tax.amount().minor(), 10_000);
+
+        let purchase_tax = derivation
+            .lines
+            .iter()
+            .find(|l| l.account().as_str() == "180")
+            .expect("仮払消費税(180)が生成されるはず");
+        assert_eq!(purchase_tax.side(), Side::Debit);
+        assert_eq!(purchase_tax.amount().minor(), 5_000);
+    }
+
+    /// 同じ税区分が借方・貸方の両方に現れたら、側ごとに別の税額行になること
+    /// （売上と売上値引・返品が同一仕訳に混在する形）。
+    ///
+    /// グルーピングキーから side が抜けると 100,000 - 50,000 = 50,000 に
+    /// 相殺され、税額が 5,000 の1行になってしまう。
+    #[test]
+    fn derive_tax_lines_separates_the_same_category_by_side() {
+        let settings = JpSettings {
+            rounding_unit: RoundingUnit::Document,
+            ..default_settings()
+        };
+        let policy = policy_from_embedded(settings);
+        let chart = empty_chart();
+        let schema = empty_schema();
+        let counterparties = CounterpartyIndex::empty();
+        let ctx = embedded_context!(chart, schema, counterparties);
+
+        let input = vec![
+            line("500", Side::Credit, 100_000, tags_with_category("SALES_10")),
+            line("500", Side::Debit, 50_000, tags_with_category("SALES_10")),
+        ];
+
+        let derivation = policy.derive_tax_lines(&ctx, &input).unwrap();
+
+        let generated: Vec<_> = derivation
+            .lines
+            .iter()
+            .filter(|l| l.account().as_str() == "330")
+            .collect();
+        assert_eq!(
+            generated.len(),
+            2,
+            "側ごとに分かれて2行になるはず（相殺されていないか）: {generated:?}"
+        );
+
+        let credit = generated
+            .iter()
+            .find(|l| !l.is_debit())
+            .expect("貸方の税額行");
+        let debit = generated
+            .iter()
+            .find(|l| l.is_debit())
+            .expect("借方の税額行");
+        assert_eq!(credit.amount().minor(), 10_000);
+        assert_eq!(debit.amount().minor(), 5_000);
+    }
+
+    /// 生成される税額行の順序が実行のたびに変わらないこと。
+    ///
+    /// 順序が非決定的だと、`kaikei-store` が `lines().iter().enumerate()` で
+    /// 採番する `line_no` が実行ごとに変わり、append-only の帳簿に
+    /// 「同じ仕訳なのに明細順が違う」記録が残りうる。`BTreeMap` を使って
+    /// いるので決定的なはずだが、`HashMap` に変えられたら落ちるようにしておく。
+    #[test]
+    fn derive_tax_lines_output_order_is_deterministic() {
+        let settings = JpSettings {
+            rounding_unit: RoundingUnit::Document,
+            ..default_settings()
+        };
+        let policy = policy_from_embedded(settings);
+        let chart = empty_chart();
+        let schema = empty_schema();
+        let counterparties = CounterpartyIndex::empty();
+        let ctx = embedded_context!(chart, schema, counterparties);
+
+        let input = vec![
+            line("500", Side::Credit, 100_003, tags_with_category("SALES_10")),
+            line(
+                "500",
+                Side::Credit,
+                50_007,
+                tags_with_category("SALES_8_REDUCED"),
+            ),
+            line(
+                "600",
+                Side::Debit,
+                30_011,
+                tags_with_category("PURCHASE_10_QUALIFIED"),
+            ),
+            line(
+                "600",
+                Side::Debit,
+                20_013,
+                tags_with_category("PURCHASE_8_REDUCED_QUALIFIED"),
+            ),
+        ];
+
+        let fingerprint = |d: &TaxDerivation| -> Vec<(String, i128, bool)> {
+            d.lines
+                .iter()
+                .map(|l| {
+                    (
+                        l.account().as_str().to_string(),
+                        l.amount().minor(),
+                        l.is_debit(),
+                    )
+                })
+                .collect()
+        };
+
+        let first = fingerprint(&policy.derive_tax_lines(&ctx, &input).unwrap());
+        for i in 1..20 {
+            let again = fingerprint(&policy.derive_tax_lines(&ctx, &input).unwrap());
+            assert_eq!(again, first, "{i}回目の実行で明細の順序・内容が変わった");
+        }
     }
 
     #[test]
