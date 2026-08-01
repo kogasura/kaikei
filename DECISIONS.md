@@ -2114,6 +2114,22 @@ crate からも依存されない」という制約自体を CI で守り続け�
 
 ---
 
+
+> 【訂正】この決定の初版は、合成ルートの組み立てヘルパ `compose()` も
+> `kaikei-e2e` に置いていた。**誤り。** `compose()` が使うのは
+> `kaikei-core` / `kaikei-jp` / `kaikei-jp-data` だけで、`kaikei-app` も
+> `kaikei-store` も使わない。つまり「両方を知ってよい層」でなければ
+> 書けないコードではなく、`kaikei-jp` 単体で閉じている。
+>
+> テスト専用 crate に置いたままだと、Phase 3（`kaikei-mcp`）と
+> Phase 4（`kaikei-api`）の合成ルートが再利用できず、**同じ組み立てが
+> 3箇所に複製される**（D-047「手で維持する複製は腐る」と同型）。
+> レビュー指摘を受けて `kaikei-jp::compose` へ移した。
+>
+> `kaikei-e2e` に残るのは**実 DB に繋ぐ E2E テストだけ**。そちらは
+> `kaikei-store` を知る必要があるため `kaikei-jp` には置けず、
+> この crate を新設した理由はそこにある（本決定の趣旨自体は変わらない）。
+
 ## D-069 `JpStatementPolicy` の `chart` は決算書生成の直前に都度読み直したもので構築する（起動時に長期保持しない）
 
 **決定**: `kaikei-e2e::compose` が返す `Composition` に `JpStatementPolicy` を

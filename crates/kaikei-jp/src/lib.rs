@@ -70,6 +70,7 @@
 mod account_type;
 pub mod chart;
 pub mod closing;
+pub mod compose;
 pub mod error;
 pub mod household_split;
 pub mod invoice;

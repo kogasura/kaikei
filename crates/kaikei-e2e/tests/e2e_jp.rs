@@ -137,34 +137,53 @@ fn default_compose_options() -> ComposeOptions {
 /// 科目だけ2パス目で `UPDATE` する（同梱の `sole_proprietor.yaml` は
 /// フラットな科目表なので実際には2パス目は素通りする）。
 async fn seed_chart(pool: &PgPool, chart: &ChartOfAccounts) {
-    for def in chart.iter() {
-        sqlx::query(
-            "INSERT INTO accounts (code, name, account_type, parent_code, postable) \
-             VALUES ($1, $2, $3, NULL, $4)",
-        )
-        .bind(def.code.as_str())
-        .bind(&def.name)
-        .bind(account_type_to_i16(def.account_type))
-        .bind(def.postable)
-        .execute(pool)
-        .await
-        .unwrap_or_else(|e| panic!("account {} の投入に失敗しました: {e}", def.code.as_str()));
+    // 科目1件ずつ INSERT すると、同梱の科目表（約60件）でテストごとに
+    // 60往復する。`kaikei-store` の明細一括 INSERT（`DECISIONS.md` D-040）と
+    // 同じく UNNEST で1文にまとめる。
+    //
+    // 2パスに分けるのは `accounts.parent_code` が `accounts(code)` への
+    // 自己参照 FK を持つため（親より先に子を入れると FK 違反になる）。
+    // 1パス目は親を NULL で入れ、2パス目でまとめて更新する。
+    let codes: Vec<String> = chart.iter().map(|d| d.code.as_str().to_string()).collect();
+    let names: Vec<String> = chart.iter().map(|d| d.name.clone()).collect();
+    let types: Vec<i16> = chart
+        .iter()
+        .map(|d| account_type_to_i16(d.account_type))
+        .collect();
+    let postables: Vec<bool> = chart.iter().map(|d| d.postable).collect();
+
+    sqlx::query(
+        "INSERT INTO accounts (code, name, account_type, parent_code, postable)          SELECT code, name, account_type, NULL, postable          FROM UNNEST($1::text[], $2::text[], $3::smallint[], $4::bool[])               AS t(code, name, account_type, postable)",
+    )
+    .bind(&codes)
+    .bind(&names)
+    .bind(&types)
+    .bind(&postables)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("accounts の一括投入に失敗しました: {e}"));
+
+    let child_codes: Vec<String> = chart
+        .iter()
+        .filter(|d| d.parent.is_some())
+        .map(|d| d.code.as_str().to_string())
+        .collect();
+    if child_codes.is_empty() {
+        return;
     }
-    for def in chart.iter() {
-        if let Some(parent) = &def.parent {
-            sqlx::query("UPDATE accounts SET parent_code = $1 WHERE code = $2")
-                .bind(parent.as_str())
-                .bind(def.code.as_str())
-                .execute(pool)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "account {} の parent_code 更新に失敗しました: {e}",
-                        def.code.as_str()
-                    )
-                });
-        }
-    }
+    let parent_codes: Vec<String> = chart
+        .iter()
+        .filter_map(|d| d.parent.as_ref().map(|p| p.as_str().to_string()))
+        .collect();
+
+    sqlx::query(
+        "UPDATE accounts SET parent_code = t.parent_code          FROM UNNEST($1::text[], $2::text[]) AS t(code, parent_code)          WHERE accounts.code = t.code",
+    )
+    .bind(&child_codes)
+    .bind(&parent_codes)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("accounts.parent_code の一括更新に失敗しました: {e}"));
 }
 
 /// 明細を1行組み立てる。
@@ -532,8 +551,17 @@ async fn condition_5_yearly_master_switch_is_based_on_entry_date(
 ) {
     let roles = common::roles(pool_opts, conn_opts).await;
 
-    let embedded_2026 =
-        TaxCategoryTable::from_embedded(kaikei_jp_data::TAX_CATEGORY_SOURCES[0]).unwrap();
+    // `TAX_CATEGORY_SOURCES` は「並び順に意味を持たせない」と宣言している
+    // （`kaikei-jp-data/src/lib.rs`）ので、添字ではなくラベルで探す。
+    // 添字で取ると、2027年度分などが先頭に追加された瞬間に別の年度の
+    // マスタを静かに掴む（コンパイルは通り、テストは別の値で通ってしまう）。
+    let embedded_2026 = TaxCategoryTable::from_embedded(
+        *kaikei_jp_data::TAX_CATEGORY_SOURCES
+            .iter()
+            .find(|e| e.label.contains("2026"))
+            .expect("2026年度の税区分マスタが同梱されているはず"),
+    )
+    .unwrap();
     let legacy_2025 = TaxCategoryTable::new(
         "test-legacy-2025".to_string(),
         AccountingDate::new(2025, 1, 1).unwrap(),

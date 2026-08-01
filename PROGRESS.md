@@ -304,7 +304,7 @@ Phase 2 は「ここが最も泥臭い」（`ROADMAP.md`）と明記されてい
 
 | # | タイトル |
 |---|---|
-| #18 | Phase 2 の骨組み: kaikei-jp / kaikei-jp-data をワークスペースに組み込む |
+| #18 | Phase 2 PR-1: kaikei-jp / kaikei-jp-data の骨組みと YAML ローダ基盤 |
 | #19 | Phase 2 PR-2+PR-3: インボイス登録番号と税区分マスタ（適用期間による選択） |
 | #20 | Phase 2 PR-4: JpTaxPolicy（消費税行の自動生成） |
 | #21 | Phase 2 PR-5+PR-6: 科目表/TagSchema のロードと家事按分 |
