@@ -127,14 +127,31 @@ impl JpSoleProprietorClosingPolicy {
         require_account(chart, &owner_drawings_account, "事業主貸")?;
         require_account(chart, &owner_contributions_account, "事業主借")?;
 
+        // 生成する明細と**同じ形の `TagSet`** をスキーマに通して、構築時に
+        // 「決算処理を走らせたら記帳できない」状態を検出する。
+        //
+        // `required_for` を問い合わせる形にしないのは、`TagSchema` がそれを
+        // 読む API を公開していない（`kaikei-core` は不変層で追加できない）ことに加え、
+        // 実際に渡す `TagSet` をそのまま検証する方が未登録キー・型不一致も
+        // 同時に拾えて強いため。
+        //
+        // 収益・費用のゼロ化明細と、元入金（Equity）の明細では**付けるタグが違う**
+        // （後者は常に空）ので、両方を対応する科目種別で検証する。同梱の
+        // `tags.yaml` は Equity に必須タグを課していないが、ユーザーが差し替えた
+        // スキーマで課していた場合、ここで検証しないと決算処理の実行時まで発覚しない。
         let zeroing_tags = build_zeroing_tags(tax_category.as_deref());
-        for account_type in [AccountType::Revenue, AccountType::Expense] {
-            schema
-                .validate(&zeroing_tags, account_type)
-                .map_err(|source| JpError::ClosingTagSchemaMismatch {
+        let capital_tags = TagSet::new();
+        for (account_type, tags) in [
+            (AccountType::Revenue, &zeroing_tags),
+            (AccountType::Expense, &zeroing_tags),
+            (AccountType::Equity, &capital_tags),
+        ] {
+            schema.validate(tags, account_type).map_err(|source| {
+                JpError::ClosingTagSchemaMismatch {
                     account_type_label: account_type.label_ja().to_string(),
                     reason: source.to_string(),
-                })?;
+                }
+            })?;
         }
 
         Ok(JpSoleProprietorClosingPolicy {
@@ -717,6 +734,70 @@ mod tests {
                 required_for: vec![AccountType::Revenue, AccountType::Expense],
             },
         )])
+    }
+
+    /// `Equity` に必須タグを課すスキーマ（ユーザーが差し替えた場合を模す）。
+    ///
+    /// 収益・費用側は通るようにしておく（`tax_category` は登録するが必須にしない）。
+    /// そうしないと収益の検証で先に落ち、Equity の検証まで到達したかが分からない。
+    fn schema_requiring_a_tag_for_equity() -> TagSchema {
+        TagSchema::new(vec![
+            (
+                TagKey::parse("tax_category").unwrap(),
+                kaikei_core::TagDef {
+                    value_type: kaikei_core::TagValueType::Code,
+                    aggregatable: true,
+                    required_for: vec![],
+                },
+            ),
+            (
+                TagKey::parse("project").unwrap(),
+                kaikei_core::TagDef {
+                    value_type: kaikei_core::TagValueType::Code,
+                    aggregatable: true,
+                    required_for: vec![AccountType::Equity],
+                },
+            ),
+        ])
+    }
+
+    /// 元入金（Equity）の明細は常にタグ無しなので、`Equity` に必須タグを課す
+    /// スキーマでは**構築時に**弾かれること。
+    ///
+    /// 収益・費用だけを検証していると、この経路は決算処理を実行するまで
+    /// 発覚しない（レビュー前の実装がそうだった）。同梱の `tags.yaml` は
+    /// Equity に必須タグを課していないため実害は出ていなかったが、
+    /// ユーザーが自分のスキーマに差し替える経路がある以上、塞いでおく。
+    #[test]
+    fn new_rejects_a_schema_that_requires_tags_on_equity_lines() {
+        let chart = test_chart();
+        let schema = schema_requiring_a_tag_for_equity();
+
+        let result = JpSoleProprietorClosingPolicy::new(
+            &chart,
+            &schema,
+            AccountCode::parse("400").unwrap(),
+            AccountCode::parse("410").unwrap(),
+            AccountCode::parse("420").unwrap(),
+            Some("NOT_APPLICABLE".to_string()),
+        );
+
+        match result {
+            Err(JpError::ClosingTagSchemaMismatch {
+                account_type_label,
+                reason,
+            }) => {
+                assert_eq!(
+                    account_type_label, "純資産",
+                    "どの科目種別で適合しなかったかが分かること"
+                );
+                assert!(
+                    reason.contains("project"),
+                    "不足しているタグキーが分かること: {reason}"
+                );
+            }
+            other => panic!("Equity に必須タグを課すスキーマは構築時に弾くべき: {other:?}"),
+        }
     }
 
     #[test]
