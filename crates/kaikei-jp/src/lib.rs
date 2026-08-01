@@ -18,6 +18,9 @@
 //!   `kaikei_core::ChartOfAccounts`（`docs/04-jp-tax.md` §5。PR-5）
 //! - [`tags`][]: タグスキーマ（`kaikei-jp-data/tags.yaml`）→
 //!   `kaikei_core::TagSchema`（`docs/04-jp-tax.md` §4。PR-5）
+//! - [`household_split`][]: 家事按分ヘルパー（[`household_split::household_split`]）。
+//!   `kaikei-policy::TaxPolicy` の実装ではなく単独の関数（`docs/04-jp-tax.md`
+//!   §8。PR-6）
 //!
 //! # 依存方向
 //!
@@ -48,6 +51,7 @@
 // ここでは fmt に任せる。
 pub mod chart;
 pub mod error;
+pub mod household_split;
 pub mod invoice;
 pub mod tags;
 pub mod tax;

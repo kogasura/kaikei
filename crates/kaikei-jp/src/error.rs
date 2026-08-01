@@ -157,4 +157,35 @@ pub enum JpError {
         /// そのマスタに存在する有効な税区分コード一覧（表示用に整形済み）。
         available: String,
     },
+
+    /// 家事按分（[`crate::household_split::household_split`]）の事業割合が
+    /// 0 以上 1 以下の範囲外。
+    ///
+    /// `kaikei_core::Ratio` 型自体は 0〜1 に制約されていない
+    /// （`Ratio::parse_rate` 経由なら 1 を超える値も、`Ratio::parse_fraction`
+    /// 経由なら 0〜1 の範囲に収まる値のみが構築できる。呼び出し側がどちらで
+    /// 構築したかを型からは区別できないため、ここで実行時に検証する）。
+    #[error(
+        "家事按分の事業割合は0以上1以下である必要があります: {ratio}。\
+         0%〜100%の範囲で指定してください"
+    )]
+    InvalidBusinessRatio {
+        /// 範囲外だった比率（表示用の10進文字列）。
+        ratio: String,
+    },
+
+    /// 家事按分（[`crate::household_split::household_split`]）の対象金額が0以下。
+    #[error(
+        "家事按分の対象金額は正の値である必要があります: {total}。\
+         0円または負の金額は按分できません"
+    )]
+    InvalidHouseholdSplitTotal {
+        /// 不正だった金額（表示用）。
+        total: String,
+    },
+
+    /// `kaikei-core` の演算（`Money::mul_ratio` / `Money::sub` /
+    /// `JournalLine::new` 等）が失敗した。
+    #[error(transparent)]
+    Core(#[from] kaikei_core::CoreError),
 }
