@@ -5,11 +5,12 @@
 //! 重複検証など不変条件を守るコードはすべてこのファイルに閉じる。
 
 use crate::error::JpError;
-use crate::tax::category::{TaxCategory, TaxCategoryRaw};
+use crate::tax::category::{TaxCategory, TaxCategoryRaw, TaxDirection};
 use crate::tax::settings::{SettingsDefaultsRaw, TaxSettingsDefaults};
 use crate::yaml::{load_embedded, load_from_path, load_str};
 use kaikei_core::AccountingDate;
 use kaikei_jp_data::EmbeddedYaml;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -76,6 +77,41 @@ impl TaxCategoryTable {
                         "税区分コードが重複しています: \"{}\"。categories[].code は \
                          マスタ内で一意である必要があります",
                         category.code
+                    ),
+                });
+            }
+        }
+
+        // `direction` が sales/purchase かつ `rate` が 0 でない区分は、税額行の
+        // 計上先科目が無いと `JpTaxPolicy::derive_tax_lines` が税額を計上できない。
+        // これは税務判断ではなく機構上の必然のためここで検証する（PR-3 からの
+        // 申し送り事項。PR-4 で決定。範囲はこの1点のみで、それ以外の
+        // direction/rate/tax_account の組み合わせ検証は税務判断を含むため追加しない）。
+        //
+        // `SALES_EXPORT`（direction: sales, rate: "0", tax_account: null）のように
+        // rate が 0 の区分は税額そのものを生成しないため、この検証の対象外
+        // （正当なデータとして通す）。
+        for category in &categories {
+            let is_taxed_direction = matches!(
+                category.direction,
+                TaxDirection::Sales | TaxDirection::Purchase
+            );
+            let Some(rate) = category.rate else {
+                continue;
+            };
+            if !is_taxed_direction || rate.as_decimal() == Decimal::ZERO {
+                continue;
+            }
+            if category.tax_account.is_none() {
+                return Err(JpError::InvalidTaxCategoryTable {
+                    label,
+                    reason: format!(
+                        "税区分 \"{}\" は課税対象（direction: {}, rate: {}）ですが \
+                         tax_account が指定されていません。税額の計上先科目を指定するか、\
+                         課税対象外にする場合は rate を \"0\" にしてください",
+                        category.code,
+                        direction_label(category.direction),
+                        rate.as_decimal(),
                     ),
                 });
             }
@@ -236,6 +272,15 @@ impl TaxCategoryTable {
     }
 }
 
+/// エラーメッセージ用の `direction` の表示ラベル（YAML の値をそのまま使う）。
+fn direction_label(direction: TaxDirection) -> &'static str {
+    match direction {
+        TaxDirection::Sales => "sales",
+        TaxDirection::Purchase => "purchase",
+        TaxDirection::None => "none",
+    }
+}
+
 /// [`TaxCategoryTable`] の YAML 上の生の形。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -360,6 +405,142 @@ categories:
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    /// テスト用に最小限の `TaxCategory` を組み立てる。フィールドはすべて `pub`
+    /// （`category.rs` の doc 参照）なので、このテストモジュールから直接構築できる。
+    fn category(
+        code: &str,
+        direction: TaxDirection,
+        rate: Option<&str>,
+        tax_account: Option<&str>,
+    ) -> TaxCategory {
+        TaxCategory {
+            code: code.to_string(),
+            label: format!("label-{code}"),
+            direction,
+            rate: rate.map(|r| kaikei_core::Ratio::parse_rate(r).unwrap()),
+            deductible: None,
+            deduction_ratio: None,
+            requires_qualified_invoice: false,
+            tax_account: tax_account.map(|a| kaikei_core::AccountCode::parse(a).unwrap()),
+            note: None,
+        }
+    }
+
+    // PR-4: PR-3 から送られた論点（直接 §4）。direction が sales/purchase かつ
+    // rate が 0 でない区分は tax_account が必須。
+    #[test]
+    fn new_rejects_taxed_category_without_tax_account() {
+        let err = TaxCategoryTable::new(
+            "test".to_string(),
+            AccountingDate::new(2026, 1, 1).unwrap(),
+            None,
+            valid_settings_defaults(),
+            vec![category(
+                "SALES_10",
+                TaxDirection::Sales,
+                Some("0.10"),
+                None,
+            )],
+        )
+        .unwrap_err();
+        match err {
+            JpError::InvalidTaxCategoryTable { reason, .. } => {
+                assert!(reason.contains("SALES_10"), "reason = {reason}");
+                assert!(reason.contains("tax_account"), "reason = {reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_rejects_taxed_purchase_category_without_tax_account() {
+        let err = TaxCategoryTable::new(
+            "test".to_string(),
+            AccountingDate::new(2026, 1, 1).unwrap(),
+            None,
+            valid_settings_defaults(),
+            vec![category(
+                "PURCHASE_10",
+                TaxDirection::Purchase,
+                Some("0.10"),
+                None,
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(err, JpError::InvalidTaxCategoryTable { .. }));
+    }
+
+    // `SALES_EXPORT`（同梱データ）と同じ形: rate が "0" なら tax_account が
+    // 無くても正当なデータとして通る。
+    #[test]
+    fn new_accepts_zero_rate_taxed_category_without_tax_account() {
+        let table = TaxCategoryTable::new(
+            "test".to_string(),
+            AccountingDate::new(2026, 1, 1).unwrap(),
+            None,
+            valid_settings_defaults(),
+            vec![category(
+                "SALES_EXPORT",
+                TaxDirection::Sales,
+                Some("0"),
+                None,
+            )],
+        )
+        .unwrap();
+        assert!(table
+            .category("SALES_EXPORT")
+            .unwrap()
+            .tax_account
+            .is_none());
+    }
+
+    // `direction: none` の区分（rate が null）は tax_account が無くても通る。
+    #[test]
+    fn new_accepts_none_direction_category_without_tax_account() {
+        let table = TaxCategoryTable::new(
+            "test".to_string(),
+            AccountingDate::new(2026, 1, 1).unwrap(),
+            None,
+            valid_settings_defaults(),
+            vec![category("TAX_FREE", TaxDirection::None, None, None)],
+        )
+        .unwrap();
+        assert!(table.category("TAX_FREE").unwrap().tax_account.is_none());
+    }
+
+    #[test]
+    fn new_accepts_taxed_category_with_tax_account() {
+        let table = TaxCategoryTable::new(
+            "test".to_string(),
+            AccountingDate::new(2026, 1, 1).unwrap(),
+            None,
+            valid_settings_defaults(),
+            vec![category(
+                "SALES_10",
+                TaxDirection::Sales,
+                Some("0.10"),
+                Some("330"),
+            )],
+        )
+        .unwrap();
+        assert!(table.category("SALES_10").unwrap().tax_account.is_some());
+    }
+
+    // 実データ（`SALES_EXPORT`。direction: sales, rate: "0", tax_account: null）が
+    // 新しい構築時検証でも引き続き通ること。
+    #[test]
+    fn from_embedded_sales_export_without_tax_account_still_loads() {
+        let found = kaikei_jp_data::TAX_CATEGORY_SOURCES
+            .iter()
+            .find_map(|source| {
+                let table = TaxCategoryTable::from_embedded(*source).unwrap();
+                table.category("SALES_EXPORT").ok().cloned()
+            });
+        let category = found.expect("同梱データのいずれかに SALES_EXPORT が存在するはず");
+        assert_eq!(category.direction, TaxDirection::Sales);
+        assert!(category.tax_account.is_none());
     }
 
     #[test]

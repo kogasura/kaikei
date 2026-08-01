@@ -2,7 +2,7 @@
 #
 # 日本・個人事業主アダプタ。kaikei-policy の trait を実装する（Phase 2）。
 # PR-1: ローダの共通基盤とエラー型。PR-2: インボイス登録番号の形式検証。
-# PR-3: 税区分マスタと適用期間による選択。
+# PR-3: 税区分マスタと適用期間による選択。PR-4: JpTaxPolicy（税額計算・タグ検証）。
 # sqlx / tokio / kaikei-app / kaikei-store / kaikei-import には依存しない
 # （CI (architecture.yml) が検査する）。
 
