@@ -695,6 +695,7 @@ dependencies = [
  "kaikei-core",
  "kaikei-jp-data",
  "kaikei-policy",
+ "proptest",
  "rust_decimal",
  "serde",
  "serde_norway",

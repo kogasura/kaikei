@@ -34,4 +34,49 @@ pub enum JpError {
         #[source]
         source: std::io::Error,
     },
+
+    /// インボイス登録番号（[`crate::invoice::InvoiceRegistrationNo`]）が `'T'` から
+    /// 始まっていない。
+    ///
+    /// 小文字の `'t'` や `T` 以外の文字から始まる入力、空文字列もこのバリアントになる。
+    #[error("インボイス登録番号は先頭が \"T\"（大文字）である必要があります: \"{input}\"")]
+    InvoiceRegNoMissingPrefix {
+        /// 検証に失敗した入力文字列（そのまま）。
+        input: String,
+    },
+
+    /// `T` の後ろの文字数が13ではない。
+    ///
+    /// 半角数字とは限らない文字数を指す（前後の空白や全角文字を含めた文字数）。
+    #[error(
+        "インボイス登録番号は \"T\" の後に13桁の数字が必要ですが、{actual_len}文字です: \"{input}\""
+    )]
+    InvoiceRegNoWrongLength {
+        /// 検証に失敗した入力文字列（そのまま）。
+        input: String,
+        /// `T` の後ろの文字数。
+        actual_len: usize,
+    },
+
+    /// `T` の後ろの13文字に半角数字以外が含まれる（全角数字・ハイフン・空白等）。
+    #[error(
+        "インボイス登録番号の \"T\" の後は半角数字のみである必要があります（全角数字・ハイフン・空白は不可）: \"{input}\""
+    )]
+    InvoiceRegNoNonDigit {
+        /// 検証に失敗した入力文字列（そのまま）。
+        input: String,
+    },
+
+    /// チェックデジット（先頭1桁）が基礎番号（残り12桁）から計算した値と一致しない。
+    #[error(
+        "インボイス登録番号のチェックデジットが一致しません（期待 {expected} / 実際 {actual}）。入力を確認してください: \"{input}\""
+    )]
+    InvoiceRegNoCheckDigit {
+        /// 検証に失敗した入力文字列（そのまま）。
+        input: String,
+        /// 基礎番号（残り12桁）から計算した期待値。
+        expected: u32,
+        /// 入力の先頭1桁として書かれていた実際の値。
+        actual: u32,
+    },
 }
