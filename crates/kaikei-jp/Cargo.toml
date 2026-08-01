@@ -1,0 +1,26 @@
+# crates/kaikei-jp/Cargo.toml
+#
+# 日本・個人事業主アダプタ。kaikei-policy の trait を実装する（Phase 2）。
+# この PR（PR-1）ではローダの共通基盤とエラー型のみ。
+# sqlx / tokio / kaikei-app / kaikei-store / kaikei-import には依存しない
+# （CI (architecture.yml) が検査する）。
+
+[package]
+name = "kaikei-jp"
+version = "0.0.1"
+description = "日本・個人事業主アダプタ（kaikei-policy の実装）"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+kaikei-policy = { path = "../kaikei-policy", version = "0.0.1" }
+kaikei-jp-data = { path = "../kaikei-jp-data", version = "0.0.1" }
+serde = { workspace = true }
+# YAML パーサ。serde_yaml の後継フォーク（DECISIONS.md D-049）
+serde_norway = { workspace = true }
+# tax/jp/{year}.yaml の rate: "0.10" のような文字列を Decimal に変換する
+# （後続 PR で使用。この PR では data.rs のローダ基盤のみ）
+rust_decimal = { workspace = true }
+thiserror = { workspace = true }

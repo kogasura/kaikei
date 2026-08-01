@@ -108,6 +108,52 @@ jobs:
           fi
           echo "OK"
 
+      - name: kaikei-jp は infra を知らない
+        run: |
+          set -euo pipefail
+          FORBIDDEN="sqlx tokio kaikei-app kaikei-store kaikei-import"
+          DEPS=$(cargo tree -p kaikei-jp --edges normal --prefix none \
+                 | sed 's/ v[0-9].*//' \
+                 | sort -u)
+          FAIL=0
+          for f in $FORBIDDEN; do
+            if echo "$DEPS" | grep -qx "$f"; then
+              echo "::error::kaikei-jp が infra 層に依存しています: $f"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "kaikei-jp は kaikei-policy の実装層です。infra（sqlx/tokio等）や"
+            echo "kaikei-app / kaikei-store / kaikei-import（上位・別文脈の層）を"
+            echo "kaikei-jp 自身が知ってはいけません（CLAUDE.md §1）。"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: kaikei-jp-data は依存ゼロを保つ
+        run: |
+          set -euo pipefail
+          # kaikei-jp-data は「データだけを持つ」crate（DECISIONS.md D-050）。
+          # ロジックを持たないことの担保が doc コメントだけだと、うっかり
+          # serde 等を足しても誰も気づかずマージできてしまう。
+          # 禁止リスト方式（既知の危険な依存だけを弾く）ではなく、
+          # 「何も依存していないこと」を検査する。
+          DEPS=$(cargo tree -p kaikei-jp-data --edges normal --depth 1 --prefix none \
+                 | sed 's/ v[0-9].*//' \
+                 | grep -v '^kaikei-jp-data$' \
+                 | grep -v '^$' \
+                 | sort -u || true)
+          if [ -n "$DEPS" ]; then
+            echo "::error::kaikei-jp-data に依存が追加されています: $DEPS"
+            echo ""
+            echo "kaikei-jp-data は YAML を include_str! で公開するだけの"
+            echo "データ crate です。YAML の解釈（デシリアライズ・検証）は"
+            echo "kaikei-jp の責務です（DECISIONS.md D-050）。"
+            exit 1
+          fi
+          echo "OK: 依存ゼロ"
+
       - name: kaikei-app は infra を知らない
         run: |
           set -euo pipefail
