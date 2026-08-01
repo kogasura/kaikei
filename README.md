@@ -63,14 +63,17 @@ READMEおよびドキュメントでの表現は
 
 `skeleton/` にはワークスペースの `Cargo.toml`、CI設定、データファイルの雛形がある。
 
-## 今すぐ着手すべきもの
+## 進捗
 
-**Phase 0: `kaikei-core` のみ。** 1〜2週間で完成する規模。
-`docs/01-core-types.md` と `docs/02-test-cases.md` だけで実装可能な粒度になっている。
+| Phase | 内容 | 状態 |
+|---|---|---|
+| Phase 0 | `kaikei-core`（貸借不一致の仕訳がプログラム上に存在できない簿記エンジン） | ✅ 完了 |
+| Phase 1 | `kaikei-policy`（trait）/ `kaikei-store`（PostgreSQL）/ `kaikei-app`（ユースケース3本） | ✅ 完了 |
+| Phase 2 | `kaikei-jp`（消費税・勘定科目・青色申告） | 未着手 |
+| Phase 3〜5 | MCP サーバー / CSV 取込 / 帳票 | 未着手 |
 
-Phase 0 完了時点の成果物は
-「貸借不一致の仕訳がプログラム上に存在できないRust製簿記エンジン」であり、
-これ単体で公開・議論に足る。
+各 Phase の実績・設計変更・申し送りは `PROGRESS.md`、設計判断の記録は
+`DECISIONS.md` を参照。
 
 ## ローカル開発環境（PostgreSQL）
 
@@ -88,6 +91,21 @@ sqlx migrate run --source crates/kaikei-store/migrations \
 DB権限とトリガで強制されているため、そもそも `UPDATE` は通らない）。
 named volume（`kaikei_pgdata`）ごと作り直せば、次回起動時に
 `docker/postgres/init/01-roles.sql` からロール作成〜マイグレーションをやり直せる。
+
+逆に、**`docker compose down`（`-v` なし）や再起動ではデータは消えない**。
+帳簿は named volume に永続化されており、コンテナを作り直しても残る。
+
+## 仕訳番号と欠番
+
+仕訳番号は**会計年度ごとの連番**とする。
+
+採番（`entry_counters` の更新）は仕訳の INSERT と**同一トランザクション**で行うため、
+検証失敗時はカウンタの増分も一緒に巻き戻り、**通常は欠番が発生しない**
+（欠番が出るのは PostgreSQL の `SEQUENCE` を別トランザクションで払い出す場合。
+`docs/03-database.md` §4、`DECISIONS.md` D-023）。
+
+`entry_counters.skipped` は、それでも**意図的に**番号を飛ばした場合の理由を
+記録するための専用フィールドであり、Phase 1 では書き込みを実装していない。
 
 ## 未決定事項（着手前に人間が決める）
 

@@ -267,7 +267,7 @@ COMMIT;
 
 単一ユーザー前提なので競合しない。
 
-### 方針の明文化（README に書く。人間承認済み・G-1）
+### 方針の明文化（`README.md`「仕訳番号と欠番」に記載済み。人間承認済み・G-1）
 
 > 仕訳番号は会計年度ごとの連番とする。
 > 採番（`entry_counters` の更新）は仕訳の INSERT と同一トランザクションで行うため、
@@ -333,57 +333,97 @@ migrations/
 ORM を使わず Data Mapper を手書きする（理由は `ARCHITECTURE.md` §10）。
 
 ```rust
-// 永続化専用の Row 型。ドメイン型とは別
+// crates/kaikei-store/src/journal/row.rs — 永続化専用の Row 型。ドメイン型とは別。
+// いずれも pub(crate)。DB 行の生表現は永続化層の内部実装詳細。
 #[derive(sqlx::FromRow)]
-struct JournalEntryRow {
-    id: uuid::Uuid,
-    fiscal_year: i32,
-    entry_no: i32,
-    entry_date: chrono::NaiveDate,
-    description: String,
-    reverses: Option<uuid::Uuid>,
-    reverse_reason: Option<String>,
-    recorded_at: chrono::DateTime<chrono::Utc>,
+pub(crate) struct JournalEntryRow {
+    pub id: uuid::Uuid,
+    pub fiscal_year: i32,
+    pub entry_no: i32,
+    pub entry_date: chrono::NaiveDate,
+    pub description: String,
+    pub reverses: Option<uuid::Uuid>,
+    pub reverse_reason: Option<String>,
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(sqlx::FromRow)]
-struct JournalLineRow {
-    entry_id: uuid::Uuid,
-    line_no: i16,
-    account_code: String,
-    side: i16,
-    amount_minor: i64,
-    currency: String,
-    tags: serde_json::Value,
-    memo: Option<String>,
+pub(crate) struct JournalLineRow {
+    // entry_id は SELECT しない（呼び出し側が WHERE entry_id = $1 で
+    // どの仕訳の明細かを既に把握しているため）
+    pub line_no: i16,
+    pub account_code: String,
+    pub side: i16,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub currency_minor_unit: i16,   // 通貨ごとの小数桁（CLAUDE.md §8）
+    pub tags: serde_json::Value,
+    pub memo: Option<String>,
 }
 
-impl TryFrom<(JournalEntryRow, Vec<JournalLineRow>)> for JournalEntry {
+/// ★ 孤児則（E0117）の回避用ローカル型
+pub(crate) struct EntryRows {
+    pub entry: JournalEntryRow,
+    pub lines: Vec<JournalLineRow>,
+}
+
+// crates/kaikei-store/src/journal/mapper.rs
+impl TryFrom<EntryRows> for JournalEntry {
     type Error = RepoError;
-    fn try_from(...) -> Result<Self, Self::Error> {
-        // JournalEntry::rehydrate を使う（検証を再実行しない）
+    fn try_from(rows: EntryRows) -> Result<Self, Self::Error> {
+        // JournalEntry::rehydrate を使う（検証を再実行しない）。
+        // rehydrate を呼んでよいのはこのファイルだけ（CI が検査する）。
     }
 }
 ```
+
+**`impl TryFrom<(JournalEntryRow, Vec<JournalLineRow>)> for JournalEntry` は書けない。**
+`Self`（`JournalEntry`）もタプル構築子も外部型（`kaikei-core` の型）であり、
+孤児則の言う「最初のローカル型」が引数リストに現れないため E0117 になる。
+`EntryRows` というローカルな包み型を1つ挟むことで
+`impl TryFrom<EntryRows> for JournalEntry`（最初の型引数がローカル型）として実装できる。
+Phase 1 の実装時に実測で確認済み。
 
 ### 取得は 2 クエリに分ける
 
 N+1 ではなく固定 2 クエリ。集約 1 つのロードならこれで十分。
 
 ```rust
-async fn find(&self, id: &EntryId) -> Result<Option<JournalEntry>, RepoError> {
-    let entry = sqlx::query_as!(JournalEntryRow,
-        "SELECT * FROM journal_entries WHERE id = $1", uuid)
-        .fetch_optional(&self.pool).await?;
-    let Some(entry) = entry else { return Ok(None) };
+async fn find_entry(&mut self, id: EntryId) -> Result<Option<JournalEntry>, RepoError> {
+    let uuid = entry_id_to_uuid(id);
 
-    let lines = sqlx::query_as!(JournalLineRow,
-        "SELECT * FROM journal_lines WHERE entry_id = $1 ORDER BY line_no", uuid)
-        .fetch_all(&self.pool).await?;
+    let entry_row: Option<JournalEntryRow> = sqlx::query_as(
+        "SELECT id, fiscal_year, entry_no, entry_date, description, reverses, \
+                reverse_reason, recorded_at \
+         FROM journal_entries WHERE id = $1",
+    )
+    .bind(uuid)
+    .fetch_optional(self.conn())
+    .await
+    .map_err(from_sqlx_error)?;
 
-    Ok(Some((entry, lines).try_into()?))
+    let Some(entry_row) = entry_row else { return Ok(None) };
+
+    let line_rows: Vec<JournalLineRow> = sqlx::query_as(
+        "SELECT line_no, account_code, side, amount_minor, currency, \
+                currency_minor_unit, tags, memo \
+         FROM journal_lines WHERE entry_id = $1 ORDER BY line_no",
+    )
+    .bind(uuid)
+    .fetch_all(self.conn())
+    .await
+    .map_err(from_sqlx_error)?;
+
+    Ok(Some(JournalEntry::try_from(EntryRows { entry: entry_row, lines: line_rows })?))
 }
 ```
+
+`SELECT *` ではなく列を明示する。append-only の帳簿は列の追加（NULL 許容のみ）が
+起こりうるため、`*` だと Row 型との対応が静かにズレる。
+
+`self.conn()` は `PgTx` が保持する `sqlx::Transaction` への排他借用。プールから
+新しい接続を取るのではなく、**呼び出し側が開いたトランザクションの中で実行する**
+（§7 を参照）。
 
 一覧取得で子も必要な場合は、Postgres の `json_agg` で 1 クエリにまとめる選択肢もある。
 **どの方式かは Repository 実装の内部に閉じる**ので、後から変えられる。
@@ -392,26 +432,57 @@ async fn find(&self, id: &EntryId) -> Result<Option<JournalEntry>, RepoError> {
 
 ## 7. トランザクション境界
 
-application 層が握る。Repository のシグネチャに `&mut Transaction` を含めるか否かは
-以下の方針で統一する。
+application 層が握る。トランザクションは**ユースケース関数の引数
+`tx: &mut Tx` として引き回す**（`DECISIONS.md` D-029）。
 
 ```rust
-// ports.rs — トランザクションは Unit of Work として渡す
-#[async_trait]
-pub trait UnitOfWork {
-    async fn begin(&self) -> Result<Box<dyn Tx>, RepoError>;
+// kaikei-app/src/ports.rs
+pub trait Store: Send + Sync + 'static {
+    type Tx: TxOps + TxScope;
+    async fn begin(&self) -> Result<Self::Tx, RepoError>;
 }
 
-#[async_trait]
-pub trait Tx: Send {
-    fn journal(&mut self) -> &mut dyn JournalRepository;
-    fn documents(&mut self) -> &mut dyn DocumentRepository;
-    async fn commit(self: Box<Self>) -> Result<(), RepoError>;
+pub trait TxScope: Send + Sized {
+    async fn commit(self) -> Result<(), RepoError>;
+    async fn rollback(self) -> Result<(), RepoError>;
 }
+
+/// 1トランザクションで使える操作の総体。
+pub trait TxOps: JournalRepo + ChartRepo + PeriodRepo + NumberingRepo + Send {}
+
+// kaikei-app/src/tx.rs — commit / rollback の取りこぼしを型で防ぐ
+pub async fn with_tx<S, T, F>(store: &S, f: F) -> Result<T, AppError>
+where
+    S: Store,
+    T: Send,
+    F: for<'a> FnOnce(&'a mut S::Tx) -> BoxFut<'a, Result<T, AppError>> + Send;
 ```
 
-Rust の借用チェッカと相性が悪い領域なので、**Phase 1 で実装したら早めに使ってみて、
-苦痛なら設計を見直す**こと。ここは理論より実感を優先してよい。
+ユースケース側は `post_entry::execute(tx, tax, tag_schema, id_gen, clock, settings, input)`
+のように `&mut Tx` を第1引数で受け取る。**採番と仕訳の INSERT が同一トランザクションに
+乗ること（§4）が、シグネチャから読める**のがこの形の要点。
+
+### 借用チェッカとの相性（Phase 1 で実装しての評価）
+
+当初案の `UnitOfWork` + `Box<dyn Tx>`（`fn journal(&mut self) -> &mut dyn JournalRepository`）は
+**採用しなかった**。ROADMAP Phase 1 の完了条件「実際に使ってみて、苦痛なら設計を
+見直す」に対する結論として、実装前の比較検討で `&mut Tx` を選び、実装後もそのまま
+維持できている（`DECISIONS.md` D-029）。実際に踏んだ痛点は2つだけで、いずれも
+回避策が確立している:
+
+1. **`match f(&mut tx).await { .. }` が E0505 になる。** match のスクルティニーが
+   match 式全体のスコープで生存し、分岐内の `tx.commit()`（`self` を消費する）と
+   `&mut tx` の借用が衝突する。`let result = f(&mut tx).await;` で受けて借用を
+   先に終わらせれば解決する（`tx.rs` にコメントで残してある）。
+2. **`with_tx` のクロージャは HRTB（`for<'a>`）のため `'static` でない借用を
+   キャプチャできない。** 呼び出し側は必要な値を `clone()` してから
+   `Box::pin(async move { .. })` に渡す。E2E テスト・ユースケーステストの
+   すべてがこの形で書けている。
+
+`Box<dyn Tx>` 案ならこの2点は避けられたが、代わりに
+「リポジトリごとに `&mut dyn` を取り出す」段階でトランザクションの排他借用が
+実行時（`RefCell` 相当）に押し出され、**同一トランザクション上の2つのリポジトリ操作を
+同時に走らせるコードがコンパイルを通ってしまう**。型で禁じられる方を選んだ。
 
 ---
 
