@@ -1723,3 +1723,70 @@ AccountType::Asset, true),` の形の行から (コード, 名称, 種別, 記�
 といった、本来なら機械的に検出できたかもしれない誤りの一部を通してしまう
 可能性がある。将来、税務ドメインの知見をもとに「明らかに誤りと言える
 組み合わせ」の一覧が定まった時点で、別 PR として追加を検討する。
+
+---
+
+## D-063 家事按分の家事分は「総額 − 事業分」の引き算で求め、比率を反転して別途丸めない
+
+**決定**: `household_split`（`docs/04-jp-tax.md` §8）は、事業分を
+`Money::mul_ratio(business_ratio, settings.rounding)` で計算した後、
+家事分を **`total.sub(&business_amount)`（引き算）** で求める。
+`total.mul_ratio(1 - business_ratio, settings.rounding)` のように
+家事分を独立してもう一度丸め計算する形にはしない。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 家事分も `apply_ratio(total, 1 - business_ratio)` で独立に計算する（`docs/04-jp-tax.md` §8 の擬似コードだけを見ると自然に見える形） | 端数処理を事業分・家事分の双方で独立に行うと、丸めの向き（`RoundMode::Ceil`/`Floor`）次第で「事業分 + 家事分」が総額から1円ずれうる。例えば総額100,001円・事業割合30%・`Ceil` の場合、事業分は `ceil(100,001×0.30)=30,001`、家事分を独立に `ceil(100,001×0.70)=70,001` と計算すると合計100,002円になり総額を1円超える。これは貸借不一致に直結する事故で、`PROGRESS.md` の Phase 1 で実際に踏んだ「明細ごとに丸めると合計が1円ずれる」バグ（`DECISIONS.md` D-058 が参照する教訓）と同型 |
+| 差額を按分後に事後調整する（大きい方の明細に差額を足し引きする） | 「引き算で求める」だけで済む問題に対して、わざわざ差額検出＋事後修正という複雑な手順を導入することになる。KISS に反し、修正対象をどちらの明細にするかという新たな仕様判断（本質的に不要な判断）を生む |
+
+**理由**: `Money` は最小通貨単位の整数（`i128`）であり、按分は必然的に
+端数処理を伴う。2値の合計を固定値（総額）に一致させたいとき、片方を
+丸めた後もう片方を「全体 − 丸めた片方」の引き算で求めれば、丸め方式や
+比率によらず合計は構造的に総額と一致する。これは「2つの独立した丸め計算の
+結果を後から検証する」のではなく、「そもそも合計がずれない計算の組み方を
+選ぶ」という設計であり、`CLAUDE.md` の「会計データは間違うと実害が出る」
+という前提に対して安全側の実装である。
+
+**トレードオフ**: 事業分・家事分のどちらに端数が寄るかは丸め方式
+（`RoundMode`）と事業分を先に計算するという実装順序に依存する。
+`RoundMode::Ceil` を選んでも「家事分が必ず切り上げられる」わけではない
+（家事分は引き算の結果であり、丸め自体は事業分の計算にしか適用されない）。
+この非対称性は「事業分を先に計算する」という実装上の選択の帰結であり、
+按分率の妥当性と同様に税務上の意味を持つ差ではないため許容する。
+
+---
+
+## D-064 家事按分は `JpTaxPolicy`/`TaxContext` を経由せず、独立関数として `JpSettings` を直接受け取る
+
+**決定**: `household_split(input: HouseholdSplitInput, settings: &JpSettings)
+-> Result<Vec<JournalLine>, JpError>` を `kaikei-policy::TaxPolicy` の
+メソッドにはせず、`kaikei-jp::household_split` の独立した関数として実装する。
+`kaikei-policy::TaxContext` は要求しない。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `TaxPolicy` に `household_split` 相当のメソッドを追加し、`ctx: &TaxContext<'_>` を受け取る | `TaxContext` の4項目（`as_of` / `chart` / `tag_schema` / `counterparties`）はどれも家事按分の計算に使わない。`tax_category` の実在確認（`TaxCategoryTable` の参照。`as_of` によるマスタ選択が必要）はこの関数では行わず、記帳時に別途 `TaxPolicy::validate_tag` が担う設計（モジュール doc 参照）にしたため、`ctx` を受け取ってもフィールドを使わない引数が残るだけになる。`TaxPolicy` trait は「税額計算と税区分の妥当性」という一貫した責務を持つ trait であり、按分そのもの（`apply_ratio`）とは責務が異なる `household_split` を無理に生やすと trait の凝集度が下がる |
+| `JpTaxPolicy::apply_ratio`（`TaxPolicy` の trait メソッド）経由で事業分を計算する | `apply_ratio` は `&self: JpTaxPolicy` のメソッドであり、呼び出すには `JpTaxPolicy`（`TaxRuleSets` を保持する重い構築物）のインスタンスと `TaxContext`（4項目の参照一式）が要る。`household_split` が実際に必要とするのは丸め方式（`JpSettings.rounding`）1個だけであり、`Money::mul_ratio(ratio, round_mode)` を直接呼ぶ方が依存が引数にそのまま現れて単純（`CLAUDE.md` §6「依存が引数に全部現れる」） |
+
+**理由**: `docs/04-jp-tax.md` §8 の擬似コードも `settings: &JpSettings` を
+引数に取る独立関数として定義されており、`TaxPolicy` のメソッドにはしていない。
+実際に必要なデータ（丸め方式）を精査した結果、`TaxContext` の4項目は
+どれも不要だと判明したため、素直にその通りに実装した。`JpSettings` は
+`kaikei-jp` 自身の型であり、`kaikei-jp` の中の関数がこれを直接受け取ることは
+`CLAUDE.md` §1 の依存方向にも抵触しない。
+
+**トレードオフ**: `household_split` は `TaxPolicy` の一部として `Arc<dyn
+TaxPolicy>` 経由で呼び出すことができず、呼び出し側（`kaikei-app`）は
+`kaikei-jp::household_split` を直接 import する必要がある。これは
+`kaikei-app` が `kaikei-jp`（`policy` の実装 crate）に直接依存しないという
+`CLAUDE.md` §1 の依存方向（`kaikei-app` は `policy` の trait にのみ依存し、
+`jp` は注入される）と表面上ずれて見えるが、`household_split` は税制判断
+（`TaxPolicy`）ではなく「3行仕訳の組み立て」という記帳前処理のヘルパーであり、
+`kaikei-app` の呼び出し元（合成ルートに近い層）が具体的な実装（`JpSettings`
+の値）を知って呼ぶこと自体は許容範囲と判断した。trait 越しに差し替え可能に
+すべき対象（税額計算・税区分検証）と、事業者が選んだ具体的な按分方法を
+組み立てるだけのヘルパーとを同列に扱わない。

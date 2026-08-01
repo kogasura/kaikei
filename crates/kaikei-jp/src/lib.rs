@@ -14,6 +14,9 @@
 //!   適用マスタの選択（[`tax::TaxRuleSets`]。PR-3）、および
 //!   `kaikei-policy::TaxPolicy` の実装（[`tax::JpTaxPolicy`] /
 //!   [`tax::JpSettings`]。PR-4）
+//! - [`household_split`][]: 家事按分ヘルパー（[`household_split::household_split`]）。
+//!   `kaikei-policy::TaxPolicy` の実装ではなく単独の関数（`docs/04-jp-tax.md`
+//!   §8。PR-6）
 //!
 //! 科目表 / `TagSchema` のロード（PR-5）はまだ実装していない。
 //!
@@ -44,6 +47,7 @@
 // モジュール doc の説明順（土台 → その上に乗るもの）と揃える。
 // アルファベット順ではないのは、読み手が doc の順にファイルを辿れるようにするため。
 pub mod error;
+pub mod household_split;
 pub mod invoice;
 pub mod tax;
 pub mod yaml;
