@@ -263,10 +263,17 @@ jobs:
           # 増えたこと自体が「MCP は薄い層」（docs/07 §4）を疑うべき兆候である。
           # 一覧を広げるときは、その PR で「なぜこの層に必要か」を説明すること。
           #
-          # ★--edges を指定しない（dev-dependency も見る）★
-          # --edges normal だけを見ると、uuid を dev-dependency として足して
-          # テストで使う抜け道が残る（D-047 の注記、および上の kaikei-e2e の
-          # ステップと同型の穴）。既定の normal,build,dev で見る。
+          # ★`cargo tree` ではなく `cargo metadata --no-deps` を読む★
+          # `cargo tree` は既定で**ホストターゲットに解決される依存しか見ない**。
+          # このジョブは ubuntu-latest で走るので、
+          #   [target.'cfg(windows)'.dependencies] uuid = "1"
+          # のように target 指定の下に置かれた依存は検査を素通りする（実測）。
+          # 有効化されていない optional 依存も同様に見えない。
+          # D-078 が塞いだつもりの「dev-dependency の抜け道」と同型の穴なので、
+          # 宣言そのもの（Cargo.toml の記載）を読む。
+          # `cargo metadata --no-deps` の packages[].dependencies[] は
+          # **kind（normal/dev/build）・target 指定・optional を問わず全て**
+          # 列挙されるため、抜け道が残らない。`jq` は ubuntu-latest に同梱。
           #
           # kaikei-store が許可リストに入っているのは、kaikei-mcp が本番で
           # 最初の**合成ルート**であり、PgStore の結線が要るため（docs/07 §4）。
@@ -277,25 +284,30 @@ jobs:
             exit 0
           fi
           ALLOWED="kaikei-core kaikei-app kaikei-jp kaikei-store rmcp tokio serde serde_json schemars"
-          if ! TREE=$(cargo tree -p kaikei-mcp --depth 1 --prefix none); then
-            echo "::error::cargo tree -p kaikei-mcp が失敗しました"
+          if ! METADATA=$(cargo metadata --no-deps --format-version 1); then
+            echo "::error::cargo metadata が失敗しました"
             exit 1
           fi
-          DEPS=$(echo "$TREE" \
-                 | sed 's/ v[0-9].*//' \
-                 | grep -v '^kaikei-mcp$' \
-                 | grep -v '^$' \
-                 | sort -u || true)
+          DEPS=$(echo "$METADATA" \
+                 | jq -r '.packages[] | select(.name == "kaikei-mcp") | .dependencies[].name' \
+                 | sort -u)
           if [ -z "$DEPS" ]; then
             echo "::error::kaikei-mcp の依存を1つも取得できませんでした（検査が働いていません）"
             exit 1
           fi
           FAIL=0
           for d in $DEPS; do
-            if ! echo "$ALLOWED" | grep -qw "$d"; then
-              echo "::error::kaikei-mcp に禁止された依存: $d"
-              FAIL=1
-            fi
+            # ★完全一致で照合する★
+            # `grep -qw` は `-` を単語構成文字として扱わないため、
+            # `core` / `app` / `jp` / `store` / `kaikei` という名前の crate を
+            # 直接依存に足しても許可リストの成分名に一致して緑になる（実測）。
+            case " $ALLOWED " in
+              *" $d "*) ;;
+              *)
+                echo "::error::kaikei-mcp に禁止された依存: $d"
+                FAIL=1
+                ;;
+            esac
           done
           if [ "$FAIL" = "1" ]; then
             echo ""
