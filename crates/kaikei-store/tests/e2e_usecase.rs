@@ -333,7 +333,8 @@ async fn run_reverse_entry(
 /// ではなく、**新規に張り直した別プール**（`common::app_pool` で得る別コネクション）
 /// から `find_entry` で読めることを確認する。同一プールのメモリキャッシュでは
 /// なく実際にDBへ保存されていることの証明であり、docker volume 自体の永続性
-/// （コンテナ再起動）は本テストの対象外（`README.md`「ローカル開発環境」を参照）。
+/// （コンテナ再起動）は本テストの対象外
+/// （`README.md`「開発中にデータを作り直す」を参照）。
 #[sqlx::test]
 async fn posted_entry_is_readable_from_a_freshly_reconnected_pool(
     pool_opts: PgPoolOptions,

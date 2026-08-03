@@ -73,3 +73,12 @@ required-features = ["pg-tests"]
 name = "mcp_stdio_server"
 path = "tests/mcp_stdio_server.rs"
 required-features = ["pg-tests"]
+
+# Phase 3 PR-I: **AI が実際にやる一連の流れ**を実バイナリに1本通す通し E2E。
+# ROADMAP.md Phase 3 の完了条件（記帳できる / 自己修正できるエラー /
+# 全操作が audit_log に残る / 削除系ツールが存在しない）をここで見る。
+# ハーネスは tests/common/mcp_stdio.rs を mcp_stdio_server と共有する。
+[[test]]
+name = "mcp_walkthrough"
+path = "tests/mcp_walkthrough.rs"
+required-features = ["pg-tests"]

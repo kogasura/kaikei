@@ -3,7 +3,21 @@
 **このプロジェクトの差別化の本体。**
 AI エージェントが会計操作を安全に行うための標準インタフェース。
 
-> **この文書の版**: Phase 3 **PR-G**（読み取り系・提案系ツール7件）と
+> **この文書の版**: Phase 3 **PR-I**（通し E2E・README・Phase 3 の記録）まで
+> 反映している（`DECISIONS.md` D-091 まで）。
+>
+> PR-I で**内容が変わったのは §10 だけ**である:
+>
+> | 節 | 変わった点 | 決定 |
+> |---|---|---|
+> | §10 | MC-01〜MC-12 の**担い手を1件ずつ表にした**（どのテストが見ているか）。実バイナリ経由で通っていなかった MC-04 / MC-05 / MC-09 / MC-10 と、**ツールをまたぐ流れ**を `crates/kaikei-e2e/tests/mcp_walkthrough.rs` で足した | D-090 |
+>
+> ツールの入出力（§3）・実装方針（§4）・監査ログ（§9）は PR-H 時点から
+> 変わっていない。**PR-I は新しいツールを1つも実装していない。**
+>
+> 以下は PR-G / PR-H 時点の版注記である。
+>
+> Phase 3 **PR-G**（読み取り系・提案系ツール7件）と
 > **PR-H**（`search_entries` / `get_ledger` とその read model）の**両方**を
 > 反映している（`DECISIONS.md` D-089 まで）。この2つは並行して開発され、
 > 本文書は両者を取り込んだ状態である——**片方だけを名乗らないこと。**
@@ -2617,6 +2631,40 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 
 **この一覧は Phase 3 の完了条件。** 実装より先にこの一覧を全部テストとして書く
 （失敗する状態でよい。`CLAUDE.md` §9）。
+
+### MC-01〜MC-12 の担い手（PR-I で1件ずつ突き合わせた）
+
+**「テストが書いてある」と「実バイナリで通っている」は別である。**
+PR-I 以前、MC-04 / MC-05 / MC-09 / MC-10 は `dispatch::call` を直接呼ぶ形
+（またはレジストリを読む形）でしか検査されておらず、`rmcp` のトランスポートと
+`ServerHandler` を通る本番の経路では一度も踏まれていなかった。
+
+| # | 内容 | 実バイナリ経由（stdio） | 直接呼び出し・単体 |
+|---|---|---|---|
+| MC-01 | 貸借一致の仕訳を post | `mcp_walkthrough.rs` の `an_ai_keeps_the_books_end_to_end_through_the_real_binary` / `mcp_stdio_server.rs` の `a_tools_call_through_the_real_binary_posts_one_entry_and_leaves_two_audit_rows` | `mcp_write_tools.rs` の `a_successful_posting_returns_the_final_lines_and_leaves_two_audit_rows` |
+| MC-02 | 貸借不一致（差額・`hint`） | **PR-I で追加**（`an_ai_keeps_the_books_end_to_end_...` が `hint.suggested_lines` に従って送り直す）。`isError` と帳簿0件は `a_failing_tools_call_through_the_real_binary_still_leaves_two_audit_rows` | `mcp_write_tools.rs` の `an_unbalanced_entry_is_rejected_with_a_hint_while_the_audit_rows_survive` |
+| MC-02b | 税込経理・免税事業者で不一致 | —（帳簿の設定を変えた起動が要るため単体側に置く） | `mcp_write_tools.rs` の `an_unbalanced_entry_under_tax_inclusive_settings_explains_why_no_tax_lines_appear` |
+| MC-02c | `description` の U+0000 | — | `mcp_write_tools.rs` の `a_nul_character_in_the_description_points_at_the_offending_character` |
+| MC-03 | `auto_tax_lines` で税額行 | `an_ai_keeps_the_books_end_to_end_...`（3行になり貸借一致） | `mcp_write_tools.rs` の `a_successful_posting_...` |
+| MC-04 | 存在しない科目コード（候補） | **PR-I で追加**（`the_refusals_keep_their_next_step_through_the_real_binary`） | `mcp_write_tools.rs` の `an_unknown_account_is_rejected_with_a_short_list_of_candidates` |
+| MC-05 | 締め済み期間への post | **PR-I で追加**（同上） | `mcp_write_tools.rs` の `posting_into_a_closed_period_is_rejected` |
+| MC-06 | `close_period`（confirm なし） | **Phase 4 以降に延期**（下の「延期したケース」）。ツール自体が無い | — |
+| MC-07 | `close_period`（confirm あり） | 同上 | — |
+| MC-08 | `suggest_tax_category` | `mcp_stdio_server.rs` の `the_read_tools_answer_through_the_real_binary_and_are_audited`（帳簿が動かないこと）／`an_ai_keeps_the_books_end_to_end_...`（候補を絞らないこと） | `suggest_tax_category.rs` の `every_candidate_carries_a_non_empty_reason` ほか3本 |
+| MC-09 | 金額を JSON number で渡す | **PR-I で追加**（`the_refusals_keep_their_next_step_through_the_real_binary`。`rmcp` のトランスポートを通る経路で、この呼び出しも `audit_log` に2行残ることまで見る） | `wire.rs` の単体／`mcp_write_tools.rs` の `an_amount_given_as_a_json_number_is_rejected_in_japanese_and_still_audited` |
+| MC-10 | 存在させないツール4件 | **PR-I で追加**（`the_forbidden_tools_are_invisible_and_unreachable_through_the_protocol`。`tools/list` の応答と `tools/call` の拒否、`audit_log` が0行であることを見る） | `kaikei-mcp/tests/forbidden_tools.rs`（レジストリ側） |
+| MC-11 | 全11ツールが audit_log に2行 | `an_ai_keeps_the_books_end_to_end_...` が**1本の通しで11ツール全てを踏み**、呼び出した順の `(tool, status)` を突き合わせる。**一覧は `server::registered_tool_names` から導出する**ので、ツールを足して通しで呼ばなければ落ちる。ツール別の内訳は `mcp_stdio_server.rs`（読み取り・提案系7件と書き込み・逆仕訳） | `mcp_write_tools.rs` / `mcp_search_ledger.rs`（`dispatch::call` を直接呼び `audit_log` を SELECT する） |
+| MC-12 | 訂正理由が空・空白のみ | `mcp_stdio_server.rs` の `reversing_through_the_real_binary_goes_through_the_same_audited_path`（空白のみ） | `mcp_write_tools.rs` の `a_blank_reverse_reason_is_rejected_before_any_io`（空文字・空白・全角スペース） |
+
+**MC-06 / MC-07 は「未実装」ではなく「延期」である。** `close_period` は
+Phase 4 以降（§2）なので、Phase 3 に検査すべき振る舞いが無い。行を消さない
+理由は「延期したケース」の節と同じ。
+
+**通しの E2E は `crates/kaikei-e2e/tests/mcp_walkthrough.rs`**（PR-I で新設）。
+科目を確認 → 記帳（1回目は貸借不一致 → `hint` に従って自己修正）→ 読み戻し →
+検索 → 元帳 → 試算表 → **間違いに気づく** → 逆仕訳 → **訂正済みと分かる** →
+正しい金額で記帳し直す → **監査ログに全部残っている**、を1本で通す。
+`ROADMAP.md` Phase 3 の完了条件4つがそのまま検査項目になっている（D-090）。
 
 - 命名規約は `docs/02-test-cases.md` に揃える（`#[test] fn 分類_期待動作()`。
   日本語識別子は使わない）。

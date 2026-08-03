@@ -103,9 +103,16 @@ fn forbidden_tools_are_absent_from_the_tool_list() {
 // - `is_registered_tool`（`ToolRegistry::has_route(name)`。`call` が
 //   「tool not found」を返すかどうかを決めているのはこの述語）
 //
-// **未登録の名前が実際に `-32602 tool not found` になること**は、実バイナリ
-// に送って確かめる経路が別にある（`crates/kaikei-e2e/tests/mcp_stdio_server.rs`
-// と同じ形。D-084 の実測欄）。
+// **未登録の名前が実際にプロトコルエラーになること**と、**`tools/list` の
+// 応答に4件が現れないこと**は、実バイナリに送って確かめる
+// （`crates/kaikei-e2e/tests/mcp_walkthrough.rs` の
+// `the_forbidden_tools_are_invisible_and_unreachable_through_the_protocol`。
+// 「呼び出しに到達しない」ので `audit_log` にも1行も残らないことを併せて見る）。
+//
+// ★この経路は PR-I まで存在しなかった★ ここには以前から
+// 「実バイナリに送って確かめる経路が別にある」と書いてあったが、
+// 名指しされていた `tests/mcp_stdio_server.rs` に該当する検査は無かった。
+// **無いテストを根拠として書かない**（`PROGRESS.md` Phase 3 の教訓3）。
 #[test]
 fn calling_a_forbidden_tool_is_rejected_as_an_unknown_tool() {
     assert_eq!(

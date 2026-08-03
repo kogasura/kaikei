@@ -436,14 +436,33 @@ async fn account_hint(ctx: &ToolContext<'_>, code: &str) -> Option<Value> {
     .ok()?;
 
     let candidates = similar_accounts(&chart, code);
+
+    // 候補が0件でも hint を返す。
+    //
+    // 前方一致で絞っているので、**1文字も共有しないコードでは候補が空になる**
+    // （同梱テンプレートは 100〜690 しか無いので、0 / 7 / 8 / 9 で始まる
+    // コードは全滅する。他社の科目表の癖で 800 番台を打つのはごく普通の
+    // 間違いである）。そこで `None` を返すと、AI に届くのは
+    // 「勘定科目が見つかりません: 800」だけになり**次の手が無くなる**
+    // （`CLAUDE.md` §11）。候補が挙げられないときは、
+    // 一覧の引き方そのものを次の手として返す。
     if candidates.is_empty() {
-        return None;
+        return Some(json!({
+            "message": format!(
+                "勘定科目 {code} は勘定科目マスタにありません。\
+                 コードの先頭が一致する科目が1つも無いため候補は挙げられません。\
+                 list_accounts で登録済みの科目コードを確認してください。\
+                 どの科目を使うかの判断はこのサーバーでは行いません"
+            ),
+            "candidate_accounts": Value::Array(Vec::new()),
+        }));
     }
 
     Some(json!({
         "message": format!(
             "勘定科目 {code} は勘定科目マスタにありません。\
              コードが近い記帳可能な科目を最大 {MAX_ACCOUNT_CANDIDATES} 件挙げます。\
+             list_accounts で一覧を確認することもできます。\
              どの科目を使うかの判断はこのサーバーでは行いません"
         ),
         "candidate_accounts": Value::Array(candidates),

@@ -16,6 +16,10 @@
 
 #![allow(dead_code)]
 
+/// 実バイナリを stdio で起動して `tools/call` を送るハーネス
+/// （`tests/mcp_stdio_server.rs` と `tests/mcp_walkthrough.rs` が共有する）。
+pub mod mcp_stdio;
+
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 

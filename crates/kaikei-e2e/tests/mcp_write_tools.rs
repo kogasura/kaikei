@@ -611,6 +611,61 @@ async fn an_unknown_account_is_rejected_with_a_short_list_of_candidates(
     assert_eq!(journal_entry_count(&app).await, 0);
 }
 
+/// MC-04（続き）: **候補が1件も挙がらないときでも次の手を返す。**
+///
+/// 候補は前方一致で絞るので、**1文字も共有しないコードでは空になる**
+/// （同梱テンプレートは 100〜690 なので 0 / 7 / 8 / 9 で始まるコードは全滅。
+/// 他社の科目表の癖で 800 番台を打つのはごく普通の間違い）。
+/// ここで `hint` ごと落とすと、AI に届くのは「勘定科目が見つかりません: 800」
+/// だけになり**次の手が無くなる**（`CLAUDE.md` §11）。
+///
+/// 既存の検査は `"136"`（候補が出る側）しか踏んでおらず、この差は
+/// 見えていなかった（PR-I レビュー2巡目の B）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_account_code_with_no_near_match_still_gets_a_next_step(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::roles(pool_opts, conn_opts).await.app;
+    let runtime = runtime(&app).await;
+
+    for code in ["800", "9999"] {
+        let response = call::<PostJournalEntry>(
+            &runtime,
+            json!({
+                "entry_date": "2026-04-15",
+                "description": "1文字も一致しない科目コード",
+                "lines": [
+                    { "account": code, "side": "debit",  "amount": "1000" },
+                    { "account": "500", "side": "credit", "amount": "1000",
+                      "tags": { "tax_category": "SALES_10" } }
+                ]
+            }),
+        )
+        .await;
+
+        assert!(is_error(&response), "{response}");
+        let body = body(&response);
+        assert_eq!(body["error"], json!("unknown_account"), "{body}");
+
+        // 候補は空でよい。**hint と次の手は必ず要る。**
+        let hint = &body["hint"];
+        assert!(!hint.is_null(), "候補が空でも hint は返すこと: {body}");
+        assert_eq!(
+            hint["candidate_accounts"].as_array().map(Vec::len),
+            Some(0),
+            "{body}"
+        );
+        let message = hint["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("list_accounts"),
+            "候補が挙げられないときは一覧の引き方を次の手として返すこと: {message}"
+        );
+    }
+
+    assert_eq!(journal_entry_count(&app).await, 0);
+}
+
 /// MC-05: 締め済み期間への post は拒否される。
 ///
 /// Phase 3 に `close_period` は無いので、`period_snapshots` に直接 INSERT して
