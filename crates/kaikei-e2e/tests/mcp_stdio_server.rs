@@ -1200,3 +1200,119 @@ async fn no_protocol_entry_point_other_than_tools_call_touches_the_ledger(
         "tools/call を1回も送っていないのに audit_log に行があります"
     );
 }
+
+/// ★読み取り系も同じ経路を通る★（Phase 3 PR-H。MC-11 / MC-16 / MC-17）
+///
+/// `search_entries` と `get_ledger` を実バイナリに送り、
+///
+/// - 記帳した仕訳が**プロトコルの入口から**引けること
+/// - **帳簿は1件も増えないのに** `audit_log` には呼び出しごとに2行残ること
+///
+/// を見る。読み取り系は帳簿を変えないので、監査ログを書かない迂回を
+/// 作っても正常系のテストでは気づけない（`ROADMAP.md` Phase 3 の完了条件
+/// 「**全操作**が audit_log に記録される」）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn reading_through_the_real_binary_leaves_two_audit_rows_without_touching_the_ledger(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts.clone()).await;
+    let mut server = McpServer::start(&conn_opts).await;
+
+    let posted = server
+        .call_tool(
+            "post_journal_entry",
+            json!({
+                "entry_date": "2026-04-15",
+                "description": "A社への請求",
+                "lines": [
+                    { "account": "135", "side": "debit",  "amount": "110000" },
+                    { "account": "500", "side": "credit", "amount": "100000",
+                      "tags": { "tax_category": "SALES_10" } }
+                ],
+                "auto_tax_lines": true
+            }),
+        )
+        .await;
+    assert!(!is_error(&posted), "{posted}");
+    let entry_id = body(&posted)["entry_id"]
+        .as_str()
+        .expect("entry_id")
+        .to_string();
+
+    // 記帳した仕訳が検索で引ける。
+    let found = server
+        .call_tool("search_entries", json!({ "description": "A社" }))
+        .await;
+    assert!(!is_error(&found), "{found}");
+    let page = body(&found);
+    assert_eq!(page["total_matches"], json!(1), "{page}");
+    assert_eq!(page["entries"][0]["entry_id"], json!(entry_id));
+    // 金額は文字列（§5）。切れていないことも応答から分かる。
+    assert!(page["entries"][0]["lines"][0]["amount"].is_string());
+    assert_eq!(page["has_more"], json!(false));
+
+    // 同じ仕訳が元帳にも出る（自動生成された仮受消費税の行を含む）。
+    let ledger = server
+        .call_tool(
+            "get_ledger",
+            json!({ "account": "500", "from": "2026-01-01", "to": "2026-12-31" }),
+        )
+        .await;
+    assert!(!is_error(&ledger), "{ledger}");
+    let page = body(&ledger);
+    assert_eq!(page["account_type"], json!("revenue"));
+    assert_eq!(page["credit_total"], json!("100000"));
+    assert_eq!(page["closing_balance"], json!("100000"));
+    assert_eq!(page["total_lines"], json!(1));
+    assert_eq!(page["rows"][0]["entry_id"], json!(entry_id));
+
+    server.shutdown().await;
+
+    // 帳簿は記帳の1件だけ（読み取りで増えも減りもしない）。
+    assert_eq!(journal_entry_count(&app).await, 1);
+
+    // 3回の tools/call でそれぞれ2行、計6行。
+    let rows = audit_rows(&app).await;
+    assert_eq!(rows.len(), 6, "{rows:?}");
+    assert_audited_pair(&rows[0..2], "post_journal_entry", "ok");
+    assert_audited_pair(&rows[2..4], "search_entries", "ok");
+    assert_audited_pair(&rows[4..6], "get_ledger", "ok");
+    // 読み取り系は仕訳を作らないので `entry_id` は入らない。
+    assert!(rows[3].entry_id.is_none(), "{rows:?}");
+    assert!(rows[5].entry_id.is_none(), "{rows:?}");
+}
+
+/// 読み取り系の**失敗**もプロトコルエラーにせず、監査ログに2行残す
+/// （D-071 / MC-26）。
+///
+/// 勘定科目マスタに無い科目コードで元帳を引くと `not_found` になる
+/// （空の元帳を返さない）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_failing_read_through_the_real_binary_is_a_tool_error_with_two_audit_rows(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts.clone()).await;
+    let mut server = McpServer::start(&conn_opts).await;
+
+    let result = server
+        .call_tool(
+            "get_ledger",
+            json!({ "account": "99999", "from": "2026-01-01", "to": "2026-12-31" }),
+        )
+        .await;
+
+    // ドメインのエラーはプロトコルエラーにしない（`request_within` は
+    // JSON-RPC の error が返ると panic するので、ここに来た時点で
+    // ツール結果エラーである）。
+    assert!(is_error(&result), "{result}");
+    assert_eq!(body(&result)["error"], json!("not_found"), "{result}");
+
+    server.shutdown().await;
+
+    assert_eq!(journal_entry_count(&app).await, 0);
+    let rows = audit_rows(&app).await;
+    assert_audited_pair(&rows, "get_ledger", "error");
+    assert_eq!(rows[1].error_code.as_deref(), Some("not_found"));
+}

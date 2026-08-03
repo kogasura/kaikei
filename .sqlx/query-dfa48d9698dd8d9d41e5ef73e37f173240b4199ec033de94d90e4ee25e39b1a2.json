@@ -1,0 +1,132 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH opening AS (\n                SELECT COALESCE(SUM(CASE WHEN l.side = 1\n                                         THEN l.amount_minor\n                                         ELSE -l.amount_minor END), 0)::BIGINT AS signed\n                FROM journal_lines l\n                JOIN journal_entries e ON e.id = l.entry_id\n                WHERE l.account_code = $1 AND e.entry_date < $2\n            ),\n            ordered AS (\n                SELECT e.id AS entry_id, e.entry_no, e.entry_date, e.description,\n                       e.reverses, e.reverse_reason,\n                       l.line_no, l.side, l.amount_minor, l.currency, l.currency_minor_unit,\n                       l.tags, l.memo,\n                       ((SELECT o.signed FROM opening o)\n                        + SUM(CASE WHEN l.side = 1 THEN l.amount_minor ELSE -l.amount_minor END)\n                            OVER (ORDER BY e.entry_date, e.entry_no, e.id, l.line_no\n                                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n                       )::BIGINT AS running_signed,\n                       (SELECT array_agg(DISTINCT c.account_code ORDER BY c.account_code)\n                          FROM journal_lines c\n                         WHERE c.entry_id = l.entry_id AND c.side <> l.side) AS counter_accounts,\n                       rev.id         AS reversed_by_id,\n                       rev.entry_no   AS reversed_by_no,\n                       rev.entry_date AS reversed_by_date\n                FROM journal_lines l\n                JOIN journal_entries e ON e.id = l.entry_id\n                LEFT JOIN LATERAL (\n                    SELECT r.id, r.entry_no, r.entry_date\n                      FROM journal_entries r\n                     WHERE r.reverses = e.id\n                     ORDER BY r.entry_date, r.entry_no, r.id\n                     LIMIT 1\n                ) rev ON TRUE\n                WHERE l.account_code = $1 AND e.entry_date BETWEEN $2 AND $3\n            )\n            SELECT entry_id                    AS \"entry_id!\",\n                   entry_no                    AS \"entry_no!\",\n                   entry_date                  AS \"entry_date!\",\n                   description                 AS \"description!\",\n                   reverses                    AS \"reverses?\",\n                   reverse_reason              AS \"reverse_reason?\",\n                   line_no                     AS \"line_no!\",\n                   side                        AS \"side!\",\n                   amount_minor                AS \"amount_minor!\",\n                   currency                    AS \"currency!\",\n                   currency_minor_unit         AS \"minor_unit!\",\n                   tags                        AS \"tags!\",\n                   memo                        AS \"memo?\",\n                   running_signed              AS \"running_signed!\",\n                   counter_accounts            AS \"counter_accounts?: Vec<String>\",\n                   reversed_by_id              AS \"reversed_by_id?\",\n                   reversed_by_no              AS \"reversed_by_no?\",\n                   reversed_by_date            AS \"reversed_by_date?\"\n            FROM ordered\n            WHERE NOT $4::boolean\n               OR (entry_date, entry_no, entry_id, line_no)\n                  > ($5::date, $6::integer, $7::uuid, $8::smallint)\n            ORDER BY entry_date, entry_no, entry_id, line_no\n            LIMIT $9\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "entry_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "entry_no!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "entry_date!",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 3,
+        "name": "description!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "reverses?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "reverse_reason?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "line_no!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 7,
+        "name": "side!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 8,
+        "name": "amount_minor!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "currency!",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "minor_unit!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 11,
+        "name": "tags!",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "memo?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "running_signed!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 14,
+        "name": "counter_accounts?: Vec<String>",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 15,
+        "name": "reversed_by_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 16,
+        "name": "reversed_by_no?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "reversed_by_date?",
+        "type_info": "Date"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Date",
+        "Date",
+        "Bool",
+        "Date",
+        "Int4",
+        "Uuid",
+        "Int2",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null,
+      null,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "dfa48d9698dd8d9d41e5ef73e37f173240b4199ec033de94d90e4ee25e39b1a2"
+}

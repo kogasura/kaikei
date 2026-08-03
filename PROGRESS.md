@@ -472,7 +472,7 @@ Phase 2 で実際に起きたことを、脚色せずに記録する。
 
 ## Phase 3 — kaikei-mcp
 
-実装中（PR-F まで完了）。完了時に他 Phase と同じ節構成で記録する。
+実装中（PR-F・PR-H まで完了。PR-G と並行）。完了時に他 Phase と同じ節構成で記録する。
 
 ### 実装中の申し送り
 
@@ -499,11 +499,64 @@ Phase 2 で実際に起きたことを、脚色せずに記録する。
   全て記録する」と定めている。読み取り系は `ToolSuccess::with_entry_id` を
   付けないだけで、経路は書き込み系と同じである。
 
-- **MC-11 の「全11ツール総当たり」は書き込み系2件まで済み。**
-  残り9件は PR-G / PR-H で `crates/kaikei-e2e/tests/mcp_write_tools.rs` と
-  同じ形（`dispatch::call` を直接呼び、`audit_log` を SELECT する）で足す。
+- **MC-11 の「全11ツール総当たり」は書き込み系2件（PR-F）と
+  `search_entries` / `get_ledger`（PR-H）まで済み。**
+  残り7件は PR-G で `crates/kaikei-e2e/tests/mcp_write_tools.rs` /
+  `mcp_search_ledger.rs` と同じ形（`dispatch::call` を直接呼び、
+  `audit_log` を SELECT する）で足す。
   読み取り専用のツールなら `kaikei-mcp` 側の `pg-tests` でも書けるが、
   `audit_log` を読むには SQL が要るので `kaikei-e2e` 側になる。
+
+- **【PR-H の申し送り】上限とページングの規律を読み取り系で揃えること。**
+  `search_entries` / `get_ledger` は keyset カーソルで、
+  上限を超える `limit` は**丸めずに拒否**し、切ったことを
+  `total_matches`（`total_lines`）/ `returned` / `has_more` / `next_cursor` /
+  `truncation_note` で必ず示す（`DECISIONS.md` D-089）。
+  PR-G の `list_accounts` / `list_tax_categories` は現状すべて返す設計だが、
+  **返す件数が帳簿の大きさに比例するツールを足すときは同じ形にすること**
+  （無言の truncation は「全部見た」と読める）。
+
+- **【PR-H の申し送り】読み取り系は「取り消された仕訳」を隠さない。**
+  赤伝で訂正された仕訳も検索・元帳に残り、`reversed_by` / `reverses` /
+  `reverse_reason` で判別できる（`DECISIONS.md` D-088）。
+  `get_entry`（PR-G）でも同じ欄を返すこと——**取り消し済みであることが
+  読み取れないと、AI は同じ仕訳をもう一度訂正しようとする**
+  （`reverse_journal_entry` は `allow_double_reversal` を明示すれば通る）。
+
+- **【PR-H の申し送り】「0件」と「見つからない」を混同しないこと。**
+  `search_entries` の0件・`get_ledger` の0行は**成功**（空配列）で、
+  **未登録の科目コード**を渡した場合だけ `not_found` のエラーである
+  （`search_entries` の `account` も `get_ledger` の `account` も同じ。
+  D-088 決定3）。前者は条件を緩める、後者はコードを調べ直すという
+  別の次の手になる（`CLAUDE.md` §11）。
+
+  **この規律はツール間で揃えること。** PR-H レビューの初版は
+  `get_ledger` だけが打ち間違いを拒否し、`search_entries` は同じ
+  打ち間違いを**空の成功**にしていた（レビュー C-3）。同じ入力ミスが
+  ツールによって別の意味になると、AI は片方の経験をもう片方に持ち込む。
+
+- **【PR-H の申し送り】読み取り系の `audit_log.output` は要約にすること。**
+  応答本文をそのまま残すと、上限まで返した1回の呼び出しで数十〜百数十 KB が
+  `audit_log`（append-only。消せない）に入る。読み取りは AI が最も多く呼ぶ
+  操作である。要約は**本文から明細と説明文を落とした残り**で、条件・合計・
+  件数・`next_cursor` は残す（`DECISIONS.md` D-089 決定6。実装は
+  `dispatch::ToolSuccess::with_audit_summary`）。
+  **書き込み系は本文をそのまま残す**（結果そのものが変更の記録なので）。
+  PR-G の読み取り系5件も同じ形にすること。
+
+- **【PR-H レビューの教訓】「実装が正しい」ことと「検査が実効的」ことは別。**
+  PR-H の実装には誤りが無かったが、次の2つが**テストで押さえられていなかった**:
+
+  | 退行 | 当時の結果 |
+  |---|---|
+  | `ledger.rs` の期間合計を `entry_date >= from` → `> from` に書き換える | 差分13件・e2e13件が**全て緑** |
+  | `search.rs` / `ledger.rs` の `LEFT JOIN LATERAL` を素朴な `LEFT JOIN` に戻す | 同上（**全て緑**） |
+
+  前者は対照実装の `from` が「その日に明細が無い日」だったため、後者は
+  土台に**二重訂正された仕訳が1件も無かった**ためである。
+  **設計判断の理由として名指ししたケース（`LEFT JOIN LATERAL` を採った理由＝
+  二重訂正）は、土台に必ず1件置くこと。** 置かなければ、その判断を
+  取り消す変更が緑のまま通る。
 
 - **`accounts.active` / `accounts.sort_order` は現在どこからも読まれていない。**
   `kaikei-store` の `load_chart`（`crates/kaikei-store/src/chart.rs`）が

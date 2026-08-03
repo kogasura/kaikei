@@ -45,15 +45,20 @@
 //! `tests/audit_is_structural.rs` が機械的に検査している。
 //! 詳細は [`dispatch`] のモジュール doc（`DECISIONS.md` D-084）。
 //!
-//! # このPR（Phase 3 PR-F）の範囲
+//! # このPR（Phase 3 PR-H）の範囲
 //!
 //! | PR | 内容 | 状態 |
 //! |---|---|---|
 //! | PR-D | `wire.rs` / `server.rs` / `error.rs`（骨組み） | 済 |
 //! | PR-E | 合成ルート（[`config`] / [`startup`] / `src/main.rs`） | 済 |
-//! | PR-F | dispatch 層（[`dispatch`]）と書き込み系ツール2件（[`tools`]） | **このPR** |
-//! | PR-G | 読み取り系・提案系ツール | 未 |
-//! | PR-H | `search_entries` / `get_ledger`（read model の新設が要る） | 未 |
+//! | PR-F | dispatch 層（[`dispatch`]）と書き込み系ツール2件（[`tools`]） | 済 |
+//! | PR-G | 残りの読み取り系5件（`list_accounts` / `get_entry` / `get_trial_balance` / `list_tax_categories` / `get_settings`）と提案系・検証系2件 | 未 |
+//! | PR-H | `search_entries` / `get_ledger`（read model を新設した） | **このPR** |
+//!
+//! 状態はこの crate の `server.rs`（レジストリ）が実物である。**同じ表を
+//! 2箇所で手入れすると必ず割れる**ので、片方を直したらもう片方も直すこと
+//! （PR-H レビュー D-1。この表が「PR-F がこのPR」のまま `server.rs` だけ
+//! PR-H を反映していた）。
 //!
 //! # stdout は JSON-RPC 専用チャネル
 //!

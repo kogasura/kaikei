@@ -53,7 +53,7 @@ use kaikei_jp::tax::TaxRuleSets;
 use kaikei_store::audit::PgAuditSink;
 use kaikei_store::convert::{naive_date_to_accounting_date, timestamp_to_datetime};
 use kaikei_store::pool::{connect_app_with, inspect_journal_privileges, PgStore};
-use kaikei_store::query::PgTrialBalanceQuery;
+use kaikei_store::query::{PgLedgerQuery, PgSearchEntriesQuery, PgTrialBalanceQuery};
 use std::fmt;
 use std::sync::Arc;
 
@@ -103,6 +103,16 @@ pub struct Runtime {
 
     /// 記帳時刻の取得。`Utc::now()` を直に呼ばずこれを通す（`CLAUDE.md` §7）。
     pub clock: SystemClock,
+
+    /// 仕訳検索の read model（Phase 3 PR-H）。
+    ///
+    /// **`store` とは別の入口である。** 読み取りは Repository を通さず
+    /// SQL から DTO へ直行する（`CLAUDE.md` §6）。同じ `PgPool` を共有する
+    /// が、`PgTx` の経路には入らない。
+    pub search_query: Arc<PgSearchEntriesQuery>,
+
+    /// 総勘定元帳の read model（同上）。
+    pub ledger_query: Arc<PgLedgerQuery>,
 
     /// 起動時の科目投入で、**テンプレートと定義が食い違ったため既存を残した**
     /// 科目（`DECISIONS.md` D-081 の `ImportChartOutput::kept_existing`）。
@@ -209,10 +219,12 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
     }
 
     let store = Arc::new(PgStore::new(pool.clone()));
-    // read model は書き込み側（`PgStore`）を経由せず、自前で同じプールから
-    // 引く（`CLAUDE.md` §6）。
+    let audit_sink = Arc::new(PgAuditSink::new(pool.clone()));
+    // read model は書き込み側（`PgStore`/`PgTx`）を経由せず、自前で同じ
+    // プールから引く（`CLAUDE.md` §6）。プールは共有するが、経路は別である。
     let trial_balance = Arc::new(PgTrialBalanceQuery::new(pool.clone()));
-    let audit_sink = Arc::new(PgAuditSink::new(pool));
+    let search_query = Arc::new(PgSearchEntriesQuery::new(pool.clone()));
+    let ledger_query = Arc::new(PgLedgerQuery::new(pool));
 
     // 4. 勘定科目マスタの投入（追加のみ・冪等。`DECISIONS.md` D-081）。
     let imported = with_tx(store.as_ref(), |tx| {
@@ -254,6 +266,8 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
             book_settings: config.book_settings,
             id_gen: UuidV7IdGenerator,
             clock,
+            search_query,
+            ledger_query,
             chart_differences: imported.kept_existing,
         }),
         diagnostics,

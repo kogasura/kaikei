@@ -12,6 +12,8 @@
 //! | [`kaikei_core::Side`] | [`side_code`] | [`side_from_code`] |
 //! | [`kaikei_policy::NoteSeverity`] | [`note_severity_code`] | （無し。下記） |
 //! | [`crate::context::FiscalYearRule`] | [`fiscal_year_rule_code`] | [`fiscal_year_rule_from_code`] |
+//! | [`crate::view::EntryCursor`] | [`entry_cursor_to_string`] | [`entry_cursor_from_string`] |
+//! | [`crate::view::LedgerCursor`] | [`ledger_cursor_to_string`] | [`ledger_cursor_from_string`] |
 //!
 //! `AccountType` / `Side` / `NoteSeverity` が**メソッドではなく自由関数**なのは、
 //! 定義元の crate（`kaikei-core` / `kaikei-policy`）が凍結層であり
@@ -47,7 +49,9 @@
 //!   依存できない（`CLAUDE.md` §1・CI が検査）ため、ここには置けない。
 
 use crate::context::FiscalYearRule;
-use kaikei_core::{AccountType, CoreError, Side};
+use crate::error::AppError;
+use crate::view::{EntryCursor, LedgerCursor};
+use kaikei_core::{AccountType, AccountingDate, CoreError, EntryNumber, Side};
 use kaikei_policy::NoteSeverity;
 
 /// 勘定科目の5要素分類の機械可読名。
@@ -150,6 +154,96 @@ pub fn fiscal_year_rule_from_code(code: &str) -> Result<FiscalYearRule, CoreErro
 /// [`fiscal_year_rule_code`] が返しうる値の一覧。
 pub const FISCAL_YEAR_RULE_CODES: &[&str] = &["calendar_year"];
 
+// ---------------------------------------------------------------------------
+// ページング位置（keyset カーソル）の線上表現。Phase 3 PR-H / `DECISIONS.md` D-089
+// ---------------------------------------------------------------------------
+
+/// カーソルの区切り文字。
+///
+/// 構成要素（ISO 日付・10進数・UUID の正準表記）のどれにも現れない文字を選ぶ。
+const CURSOR_SEPARATOR: char = ':';
+
+/// [`crate::view::EntryCursor`] を線上の文字列にする。
+///
+/// 形は `取引日:仕訳番号:仕訳ID`（例: `2026-04-15:42:0192a7b3-…`）。
+/// **呼び出し元（AI）が自分で組み立てることを想定していない。**
+/// 応答の `next_cursor` をそのまま次の要求に渡す使い方だけを説明する
+/// （形式は将来変わりうる。変わってもこの関数と
+/// [`entry_cursor_from_string`] を同時に直せばよい形にしてある）。
+pub fn entry_cursor_to_string(cursor: &EntryCursor) -> String {
+    format!(
+        "{date}{sep}{no}{sep}{id}",
+        date = cursor.entry_date.to_iso_string(),
+        sep = CURSOR_SEPARATOR,
+        no = cursor.entry_no.as_u32(),
+        id = crate::id::entry_id_to_uuid_string(cursor.entry_id),
+    )
+}
+
+/// [`entry_cursor_to_string`] の逆向き。
+///
+/// # Errors
+///
+/// 解釈できない文字列は [`AppError::Rejected`]。**既定値（先頭から）へ
+/// フォールバックしない**——壊れたカーソルを黙って無視すると、続きのつもりの
+/// 要求が1ページ目を返し、呼び出し元は同じ内容を「続き」として読む。
+pub fn entry_cursor_from_string(text: &str) -> Result<EntryCursor, AppError> {
+    let mut parts = text.split(CURSOR_SEPARATOR);
+    let (Some(date), Some(no), Some(id), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(malformed_cursor(text));
+    };
+    Ok(EntryCursor {
+        entry_date: AccountingDate::parse(date).map_err(|_| malformed_cursor(text))?,
+        entry_no: EntryNumber::new(no.parse::<u32>().map_err(|_| malformed_cursor(text))?),
+        entry_id: crate::id::entry_id_from_uuid_string(id).map_err(|_| malformed_cursor(text))?,
+    })
+}
+
+/// [`crate::view::LedgerCursor`] を線上の文字列にする。
+///
+/// 形は `取引日:仕訳番号:仕訳ID:明細行番号`。
+pub fn ledger_cursor_to_string(cursor: &LedgerCursor) -> String {
+    format!(
+        "{entry}{sep}{line_no}",
+        entry = entry_cursor_to_string(&cursor.entry),
+        sep = CURSOR_SEPARATOR,
+        line_no = cursor.line_no,
+    )
+}
+
+/// [`ledger_cursor_to_string`] の逆向き。
+///
+/// # Errors
+///
+/// 解釈できない文字列は [`AppError::Rejected`]（[`entry_cursor_from_string`]
+/// と同じ理由でフォールバックしない）。
+pub fn ledger_cursor_from_string(text: &str) -> Result<LedgerCursor, AppError> {
+    let Some((entry, line_no)) = text.rsplit_once(CURSOR_SEPARATOR) else {
+        return Err(malformed_cursor(text));
+    };
+    Ok(LedgerCursor {
+        entry: entry_cursor_from_string(entry)?,
+        line_no: line_no.parse::<u16>().map_err(|_| malformed_cursor(text))?,
+    })
+}
+
+/// 壊れたカーソルに対する共通の拒否。
+///
+/// 入力そのものは載せない（呼び出し元が送ってきた任意長の文字列を応答と
+/// `audit_log` に載せると、入力次第でいくらでも膨らむ。
+/// [`crate::id::entry_id_from_uuid_string`] が入力を切り詰めているのと同じ配慮）。
+fn malformed_cursor(_text: &str) -> AppError {
+    AppError::Rejected {
+        reason: "cursor を解釈できません。cursor には、直前の応答が返した \
+                 next_cursor の値をそのまま指定してください\
+                 （自分で組み立てた値は受け付けません）。\
+                 先頭から読み直す場合は cursor を指定しないでください"
+            .to_string(),
+    }
+}
+
 /// 「未知の機械可読名」に対する共通のエラー文言。
 ///
 /// 有効な値を必ず列挙する（`CLAUDE.md` §11「次の手が分かる文言」）。
@@ -248,6 +342,54 @@ mod tests {
 
         let err = account_type_from_code("Asset").unwrap_err();
         assert!(err.to_string().contains("asset"), "{err}");
+    }
+
+    // WV-7（Phase 3 PR-H）: カーソルは往復する。
+    #[test]
+    fn entry_and_ledger_cursors_round_trip() {
+        use crate::view::{EntryCursor, LedgerCursor};
+        use kaikei_core::EntryId;
+
+        let entry = EntryCursor {
+            entry_date: AccountingDate::new(2026, 4, 15).unwrap(),
+            entry_no: EntryNumber::new(42),
+            entry_id: EntryId::new(0x0192_a7b3_1234_7abc_8def_0123_4567_89ab),
+        };
+        let text = entry_cursor_to_string(&entry);
+        assert_eq!(entry_cursor_from_string(&text).unwrap(), entry);
+        // 仕訳IDは UUID の正準表記（10進表記にしない）。
+        assert!(text.contains(&crate::id::entry_id_to_uuid_string(entry.entry_id)));
+        assert!(text.starts_with("2026-04-15:42:"), "{text}");
+
+        let ledger = LedgerCursor { entry, line_no: 3 };
+        let text = ledger_cursor_to_string(&ledger);
+        assert_eq!(ledger_cursor_from_string(&text).unwrap(), ledger);
+    }
+
+    // WV-8: 壊れたカーソルは「先頭から」に落ちず、次の手を示して拒否される。
+    #[test]
+    fn a_malformed_cursor_is_rejected_instead_of_restarting_from_the_beginning() {
+        for text in [
+            "",
+            "2026-04-15",
+            "2026-04-15:42",
+            "2026-04-15:42:not-a-uuid",
+            "2026-13-01:42:0192a7b3-1234-7abc-8def-0123456789ab",
+            "2026-04-15:-1:0192a7b3-1234-7abc-8def-0123456789ab",
+            "2026-04-15:42:0192a7b3-1234-7abc-8def-0123456789ab:9",
+        ] {
+            match entry_cursor_from_string(text) {
+                Err(AppError::Rejected { reason }) => {
+                    assert!(reason.contains("next_cursor"), "{reason}");
+                }
+                other => panic!("{text:?} が拒否されていません: {other:?}"),
+            }
+        }
+        // 元帳側も同じ（明細行番号が数値でない）。
+        assert!(matches!(
+            ledger_cursor_from_string("2026-04-15:42:0192a7b3-1234-7abc-8def-0123456789ab:x"),
+            Err(AppError::Rejected { .. })
+        ));
     }
 
     // WV-6: 線上語彙は `codes` と同じく snake_case の ASCII 識別子である。

@@ -174,12 +174,15 @@ kaikei-app/src/
 ├── id.rs                   UuidV7IdGenerator
 ├── currency.rs             帳簿通貨の決定
 ├── period_guard.rs         ClosedPeriodGuard（core の PeriodGuard 実装）
-├── view.rs                 read model の DTO（BalanceRowView / TrialBalanceView）
+├── view.rs                 read model の DTO（BalanceRowView / TrialBalanceView /
+│                            EntrySummaryView / LedgerPageView …）
 ├── testing.rs              InMemoryStore 等の fake（testing feature 配下）
 └── usecase/
     ├── post_entry.rs       仕訳を起こす
     ├── reverse_entry.rs    赤伝を起こす
     ├── report.rs           試算表
+    ├── search_entries.rs   仕訳検索                       (P3)
+    ├── ledger.rs           総勘定元帳                     (P3)
     ├── import_chart.rs     勘定科目マスタの投入           (P3)
     ├── import_csv.rs       CSV取込                        (P4+)
     ├── journalize.rs       取込明細を仕訳化（★翻訳層）    (P4+)
@@ -187,10 +190,12 @@ kaikei-app/src/
     └── close_period.rs     期間を締める                   (P4+)
 ```
 
-Phase 3（`kaikei-mcp`）で `kaikei-app` に追加するのは上記の `import_chart.rs`
-（`DECISIONS.md` D-070）のほか、`ports.rs` への監査ログ用ポートと
-read model クエリ trait（`search` / `ledger` / `entry_detail`）、
+Phase 3（`kaikei-mcp`）で `kaikei-app` に追加したのは上記の `import_chart.rs`
+（`DECISIONS.md` D-070）のほか、`ports.rs` への監査ログ用ポート（`AuditSink`）と
+read model クエリ trait（`SearchEntriesQuery` / `LedgerQuery`。PR-H）、
 `post_entry::execute` の戻り値拡張（`PolicyNote` を返す）である。
+**`entry_detail` の read model は新設していない**——`get_entry` が扱うのは
+仕訳1件で、`JournalRepo::find_entry` で足りる。
 詳細は `docs/07-mcp-server.md` §4。
 
 **ユースケース1つ = 1ファイル = 1関数。**
@@ -237,8 +242,7 @@ I/O とドメイン検証の**順序**が重要。採番（4）を検証（2・3
 
 ## 6. store 層
 
-Phase 1 完了時点の実物（`ledger.rs` / `search.rs` / 取込・証憑の Repository は
-Phase 2 以降）:
+Phase 3 PR-H 時点の実物（取込・証憑の Repository は Phase 4 以降）:
 
 ```
 kaikei-store/src/
@@ -258,7 +262,9 @@ kaikei-store/src/
 ├── error.rs                   sqlx::Error → RepoError の入口
 ├── bin/kaikei-migrate.rs      マイグレーション実行バイナリ
 ├── query/                     ★ read model（Repositoryを通さない）
-│   └── trial_balance.rs       SQL集計 → DTO直行
+│   ├── trial_balance.rs       SQL集計 → DTO直行           (P1)
+│   ├── search.rs              仕訳検索（keysetページング）(P3)
+│   └── ledger.rs              総勘定元帳（残高の累計）    (P3)
 └── ../migrations/
 ```
 

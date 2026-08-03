@@ -38,10 +38,11 @@
 
 use crate::audit::{AuditResult, AuditStart};
 use crate::error::RepoError;
-use crate::view::BalanceRowView;
+use crate::view::{BalanceRowView, EntryCursor, EntrySearchPageView, LedgerCursor, LedgerPageView};
 use async_trait::async_trait;
 use kaikei_core::{
-    AccountDef, AccountingDate, ChartOfAccounts, Clock, EntryId, EntryNumber, JournalEntry, TagKey,
+    AccountCode, AccountDef, AccountingDate, ChartOfAccounts, Clock, Currency, EntryId,
+    EntryNumber, JournalEntry, Money, TagKey,
 };
 use kaikei_policy::CounterpartyIndex;
 
@@ -244,6 +245,100 @@ pub trait TrialBalanceQuery: Send + Sync {
         to: AccountingDate,
         group_by: &[TagKey],
     ) -> Result<Vec<BalanceRowView>, RepoError>;
+}
+
+/// 仕訳検索の read model クエリ（Phase 3 PR-H）。
+///
+/// [`TrialBalanceQuery`] と同じく `Tx` を通さない
+/// （`CLAUDE.md` §6「read model は物理的に分離する」）。
+///
+/// **入力の妥当性検証はユースケース側の責務である**
+/// （[`crate::usecase::search_entries`]）。この trait の実装は SQL に徹する:
+/// `from > to` の拒否、`tags` のキーが `TagSchema::is_aggregatable` を
+/// 満たすかどうか、`limit` の上限は SQL に到達する前に済んでいる。
+#[async_trait]
+pub trait SearchEntriesQuery: Send + Sync {
+    /// 条件に一致する仕訳を1ページ分返す。
+    ///
+    /// # Errors
+    ///
+    /// 問い合わせに失敗した場合、または保存されている値を復元できない場合は
+    /// [`RepoError`]。
+    async fn search_entries(
+        &self,
+        params: &SearchEntriesParams,
+    ) -> Result<EntrySearchPageView, RepoError>;
+}
+
+/// [`SearchEntriesQuery::search_entries`] の絞り込み条件。
+///
+/// フィールドを増やす形にしているのは、条件が7つあり位置引数では
+/// 呼び出し側が読めなくなるためである（[`TrialBalanceQuery`] は3つなので
+/// 位置引数のままにしてある）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchEntriesParams {
+    /// 取引日の下限（両端を含む）。`None` なら下限なし。
+    pub from: Option<AccountingDate>,
+    /// 取引日の上限（両端を含む）。`None` なら上限なし。
+    pub to: Option<AccountingDate>,
+    /// この科目の明細を含む仕訳だけに絞る。
+    pub account: Option<AccountCode>,
+    /// 摘要にこの文字列を含む仕訳だけに絞る（部分一致・英字は大小を無視）。
+    pub description_contains: Option<String>,
+    /// 明細1行の金額がこの額**以上**である仕訳だけに絞る。
+    pub min_amount: Option<Money>,
+    /// 明細1行の金額がこの額**以下**である仕訳だけに絞る。
+    pub max_amount: Option<Money>,
+    /// タグの絞り込み（キーと**正準化済みの値文字列**の組）。
+    ///
+    /// 複数指定した場合は**すべてを満たす**仕訳だけが残る。判定は仕訳単位で
+    /// あり、「キーごとにいずれかの明細が一致すればよい」（同じ1行が
+    /// 全部のタグを持つ必要はない）。
+    pub tags: Vec<(TagKey, String)>,
+    /// 続きから読む場合の開始位置。`None` なら先頭から。
+    pub cursor: Option<EntryCursor>,
+    /// 1ページの上限件数。
+    pub limit: u32,
+}
+
+/// 総勘定元帳の read model クエリ（Phase 3 PR-H）。
+#[async_trait]
+pub trait LedgerQuery: Send + Sync {
+    /// 指定科目の元帳を1ページ分返す。
+    ///
+    /// # Errors
+    ///
+    /// - 指定した科目コードが `accounts` に無い場合は [`RepoError::NotFound`]
+    ///   （**空の元帳を返さない**。科目コードの打ち間違いと「その期間に
+    ///   取引が無い」は呼び出し元が取るべき次の手が違う）
+    /// - 集計対象に複数の通貨が混在する場合は [`RepoError::Unsupported`]
+    ///   （`DECISIONS.md` D-042。試算表の read model と同じ粒度）
+    /// - そのほか問い合わせ・復元に失敗した場合は [`RepoError`]
+    async fn ledger(&self, params: &LedgerParams) -> Result<LedgerPageView, RepoError>;
+}
+
+/// [`LedgerQuery::ledger`] の条件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerParams {
+    /// 対象の勘定科目コード。
+    pub account: AccountCode,
+    /// 集計期間の開始日（取引日、両端を含む）。
+    pub from: AccountingDate,
+    /// 集計期間の終了日（取引日、両端を含む）。
+    pub to: AccountingDate,
+    /// 帳簿通貨（[`crate::context::BookSettings::book_currency`]）。
+    ///
+    /// **明細が1行も無い元帳でも通貨を名乗れるようにするために渡す。**
+    /// `Money` は通貨なしでは構築できないので、0円の期首残高すら
+    /// 通貨を決めなければ返せない（[`crate::view::TrialBalanceView::new`]
+    /// が帳簿通貨を必須の引数として受け取るのと同じ理由。`DECISIONS.md` D-074）。
+    /// 実装はこの値を**ゼロ値の通貨としてのみ**使い、行があるときは
+    /// 保存されている通貨を使う（食い違いはユースケース側が検出する）。
+    pub book_currency: Currency,
+    /// 続きから読む場合の開始位置。`None` なら期間の先頭から。
+    pub cursor: Option<LedgerCursor>,
+    /// 1ページの上限行数。
+    pub limit: u32,
 }
 
 /// 監査ログ（`audit_log`）の記録先。

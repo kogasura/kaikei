@@ -54,7 +54,7 @@ use kaikei_mcp::tools::post_journal_entry::PostJournalEntry;
 use kaikei_mcp::tools::reverse_journal_entry::ReverseJournalEntry;
 use kaikei_store::audit::PgAuditSink;
 use kaikei_store::pool::PgStore;
-use kaikei_store::query::PgTrialBalanceQuery;
+use kaikei_store::query::{PgLedgerQuery, PgSearchEntriesQuery, PgTrialBalanceQuery};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -123,6 +123,10 @@ async fn runtime_with(app: &PgPool, options: ComposeOptions) -> Runtime {
         book_settings: book_settings(),
         id_gen: UuidV7IdGenerator,
         clock: SystemClock,
+        // 読み取り系（PR-H）。このファイルの検査では使わないが、`Runtime` は
+        // 依存を欠いた状態を作れない形にしてある（`src/server.rs` の doc）。
+        search_query: Arc::new(PgSearchEntriesQuery::new(app.clone())),
+        ledger_query: Arc::new(PgLedgerQuery::new(app.clone())),
         // このテストはテンプレートと同じ定義を投入するので食い違いは出ない
         // （食い違いを `get_settings` が返すことは `kaikei-mcp` 側の単体検査が
         // 見る。`DECISIONS.md` D-086）。

@@ -210,21 +210,23 @@ pub fn server_info() -> ServerInfo {
 /// のは `dispatch.rs` と `error.rs` だけ。`tests/audit_is_structural.rs`）で
 /// ある。
 ///
-/// **PR-F で書き込み系2件、PR-G で読み取り系・提案系7件**を登録した。
-/// 残るのは `search_entries` / `get_ledger`（PR-H。read model の新設が要る）。
-/// 追加してよいのは `docs/07-mcp-server.md` §2 の表で **Phase 3** と書かれた
-/// 11件だけで、「存在させないツール」の4件をここに足してはならない
-/// （`tests/forbidden_tools.rs` の
+/// **PR-F で書き込み系2件、PR-G で読み取り系・提案系7件、PR-H で
+/// `search_entries` / `get_ledger` の2件**を登録した。これで
+/// `docs/07-mcp-server.md` §2 の表で **Phase 3** と書かれた11件のうち
+/// 9件が揃っている。追加してよいのはその11件だけで、「存在させないツール」の
+/// 4件をここに足してはならない（`tests/forbidden_tools.rs` の
 /// `every_registered_tool_is_one_of_the_eleven_phase_3_tools` が
 /// **許可リスト側からも**閉じている）。
 pub fn tool_registry() -> ToolRegistry {
     use crate::tools::get_entry::GetEntry;
+    use crate::tools::get_ledger::GetLedger;
     use crate::tools::get_settings::GetSettings;
     use crate::tools::get_trial_balance::GetTrialBalance;
     use crate::tools::list_accounts::ListAccounts;
     use crate::tools::list_tax_categories::ListTaxCategories;
     use crate::tools::post_journal_entry::PostJournalEntry;
     use crate::tools::reverse_journal_entry::ReverseJournalEntry;
+    use crate::tools::search_entries::SearchEntries;
     use crate::tools::suggest_tax_category::SuggestTaxCategory;
     use crate::tools::validate_invoice_number::ValidateInvoiceNumber;
 
@@ -241,6 +243,9 @@ pub fn tool_registry() -> ToolRegistry {
         // 提案系・検証系（PR-G。帳簿を変更しない）。
         .with::<SuggestTaxCategory>()
         .with::<ValidateInvoiceNumber>()
+        // 読み取り系（PR-H。read model の新設が要ったぶん）。
+        .with::<SearchEntries>()
+        .with::<GetLedger>()
 }
 
 #[cfg(test)]
@@ -248,8 +253,8 @@ mod tests {
     use super::*;
 
     // PR-F の書き込み系2件と、PR-G の読み取り系・提案系7件が登録されている。
-    // 件数そのものではなく「その9件が居ること」を見る
-    // （件数のリテラルは PR-H で必ず古くなる。上限側は
+    // 件数そのものではなく「その名前が居ること」を見る
+    // （件数のリテラルは並行して進む PR で必ず古くなる。上限側は
     // `tests/forbidden_tools.rs` の許可リスト検査が見ている）。
     #[test]
     fn the_write_and_read_tools_are_registered() {
@@ -265,6 +270,15 @@ mod tests {
             "suggest_tax_category",
             "validate_invoice_number",
         ] {
+            assert!(names.iter().any(|name| name == expected), "{expected}");
+        }
+    }
+
+    // PR-H で足した読み取り系2件（`search_entries` / `get_ledger`）。
+    #[test]
+    fn the_search_and_ledger_tools_are_registered() {
+        let names = registered_tool_names();
+        for expected in ["search_entries", "get_ledger"] {
             assert!(names.iter().any(|name| name == expected), "{expected}");
         }
     }
