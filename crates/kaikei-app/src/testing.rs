@@ -304,6 +304,156 @@ impl crate::ports::IdGenerator for SequentialIdGenerator {
     }
 }
 
+/// [`crate::audit::with_audit`] のテスト用に、書かれた監査ログの行を
+/// メモリに溜める [`AuditSink`] フェイク。
+///
+/// **実際の永続化層の代わりにはならない。** このフェイクは
+/// 「帳簿とは別のコネクションで書く」という D-070 の要件を検証できない
+/// （そもそもトランザクションが無い）。それを実証するのは実 PostgreSQL の
+/// テスト（`crates/kaikei-store/tests/audit_log.rs`）の役目であり、
+/// ここで検証するのは **fail-closed / fail-open の手順**だけである。
+pub struct RecordingAuditSink {
+    rows: Mutex<Vec<RecordedAuditRow>>,
+    fail_start: bool,
+    fail_result: bool,
+}
+
+/// [`RecordingAuditSink`] が記録した1行（`audit_log` の行に相当）。
+#[derive(Debug, Clone)]
+pub struct RecordedAuditRow {
+    /// `request_id` 列。
+    pub request_id: crate::audit::RequestId,
+    /// `occurred_at` 列。
+    pub occurred_at: kaikei_core::Timestamp,
+    /// `actor` 列。
+    pub actor: String,
+    /// `tool` 列。
+    pub tool: String,
+    /// `status` 列（`crate::audit::status` の定数）。
+    pub status: &'static str,
+    /// `input` 列（開始レコードのみ）。
+    pub input_json: Option<String>,
+    /// `output` 列に載せる JSON（成功の結果レコードのみ）。
+    pub output_json: Option<String>,
+    /// 失敗の結果レコードで AI に返した本文（`public_message()`）。
+    pub public_message: Option<String>,
+    /// `error_code` 列。
+    pub error_code: Option<String>,
+    /// `entry_id` 列。
+    pub entry_id: Option<EntryId>,
+}
+
+impl RecordingAuditSink {
+    /// すべての書き込みに成功するフェイクを作る。
+    pub fn new() -> Self {
+        RecordingAuditSink {
+            rows: Mutex::new(Vec::new()),
+            fail_start: false,
+            fail_result: false,
+        }
+    }
+
+    /// **開始レコードの書き込みが必ず失敗する**フェイク（fail-closed の検証用）。
+    ///
+    /// 返す [`RepoError`] は、実際に `REVOKE INSERT ON audit_log FROM
+    /// kaikei_app` した場合と同じ形（SQLSTATE 42501 →
+    /// `AppendOnlyViolation`）にしてある。この文言（「訂正は逆仕訳で」）が
+    /// **応答に漏れないこと**の回帰テストを書けるようにするため。
+    pub fn failing_on_start() -> Self {
+        RecordingAuditSink {
+            rows: Mutex::new(Vec::new()),
+            fail_start: true,
+            fail_result: false,
+        }
+    }
+
+    /// **結果レコードの書き込みだけが失敗する**フェイク（fail-open の検証用）。
+    pub fn failing_on_result() -> Self {
+        RecordingAuditSink {
+            rows: Mutex::new(Vec::new()),
+            fail_start: false,
+            fail_result: true,
+        }
+    }
+
+    /// 記録された行を古い順に返す。
+    pub fn rows(&self) -> Vec<RecordedAuditRow> {
+        self.rows
+            .lock()
+            .expect("RecordingAuditSink の Mutex はテスト用フェイクなので毒されない前提")
+            .clone()
+    }
+
+    fn denied() -> RepoError {
+        RepoError::AppendOnlyViolation {
+            reason: "権限エラーです（SQLSTATE 42501: insufficient_privilege）: \
+                     permission denied for table audit_log"
+                .to_string(),
+        }
+    }
+}
+
+impl Default for RecordingAuditSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl crate::ports::AuditSink for RecordingAuditSink {
+    async fn record_start(&self, record: &crate::audit::AuditStart<'_>) -> Result<(), RepoError> {
+        if self.fail_start {
+            return Err(Self::denied());
+        }
+        self.rows
+            .lock()
+            .expect("RecordingAuditSink の Mutex はテスト用フェイクなので毒されない前提")
+            .push(RecordedAuditRow {
+                request_id: record.request_id,
+                occurred_at: record.occurred_at,
+                actor: record.actor.to_string(),
+                tool: record.tool.to_string(),
+                status: crate::audit::status::STARTED,
+                input_json: record.input_json.map(str::to_string),
+                output_json: None,
+                public_message: None,
+                error_code: None,
+                entry_id: None,
+            });
+        Ok(())
+    }
+
+    async fn record_result(&self, record: &crate::audit::AuditResult<'_>) -> Result<(), RepoError> {
+        if self.fail_result {
+            return Err(Self::denied());
+        }
+        let (output_json, public_message) = match record.outcome {
+            crate::audit::AuditOutcome::Succeeded { output_json } => {
+                (output_json.map(str::to_string), None)
+            }
+            crate::audit::AuditOutcome::Failed { public_message, .. } => {
+                (None, Some(public_message.to_string()))
+            }
+        };
+        self.rows
+            .lock()
+            .expect("RecordingAuditSink の Mutex はテスト用フェイクなので毒されない前提")
+            .push(RecordedAuditRow {
+                request_id: record.request_id,
+                occurred_at: record.occurred_at,
+                actor: record.actor.to_string(),
+                tool: record.tool.to_string(),
+                status: record.outcome.status_code(),
+                input_json: None,
+                output_json,
+                public_message,
+                error_code: record.outcome.error_code().map(str::to_string),
+                entry_id: record.entry_id,
+            });
+        Ok(())
+    }
+}
+
 /// `Tx` が [`TxOps`] を満たすこと（束ね trait のブランケット実装が
 /// `InMemoryTx` にも効くこと）の静的検査。
 fn _assert_in_memory_tx_satisfies_tx_ops<T: TxOps>() {}
