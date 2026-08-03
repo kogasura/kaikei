@@ -33,9 +33,11 @@
 //! 1. NUL 文字（U+0000）を U+FFFD に置換する（[`sanitize_in_place`]）。
 //!    置換したときは値を封筒（`_audit` + `value`）に包み、
 //!    **原文どおりではないことが記録から読み取れる**ようにする。
-//! 2. それでも INSERT が失敗したら、`input` / `output` を
+//! 2. それでも **DB がその文を拒否した**場合に限り、`input` / `output` を
 //!    「記録できなかった旨のプレースホルダ」に差し替えて**1度だけ**再試行する。
 //!    監査の証拠（誰がいつ何のツールを呼んだか）だけは必ず残す。
+//!    接続断・プールのタイムアウトのような**転送レベルの失敗では再試行しない**
+//!    （[`retryable_payload_rejection`] に理由を書いてある）。
 //! 3. JSON として解釈できない文字列（呼び出し側のバグ）も同じ扱いにする。
 //!    行を捨てるより、`tool` と `actor` が残る方が監査として価値がある。
 //!
@@ -153,13 +155,13 @@ impl PgAuditSink {
         .map(|_| ())
     }
 
-    /// 1行を追記する。**入力が原因で落ちたなら内容を諦めてでも行を残す。**
+    /// 1行を追記する。**DB が payload を拒否したなら内容を諦めてでも行を残す。**
     ///
-    /// `input` / `output` を載せた INSERT が失敗した場合に限り、
+    /// `input` / `output` を載せた INSERT を **DB が拒否した**場合に限り、
     /// その2列を「記録できなかった旨のプレースホルダ」に差し替えて
-    /// **1度だけ**再試行する。プレースホルダはこの実装が組み立てた
-    /// 固定構造なので、再試行も失敗したなら原因は payload ではない
-    /// （＝ sink が本当に使えない）と判断できる。
+    /// **1度だけ**再試行する（判定は [`retryable_payload_rejection`]）。
+    /// プレースホルダはこの実装が組み立てた固定構造なので、再試行も失敗した
+    /// なら原因は payload ではない（＝ sink が本当に使えない）と判断できる。
     async fn append(&self, mut row: AuditRow<'_>) -> Result<(), RepoError> {
         let first = match self.insert(&row).await {
             Ok(()) => return Ok(()),
@@ -171,19 +173,55 @@ impl PgAuditSink {
             return Err(audit_sink_error(first));
         }
 
-        let sqlstate = first
-            .as_database_error()
-            .and_then(sqlx::error::DatabaseError::code)
-            .map(|code| code.into_owned());
+        let Some(sqlstate) = retryable_payload_rejection(&first) else {
+            // payload を差し替えても直らない失敗。**内容を捨てない。**
+            return Err(audit_sink_error(first));
+        };
+
         row.input = row
             .input
-            .map(|_| unstorable_placeholder("input", sqlstate.as_deref()));
+            .map(|_| unstorable_placeholder("input", &sqlstate));
         row.output = row
             .output
-            .map(|_| unstorable_placeholder("output", sqlstate.as_deref()));
+            .map(|_| unstorable_placeholder("output", &sqlstate));
 
         self.insert(&row).await.map_err(audit_sink_error)
     }
+}
+
+/// payload を差し替えて**やり直してよい失敗か**を判定し、記録する SQLSTATE を返す。
+///
+/// `Some` を返すのは「**DB がその文を受け取って拒否した**」ことが SQLSTATE
+/// 付きで確認できた場合だけである。理由は2つある。
+///
+/// 1. **重複行を作らない。** 転送レベルの失敗（[`sqlx::Error::Io`] /
+///    [`sqlx::Error::PoolTimedOut`] / [`sqlx::Error::PoolClosed`] 等）は
+///    **コミット済みかどうかが分からない**。1回目が実はコミットされていて
+///    応答だけ失われた場合、やり直すと同じ `request_id` の `started` 行が
+///    2行になる。DB がエラー応答を返した場合は、その文が実行されなかった
+///    （暗黙のトランザクションがアボートした）ことが確定しているので、
+///    やり直しても行は重複しない。
+/// 2. **事実と違う理由を名乗らせない。** 差し替え後に残るのは
+///    [`unstorable_placeholder`]（`reason: "not_storable_as_jsonb"`）であり、
+///    これは「DB が格納を拒否した」と主張する。転送レベルの失敗で
+///    差し替えると、実入力を失ったうえに**誤った理由**が記録に残る。
+///    監査ログは内容の忠実さが本体なので、これは看過できない。
+///
+/// SQLSTATE が取れない `DatabaseError` でも `None` を返す。理由を名乗れない
+/// （`sqlstate: null`）記録は「なぜ内容を失ったか」を後から読む側に伝えられず、
+/// 1つ目の理由（重複しない）だけでは差し替えを正当化できないためである。
+/// これにより **`sqlstate` が `null` の `not_storable_as_jsonb` は
+/// 構造的に発生しない**（[`unstorable_placeholder`] は `&str` を要求する）。
+///
+/// 「クラス 22（data exception）だけ」までは絞らない。`22P05`
+/// （U+0000）以外にも DB が payload を拒否しうる経路（サイズ上限など）が
+/// あり、そこで内容もろとも行を失うより、理由付きで行を残す方が監査として
+/// 価値がある。差し替えても直らない失敗（`42501` 等）は2回目も同じ
+/// SQLSTATE で失敗するので、往復が1回増えるだけで結論は変わらない。
+fn retryable_payload_rejection(err: &sqlx::Error) -> Option<String> {
+    err.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(|code| code.into_owned())
 }
 
 /// 監査ログの書き込み失敗を [`RepoError`] に写す。
@@ -296,7 +334,10 @@ fn unparsable_placeholder(field: &str, parse_error: &serde_json::Error) -> Value
 }
 
 /// 記録できなかった内容の代わりに入れるプレースホルダ（DB が格納を拒否）。
-fn unstorable_placeholder(field: &str, sqlstate: Option<&str>) -> Value {
+///
+/// `sqlstate` は **`&str`**（`Option` ではない）。理由を名乗れないまま
+/// 内容を捨てる経路を型で塞いである（[`retryable_payload_rejection`]）。
+fn unstorable_placeholder(field: &str, sqlstate: &str) -> Value {
     json!({
         AUDIT_NOTE_KEY: {
             "field": field,
@@ -467,9 +508,98 @@ mod tests {
 
     #[test]
     fn unstorable_placeholder_keeps_the_sqlstate_for_diagnosis() {
-        let value = unstorable_placeholder("input", Some("22P05"));
+        let value = unstorable_placeholder("input", "22P05");
         assert_eq!(value[AUDIT_NOTE_KEY]["sqlstate"], json!("22P05"));
         assert_eq!(value[AUDIT_NOTE_KEY]["recorded"], json!(false));
+        // 理由を名乗る以上、SQLSTATE を欠いた行は作れない（型で塞いである）。
+        assert!(!value[AUDIT_NOTE_KEY]["sqlstate"].is_null());
+    }
+
+    /// `sqlx::Error::Database` を組み立てるためのテスト用エラー。
+    ///
+    /// 実 PostgreSQL を起動せずに「DB がその文を拒否した」失敗を作れる
+    /// （`PgDatabaseError` は外から構築できない）。
+    #[derive(Debug)]
+    struct FakeDbError {
+        code: Option<&'static str>,
+    }
+
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "unsupported Unicode escape sequence")
+        }
+    }
+
+    impl std::error::Error for FakeDbError {}
+
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            "unsupported Unicode escape sequence"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.map(std::borrow::Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn database_error(code: Option<&'static str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError { code }))
+    }
+
+    // 【C】DB が payload を拒否した場合だけ差し替えて再試行する。
+    #[test]
+    fn a_database_rejection_is_retried_with_its_sqlstate() {
+        assert_eq!(
+            retryable_payload_rejection(&database_error(Some("22P05"))),
+            Some("22P05".to_string())
+        );
+    }
+
+    // 転送レベルの失敗では再試行しない。
+    // 1回目がコミット済みで応答だけ失われた場合、同じ request_id の
+    // started 行が2行になる。加えて、生き残る行が
+    // not_storable_as_jsonb という事実と違う理由を名乗ってしまう。
+    #[test]
+    fn transport_level_failures_are_never_retried_with_a_placeholder() {
+        for err in [
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+            sqlx::Error::Protocol("unexpected message".to_string()),
+        ] {
+            assert_eq!(
+                retryable_payload_rejection(&err),
+                None,
+                "転送レベルの失敗で再試行している: {err:?}"
+            );
+        }
+    }
+
+    // SQLSTATE を名乗れない DatabaseError でも差し替えない
+    // （sqlstate: null の not_storable_as_jsonb を作らない）。
+    #[test]
+    fn a_database_error_without_a_sqlstate_is_not_retried() {
+        assert_eq!(retryable_payload_rejection(&database_error(None)), None);
     }
 
     // 失敗の結果レコードに載るのは public_message() だけであることの
