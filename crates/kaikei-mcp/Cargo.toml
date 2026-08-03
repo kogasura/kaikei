@@ -1,0 +1,34 @@
+# crates/kaikei-mcp/Cargo.toml
+#
+# ★ MCP サーバー（presentation 層）★
+# stdio で MCP クライアント（Claude Code 等）に会計操作を開く薄い層。
+# ビジネスロジックはここに書かない（docs/07-mcp-server.md §4）。
+#
+# ★依存は最小限に保つ★
+# 線上表現（金額の文字列化・列挙型の機械可読名・仕訳IDの表記・タグ値の変換・
+# エラーコードの写像）は PR-B が kaikei-app / kaikei-jp の公開 API として
+# 用意している。それらを使えば `uuid` / `rust_decimal` / `sqlx` を
+# この crate に足す必要は無い（DECISIONS.md D-072 / D-079）。
+# `.github/workflows/architecture.yml` の
+# 「kaikei-mcp の依存は最小限」ステップが機械的に検査する（docs/07 §10 MC-30）。
+
+[package]
+name = "kaikei-mcp"
+version = "0.0.1"
+description = "MCP サーバー（stdio）。AI エージェント向けの会計操作インタフェース"
+edition.workspace = true
+# ★ workspace 既定（1.80）を継承しない ★
+# rmcp 3.x の MSRV が 1.88 であるため個別に宣言する。workspace 全体を上げると
+# kaikei-core まで「1.80 でビルドできる」性質を失う（DECISIONS.md D-071 / D-078）。
+rust-version = "1.88"
+license.workspace = true
+
+[dependencies]
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
+kaikei-jp = { path = "../kaikei-jp", version = "0.0.1" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
