@@ -118,3 +118,24 @@ jobs:
 
       - name: kaikei-e2e の pg-tests 対象への clippy
         run: cargo clippy -p kaikei-e2e --features pg-tests --all-targets -- -D warnings
+
+      - name: kaikei-mcp の pg-tests を実行（合成ルート）
+        # Phase 3 PR-E: 本番の合成ルートが実 PostgreSQL に対して最後まで
+        # 通ること（設定 → compose → 接続 → ロール検査 → 勘定科目マスタの投入）。
+        #
+        # kaikei-mcp は sqlx に依存しない（architecture.yml の MC-30）ため
+        # `#[sqlx::test]` を使えず、APP_DATABASE_URL が指す DB をそのまま使う。
+        # 書き込むのは勘定科目マスタだけ（追加のみ・冪等。DECISIONS.md D-081）で、
+        # 仕訳は1件も書かない。
+        #
+        # 上の `sqlx migrate run` が適用済みの postgres データベースを使う
+        # （DATABASE_URL と同じDBを、ロールだけ kaikei_app / kaikei_migrator に
+        # 張り替えて指す）。所有者ロールでの起動が拒否されることの確認に
+        # MIGRATOR_DATABASE_URL も渡す。
+        env:
+          APP_DATABASE_URL: postgres://kaikei_app:kaikei_app_ci_password@localhost:5432/postgres
+          MIGRATOR_DATABASE_URL: postgres://kaikei_migrator:kaikei_migrator_ci_password@localhost:5432/postgres
+        run: cargo test -p kaikei-mcp --features pg-tests
+
+      - name: kaikei-mcp の pg-tests 対象への clippy
+        run: cargo clippy -p kaikei-mcp --features pg-tests --all-targets -- -D warnings

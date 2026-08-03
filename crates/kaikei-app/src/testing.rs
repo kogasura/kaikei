@@ -11,9 +11,13 @@
 //! 完全な模倣ではない。
 
 use crate::error::RepoError;
-use crate::ports::{ChartRepo, JournalRepo, NumberingRepo, PeriodRepo, Store, TxOps, TxScope};
+use crate::ports::{
+    ChartRepo, ChartWriteRepo, JournalRepo, NumberingRepo, PeriodRepo, Store, TxOps, TxScope,
+};
 use async_trait::async_trait;
-use kaikei_core::{AccountingDate, ChartOfAccounts, EntryId, EntryNumber, JournalEntry};
+use kaikei_core::{
+    AccountDef, AccountingDate, ChartOfAccounts, EntryId, EntryNumber, JournalEntry,
+};
 use kaikei_policy::CounterpartyIndex;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -104,6 +108,7 @@ impl Store for InMemoryStore {
         Ok(InMemoryTx {
             shared: Arc::clone(&self.state),
             inserted_entries: Vec::new(),
+            inserted_accounts: Vec::new(),
             issued_numbers: BTreeMap::new(),
         })
     }
@@ -118,6 +123,9 @@ impl Store for InMemoryStore {
 pub struct InMemoryTx {
     shared: Arc<Mutex<InMemoryState>>,
     inserted_entries: Vec<JournalEntry>,
+    /// このトランザクション内で追加した勘定科目
+    /// （[`ChartWriteRepo::insert_accounts`]）。commit 時に共有状態へ反映する。
+    inserted_accounts: Vec<AccountDef>,
     /// 会計年度ラベル → このトランザクション内で払い出した最後の番号。
     issued_numbers: BTreeMap<i32, u32>,
 }
@@ -203,11 +211,47 @@ impl JournalRepo for InMemoryTx {
 #[async_trait]
 impl ChartRepo for InMemoryTx {
     async fn load_chart(&mut self) -> Result<ChartOfAccounts, RepoError> {
-        Ok(self.lock_shared().chart.clone())
+        let committed = self.lock_shared().chart.clone();
+        if self.inserted_accounts.is_empty() {
+            return Ok(committed);
+        }
+        // 同一トランザクション内の追加が見えること（read-your-writes）を
+        // 実 DB と揃える。`import_chart::execute` は load → insert の順なので
+        // 現状これに依存していないが、依存しない実装であることをテストで
+        // 保証しているわけではないので、忠実度の高い方に寄せる。
+        let mut defs: Vec<AccountDef> = committed.iter().cloned().collect();
+        defs.extend(self.inserted_accounts.iter().cloned());
+        ChartOfAccounts::new(defs).map_err(|e| RepoError::Corrupt {
+            reason: format!("勘定科目表が整合しません: {e}"),
+        })
     }
 
     async fn load_counterparties(&mut self) -> Result<CounterpartyIndex, RepoError> {
         Ok(self.lock_shared().counterparties.clone())
+    }
+}
+
+#[async_trait]
+impl ChartWriteRepo for InMemoryTx {
+    async fn insert_accounts(&mut self, defs: &[AccountDef]) -> Result<usize, RepoError> {
+        // 実装の契約（`ports::ChartWriteRepo`）どおり、既にあるコードは
+        // **何もしない**（上書きしない）。PostgreSQL 実装の
+        // `ON CONFLICT (code) DO NOTHING` に対応する。
+        let committed = self.lock_shared().chart.clone();
+        let mut inserted = 0usize;
+        for def in defs {
+            let already_committed = committed.get(&def.code).is_some();
+            let already_buffered = self
+                .inserted_accounts
+                .iter()
+                .any(|existing| existing.code == def.code);
+            if already_committed || already_buffered {
+                continue;
+            }
+            self.inserted_accounts.push(def.clone());
+            inserted += 1;
+        }
+        Ok(inserted)
     }
 }
 
@@ -254,6 +298,7 @@ impl TxScope for InMemoryTx {
         let InMemoryTx {
             shared,
             inserted_entries,
+            inserted_accounts,
             issued_numbers,
         } = self;
         let mut guard = shared
@@ -262,6 +307,13 @@ impl TxScope for InMemoryTx {
         for entry in inserted_entries {
             guard.entries.insert(entry.id().as_u128(), entry);
         }
+        if !inserted_accounts.is_empty() {
+            let mut defs: Vec<AccountDef> = guard.chart.iter().cloned().collect();
+            defs.extend(inserted_accounts);
+            guard.chart = ChartOfAccounts::new(defs).map_err(|e| RepoError::Corrupt {
+                reason: format!("勘定科目表が整合しません: {e}"),
+            })?;
+        }
         for (fiscal_year, next) in issued_numbers {
             guard.next_no.insert(fiscal_year, next);
         }
@@ -269,8 +321,8 @@ impl TxScope for InMemoryTx {
     }
 
     async fn rollback(self) -> Result<(), RepoError> {
-        // ローカルバッファ（`inserted_entries` / `issued_numbers`）を
-        // そのまま破棄するだけで、共有状態には一切触れない。
+        // ローカルバッファ（`inserted_entries` / `inserted_accounts` /
+        // `issued_numbers`）をそのまま破棄するだけで、共有状態には一切触れない。
         Ok(())
     }
 }

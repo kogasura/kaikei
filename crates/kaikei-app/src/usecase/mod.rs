@@ -1,4 +1,4 @@
-//! ユースケース（`post_entry` / `reverse_entry` / `report`）。
+//! ユースケース（`post_entry` / `reverse_entry` / `report` / `import_chart`）。
 //!
 //! 各ユースケースは「1ファイル = 1関数」の原則に従う（`CLAUDE.md` §6）。
 //! `AccountingService` のような巨大構造体は作らない。
@@ -7,7 +7,13 @@
 //! [`crate::tx::with_tx`]）。[`post_entry`] / [`reverse_entry`] は
 //! `execute<Tx: TxOps>(tx: &mut Tx, ...)` の形を取り、[`report`] は `Tx` を
 //! 通さず read model（[`crate::ports::TrialBalanceQuery`]）に直行する。
+//!
+//! [`import_chart`] は勘定科目マスタの投入（合成ルートが起動時に呼ぶ。
+//! MCP ツールではない。`DECISIONS.md` D-070 / D-081）で、`TxOps` ではなく
+//! `Tx: ChartRepo + ChartWriteRepo` を要求する——記帳の経路にマスタ書き込みの
+//! 能力を持ち込まないため（[`crate::ports::ChartWriteRepo`] の doc を参照）。
 
+pub mod import_chart;
 pub mod post_entry;
 pub mod report;
 pub mod reverse_entry;

@@ -25,7 +25,8 @@
 //!   ロールバック後に再利用できないようにするための意図的な設計）ため、
 //!   **`dyn TxScope` は原理的に構成できない**（`Self: Sized` を要求する
 //!   メソッドを持つ trait は object-safe にならない）
-//! - [`TxOps`]・[`JournalRepo`]・[`ChartRepo`]・[`PeriodRepo`]・
+//! - [`TxOps`]・[`JournalRepo`]・[`ChartRepo`]・[`ChartWriteRepo`]・
+//!   [`PeriodRepo`]・
 //!   [`NumberingRepo`] はいずれも `&mut self` のメソッドのみを持つため
 //!   `dyn` 互換（`&mut dyn TxOps` 等として使える）。下部の `dyn_safety`
 //!   テストで実際にコンパイルすることを確認している
@@ -40,7 +41,7 @@ use crate::error::RepoError;
 use crate::view::BalanceRowView;
 use async_trait::async_trait;
 use kaikei_core::{
-    AccountingDate, ChartOfAccounts, Clock, EntryId, EntryNumber, JournalEntry, TagKey,
+    AccountDef, AccountingDate, ChartOfAccounts, Clock, EntryId, EntryNumber, JournalEntry, TagKey,
 };
 use kaikei_policy::CounterpartyIndex;
 
@@ -130,10 +131,12 @@ pub trait JournalRepo: Send {
 /// どちらも「その時点のスナップショット」を返す読み取り専用の操作であり、
 /// この trait には書き込みメソッドを定義しない。
 ///
-/// 取引先マスタの編集は Phase 4 以降。勘定科目マスタの**投入**は Phase 3 で
-/// 専用のユースケース（`usecase/import_chart.rs` 等）と対応するポートを新設して
-/// 行う（`DECISIONS.md` D-070）。書き込み用の trait をこの `ChartRepo` に足すのか
-/// 別 trait として分けるのかは、その PR で決める。
+/// 取引先マスタの編集は Phase 4 以降。**勘定科目マスタの投入は
+/// [`ChartWriteRepo`] と [`crate::usecase::import_chart`] で行う**
+/// （Phase 3 PR-E。`DECISIONS.md` D-070 / D-081）。読み書きを別 trait に
+/// 分けたのは、読み取りしか要らないユースケース（記帳・試算表）が
+/// 書き込み能力を持つ `Tx` を要求しないようにするため
+/// （`TxOps` の束ねにも [`ChartWriteRepo`] を含めていない）。
 ///
 /// `CounterpartyIndex` は `kaikei-policy` の型だが、`kaikei-app`
 /// （このファイルの `lib.rs`）が再エクスポートしている。実装者
@@ -148,6 +151,46 @@ pub trait ChartRepo: Send {
 
     /// 取引先索引を読み込む。
     async fn load_counterparties(&mut self) -> Result<CounterpartyIndex, RepoError>;
+}
+
+/// 勘定科目マスタへの**追加**（新規科目の投入）。
+///
+/// # なぜ [`ChartRepo`] と分けるのか
+///
+/// `ChartRepo` は記帳・試算表の経路が使う読み取り専用のポートで、
+/// [`TxOps`] の束ねに含まれている。ここに書き込みメソッドを足すと、
+/// **記帳しかしないユースケースの `Tx` にも科目マスタを書き換える能力が
+/// 付いて回る**。分けておけば、`where Tx: ChartWriteRepo` と書いた
+/// ユースケース（現状 [`crate::usecase::import_chart`] だけ）以外は
+/// マスタに触れないことが型で読み取れる。
+///
+/// # 実装の契約（★これを破ると会計上の実害が出る★）
+///
+/// - **既存行を `UPDATE` / `DELETE` してはならない。**
+///   同じ科目コードが既に存在する場合は**何もしない**
+///   （PostgreSQL 実装は `ON CONFLICT (code) DO NOTHING`）。
+///   既に仕訳が参照している科目の名称・種別を投入経路が黙って書き換えると、
+///   過去の仕訳の意味（試算表の符号・決算書の区分）が後から変わる
+///   （`DECISIONS.md` D-081）。
+/// - `accounts` は帳簿本体（`journal_entries` / `journal_lines`）とは違い
+///   append-only ではなく、DB 権限としては `UPDATE` が許可されている
+///   （`0002_accounts.sql`）。**それでもこのポートは追加しか行わない。**
+///   科目の編集はユーザーの明示的な操作（Phase 4 以降）の領分である。
+#[async_trait]
+pub trait ChartWriteRepo: Send {
+    /// まだ存在しない科目コードの定義を追加する。
+    ///
+    /// 実際に挿入された行数を返す（既存コードと重複した分は数えない）。
+    /// 呼び出し側が事前に差分を取っていても、同時に起動した別プロセスが
+    /// 先に入れている可能性があるため、戻り値は要求した件数と一致するとは
+    /// 限らない。
+    ///
+    /// `defs` が空なら何もせず `Ok(0)` を返す。
+    ///
+    /// # Errors
+    ///
+    /// 挿入に失敗した場合は [`RepoError`]（親科目が存在しない場合など）。
+    async fn insert_accounts(&mut self, defs: &[AccountDef]) -> Result<usize, RepoError>;
 }
 
 /// 会計期間の締め状態（の生データ）の読み込み。
@@ -312,6 +355,13 @@ mod dyn_safety {
     }
 
     #[async_trait]
+    impl ChartWriteRepo for NoopTx {
+        async fn insert_accounts(&mut self, _defs: &[AccountDef]) -> Result<usize, RepoError> {
+            Ok(0)
+        }
+    }
+
+    #[async_trait]
     impl PeriodRepo for NoopTx {
         async fn closed_through(
             &mut self,
@@ -353,6 +403,7 @@ mod dyn_safety {
 
     fn _dyn_journal_repo(_: &mut dyn JournalRepo) {}
     fn _dyn_chart_repo(_: &mut dyn ChartRepo) {}
+    fn _dyn_chart_write_repo(_: &mut dyn ChartWriteRepo) {}
     fn _dyn_period_repo(_: &mut dyn PeriodRepo) {}
     fn _dyn_numbering_repo(_: &mut dyn NumberingRepo) {}
     fn _dyn_tx_ops(_: &mut dyn TxOps) {}
@@ -362,6 +413,7 @@ mod dyn_safety {
         let mut tx = NoopTx;
         _dyn_journal_repo(&mut tx);
         _dyn_chart_repo(&mut tx);
+        _dyn_chart_write_repo(&mut tx);
         _dyn_period_repo(&mut tx);
         _dyn_numbering_repo(&mut tx);
         _dyn_tx_ops(&mut tx);

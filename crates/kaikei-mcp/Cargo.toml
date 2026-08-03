@@ -27,11 +27,46 @@ license.workspace = true
 kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
 kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
 kaikei-jp = { path = "../kaikei-jp", version = "0.0.1" }
+# PR-E: 合成ルート（PgStore / PgAuditSink / connect_app）の結線。
+# ★sqlx は足さない★ sqlx の型を直接触りたくなったら、それは kaikei-store の
+# 公開 API が足りないという別の問題である（MC-30 の許可リストにも sqlx は無い）。
+# `connect_app` が返す `PgPool` は型推論で受けるので、型名を書く必要は無い。
+kaikei-store = { path = "../kaikei-store", version = "0.0.1" }
 rmcp = { workspace = true }
-# tokio はここには無い。この crate の src/ から参照が0件のため。
-# 実際に要るのは合成ルート（`#[tokio::main]`）を置く PR-E であり、使う PR で足す。
-# MC-30 の許可リストには残してある（許可リストは「足してよい上限」であって
-# 「足さねばならない一覧」ではない）。
+# PR-E で追加。`[workspace.dependencies]` の tokio は features = ["full"] だが、
+# この crate が実際に要るのは #[tokio::main]（rt-multi-thread + macros）と
+# stdio トランスポート（io-std）だけなので、意図が読めるよう個別に宣言する。
+# （workspace の feature 統合により、他 crate が "full" を有効にしていれば
+#  実際にビルドされるバイナリは同じになる。この宣言は「この層が何を必要と
+#  しているか」の記録である。ソケットを開く feature（net）を含めていない
+#  ことが docs/07-mcp-server.md §8 の「ソケットを一切開かない」と対応する）
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
+
+[dev-dependencies]
+# 起動テスト（tests/startup_*.rs）が子プロセスとしてこのバイナリを起動し、
+# 応答をタイムアウト付きで読むために使う（process / time / io-util）。
+# dev-dependencies も MC-30 の検査対象（`cargo metadata` は kind を問わず
+# 全て列挙する。D-078）だが、tokio は許可リストに入っている。
+tokio = { workspace = true }
+
+[features]
+# 既定オフ。PostgreSQL を要するテストをゲートする（kaikei-store /
+# kaikei-e2e と同じ方式。`#[ignore]` による無言スキップは使わない）。
+#
+# ★このテストは使い捨てDBを作らない★
+# kaikei-mcp は sqlx に依存しないため `#[sqlx::test]` を使えない。
+# APP_DATABASE_URL が指す DB をそのまま使い、**勘定科目マスタの投入
+# （追加のみ・冪等）と読み取りしか行わない**。仕訳は1件も書かない。
+pg-tests = []
+
+[[test]]
+name = "startup_pg"
+path = "tests/startup_pg.rs"
+required-features = ["pg-tests"]
