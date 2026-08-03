@@ -15,9 +15,16 @@
 
 use std::fmt;
 
-use kaikei_core::{CoreError, Currency, Money};
+// `PolicyNote` は `kaikei-app` の再エクスポート経由で参照する。
+// `kaikei-policy` を直接 `use` すると、この crate の `Cargo.toml` に
+// `kaikei-policy` を足すことになり MC-30（依存の許可リスト）に反する
+// （`DECISIONS.md` D-047 と同型の問題。`kaikei-app` のクレート doc
+// 「`kaikei-policy` 型の再エクスポート」を参照）。
+use kaikei_app::PolicyNote;
+use kaikei_core::{CoreError, Currency, JournalLine, Money, TagSet};
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{json, Map, Value};
 
 /// JSON の number で金額を渡されたときのエラーメッセージ。
 ///
@@ -131,6 +138,139 @@ impl<'de> Deserialize<'de> for AmountStr {
     }
 }
 
+/// 線上の `tags`（キーも値も文字列のマップ）。**重複キーを保持する。**
+///
+/// # なぜ `Map<String, String>` にしないのか
+///
+/// `serde_json` の `Map` は同じキーが2回現れると**後勝ちで黙って上書き**する。
+/// `{"tags": {"tax_category": "SALES_10", "tax_category": "SALES_8"}}` を
+/// `Map` として受けた時点で片方が消えるので、`kaikei-jp` が用意している
+/// [`kaikei_jp::error::JpError::DuplicateTagKeyInInput`]（「重複した指定を
+/// 1つにまとめてください」）に**到達する経路が無くなる**。
+/// `CLAUDE.md` §4「`TagSet` はゴミ箱ではない。黙って落とさない」に反する。
+///
+/// そこで出現順のペアをそのまま保持し、重複の検出は
+/// [`kaikei_jp::tags::TagCatalog::parse_tag_set`] に委ねる（判定を MCP 層に
+/// 書き直さない。`DECISIONS.md` D-072）。
+///
+/// `JsonSchema` 上は素直なオブジェクト（`{"キー": "値"}`）として見える。
+#[derive(Debug, Clone, Default, PartialEq, Eq, schemars::JsonSchema)]
+#[schemars(
+    with = "std::collections::BTreeMap<String, String>",
+    description = "タグ。キーも値も文字列で指定します（例: {\"tax_category\": \"SALES_10\"}）"
+)]
+pub struct TagPairs(Vec<(String, String)>);
+
+impl TagPairs {
+    /// 出現順のキーと値。
+    pub fn as_slice(&self) -> &[(String, String)] {
+        &self.0
+    }
+
+    /// 空かどうか。
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for TagPairs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PairsVisitor;
+
+        impl<'de> de::Visitor<'de> for PairsVisitor {
+            type Value = TagPairs;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("タグのオブジェクト（キーも値も文字列）")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<TagPairs, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                let mut pairs = Vec::new();
+                // `MapAccess` は入力に現れた順で1組ずつ渡してくるので、
+                // 重複キーもここでは失われない（畳み込むのは呼び出し先）。
+                while let Some((key, value)) = access.next_entry::<String, String>()? {
+                    pairs.push((key, value));
+                }
+                Ok(TagPairs(pairs))
+            }
+        }
+
+        deserializer.deserialize_map(PairsVisitor)
+    }
+}
+
+/// [`TagSet`] を線上の `tags`（文字列マップ）にする。
+///
+/// 値の文字列化は [`kaikei_jp::tags::tag_value_to_string`] に委ねる
+/// （線上とDBで別の書き方を発明しない。`docs/07-mcp-server.md` §3）。
+pub fn tag_set_to_json(tags: &TagSet) -> Value {
+    let mut object = Map::new();
+    for (key, value) in tags.iter() {
+        object.insert(
+            key.as_str().to_string(),
+            json!(kaikei_jp::tags::tag_value_to_string(value)),
+        );
+    }
+    Value::Object(object)
+}
+
+/// 確定後の明細1行を線上の JSON にする。
+///
+/// 金額は**区切り無しの文字列**（`docs/07-mcp-server.md` §5）。
+/// `side` は [`kaikei_app::wire::side_code`]。`memo` は指定されていた場合だけ
+/// 現れる（`null` を置くと「メモが空文字である」と区別できない）。
+pub fn line_to_json(line: &JournalLine) -> Value {
+    let mut object = Map::new();
+    object.insert("account".to_string(), json!(line.account().as_str()));
+    object.insert(
+        "side".to_string(),
+        json!(kaikei_app::wire::side_code(line.side())),
+    );
+    object.insert(
+        "amount".to_string(),
+        json!(AmountStr::from_money(line.amount()).as_str()),
+    );
+    object.insert(
+        "currency".to_string(),
+        json!(line.amount().currency().code()),
+    );
+    object.insert("tags".to_string(), tag_set_to_json(line.tags()));
+    if let Some(memo) = line.memo() {
+        object.insert("memo".to_string(), json!(memo));
+    }
+    Value::Object(object)
+}
+
+/// 明細の一覧を線上の JSON 配列にする。
+pub fn lines_to_json(lines: &[JournalLine]) -> Value {
+    Value::Array(lines.iter().map(line_to_json).collect())
+}
+
+/// `PolicyNote` の一覧を線上の JSON 配列にする。
+///
+/// **文言は `kaikei-policy` の実装が組み立てたものをそのまま素通しする**
+/// （税務判断を断定する言い換えをしない。`CLAUDE.md` §10）。
+/// `severity` は [`kaikei_app::wire::note_severity_code`]。
+pub fn policy_notes_to_json(notes: &[PolicyNote]) -> Value {
+    Value::Array(
+        notes
+            .iter()
+            .map(|note| {
+                json!({
+                    "severity": kaikei_app::wire::note_severity_code(note.severity),
+                    "message": note.message,
+                })
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +357,101 @@ mod tests {
         let schema = schemars::schema_for!(AmountStr);
         let json = serde_json::to_value(&schema).unwrap();
         assert_eq!(json.get("type").and_then(|t| t.as_str()), Some("string"));
+    }
+
+    // ★重複キーが畳み込まれない★
+    //
+    // `Map<String, String>` で受けていると後勝ちで1件に潰れ、
+    // `JpError::DuplicateTagKeyInInput` に到達する経路が消える。
+    #[test]
+    fn tag_pairs_keep_duplicate_keys_in_input_order() {
+        let pairs: TagPairs =
+            serde_json::from_str(r#"{"tax_category":"SALES_10","tax_category":"SALES_8"}"#)
+                .unwrap();
+        assert_eq!(
+            pairs.as_slice(),
+            [
+                ("tax_category".to_string(), "SALES_10".to_string()),
+                ("tax_category".to_string(), "SALES_8".to_string()),
+            ]
+        );
+
+        // 対照: `Map` で受けると 1 件に潰れる（この差がこの型の存在理由）。
+        let collapsed: Map<String, Value> =
+            serde_json::from_str(r#"{"tax_category":"SALES_10","tax_category":"SALES_8"}"#)
+                .unwrap();
+        assert_eq!(collapsed.len(), 1);
+    }
+
+    #[test]
+    fn tag_pairs_schema_is_an_object_of_strings() {
+        let schema = serde_json::to_value(schemars::schema_for!(TagPairs)).unwrap();
+        assert_eq!(schema.get("type").and_then(|t| t.as_str()), Some("object"));
+    }
+
+    // 出力側の整形は `kaikei-app` / `kaikei-jp` に委ねている。
+    #[test]
+    fn line_to_json_uses_the_frozen_wire_vocabulary() {
+        use kaikei_core::{AccountCode, Side, TagKey, TagValue};
+
+        let mut tags = TagSet::new();
+        tags.insert(
+            TagKey::parse("tax_category").unwrap(),
+            TagValue::Code("SALES_10".to_string()),
+        );
+        let line = JournalLine::new(
+            AccountCode::parse("135").unwrap(),
+            Side::Debit,
+            Money::from_minor(110_000, Currency::JPY),
+            tags,
+            Some("4月分".to_string()),
+        )
+        .unwrap();
+
+        let value = line_to_json(&line);
+        assert_eq!(value["account"], json!("135"));
+        assert_eq!(
+            value["side"],
+            json!(kaikei_app::wire::side_code(Side::Debit))
+        );
+        // 金額は区切り無しの文字列（number にしない。§5）。
+        assert_eq!(value["amount"], json!("110000"));
+        assert!(value["amount"].is_string());
+        assert_eq!(value["currency"], json!("JPY"));
+        assert_eq!(value["tags"]["tax_category"], json!("SALES_10"));
+        assert_eq!(value["memo"], json!("4月分"));
+    }
+
+    // メモが無ければキーごと出さない（`null` と空文字を混同させない）。
+    #[test]
+    fn line_to_json_omits_the_memo_key_when_absent() {
+        use kaikei_core::{AccountCode, Side};
+
+        let line = JournalLine::new(
+            AccountCode::parse("100").unwrap(),
+            Side::Credit,
+            Money::from_minor(1, Currency::JPY),
+            TagSet::new(),
+            None,
+        )
+        .unwrap();
+        assert!(line_to_json(&line).get("memo").is_none());
+    }
+
+    // 注記の文言は素通しし、severity は凍結済みの語彙を使う。
+    #[test]
+    fn policy_notes_to_json_passes_the_message_through_verbatim() {
+        use kaikei_app::NoteSeverity;
+
+        let notes = [PolicyNote {
+            severity: NoteSeverity::Info,
+            message: "税込経理の設定のため税額行を生成していません".to_string(),
+        }];
+        let value = policy_notes_to_json(&notes);
+        assert_eq!(value[0]["severity"], json!("info"));
+        assert_eq!(
+            value[0]["message"],
+            json!("税込経理の設定のため税額行を生成していません")
+        );
     }
 }

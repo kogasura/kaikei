@@ -37,7 +37,8 @@ use crate::startup::Runtime;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo, Tool};
 use rmcp::{tool_handler, ServerHandler};
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, OnceLock};
 
 /// このサーバーが MCP クライアントに名乗る名前。
 pub const SERVER_NAME: &str = "kaikei-mcp";
@@ -89,11 +90,28 @@ impl KaikeiServer {
 /// そのまま返すので、この関数が見ている集合と `tools/list` の応答は同一で
 /// ある。
 pub fn registered_tool_names() -> Vec<String> {
-    tool_router()
-        .list_all()
-        .into_iter()
-        .map(|tool| tool.name.to_string())
-        .collect()
+    registered_name_set().iter().cloned().collect()
+}
+
+/// 登録済みツール名の集合（[`tool_router`] から一度だけ導出してキャッシュする）。
+///
+/// キャッシュするのは、[`is_registered_tool`] が**ツール呼び出しのたびに**
+/// 呼ばれるためである（`crate::dispatch::ToolName::resolve`）。毎回
+/// [`tool_router`] を組み立てると、入力スキーマの生成とルート表の構築が
+/// 1呼び出しあたり11回走る。
+///
+/// **導出元は変えていない。** ここで見るのも `tool_router().list_all()` で
+/// あり、`#[tool_handler]` が生成する `list_tools` と同じ集合である
+/// （ツールの登録は起動前に確定し、実行中に増減しない）。
+fn registered_name_set() -> &'static BTreeSet<String> {
+    static NAMES: OnceLock<BTreeSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect()
+    })
 }
 
 /// そのツール名が登録されているか。
@@ -106,7 +124,7 @@ pub fn registered_tool_names() -> Vec<String> {
 /// 「tool not found」を返すかどうかを決めているのはこの述語
 /// （`ToolRouter::has_route`）である。
 pub fn is_registered_tool(name: &str) -> bool {
-    tool_router().has_route(name)
+    registered_name_set().contains(name)
 }
 
 /// ツール定義（`tools/list` の1要素）を名前で引く。
@@ -137,17 +155,30 @@ pub fn server_info() -> ServerInfo {
 
 /// Phase 3 の11ツールを合成する。
 ///
-/// 1ツール1ファイル（`src/tools/<ツール名>.rs`）とし、各ファイルの
-/// `#[tool_router(router = <ツール名>_router, vis = "pub")]` が生成する
-/// ルータをここで `+` で合成する（`docs/07-mcp-server.md` §4）。
+/// 1ツール1ファイル（`src/tools/<ツール名>.rs`）とし、ここでは
+/// [`crate::dispatch::route`] に型を渡して並べるだけにする
+/// （`docs/07-mcp-server.md` §4）。
 ///
-/// **このPR（Phase 3 PR-D）では0件である。** ツールの実装は PR-F / PR-G。
-/// 追加してよいのは `docs/07-mcp-server.md` §2 の表で **Phase 3** と
-/// 書かれた11件だけで、「存在させないツール」の4件をここに足してはならない。
+/// # ★ここに `ToolRoute` を直接書かないこと★
+///
+/// [`crate::dispatch::route`] が**唯一の登録経路**であり、そこを通った
+/// ハンドラは必ず [`crate::dispatch::call`]（＝監査ログで挟む経路）に入る。
+/// `ToolRoute::new_dyn` や `#[tool]` マクロでここに別のルートを足すと、
+/// **監査ログを通らないツールが作れてしまう**（`DECISIONS.md` D-084）。
+/// `tests/audit_is_structural.rs` がソースを走査して見張っている。
+///
+/// **このPR（Phase 3 PR-F）では2件**（書き込み系）。読み取り系・提案系は
+/// PR-G / PR-H。追加してよいのは `docs/07-mcp-server.md` §2 の表で
+/// **Phase 3** と書かれた11件だけで、「存在させないツール」の4件を
+/// ここに足してはならない。
 pub fn tool_router() -> ToolRouter<KaikeiServer> {
+    use crate::dispatch::route;
+    use crate::tools::post_journal_entry::PostJournalEntry;
+    use crate::tools::reverse_journal_entry::ReverseJournalEntry;
+
     ToolRouter::new()
-    // 例（PR-F 以降）:
-    // + crate::tools::post_journal_entry::post_journal_entry_router()
+        .with_route(route::<PostJournalEntry>())
+        .with_route(route::<ReverseJournalEntry>())
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -185,11 +216,57 @@ pub async fn serve_stdio(server: KaikeiServer) -> Result<(), Box<dyn std::error:
 mod tests {
     use super::*;
 
-    // このPRの時点ではツールを1つも登録していない（PR-E は前工事であり、
-    // ツールは PR-F / PR-G）。
+    // PR-F の時点で登録されているのは書き込み系の2件（読み取り系・提案系は
+    // PR-G / PR-H）。件数そのものではなく「その2件が居ること」を見る
+    // （件数のリテラルは PR-G で必ず古くなる）。
     #[test]
-    fn the_skeleton_registers_no_tools_yet() {
-        assert!(registered_tool_names().is_empty());
+    fn the_write_tools_are_registered() {
+        let names = registered_tool_names();
+        for expected in ["post_journal_entry", "reverse_journal_entry"] {
+            assert!(names.iter().any(|name| name == expected), "{expected}");
+        }
+    }
+
+    // キャッシュした名前の集合と `ToolRouter::has_route`（`call` が
+    // 「tool not found」を返すかどうかを決めている述語）が一致すること。
+    //
+    // `is_registered_tool` は呼び出しごとにルータを組み立てないよう
+    // `OnceLock` の集合を引く。導出元が同じであることを実際に突き合わせないと、
+    // 「キャッシュだけが古い」状態を検出できない。
+    #[test]
+    fn the_cached_name_set_agrees_with_the_router() {
+        let router = tool_router();
+        for name in registered_tool_names() {
+            assert!(router.has_route(&name), "{name}");
+            assert!(is_registered_tool(&name), "{name}");
+        }
+        for absent in ["delete_journal_entry", "execute_sql", ""] {
+            assert_eq!(
+                router.has_route(absent),
+                is_registered_tool(absent),
+                "{absent}"
+            );
+            assert!(!is_registered_tool(absent), "{absent}");
+        }
+    }
+
+    // 登録済みのツールは全て `tools/list` の定義（説明文と入力スキーマ）を持つ。
+    #[test]
+    fn every_registered_tool_has_a_description_and_an_object_input_schema() {
+        for name in registered_tool_names() {
+            let tool = tool_definition(&name).unwrap_or_else(|| panic!("{name} の定義が引けない"));
+            let description = tool.description.unwrap_or_default();
+            assert!(!description.is_empty(), "{name} に説明文が無い");
+            // `CLAUDE.md` §10 の禁止表現はツールの説明文にも及ぶ。
+            for forbidden in ["準拠", "法令対応", "JIIMA"] {
+                assert!(!description.contains(forbidden), "{name}: {forbidden}");
+            }
+            assert_eq!(
+                tool.input_schema.get("type").and_then(|t| t.as_str()),
+                Some("object"),
+                "{name} の inputSchema がオブジェクトではない"
+            );
+        }
     }
 
     // サーバーは tools capability を名乗り、名前とバージョンを持つ。

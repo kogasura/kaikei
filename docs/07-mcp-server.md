@@ -3,13 +3,18 @@
 **このプロジェクトの差別化の本体。**
 AI エージェントが会計操作を安全に行うための標準インタフェース。
 
-> **この文書の版**: Phase 3 **PR-E**（合成ルート）時点
-> （`DECISIONS.md` D-083 まで）を反映している。§7（起動と設定）は
-> PR-E で**内容が変わった**——`tax_mode` / `rounding` / `rounding_unit` も
-> 明示必須にし、`KAIKEI_CLOSING_TAX_CATEGORY` の語彙検証と
-> `ComposeError` への環境変数名の追記をレビューで足した（D-082）。
+> **この文書の版**: Phase 3 **PR-F**（dispatch 層 + 書き込み系ツール2件）時点
+> （`DECISIONS.md` D-085 まで）を反映している。PR-F で**内容が変わったのは
+> 3箇所**:
+>
+> | 節 | 変わった点 | 決定 |
+> |---|---|---|
+> | §4 | ツールの実現機構を `#[tool_router]` / `#[tool]` マクロから **dispatch 層**（`McpTool` + `dispatch::route` / `dispatch::call`）に変えた。1ツール1ファイルは維持。`audit.rs` は**作らない** | D-084 |
+> | §9 | 「未知のツール名は `isError: true` + `rejected` で返す」を撤回し、**プロトコルエラー**（§6 が認める唯一の例外）に揃えた。`audit_log.tool` にクライアント由来の文字列を載せないという不変条件は `ToolName` が型で保証する | D-084 |
+> | §10 | 書き込み系の実 DB テストの置き場を `crates/kaikei-e2e/tests/mcp_write_tools.rs` と明記した（`kaikei-mcp` は `sqlx` を持てないので使い捨てDBも `audit_log` の SELECT もできない） | D-084 |
+>
+> §7（起動と設定）は PR-E 時点のまま（D-082）。
 > §8 の接続ロール検査は**2テーブル × 3権限**に広げてある。
-> §9（監査ログ）は PR-C 時点のまま（D-077）。
 > D-072 以降の決定でここに書かれた内容が覆った場合、**決定を入れた PR の中で
 > この文書も直すこと**。設計書は一度書いたら終わりではなく、直さないと
 > 「却下済みの設計を後続の実装者に指示する文書」に劣化する
@@ -409,9 +414,31 @@ JSON-RPC のエラー応答は使わない。D-071）：
   成功時と同じく、`auto_tax_lines: false` なら常に空になるので、
   空配列は「注記が無い」を意味しない。
 
-`hint`（修正案）を応答に載せるのは **`kaikei-mcp` を新設する PR**
-（`hint` はツール応答のフィールドであり、組み立て先の crate が要る）。
-**前工事（dry-run ユースケース）は PR-B 2巡目で完了している。**
+`hint`（修正案）は **PR-F で実装した**
+（`crates/kaikei-mcp/src/tools/post_journal_entry.rs`。前工事の dry-run
+ユースケースは PR-B 2巡目で完了していた）。実物:
+
+```json
+{
+  "error": "unbalanced",
+  "message": "貸借不一致: 借方 110,000 / 貸方 100,000（差額 10,000）",
+  "debit_total": "110000",
+  "credit_total": "100000",
+  "difference": "10000",
+  "policy_notes": [],
+  "hint": {
+    "message": "auto_tax_lines を true にして同じ明細を渡すと、下の suggested_lines の内容で貸借が一致します。…どちらにするかの判断はこのサーバーでは行いません",
+    "suggested_lines": [
+      { "account": "135", "side": "debit",  "amount": "110000", "currency": "JPY", "tags": {} },
+      { "account": "500", "side": "credit", "amount": "100000", "currency": "JPY", "tags": { "tax_category": "SALES_10" } },
+      { "account": "330", "side": "credit", "amount": "10000",  "currency": "JPY", "tags": { "tax_category": "SALES_10" } }
+    ],
+    "debit_total": "110000",
+    "credit_total": "110000",
+    "policy_notes": []
+  }
+}
+```
 
 AI の自己修正を一段速くする効果は大きいが、
 「税区分 → 税額科目」の対応を知るのは `kaikei-jp` の `TaxCategoryTable` だけで、
@@ -435,6 +462,12 @@ AI の自己修正を一段速くする効果は大きいが、
   「勘定科目が見つかりません: {code}」だけであり、**core に候補一覧を持たせない**
   （core の変更は人間の承認事項。`CLAUDE.md` §1・§9）。候補は全件ではなく
   絞って返し、件数の上限を決める。
+  **PR-F で実装**（`similar_accounts`。科目コードの**前方一致の長さ**が長い順、
+  記帳可能（`postable`）な科目のみ、上限5件。1文字も一致しない場合は
+  `hint` ごと返さない——無関係な科目を並べても次の手にならない）。
+- **明細のエラーは「何行目か」を添える。** 下位層の文言は言い換えず、
+  `明細 2 行目: ` の接頭辞と `line: 2` の欄を足すだけにする
+  （`CLAUDE.md` §10 / §11）。
 
 ### reverse_journal_entry
 
@@ -592,6 +625,51 @@ AI の自己修正を一段速くする効果は大きいが、
   `kaikei-app/src/usecase/post_entry.rs` と同名になり、grep でどちらの層の話か
   区別できなくなる。
 
+### dispatch 層 — 監査ログを通らないツールを書けない形にする（PR-F。D-084）
+
+**11ツールが個別に監査ログの手順を書く形にしない。**
+D-076 が `kaikei_app::audit::with_audit` に手順を閉じたのは
+「fail-closed の書き忘れは正常系テストでは検出できない」からであり、
+**同じ理由が MCP 層にも当てはまる**。
+
+各ツールは `crates/kaikei-mcp/src/dispatch.rs` の `McpTool` を実装するだけで、
+監査ログの手順も `isError` の扱いも書かない。
+
+```rust
+pub trait McpTool: Send + Sync + 'static {
+    type Input: DeserializeOwned + JsonSchema + Send + 'static;
+    const NAME: &'static str;
+    const DESCRIPTION: &'static str;   // ツールの説明文（AI が最初に読む）
+    fn run(ctx: &ToolContext<'_>, input: Self::Input)
+        -> impl Future<Output = Result<ToolSuccess, ToolFailure>> + Send;
+}
+
+pub fn route<T: McpTool>() -> ToolRoute<KaikeiServer>;  // 唯一の登録経路
+pub async fn call<T: McpTool>(runtime: &Runtime, arguments: Option<Map<String, Value>>)
+    -> CallToolResult;                                  // 唯一の実行経路
+```
+
+| 塞ぐもの | 実体 |
+|---|---|
+| ツールが応答を組み立てる | `run` の戻り値は `Result<ToolSuccess, ToolFailure>`。`CallToolResult`（`isError` を含む）を作れるのは `dispatch::call` と `ToolError` だけ |
+| ツールが監査ログを書く／書き忘れる | `run` が受け取る `ToolContext` は `AuditSink` を**露出しない**（`Runtime` 自体が渡らない） |
+| `ToolContext` を自作する | フィールドも `new` も private |
+| 別経路でルータに載せる | `ToolRoute` を組み立てるのは `dispatch::route` だけ |
+| fail-open の警告を捨てる | `call` は `AuditedCall::into_result(&mut notes)`（既定経路）しか使わず、警告を必ず応答の `warnings` に載せる。`into_parts_unchecked` はこの crate に1箇所も無い |
+| クライアント由来の名前が `audit_log.tool` に載る | `AuditCall.tool` に渡せるのは `ToolName` だけで、唯一の構築子 `ToolName::resolve` はレジストリを引く（§9） |
+
+型で閉じられない残り（同一 crate 内から `with_audit` を呼ぶ、`ToolRoute` を
+直に組み立てる）は `crates/kaikei-mcp/tests/audit_is_structural.rs` が
+ソースを走査して見張る。**「型で閉じる → 残りを走査で見張る」の順**であって、
+走査が主ではない。
+
+**`rmcp` のツールマクロ（`#[tool]` / `#[tool_router]`）は使わない。**
+マクロで書くとハンドラ本体をその場に書くことになり、`dispatch::call` を
+経由しない登録経路が生まれる。`rmcp` 3.1 が「ツールが増えたらこちら」と
+勧めている `AsyncTool` / `ToolBase` trait も使えない——`invoke` の失敗値が
+`Into<ErrorData>`（＝**JSON-RPC のプロトコルエラー**）に固定されており、
+D-071 の「ドメインのエラーは全てツール結果エラー」と両立しないため。
+
 ### MCP SDK とトランスポート
 
 | 項目 | 選定 |
@@ -602,13 +680,14 @@ AI の自己修正を一段速くする効果は大きいが、
 
 - 入力は `Parameters<T>` で受け、`T` に `#[derive(Deserialize, JsonSchema)]` を付けると
   input_schema が自動生成される（`schemars` feature がこれを有効にする）。
-- `#[tool]` はツール説明文を**関数の doc コメント**から採る。したがって
+- ツールの説明文は `McpTool::DESCRIPTION`（上記 dispatch 層）に書く。
   `CLAUDE.md` §11（次の手が分かる文言）と §10（税務判断を断定しない）の規律は
-  doc コメントにも及ぶ。§5 の「金額は文字列」もツールの doc コメントに書く。
-- 1ツール1ファイルを rmcp で実現するには、各ファイルに
-  `#[tool_router(router = <ツール名>_router, vis = "pub")]` を置き、`server.rs` で
-  `tool_router_a() + tool_router_b()` と `+` で合成する。
-  この機構を使わないと「単一 `impl` ブロックに全ツールを書く」しかなくなる。
+  この文面にも及ぶ。§5 の「金額は文字列」も説明文に書く
+  （`crates/kaikei-mcp/src/server.rs` のテストが全登録ツールの説明文を検査する）。
+- 1ツール1ファイルは `src/tools/<ツール名>.rs` に `impl McpTool` を置き、
+  `server.rs` の `tool_router()` で `route::<T>()` を並べて実現する。
+  ~~`#[tool_router(router = ..., vis = "pub")]` を各ファイルに置いて `+` で合成する~~
+  → **PR-F で撤回**（D-084。マクロで書くと dispatch 層を迂回できる）。
 - `crates/kaikei-mcp` を workspace の `members` に**追加する**
   （現在はコメントアウトされている。追加しないと CI の
   `cargo test --workspace` / `cargo clippy --workspace` の対象にすらならない）。
@@ -718,8 +797,8 @@ kaikei-mcp/src/
 ├── main.rs               起動（設定ロード → 合成 → stdio サーバ）        ← PR-E で新設
 ├── startup.rs            合成ルート。kaikei_jp::compose::compose + PgStore の結線 ← PR-E で新設
 ├── config.rs             事業者設定の読み込みと必須検証（欠けていたら起動失敗。§7） ← PR-E で新設
-├── audit.rs              audit_log。別コネクション・2回書き・fail-closed/fail-open（§9） ← PR-F
-├── wire.rs               線上の DTO（AmountStr 等）。★整形は書かない★       ← PR-D で新設
+├── dispatch.rs           ★監査ログを通す唯一の経路★ McpTool / ToolContext / route / call ← PR-F で新設
+├── wire.rs               線上の DTO（AmountStr / TagPairs 等）。★整形は書かない★ ← PR-D で新設
 ├── server.rs             tool_router の合成、rmcp の ServerHandler 実装     ← PR-D で新設
 ├── error.rs              JpError → 分類コード、ToolError → CallToolResult::structured_error（§6） ← PR-D で新設
 └── tools/
@@ -740,6 +819,11 @@ kaikei-mcp/src/
 `kaikei_app::amount` に置かれたため、同じ整形が2箇所に育つだけになる。§5）。
 線上の金額の型（`AmountStr`。number を日本語のエラーで拒否する）は `wire.rs` に
 置き、文字列化は `money_to_plain_string` に委ねる（D-079）。
+
+**`audit.rs` も作らない**（初版の構成案にはあったが、手順は PR-C が
+`kaikei_app::audit::with_audit` に閉じた。MCP 層に残る仕事は「入力・出力の
+JSON を組み立てて `with_audit` を1箇所から呼ぶ」ことだけで、それは
+`dispatch.rs` の役目である。§9・D-076 / D-084）。
 
 `tools/` というフォルダ名は `CLAUDE.md` §6 に反しない。§6 が禁じるのは
 `entities/` / `value_objects/` のような DDD のパターン名（技術的分類）であり、
@@ -1365,6 +1449,11 @@ with_tx(...) で操作を実行
   **警告を自分で応答へ載せる責任を負う場合にだけ**使う。
   名前に `_unchecked` が入っているのはそのためで、逃げ道を使っている箇所は
   grep で全て出る。
+  **`kaikei-mcp` は `into_result`（既定経路）だけを使う**（PR-F。
+  `into_parts_unchecked` はこの crate に1箇所も無く、
+  `tests/audit_is_structural.rs` がそれを見張る）。積まれた警告は
+  `dispatch::call` が応答の **`warnings`**（文字列の配列）に必ず載せる。
+  成功応答にも失敗応答にも付き、警告が無ければキーごと出さない。
 - 開始レコードだけが残り結果レコードが無い行は「**結果不明**」として読む。
 
 ### 入力を理由に fail-closed へ落とさない
@@ -1426,14 +1515,26 @@ D-075 が JSONB 側で塞いだ「**入力1文字で操作が実行できない*
 > 登録済みのツール名以外を載せない。未知の名前は audit に載せる前に弾く。**
 > `actor` は `kaikei_app::audit::actor` の定数（`mcp` / `cli` / `api`）だけを使う。
 
-未知のツール名は「そのツールは存在しない」という拒否
-（`isError: true` + `rejected`）で返す。監査ログに載せる前に弾くので、
-`tool` 列に入るのは常にサーバが知っている有限個の文字列になる。
+**PR-F で実装した（D-084）。型で閉じてある。**
 
-**この不変条件を実装で満たすのは PR-F（`kaikei-mcp` の結線）である。**
-PR-C が置いたのは記述だけで、機械的な検査は無い（`kaikei-mcp` がまだ無いため）。
-`kaikei_app::audit::AuditCall::tool` と `with_audit` の doc にも同じことを
-書いてあるので、結線するときに突き合わせること。
+`AuditCall` を組み立てるのは `crates/kaikei-mcp/src/dispatch.rs` の
+`dispatch::call` 1箇所だけで、そこに渡せる `tool` の型は
+**`dispatch::ToolName`** である。`ToolName` はフィールドが private で、
+唯一の構築子 `ToolName::resolve(name)` は
+`crate::server::is_registered_tool`（＝`tools/list` が返すのと同じ
+レジストリ）を通る。**登録済みの名前以外から `ToolName` を作る方法が存在
+しない**ので、`tool` 列に入るのは常にサーバが知っている有限個の文字列になる。
+`tool` に U+0000 を1文字入れた名前は `resolve` が `None` を返す
+（`dispatch.rs` の `a_nul_character_in_the_tool_name_never_reaches_the_audit_log`）。
+
+**未知のツール名はプロトコルエラーで返る（§6 が認めている唯一の例外）。**
+初版はここで「`isError: true` + `rejected` で返す」と書いていたが、
+`rmcp` の `ToolRouter` は未登録名をハンドラに**到達させず**
+`invalid_params: tool not found` を返す。§6・§2（MC-10）および PR-D の
+`server.rs` の doc は最初からそう書いており、**この節の記述だけが食い違って
+いた**ので §6 に合わせる。この節が本当に守りたいのは
+「`audit_log.tool` にクライアント由来の文字列を載せない」であり、
+それは上記のとおり型で保証されている。
 
 ### 42501 を帳簿と同じ分類のまま返さない
 
@@ -1595,8 +1696,23 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
   実 DB に仕訳を書くテスト（記帳が通ること・試算表・決算）は
   `kaikei-e2e` 側に置く（あちらは `#[sqlx::test]` でテストごとに
   使い捨てDBを作れる）。
+- **書き込み系ツールの実 DB テストは
+  `crates/kaikei-e2e/tests/mcp_write_tools.rs`**（PR-F で新設）。
+  `audit_log` を SELECT するにも SQL が要るので、`kaikei-mcp` 側には置けない。
+  依存の向きは `kaikei-e2e` → `kaikei-mcp` であり、
+  「`kaikei-e2e` は誰からも依存されない」（D-068）は保たれる。
+  そこで組み立てる `Runtime` は本番の `startup::assemble` と**同じ部品**
+  （`kaikei_jp::compose` / `PgStore` / `PgAuditSink`）から作る
+  （`assemble` 自身は `APP_DATABASE_URL` を読むので使い捨てDBを指せない）。
+  ツールは `dispatch::call`（ルータのハンドラが呼ぶのと**同じ関数**）を
+  直接呼ぶ——`rmcp::service::Peer::new` が `pub(crate)` で `RequestContext` を
+  外部 crate から組み立てられないため（MC-10 の注記と同じ理由）。
 
 ### 書き込み系
+
+**PR-F で実装済み。** 置き場は `crates/kaikei-e2e/tests/mcp_write_tools.rs`
+（実 PostgreSQL・使い捨てDB）と、入力 DTO の単体検査が
+`crates/kaikei-mcp/src/tools/*.rs`。
 
 | # | ケース | 期待 |
 |---|---|---|
@@ -1630,7 +1746,7 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 
 | # | ケース | 期待 |
 |---|---|---|
-| MC-09 | 金額を number で渡す | **エラー（整数でも受理しない）。** (1) メッセージが「金額は文字列で渡してください。例: `"amount": "110000"`」という次の手を含む、(2) `isError: true` のツール結果として返る、(3) この呼び出しも audit_log に残る。金額フィールドを素の `String` にするだけでは (1) を満たせない（§5 の実装形を参照）。**PR-D で (1) を実装**（`kaikei_mcp::wire::AmountStr`。`crates/kaikei-mcp/src/wire.rs` のテスト）。(2) は rmcp が担保する（`ToolRouter::call` が `failed to deserialize parameters:` で始まる `INVALID_PARAMS` を `CallToolResult::error` に変換する。rmcp 3.1.0 の実装を確認済み）。(3) は PR-F |
+| MC-09 | 金額を number で渡す | **エラー（整数でも受理しない）。** (1) メッセージが「金額は文字列で渡してください。例: `"amount": "110000"`」という次の手を含む、(2) `isError: true` のツール結果として返る、(3) この呼び出しも audit_log に残る。金額フィールドを素の `String` にするだけでは (1) を満たせない（§5 の実装形を参照）。**PR-D で (1) を実装**（`kaikei_mcp::wire::AmountStr`。`crates/kaikei-mcp/src/wire.rs` のテスト）。**(2)(3) は PR-F で実装**——`rmcp` の `Parameters<T>` に任せると (2) は満たせても (3) が満たせない（デシリアライズがツール本体に入る前、＝ `dispatch::call` の外側で走るため audit_log に1行も残らない）。そこで `dispatch::call` が `with_audit` の**操作の中**でデシリアライズし、失敗を `rejected` の構造化エラーとして返す（D-085）。実 DB での確認は `crates/kaikei-e2e/tests/mcp_write_tools.rs` の `an_amount_given_as_a_json_number_is_rejected_in_japanese_and_still_audited` |
 | MC-10 | 存在させないツール4件 | `tools/list` の応答に `delete_journal_entry` / `update_journal_entry` / `execute_sql` / `reopen_period` のいずれも現れず、それらの名前で `tools/call` すると未知ツールとして拒否される。**禁止リストをテスト側の定数にして4件すべてをループで検査する**（1件だけの検査では他が復活しても緑のまま通る）。**PR-D で実装済み**（`crates/kaikei-mcp/tests/forbidden_tools.rs`）。検査はレジストリ（`ToolRouter`）から導出しており、`tools/list` が返す集合と同一。`tools/call` 側は `ToolRouter::get` と `ToolRouter::has_route` で見る（`rmcp::service::Peer::new` が `pub(crate)` で `RequestContext` を外部 crate から組み立てられないため、`call` を直接叩けない）。**PR-E でサーバーを組み立てずに検査する形に変えた**——`KaikeiServer` は実行時依存（`Runtime`）を必須で持つようになったので、レジストリを見るために DB 接続を要求しないよう `kaikei_mcp::server::{registered_tool_names, is_registered_tool, tool_definition}`（サーバー本体と同じ `tool_router()` から導出する自由関数）を通す。それが**本物のサーバー**（`ServerHandler::get_tool`）と同じ集合を指すことは `tests/startup_pg.rs` が突き合わせる。**許可リスト側（Phase 3 の11件）からも閉じてある**——禁止4件だけを見張ると新しい名前の破壊的ツールが素通りする |
 | MC-26 | ドメインエラー（貸借不一致等） | JSON-RPC のプロトコルエラーではなく `isError: true` のツール結果として返る（D-071） |
 | MC-27 | 出力の金額 | 全て JSON 文字列である（入力だけでなく出力側も number にしない。§5） |
@@ -1654,7 +1770,7 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 
 | # | ケース | 期待 |
 |---|---|---|
-| MC-11 | 全ツール呼び出しが audit_log に記録される | 1回のツール呼び出しにつき**同一 `request_id` で2行**（`status='started'` と `status='ok'\|'error'`）が残る。`tool` 列が呼び出したツール名と一致する。書き込み系は結果レコードの `entry_id` が返した仕訳IDと一致する。**Phase 3 の全11ツールに対して総当たりで確認する**（1ツールだけのサンプル検査にしない） |
+| MC-11 | 全ツール呼び出しが audit_log に記録される | 1回のツール呼び出しにつき**同一 `request_id` で2行**（`status='started'` と `status='ok'\|'error'`）が残る。`tool` 列が呼び出したツール名と一致する。書き込み系は結果レコードの `entry_id` が返した仕訳IDと一致する。**Phase 3 の全11ツールに対して総当たりで確認する**（1ツールだけのサンプル検査にしない）。**PR-F で書き込み系2件を実装**（`crates/kaikei-e2e/tests/mcp_write_tools.rs`）。残り9件は PR-G / PR-H。なお**「総当たり」の性質そのものは PR-F で構造に移した**——ツールをレジストリに載せる経路が `dispatch::route` の1本しか無く、その中身が必ず `dispatch::call`（監査ログで挟む）なので、「監査ログを通らないツール」は書けない（D-084。`crates/kaikei-mcp/tests/audit_is_structural.rs`）。総当たりのテストは、その構造が守られていることを実 DB で追認するものになった |
 | MC-20 | 開始レコードの書き込みが失敗する状況（audit 用接続を落とす、または `REVOKE INSERT ON audit_log FROM kaikei_app`）で post | ツールは `isError: true` を返し、**帳簿には1件も入っていない**（fail-closed） |
 | MC-21 | 結果レコードの書き込みだけが失敗 | 記帳は成功として返り、警告が添えられる。開始レコードだけが残り「結果不明」として識別できる（fail-open） |
 | MC-22 | 記帳が失敗（貸借不一致等）してトランザクションが rollback される | **開始レコードは audit_log に残る。** D-070 の存在理由そのもの（同一トランザクションで書く実装に退行したら、このテストだけが落ちる） |
@@ -1663,14 +1779,20 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 | MC-31 | `input` に U+0000 を含む JSON（`{"description":"A\u0000B"}`）で post | **操作は実行され**、audit_log に2行残る。`input` は U+FFFD に置換されたうえで `_audit.verbatim = false` を伴って記録される（fail-closed に落ちない。§9「入力を理由に fail-closed へ落とさない」） |
 | MC-32 | `REVOKE INSERT ON audit_log FROM kaikei_app` で post | fail-closed（MC-20）に加えて、`AuditLogUnavailable::cause` の分類が `backend` であり、`cause.public_message()` にも「逆仕訳」が現れない（§9「42501 を帳簿と同じ分類のまま返さない」） |
 
-**MC-20 / MC-21 / MC-22 / MC-23 / MC-31 / MC-32 は PR-C で実装済み**
+**MC-20 / MC-21 / MC-23 / MC-31 / MC-32 は PR-C で実装済み**
 （`crates/kaikei-store/tests/audit_log.rs` / `tests/privileges.rs` /
 `tests/append_only.rs`。`pg-tests` feature 配下で `database` ジョブが実行する）。
-`kaikei-mcp` 側で重ねて書く必要は無い。MC-11 のうち
-「**Phase 3 の全11ツールに対して総当たり**」の部分だけが
-`kaikei-mcp` を新設する PR の担当として残る（PR-C 時点ではツールが
-存在しないため、記帳操作を代表例として `request_id` で2行が対応することを
-検証している）。
+`kaikei-mcp` 側で重ねて書く必要は無い。
+
+**MC-22（記帳が失敗しても監査ログが残る）だけは PR-F でも重ねて書いた。**
+PR-C の同名テストは `AuditSink` と `with_tx` を直接組み合わせて確かめており、
+**ツール経由でもそうなっている**ことは示していない。D-070 の存在理由その
+ものなので、`post_journal_entry` を貸借不一致で呼んで「帳簿0件・監査ログ
+2行」を見る側を `crates/kaikei-e2e/tests/mcp_write_tools.rs` に置いた
+（`an_unbalanced_entry_is_rejected_with_a_hint_while_the_audit_rows_survive`）。
+
+MC-11 のうち「**Phase 3 の全11ツールに対して総当たり**」は、書き込み系2件が
+PR-F で済み、残り9件が PR-G / PR-H の担当として残る。
 
 ### Phase 4 以降に延期したケース（行を消さない）
 

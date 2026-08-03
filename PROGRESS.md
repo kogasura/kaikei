@@ -472,9 +472,27 @@ Phase 2 で実際に起きたことを、脚色せずに記録する。
 
 ## Phase 3 — kaikei-mcp
 
-実装中（PR-E まで完了）。完了時に他 Phase と同じ節構成で記録する。
+実装中（PR-F まで完了）。完了時に他 Phase と同じ節構成で記録する。
 
 ### 実装中の申し送り
+
+- **【PR-G / PR-H への申し送り】ツールは `dispatch::McpTool` を実装して
+  `dispatch::route` で登録すること。** `rmcp` の `#[tool]` /
+  `#[tool_router]` マクロは使わない（`DECISIONS.md` D-084、
+  `docs/07-mcp-server.md` §4）。ツールに渡る `ToolContext` は
+  `AuditSink` を露出しないので、監査ログを自分で書くことも書き忘れることも
+  できない。`crates/kaikei-mcp/tests/audit_is_structural.rs` が
+  型で閉じられない残り（`ToolRoute` を直に組み立てる等）を見張っている。
+
+- **読み取り系ツールも `dispatch::call` を通す。** §9 は「読み取り系も含めて
+  全て記録する」と定めている。読み取り系は `ToolSuccess::with_entry_id` を
+  付けないだけで、経路は書き込み系と同じである。
+
+- **MC-11 の「全11ツール総当たり」は書き込み系2件まで済み。**
+  残り9件は PR-G / PR-H で `crates/kaikei-e2e/tests/mcp_write_tools.rs` と
+  同じ形（`dispatch::call` を直接呼び、`audit_log` を SELECT する）で足す。
+  読み取り専用のツールなら `kaikei-mcp` 側の `pg-tests` でも書けるが、
+  `audit_log` を読むには SQL が要るので `kaikei-e2e` 側になる。
 
 - **`accounts.active` / `accounts.sort_order` は現在どこからも読まれていない。**
   `kaikei-store` の `load_chart`（`crates/kaikei-store/src/chart.rs`）が

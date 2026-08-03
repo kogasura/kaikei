@@ -24,19 +24,31 @@
 //!   実装しないため、詰め替えはこの層の責務である（`docs/07-mcp-server.md` §4）。
 //! - `kaikei_jp::JpError` → 分類コードの対応表（[`error`]）。`kaikei-app` は
 //!   `kaikei-jp` に依存できないため、ここが唯一の置き場になる（同 §6）。
-//! - ツールレジストリ（[`server`]）。
+//! - ツールレジストリ（[`server`]）と、**監査ログで挟む唯一の呼び出し経路**
+//!   （[`dispatch`]）。
 //!
-//! # このPR（Phase 3 PR-E）の範囲
+//! # 監査ログを通らないツールは書けない
 //!
-//! **ツールはまだ1つも実装していない。** PR-E が足したのは
-//! 「サーバが起動でき、勘定科目が入っており、記帳が通せる状態」までである。
+//! `ROADMAP.md` Phase 3 の完了条件は「全操作が audit_log に記録される」で
+//! ある。それを11ツールの手作業（各ツールが `with_audit` を呼ぶ）に委ねると、
+//! **書き忘れても正常系のテストが全て緑のまま通る**（`DECISIONS.md` D-076 が
+//! fail-closed について挙げた却下理由と同じ性質）。
+//!
+//! そこで [`dispatch`] が「呼び忘れる形が存在しない」ようにしてある。
+//! ツールが実装する [`dispatch::McpTool`] は応答（`CallToolResult`）を
+//! 組み立てられず、受け取る [`dispatch::ToolContext`] は
+//! [`kaikei_app::ports::AuditSink`] を露出しない。詳細は [`dispatch`] の
+//! モジュール doc（`DECISIONS.md` D-084）。
+//!
+//! # このPR（Phase 3 PR-F）の範囲
 //!
 //! | PR | 内容 | 状態 |
 //! |---|---|---|
 //! | PR-D | `wire.rs` / `server.rs` / `error.rs`（骨組み） | 済 |
-//! | PR-E | 合成ルート（[`config`] / [`startup`] / `src/main.rs`） | **このPR** |
-//! | PR-F | 書き込み系ツールと `audit.rs`（監査ログの結線） | 未 |
+//! | PR-E | 合成ルート（[`config`] / [`startup`] / `src/main.rs`） | 済 |
+//! | PR-F | dispatch 層（[`dispatch`]）と書き込み系ツール2件（[`tools`]） | **このPR** |
 //! | PR-G | 読み取り系・提案系ツール | 未 |
+//! | PR-H | `search_entries` / `get_ledger`（read model の新設が要る） | 未 |
 //!
 //! # stdout は JSON-RPC 専用チャネル
 //!
@@ -53,7 +65,9 @@
 #![warn(missing_docs)]
 
 pub mod config;
+pub mod dispatch;
 pub mod error;
 pub mod server;
 pub mod startup;
+pub mod tools;
 pub mod wire;

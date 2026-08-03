@@ -22,9 +22,22 @@ kaikei-jp = { path = "../kaikei-jp", version = "0.0.1" }
 kaikei-jp-data = { path = "../kaikei-jp-data", version = "0.0.1" }
 kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
 kaikei-store = { path = "../kaikei-store", version = "0.0.1" }
+# Phase 3 PR-F: MCP の書き込み系ツールを**実 PostgreSQL に対して**通す。
+#
+# ★なぜ kaikei-mcp 側に置けないのか★
+# kaikei-mcp は sqlx に依存しない（docs/07-mcp-server.md §10 MC-30 の許可リスト）
+# ため、`#[sqlx::test]` で使い捨てDBを作れず、audit_log を SELECT する手段も無い。
+# 「記帳が失敗しても監査ログには2行残る」を確かめるには、仕訳を書ける使い捨てDBと
+# SQL の両方が要る。それを持っているのはこの crate だけである（同 §10 の
+# 「実 DB に仕訳を書くテストは kaikei-e2e 側に置く」）。
+#
+# 依存の向きは kaikei-e2e → kaikei-mcp であり、「kaikei-e2e は誰からも
+# 依存されない」（DECISIONS.md D-068、architecture.yml が検査）は保たれる。
+kaikei-mcp = { path = "../kaikei-mcp", version = "0.0.1" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 # 既定オフ。PostgreSQL を要する E2E テストをゲートする（kaikei-store と同じ
@@ -37,4 +50,9 @@ pg-tests = []
 [[test]]
 name = "e2e_jp"
 path = "tests/e2e_jp.rs"
+required-features = ["pg-tests"]
+
+[[test]]
+name = "mcp_write_tools"
+path = "tests/mcp_write_tools.rs"
 required-features = ["pg-tests"]
