@@ -242,6 +242,72 @@ jobs:
           fi
           echo "OK: $DEPS"
 
+      - name: kaikei-mcp の依存は最小限（MC-30）
+        run: |
+          set -euo pipefail
+          # docs/07-mcp-server.md §4 の申し送り / §10 MC-30。
+          #
+          # PR-B は「下流が線上表現（金額の文字列化・仕訳IDの表記・タグ値の
+          # 変換・エラーコードの写像）を再発明せずに済む」ことを狙って
+          # kaikei-app / kaikei-jp に入口を用意し、それを
+          # crates/{kaikei-app,kaikei-jp}/tests/contract_from_downstream.rs が
+          # 検証している。しかし**プローブでは下流の依存が増えないことを
+          # 検査できない**（統合テストのターゲットにはその crate の
+          # dev-dependencies までリンクされるため、uuid / rust_decimal を
+          # 直接使っても通ってしまう。PR-B で実測済み）。
+          # kaikei-mcp が実在してはじめて、その Cargo.toml を機械的に見られる。
+          #
+          # ★禁止リストではなく許可リストにする★
+          # 「uuid と rust_decimal さえ無ければよい」ではない。線上表現を
+          # kaikei-app / kaikei-jp から取る限りこの層に依存が増える理由は無く、
+          # 増えたこと自体が「MCP は薄い層」（docs/07 §4）を疑うべき兆候である。
+          # 一覧を広げるときは、その PR で「なぜこの層に必要か」を説明すること。
+          #
+          # ★--edges を指定しない（dev-dependency も見る）★
+          # --edges normal だけを見ると、uuid を dev-dependency として足して
+          # テストで使う抜け道が残る（D-047 の注記、および上の kaikei-e2e の
+          # ステップと同型の穴）。既定の normal,build,dev で見る。
+          #
+          # kaikei-store が許可リストに入っているのは、kaikei-mcp が本番で
+          # 最初の**合成ルート**であり、PgStore の結線が要るため（docs/07 §4）。
+          # 逆に sqlx は入れない——sqlx の型を kaikei-mcp が直接触りたくなったら、
+          # それは kaikei-store の公開 API が足りていないという別の問題である。
+          if [ ! -d crates/kaikei-mcp ]; then
+            echo "OK: crates/kaikei-mcp が存在しません"
+            exit 0
+          fi
+          ALLOWED="kaikei-core kaikei-app kaikei-jp kaikei-store rmcp tokio serde serde_json schemars"
+          if ! TREE=$(cargo tree -p kaikei-mcp --depth 1 --prefix none); then
+            echo "::error::cargo tree -p kaikei-mcp が失敗しました"
+            exit 1
+          fi
+          DEPS=$(echo "$TREE" \
+                 | sed 's/ v[0-9].*//' \
+                 | grep -v '^kaikei-mcp$' \
+                 | grep -v '^$' \
+                 | sort -u || true)
+          if [ -z "$DEPS" ]; then
+            echo "::error::kaikei-mcp の依存を1つも取得できませんでした（検査が働いていません）"
+            exit 1
+          fi
+          FAIL=0
+          for d in $DEPS; do
+            if ! echo "$ALLOWED" | grep -qw "$d"; then
+              echo "::error::kaikei-mcp に禁止された依存: $d"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "kaikei-mcp は薄い presentation 層です（docs/07-mcp-server.md §4）。"
+            echo "uuid / rust_decimal / sqlx を足したくなったら、まず"
+            echo "kaikei_app::{amount,wire,id,currency} と kaikei_jp::{tags,tax} に"
+            echo "同じことをする入口が無いか確認してください（DECISIONS.md D-072）。"
+            echo "許可リストを広げる場合は、その PR で理由を説明すること。"
+            exit 1
+          fi
+          echo "OK: $DEPS"
+
       - name: rehydrate の呼び出しは1箇所に限定
         run: |
           set -euo pipefail
