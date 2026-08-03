@@ -304,11 +304,39 @@ impl AuditLogUnavailable {
     /// **帳簿が無変更であることまで含める**（`CLAUDE.md` §11。
     /// これが無いと AI は「記帳されたかもしれない」と考えて確認や
     /// 二重記帳に走る）。`cause` は含めない（下位層の生メッセージが漏れる）。
+    ///
+    /// # 「時間をおいて再試行」を全ての失敗に出さない
+    ///
+    /// `cause` が [`RepoError::Corrupt`] のときは**記録しようとした内容が
+    /// 不正**（`actor` / `tool` が空、等の呼び出し側の不具合）であり、
+    /// 監査ログ自体は正常に動いている。ここで「監査ログに記録できなかった
+    /// ので時間をおいて再試行してください」と返すと、
+    ///
+    /// 1. 正常な監査ログを「使えない」と誤診し、
+    /// 2. 何度再試行しても成功しない
+    ///
+    /// という詰みになる（`CLAUDE.md` §11。D-038 が潰した誤診クラス）。
+    /// この場合は**同じ内容では成功しない**ことを明示する。
+    ///
+    /// なお `input` / `output` が JSONB に格納できない内容だった場合は
+    /// ここに到達しない。`kaikei_store::audit::PgAuditSink` が無害化して
+    /// 記録し、操作は実行される（D-075）。
     #[must_use]
     pub fn public_message(&self) -> String {
-        "監査ログに記録できなかったため、操作を実行していません。帳簿は変更されていません。\
-         時間をおいて再試行するか、サーバのログを添えて管理者に連絡してください"
-            .to_string()
+        match self.cause {
+            RepoError::Corrupt { .. } => {
+                "監査ログに記録する内容が不正だったため、操作を実行していません。\
+                 帳簿は変更されていません。これはサーバ側の不具合であり、\
+                 同じ内容で再試行しても成功しません。\
+                 サーバのログを添えて管理者に連絡してください"
+                    .to_string()
+            }
+            _ => {
+                "監査ログに記録できなかったため、操作を実行していません。帳簿は変更されていません。\
+                 時間をおいて再試行するか、サーバのログを添えて管理者に連絡してください"
+                    .to_string()
+            }
+        }
     }
 }
 
@@ -316,7 +344,12 @@ impl AuditLogUnavailable {
 ///
 /// 操作は既に確定しており、拒否しても取り消せない。開始レコードだけが残る
 /// ので、その行は「結果不明」として読む。
+///
+/// 受け取ったら**必ず応答に添える**（[`AuditedCall::into_result`] を使えば
+/// 自動で積まれる）。
 #[derive(Debug, thiserror::Error)]
+#[must_use = "fail-open の警告は応答に添えること（握り潰すと「結果不明」の行が\
+              誰にも気づかれないまま残る）"]
 #[error("監査ログの結果レコードを記録できませんでした（request_id={request_id_text}）: {cause}")]
 pub struct AuditResultNotRecorded {
     /// 開始レコードを引くためのリクエストID。
@@ -345,17 +378,61 @@ impl AuditResultNotRecorded {
 }
 
 /// [`with_audit`] の戻り値。**操作は実行された**（成功・失敗を問わない）。
+///
+/// # 警告を握り潰せない形にしてある（`DECISIONS.md` D-076）
+///
+/// fail-open の警告（[`AuditResultNotRecorded`]）を応答に添える規律を
+/// **11ツールの手作業に残さない**。フィールドを `pub` にすると
+/// `audited.result` だけを読んで `warning` を捨てるコードが書け、
+/// しかもそれは**正常系のテストでは検出できない**
+/// （D-076 が fail-closed について挙げた却下理由と同じ性質）。
+///
+/// そのため中身は private にし、取り出す口を2つに絞ってある。
+///
+/// - [`AuditedCall::into_result`][]（**既定**）: 警告があれば注記の
+///   `Vec<String>` に本文を積んでから結果を返す。呼び出し側は注記の入れ物を
+///   渡さないと結果を受け取れない
+/// - [`AuditedCall::into_parts`][]: 結果と警告を**同時に**取り出す
+///   （警告を自前で組み立てる presentation 層向け。捨てるには
+///   `let (result, _) = ...` と明示的に書く必要があり、grep で見つかる）
 #[derive(Debug)]
+#[must_use = "操作は実行済みです。結果と fail-open の警告を \
+              into_result / into_parts で取り出してください"]
 pub struct AuditedCall<T, E> {
+    request_id: RequestId,
+    result: Result<T, E>,
+    warning: Option<AuditResultNotRecorded>,
+}
+
+impl<T, E> AuditedCall<T, E> {
     /// このツール呼び出しのID。監査ログの2行はこの値で引ける。
-    pub request_id: RequestId,
-    /// 操作そのものの結果。監査ログの都合で書き換えない。
-    pub result: Result<T, E>,
-    /// 結果レコードを記録できなかった場合の警告（fail-open）。
+    #[must_use]
+    pub fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// **結果を取り出し、fail-open の警告を `notes` に積む。**
     ///
-    /// `Some` でも `result` は加工しない。応答に
-    /// [`AuditResultNotRecorded::public_message`] を添えること。
-    pub warning: Option<AuditResultNotRecorded>,
+    /// 警告が無ければ `notes` は変わらない。`notes` は応答の注記
+    /// （MCP のツール結果に添える文言。`PolicyNote` の一覧と同じ場所）を
+    /// 想定しており、ここに積んだ本文をそのまま応答へ載せること。
+    ///
+    /// 結果だけを受け取る API は用意しない。「警告を応答に添える」規律を
+    /// 型で強制するのがこのメソッドの唯一の目的である。
+    pub fn into_result(self, notes: &mut Vec<String>) -> Result<T, E> {
+        if let Some(warning) = self.warning {
+            notes.push(warning.public_message());
+        }
+        self.result
+    }
+
+    /// 結果と警告を**同時に**取り出す。
+    ///
+    /// 警告の載せ方を自分で決める場合（`isError` の扱いを変える等）に使う。
+    /// 既定は [`AuditedCall::into_result`]。
+    pub fn into_parts(self) -> (Result<T, E>, Option<AuditResultNotRecorded>) {
+        (self.result, self.warning)
+    }
 }
 
 /// 操作を監査ログで挟んで実行する（開始レコード → 操作 → 結果レコード）。
@@ -366,7 +443,8 @@ pub struct AuditedCall<T, E> {
 ///   `operation` はクロージャで受け取っており、呼ばれなければ future すら
 ///   構築されない。
 /// - 結果レコードが書けなくても操作の結果はそのまま返す
-///   （[`AuditedCall::warning`] に理由が入る）。
+///   （警告は [`AuditedCall::into_result`] / [`AuditedCall::into_parts`] で
+///   受け取る。捨てられない形にしてある）。
 ///
 /// # 引数
 ///
@@ -385,7 +463,7 @@ pub struct AuditedCall<T, E> {
 ///
 /// 開始レコードを記録できなかった場合のみ [`AuditLogUnavailable`]
 /// （このとき **`operation` は実行されていない**）。操作自体の失敗は
-/// `Ok(AuditedCall { result: Err(..), .. })` として返る。
+/// `Ok(AuditedCall)` の中の `Err` として返る（[`AuditedCall::into_result`]）。
 pub async fn with_audit<T, E, Op, Fut, D>(
     sink: &dyn AuditSink,
     clock: &dyn AppClock,
@@ -499,8 +577,10 @@ mod tests {
         .await
         .expect("開始レコードは書けるはず");
 
-        assert_eq!(audited.result.unwrap(), 42);
-        assert!(audited.warning.is_none());
+        assert_eq!(audited.request_id(), request_id);
+        let mut notes = Vec::new();
+        assert_eq!(audited.into_result(&mut notes).unwrap(), 42);
+        assert!(notes.is_empty(), "警告が無ければ注記は増えない: {notes:?}");
 
         let rows = sink.rows();
         assert_eq!(rows.len(), 2);
@@ -535,7 +615,9 @@ mod tests {
         .await
         .expect("開始レコードは書けるはず");
 
-        assert!(audited.result.is_err());
+        let (result, warning) = audited.into_parts();
+        assert!(result.is_err());
+        assert!(warning.is_none());
         let rows = sink.rows();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].status, status::STARTED);
@@ -593,6 +675,41 @@ mod tests {
         assert!(!message.contains("permission denied"), "{message}");
         // 診断用の Display 側には残っている。
         assert!(err.to_string().contains("permission denied"));
+        // sink が本当に使えない場合なので、再試行の案内は正しい。
+        assert!(message.contains("時間をおいて再試行"), "{message}");
+    }
+
+    // AUD-04b: 記録内容が不正（呼び出し側のバグ）で fail-closed になった場合、
+    // 「監査ログが使えない／時間をおいて再試行」と誤診しない。
+    // 監査ログ自体は正常であり、同じ内容では何度やっても成功しない。
+    #[test]
+    fn fail_closed_on_a_caller_defect_does_not_advise_retrying_later() {
+        let err = AuditLogUnavailable {
+            request_id: RequestId::new_v7(),
+            tool: "post_journal_entry".to_string(),
+            // `actor` / `tool` の `CHECK btrim(...) <> ''` 違反（23514）が
+            // `kaikei-store` の写像を通ると `Corrupt` になる。
+            cause: RepoError::Corrupt {
+                reason: "保存しようとしたデータがデータベースの制約に違反しています\
+                         （SQLSTATE 23514）: audit_log_tool_check"
+                    .to_string(),
+            },
+        };
+
+        let message = err.public_message();
+        assert_eq!(err.code(), codes::AUDIT_LOG_UNAVAILABLE);
+        assert!(message.contains("帳簿は変更されていません"), "{message}");
+        assert!(
+            !message.contains("時間をおいて再試行"),
+            "再試行しても永久に成功しない経路で再試行を促している: {message}"
+        );
+        assert!(
+            message.contains("同じ内容で再試行しても成功しません"),
+            "{message}"
+        );
+        assert!(!message.contains("逆仕訳"), "{message}");
+        // 診断用の生メッセージは応答に混ぜない。
+        assert!(!message.contains("audit_log_tool_check"), "{message}");
     }
 
     // AUD-05（fail-open）: 結果レコードが書けなくても操作の結果は返る。
@@ -611,9 +728,12 @@ mod tests {
         .await
         .expect("開始レコードは書けるはず");
 
-        assert_eq!(audited.result.unwrap(), 42);
-        let warning = audited.warning.expect("警告が添えられるはず");
-        let message = warning.public_message();
+        // ★ 結果を取り出す唯一の既定経路が、警告を注記へ積む
+        //   （「警告を添え忘れる」経路をコード上に用意していない）。
+        let mut notes = Vec::new();
+        assert_eq!(audited.into_result(&mut notes).unwrap(), 42);
+        assert_eq!(notes.len(), 1, "fail-open の警告が注記に積まれていない");
+        let message = &notes[0];
         assert!(message.contains(&request_id.to_uuid_string()), "{message}");
         // 再実行を促さない（二重計上を招く）。
         assert!(!message.contains("再実行"), "{message}");
@@ -621,6 +741,33 @@ mod tests {
         // 開始レコードだけが残る（＝「結果不明」として読める）。
         assert_eq!(sink.rows().len(), 1);
         assert_eq!(sink.rows()[0].status, status::STARTED);
+    }
+
+    // AUD-05b（fail-open の規律を構造で閉じる。D-076）:
+    // 結果を取り出す口は into_result / into_parts の2つだけで、どちらも
+    // 警告を必ず手渡す。`audited.result` のようにフィールドを直接読んで
+    // 警告を捨てる書き方はコンパイルが通らない
+    // （このテストは「口が2つとも警告を運ぶ」ことを固定する）。
+    #[tokio::test]
+    async fn the_only_ways_to_take_the_result_also_hand_over_the_warning() {
+        let sink = RecordingAuditSink::failing_on_result();
+
+        let audited = with_audit(
+            &sink,
+            &SystemClock,
+            &call(RequestId::new_v7(), None),
+            || async { Ok::<_, AppError>(1_u32) },
+            |_| AuditSuccess::default(),
+        )
+        .await
+        .expect("開始レコードは書けるはず");
+
+        let (result, warning) = audited.into_parts();
+        assert_eq!(result.unwrap(), 1);
+        assert!(
+            warning.is_some(),
+            "into_parts でも警告が同時に手渡されること"
+        );
     }
 
     // AUD-06: 結果レコードに載る本文は public_message() であり、
@@ -644,7 +791,8 @@ mod tests {
         .await
         .expect("開始レコードは書けるはず");
 
-        assert!(audited.result.is_err());
+        let (result, _warning) = audited.into_parts();
+        assert!(result.is_err());
         let rows = sink.rows();
         let message = rows[1]
             .public_message

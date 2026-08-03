@@ -25,6 +25,18 @@
 //! | MC-22 | 記帳が失敗して rollback | `failed_posting_rolls_back_the_ledger_but_keeps_both_audit_rows` |
 //! | MC-23 | `kaikei_app` の権限 | `crates/kaikei-store/tests/privileges.rs` / `tests/append_only.rs` |
 //!
+//! # 入力を理由に fail-closed へ落ちないこと（D-075）
+//!
+//! `with_audit` は開始レコードが書けなければ操作を実行しない。したがって
+//! **入力に起因する INSERT の失敗は「監査ログが使えない」という誤診**になり、
+//! 同じ入力で再試行する限り永久に成功しない。JSONB に格納できない入力
+//! （U+0000）と、JSON として壊れた入力の2つが実際にその経路へ落ちるため、
+//! `PgAuditSink` が無害化して記録する。次の3本がそれを実証している。
+//!
+//! - `a_nul_character_in_the_input_is_sanitized_and_never_blocks_the_operation`
+//! - `a_nul_character_in_the_error_message_still_records_the_result_row`
+//! - `an_unparsable_input_is_replaced_by_a_placeholder_instead_of_blocking`
+//!
 //! `kaikei-mcp` はまだ存在しないため、ツール呼び出しの代わりに
 //! 「帳簿への記帳（`JournalRepo::insert_entry` を `with_tx` で包んだもの）」を
 //! 操作として使う。検証したいのは監査ログと帳簿トランザクションの関係で
@@ -206,8 +218,10 @@ async fn successful_posting_records_started_then_ok_with_the_entry_id(
     .await
     .expect("開始レコードは書けるはず");
 
-    assert!(audited.result.is_ok());
-    assert!(audited.warning.is_none(), "結果レコードは書けているはず");
+    let mut notes = Vec::new();
+    assert_eq!(audited.request_id(), request_id);
+    assert!(audited.into_result(&mut notes).is_ok());
+    assert!(notes.is_empty(), "結果レコードは書けているはず: {notes:?}");
     assert_eq!(journal_entry_count(&app).await, 1);
 
     let rows = audit_rows(&app, request_id).await;
@@ -284,7 +298,9 @@ async fn failed_posting_rolls_back_the_ledger_but_keeps_both_audit_rows(
     .await
     .expect("開始レコードは書けるはず");
 
-    let err = audited.result.expect_err("操作は失敗するはず");
+    let (result, warning) = audited.into_parts();
+    assert!(warning.is_none(), "結果レコードは書けているはず");
+    let err = result.expect_err("操作は失敗するはず");
     assert_eq!(err.code(), codes::REJECTED);
 
     // 帳簿は変わっていない（rollback された）。
@@ -454,6 +470,198 @@ async fn start_record_failure_prevents_the_posting_and_leaves_the_ledger_untouch
     // 42501 は RepoError::AppendOnlyViolation に写像されるが、その
     // 「訂正は逆仕訳で」という案内が応答に漏れてはいけない（D-038 と同じ誤診クラス）。
     assert!(!message.contains("逆仕訳"), "{message}");
+
+    // ★ `cause` は pub フィールドである。presentation 層が診断のつもりで
+    //   `cause.public_message()` を出しても誤案内が復活しないこと
+    //   （`sqlstate.rs` の共通写像は 42501 を一律 AppendOnlyViolation にする。
+    //   `kaikei_store::audit` 側で包み直している）。
+    assert_eq!(
+        err.cause.code(),
+        codes::BACKEND,
+        "audit_log の 42501 が帳簿と同じ分類のまま漏れている: {:?}",
+        err.cause
+    );
+    assert_ne!(err.cause.code(), codes::APPEND_ONLY_VIOLATION);
+    assert!(
+        !err.cause.public_message().contains("逆仕訳"),
+        "{}",
+        err.cause.public_message()
+    );
+    assert!(!err.cause.to_string().contains("逆仕訳"), "{}", err.cause);
+    // 診断情報（SQLSTATE と DB のメッセージ）は失っていない。
+    assert!(err.to_string().contains("42501"), "{err}");
+    assert!(err.to_string().contains("permission denied"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// ★ 入力が原因で fail-closed に落ちない（D-075）
+// ---------------------------------------------------------------------------
+
+/// `input` に **U+0000** を含む JSON（JSON としても JSON-RPC としても正当）を
+/// 渡しても、操作は**実行され**、監査ログには**記録が残る**。
+///
+/// PostgreSQL の `jsonb` は U+0000 を格納できず SQLSTATE `22P05`
+/// （`unsupported Unicode escape sequence`）で拒否する。無害化しない実装では
+/// 開始レコードの INSERT が失敗し、`with_audit` が fail-closed に落ちて
+///
+/// 1. 正常な監査ログを「使えない」と誤診し
+/// 2. 再試行しても永久に成功せず
+/// 3. AI には原因（自分が送った1文字）が分からない
+///
+/// という詰みになる（`CLAUDE.md` §11 / D-038 が潰した誤診クラス）。
+#[sqlx::test]
+async fn a_nul_character_in_the_input_is_sanitized_and_never_blocks_the_operation(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let (store, sink, app, _migrator) = fixture(pool_opts, conn_opts).await;
+    let clock = FixedClock(Timestamp::from_unix_nanos(FIXED_NANOS));
+    let request_id = RequestId::new_v7();
+    let entry = balanced_entry(6, 1);
+
+    // レビュアーが実 PostgreSQL で再現に使った入力そのもの。
+    let input = "{\"description\":\"A\\u0000B\"}";
+
+    let audited = with_audit(
+        &sink,
+        &clock,
+        &call(request_id, Some(input)),
+        || post(&store, entry),
+        |id| AuditSuccess {
+            entry_id: Some(*id),
+            output_json: None,
+        },
+    )
+    .await
+    .expect("U+0000 入りの入力で fail-closed に落ちてはいけない");
+
+    // (1) 操作が実行されている。
+    let mut notes = Vec::new();
+    assert!(audited.into_result(&mut notes).is_ok());
+    assert_eq!(
+        journal_entry_count(&app).await,
+        1,
+        "入力の1文字を理由に操作が実行されなくなっている"
+    );
+    assert!(notes.is_empty(), "結果レコードも書けているはず: {notes:?}");
+
+    // (2) 記録が残っている（2行）。
+    let rows = audit_rows(&app, request_id).await;
+    assert_eq!(rows.len(), 2, "監査の証拠が残っていない");
+    assert_eq!(rows[0].status, status::STARTED);
+    assert_eq!(rows[1].status, status::OK);
+
+    // (3) 置換されたことが記録から分かる（「原文どおり」と読めない形）。
+    let recorded_input = rows[0].input.as_ref().expect("input が記録されていない");
+    assert_eq!(
+        recorded_input["_audit"]["verbatim"],
+        serde_json::json!(false),
+        "原文と違うものを黙って記録している: {recorded_input}"
+    );
+    assert_eq!(
+        recorded_input["_audit"]["replaced_nul"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        recorded_input["value"]["description"],
+        serde_json::json!("A\u{FFFD}B"),
+        "内容が失われている: {recorded_input}"
+    );
+}
+
+/// 失敗の結果レコードに載る本文（`public_message()`）に U+0000 が
+/// 混じっても、結果レコードは記録される（fail-open の警告にならない）。
+///
+/// 本文には入力由来の文字列が入りうる（`AppError::Rejected` の `reason` 等）。
+#[sqlx::test]
+async fn a_nul_character_in_the_error_message_still_records_the_result_row(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let (_store, sink, app, _migrator) = fixture(pool_opts, conn_opts).await;
+    let clock = FixedClock(Timestamp::from_unix_nanos(FIXED_NANOS));
+    let request_id = RequestId::new_v7();
+
+    let audited = with_audit(
+        &sink,
+        &clock,
+        &call(request_id, None),
+        || async {
+            Err::<EntryId, _>(AppError::Rejected {
+                reason: "摘要に不正な文字が含まれています: A\u{0000}B".to_string(),
+            })
+        },
+        |id| AuditSuccess {
+            entry_id: Some(*id),
+            output_json: None,
+        },
+    )
+    .await
+    .expect("開始レコードは書けるはず");
+
+    let (result, warning) = audited.into_parts();
+    assert!(result.is_err());
+    assert!(
+        warning.is_none(),
+        "本文の1文字を理由に結果レコードを落としている"
+    );
+
+    let rows = audit_rows(&app, request_id).await;
+    assert_eq!(rows.len(), 2);
+    let output = rows[1].output.as_ref().expect("output が記録されていない");
+    assert_eq!(output["_audit"]["verbatim"], serde_json::json!(false));
+    assert!(
+        output["value"]["message"]
+            .as_str()
+            .expect("message は文字列")
+            .contains('\u{FFFD}'),
+        "{output}"
+    );
+}
+
+/// JSON として解釈できない `input`（presentation 層のバグ）でも、
+/// 操作は実行され、**誰がいつ何のツールを呼んだか**は記録される。
+#[sqlx::test]
+async fn an_unparsable_input_is_replaced_by_a_placeholder_instead_of_blocking(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let (store, sink, app, _migrator) = fixture(pool_opts, conn_opts).await;
+    let clock = FixedClock(Timestamp::from_unix_nanos(FIXED_NANOS));
+    let request_id = RequestId::new_v7();
+    let entry = balanced_entry(7, 1);
+
+    let audited = with_audit(
+        &sink,
+        &clock,
+        &call(request_id, Some("{壊れた")),
+        || post(&store, entry),
+        |id| AuditSuccess {
+            entry_id: Some(*id),
+            output_json: None,
+        },
+    )
+    .await
+    .expect("壊れた JSON で fail-closed に落ちてはいけない");
+
+    let mut notes = Vec::new();
+    assert!(audited.into_result(&mut notes).is_ok());
+    assert_eq!(journal_entry_count(&app).await, 1);
+
+    let rows = audit_rows(&app, request_id).await;
+    assert_eq!(rows.len(), 2);
+    let recorded_input = rows[0].input.as_ref().expect("input が記録されていない");
+    assert_eq!(
+        recorded_input["_audit"]["recorded"],
+        serde_json::json!(false),
+        "記録できなかったことが分かる形になっていない: {recorded_input}"
+    );
+    assert_eq!(
+        recorded_input["_audit"]["reason"],
+        serde_json::json!("invalid_json")
+    );
+    assert_eq!(rows[0].tool, "post_journal_entry");
+    assert_eq!(rows[0].actor, actor::MCP);
 }
 
 /// MC-21: 結果レコードだけが書けない場合、操作は成功として返り、
@@ -489,12 +697,13 @@ async fn result_record_failure_still_returns_success_and_leaves_a_started_row(
     .await
     .expect("開始レコードは書けている（剥奪は操作の後）");
 
-    // 操作は成功として返る（fail-open）。
-    assert!(audited.result.is_ok());
+    // 操作は成功として返る（fail-open）。警告は注記に積まれる。
+    let mut notes = Vec::new();
+    assert!(audited.into_result(&mut notes).is_ok());
     assert_eq!(journal_entry_count(&app).await, 1);
 
-    let warning = audited.warning.expect("警告が添えられるはず");
-    let message = warning.public_message();
+    assert_eq!(notes.len(), 1, "fail-open の警告が注記に積まれていない");
+    let message = &notes[0];
     assert!(message.contains(&request_id.to_uuid_string()), "{message}");
     assert!(
         !message.contains("再実行"),
@@ -546,7 +755,8 @@ async fn audit_output_never_carries_the_connection_string_from_a_backend_error(
     .await
     .expect("開始レコードは書けるはず");
 
-    assert!(audited.result.is_err());
+    let (result, _warning) = audited.into_parts();
+    assert!(result.is_err());
 
     let rows = audit_rows(&app, request_id).await;
     // 記録された JSONB 列を全て繋いで、生メッセージが混じっていないか見る。
