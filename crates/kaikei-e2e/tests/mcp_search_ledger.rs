@@ -168,9 +168,20 @@ fn assert_two_rows(rows: &[AuditRow], tool: &str, expected_status: &str) {
 // 素材（本番の経路で記帳する）
 // ---------------------------------------------------------------------------
 
-/// 4件の仕訳を記帳し、うち1件を赤伝で取り消す。
+/// 5件の仕訳を記帳し、うち1件を赤伝で1回、もう1件を**2回**取り消す。
 ///
-/// 戻り値は記帳順の仕訳ID（`[売上A, 消耗品, 売上B, 取消対象, 赤伝]`）。
+/// 戻り値は記帳順の仕訳ID:
+/// `[売上A, 消耗品, 売上B, 取消対象, 赤伝, 二重訂正の対象, 赤伝1, 赤伝2]`。
+///
+/// # 二重訂正を土台に入れる理由（PR-H レビュー C-2）
+///
+/// `search.rs` / `ledger.rs` が `LEFT JOIN LATERAL ... LIMIT 1` を採った
+/// 理由（`DECISIONS.md` D-088）が、**同じ仕訳に赤伝が2件以上ありうる**こと
+/// である。素朴な `LEFT JOIN` に戻すと検索は `{"error":"corrupt"}` になり、
+/// 元帳は同じ明細を2行返す。土台に1件も無ければその退行が緑のまま通る。
+///
+/// 二重訂正の対象には**専用の科目（620 支払手数料）**を使う。
+/// 609 / 500 を動かすと他の検査の期待値がまとめて変わるためである。
 async fn post_sample_entries(runtime: &Runtime) -> Vec<String> {
     let mut ids = Vec::new();
 
@@ -179,6 +190,7 @@ async fn post_sample_entries(runtime: &Runtime) -> Vec<String> {
         ("2026-02-01", "文具の購入", "609", "100", "1500", false),
         ("2026-02-01", "B社への請求", "135", "500", "3000", true),
         ("2026-03-20", "消耗品の購入", "609", "100", "800", false),
+        ("2026-05-10", "振込手数料", "620", "100", "500", false),
     ] {
         let credit_tags = if tax_category {
             json!({ "tax_category": "SALES_10" })
@@ -217,8 +229,33 @@ async fn post_sample_entries(runtime: &Runtime) -> Vec<String> {
     )
     .await;
     assert!(!is_error(&response), "逆仕訳に失敗しました: {response}");
-    ids.push(body(&response)["entry_id"].as_str().unwrap().to_string());
+    let single_reversal = body(&response)["entry_id"].as_str().unwrap().to_string();
 
+    // ★二重訂正★ 5件目（620）を2回取り消す。2回目は
+    // `allow_double_reversal: true` を明示しないと拒否される。
+    let double_reversed = ids[4].clone();
+    let mut double_reversals = Vec::new();
+    for (reverse_date, reason, allow) in [
+        ("2026-05-20", "金額の誤り", false),
+        ("2026-05-30", "科目の誤り（二重に訂正した）", true),
+    ] {
+        let response = call::<ReverseJournalEntry>(
+            runtime,
+            json!({
+                "original_id": double_reversed,
+                "reverse_date": reverse_date,
+                "reason": reason,
+                "allow_double_reversal": allow
+            }),
+        )
+        .await;
+        assert!(!is_error(&response), "二重訂正に失敗しました: {response}");
+        double_reversals.push(body(&response)["entry_id"].as_str().unwrap().to_string());
+    }
+
+    // 記帳順（4の赤伝 → 620の赤伝2件）に並べ直す。
+    ids.insert(4, single_reversal);
+    ids.extend(double_reversals);
     ids
 }
 
@@ -326,17 +363,21 @@ async fn a_truncated_search_says_so_and_the_cursor_walks_the_rest(
     let app = common::app_pool(conn_opts).await;
     let runtime = runtime(&app).await;
     let posted = post_sample_entries(&runtime).await;
+    let total = posted.len() as u64;
 
     let first = call::<SearchEntries>(&runtime, json!({ "limit": 2 })).await;
     let page = body(&first);
-    assert_eq!(page["total_matches"], json!(5), "{page}");
+    assert_eq!(page["total_matches"], json!(total), "{page}");
     assert_eq!(page["returned"], json!(2));
     assert_eq!(page["has_more"], json!(true));
     let note = page["truncation_note"]
         .as_str()
         .expect("切ったことが応答から分かること");
-    assert!(note.contains('5'), "{note}");
+    assert!(note.contains(&total.to_string()), "{note}");
     assert!(note.contains("next_cursor"), "{note}");
+    // ★切れた理由が「自分の limit」だと分かる★（PR-H レビュー D-4）
+    assert!(note.contains("limit=2"), "{note}");
+    assert!(note.contains("100"), "上限も併記する: {note}");
 
     // 続きを最後まで辿る。
     let mut seen: Vec<String> = page["entries"]
@@ -351,7 +392,11 @@ async fn a_truncated_search_says_so_and_the_cursor_walks_the_rest(
             call::<SearchEntries>(&runtime, json!({ "limit": 2, "cursor": cursor })).await;
         assert!(!is_error(&response), "{response}");
         let page = body(&response);
-        assert_eq!(page["total_matches"], json!(5), "総件数はページによらない");
+        assert_eq!(
+            page["total_matches"],
+            json!(total),
+            "総件数はページによらない"
+        );
         seen.extend(
             page["entries"]
                 .as_array()
@@ -363,14 +408,18 @@ async fn a_truncated_search_says_so_and_the_cursor_walks_the_rest(
             Some(next) => cursor = next.to_string(),
             None => break,
         }
-        assert!(seen.len() <= 5, "ページングが終わらない");
+        assert!(seen.len() as u64 <= total, "ページングが終わらない");
     }
 
-    assert_eq!(seen.len(), 5, "取りこぼしがある: {seen:?}");
+    assert_eq!(seen.len() as u64, total, "取りこぼしがある: {seen:?}");
     let mut sorted = seen.clone();
     sorted.sort();
     sorted.dedup();
-    assert_eq!(sorted.len(), 5, "同じ仕訳が2回返っている: {seen:?}");
+    assert_eq!(
+        sorted.len() as u64,
+        total,
+        "同じ仕訳が2回返っている: {seen:?}"
+    );
     for id in &posted {
         assert!(seen.contains(id), "記帳した仕訳が返っていない: {id}");
     }
@@ -484,6 +533,245 @@ async fn search_marks_reversed_entries_and_their_reversals(
         .unwrap();
     assert!(plain.get("reverses").is_none());
     assert!(plain.get("reversed_by").is_none());
+}
+
+/// ★二重訂正された仕訳が1件だけ返る★（D-088。PR-H レビュー C-2）
+///
+/// `allow_double_reversal: true` で2回訂正された仕訳が、検索では**1件**、
+/// 元帳では**明細1行につき1行**しか返らない。素朴な `LEFT JOIN` に戻すと
+/// 検索は `{"error":"corrupt"}` になり、元帳は同じ明細を2行返す。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_doubly_reversed_entry_is_returned_only_once_by_search_and_by_the_ledger(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let runtime = runtime(&app).await;
+    let posted = post_sample_entries(&runtime).await;
+    let (original, first_reversal, second_reversal) =
+        (posted[5].clone(), posted[6].clone(), posted[7].clone());
+
+    // --- 検索 ---
+    let response = call::<SearchEntries>(&runtime, json!({ "account": "620" })).await;
+    assert!(
+        !is_error(&response),
+        "二重訂正で応答が壊れています: {response}"
+    );
+    let page = body(&response);
+    assert_eq!(page["total_matches"], json!(3), "{page}");
+    assert_eq!(page["returned"], json!(3), "{page}");
+
+    let entries = page["entries"].as_array().unwrap();
+    let occurrences = entries
+        .iter()
+        .filter(|e| e["entry_id"] == json!(original))
+        .count();
+    assert_eq!(occurrences, 1, "同じ仕訳が2件返っています: {page}");
+
+    // `reversed_by` は最も古い赤伝1件（2件目は現れない。D-088 のトレードオフ）。
+    let entry = entries
+        .iter()
+        .find(|e| e["entry_id"] == json!(original))
+        .unwrap();
+    assert_eq!(entry["reversed_by"]["entry_id"], json!(first_reversal));
+
+    // 2件目の赤伝も検索には出る（帳簿は追記のみ）。
+    let second = entries
+        .iter()
+        .find(|e| e["entry_id"] == json!(second_reversal))
+        .expect("2件目の赤伝も返る");
+    assert_eq!(second["reverses"], json!(original));
+    assert_eq!(
+        second["reverse_reason"],
+        json!("科目の誤り（二重に訂正した）")
+    );
+
+    // --- 元帳 ---
+    let response = call::<GetLedger>(
+        &runtime,
+        json!({ "account": "620", "from": "2026-01-01", "to": "2026-12-31" }),
+    )
+    .await;
+    assert!(!is_error(&response), "{response}");
+    let page = body(&response);
+
+    // 借方 500（元仕訳）と貸方 500 × 2（赤伝2件）の3行。
+    assert_eq!(page["total_lines"], json!(3), "{page}");
+    assert_eq!(page["returned"], json!(3), "{page}");
+    let rows = page["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "同じ明細が2行出ています: {page}");
+    let occurrences = rows
+        .iter()
+        .filter(|r| r["entry_id"] == json!(original))
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "二重訂正された仕訳の行が2行あります: {page}"
+    );
+    // 費用（借方が正）。500 − 500 − 500 = −500。
+    assert_eq!(page["closing_balance"], json!("-500"));
+
+    // ★赤伝の行だけを見て訂正理由が読める★（PR-H レビュー D-2）
+    let red = rows
+        .iter()
+        .find(|r| r["entry_id"] == json!(second_reversal))
+        .unwrap();
+    assert_eq!(red["reverses"], json!(original));
+    assert_eq!(red["reverse_reason"], json!("科目の誤り（二重に訂正した）"));
+    // 取り消されていない行には出ない。
+    let plain = rows
+        .iter()
+        .find(|r| r["entry_id"] == json!(original))
+        .unwrap();
+    assert!(plain.get("reverse_reason").is_none(), "{plain}");
+}
+
+/// ★打ち間違いを0件の成功にしない★（PR-H レビュー C-3）
+///
+/// `search_entries` の `account` に勘定科目マスタに無いコードを渡すと
+/// `not_found` になる（`get_ledger` と同じ規律）。実在する科目に該当が
+/// 無いだけなら 0 件の**成功**である。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn searching_by_an_account_code_that_is_not_in_the_chart_is_not_found(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let runtime = runtime(&app).await;
+    post_sample_entries(&runtime).await;
+
+    let response = call::<SearchEntries>(&runtime, json!({ "account": "99999" })).await;
+
+    assert!(is_error(&response), "0件の成功にしない: {response}");
+    assert_eq!(body(&response)["error"], json!("not_found"), "{response}");
+    let message = body(&response)["message"].as_str().unwrap();
+    assert!(message.contains("99999"), "{message}");
+    // 次の手（`CLAUDE.md` §11）。`get_ledger` と同じ案内。
+    assert!(message.contains("list_accounts"), "{message}");
+
+    // 失敗した読み取りも監査ログには2行残る。
+    let rows = audit_rows(&app).await;
+    assert_two_rows(&rows[rows.len() - 2..], "search_entries", "error");
+
+    // 対照実験: 実在する科目で該当が無いだけなら 0 件の成功。
+    let response = call::<SearchEntries>(
+        &runtime,
+        json!({ "account": "620", "from": "2027-01-01", "to": "2027-12-31" }),
+    )
+    .await;
+    assert!(!is_error(&response), "{response}");
+    assert_eq!(body(&response)["entries"], json!([]));
+    assert_eq!(body(&response)["total_matches"], json!(0));
+}
+
+/// ★読み取り系の `audit_log.output` は要約★（D-089 の決定6。
+/// PR-H レビュー C-5）
+///
+/// 読み取りは AI が最も多く呼ぶ操作であり、応答本文をそのまま記録すると
+/// 1回で数十 KB になる。監査ログにおける読み取りの目的は
+/// 「**誰がいつ何を読んだか**」であり、返した内容そのものは
+/// (`input` の条件 + その時点の帳簿) から再現できる。
+///
+/// **書き込み系は結果そのものが変更の記録なので全体を残す。**
+/// この非対称が実際に効いていることも併せて見る。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_read_records_a_summary_in_the_audit_log_while_a_write_records_the_whole_body(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let runtime = runtime(&app).await;
+    post_sample_entries(&runtime).await;
+
+    // --- search_entries ---
+    let response = call::<SearchEntries>(&runtime, json!({ "limit": 100 })).await;
+    assert!(!is_error(&response), "{response}");
+    let body_bytes = body(&response).to_string().len();
+
+    let rows = audit_rows(&app).await;
+    let output = rows.last().unwrap().output.clone().expect("結果レコード");
+    let output_bytes = output.to_string().len();
+    println!(
+        "search_entries: 応答本文 {body_bytes} バイト / audit_log.output {output_bytes} バイト"
+    );
+
+    // 明細そのものは残さない。
+    assert!(
+        output.get("entries").is_none(),
+        "明細が記録されている: {output}"
+    );
+    assert!(output.get("truncation_note").is_none(), "{output}");
+    // 「何件のうち何件を、どこまで読んだか」は残る。
+    assert_eq!(output["total_matches"], body(&response)["total_matches"]);
+    assert_eq!(output["returned"], body(&response)["returned"]);
+    assert!(output.get("has_more").is_some(), "{output}");
+    assert!(
+        output_bytes * 4 < body_bytes,
+        "要約になっていない（本文 {body_bytes} / output {output_bytes}）"
+    );
+
+    // --- get_ledger ---
+    let response = call::<GetLedger>(
+        &runtime,
+        json!({ "account": "609", "from": "2026-01-01", "to": "2026-12-31" }),
+    )
+    .await;
+    assert!(!is_error(&response), "{response}");
+    let body_bytes = body(&response).to_string().len();
+
+    let rows = audit_rows(&app).await;
+    let output = rows.last().unwrap().output.clone().expect("結果レコード");
+    let output_bytes = output.to_string().len();
+    println!("get_ledger: 応答本文 {body_bytes} バイト / audit_log.output {output_bytes} バイト");
+
+    assert!(
+        output.get("rows").is_none(),
+        "明細が記録されている: {output}"
+    );
+    // 条件（何を読んだか）と期間全体の合計・件数は残る。
+    for key in [
+        "account",
+        "from",
+        "to",
+        "opening_balance",
+        "debit_total",
+        "credit_total",
+        "closing_balance",
+        "total_lines",
+        "returned",
+        "has_more",
+    ] {
+        assert_eq!(output[key], body(&response)[key], "{key}: {output}");
+    }
+    assert!(
+        output_bytes * 2 < body_bytes,
+        "要約になっていない（本文 {body_bytes} / output {output_bytes}）"
+    );
+
+    // --- 対照実験: 書き込み系は本文そのものが残る ---
+    let response = call::<PostJournalEntry>(
+        &runtime,
+        json!({
+            "entry_date": "2026-07-01",
+            "description": "打ち合わせの茶菓",
+            "lines": [
+                { "account": "623", "side": "debit", "amount": "1200",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "100", "side": "credit", "amount": "1200" }
+            ]
+        }),
+    )
+    .await;
+    assert!(!is_error(&response), "{response}");
+
+    let rows = audit_rows(&app).await;
+    let output = rows.last().unwrap().output.clone().expect("結果レコード");
+    assert_eq!(
+        &output,
+        body(&response),
+        "書き込み系は応答本文がそのまま残る（明細を落とさない）"
+    );
+    assert!(output.get("lines").is_some(), "{output}");
 }
 
 // ---------------------------------------------------------------------------

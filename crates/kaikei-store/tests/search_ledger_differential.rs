@@ -109,6 +109,8 @@ fn chart() -> ChartOfAccounts {
         account("100", "現金", AccountType::Asset),
         account("500", "売上高", AccountType::Revenue),
         account("600", "消耗品費", AccountType::Expense),
+        // 二重訂正の検査だけに使う科目（他の検査の合計を動かさないため）。
+        account("700", "支払手数料", AccountType::Expense),
     ])
     .unwrap()
 }
@@ -206,7 +208,37 @@ async fn insert_entry(pool: &PgPool, entry: &JournalEntry) {
     tx.commit().await.unwrap();
 }
 
-/// 差分テストの土台。5件の仕訳（うち1件は赤伝で取り消し済み）を作る。
+/// 差分テストの土台。8件の仕訳を作る。
+///
+/// | # | 取引日 | 内容 | 科目 |
+/// |---|---|---|---|
+/// | 1 | 2026-01-10 | A社への請求 | 100 / 500 |
+/// | 2 | 2026-02-01 | 文具の購入 | 600 / 100 |
+/// | 3 | 2026-02-01 | B社への請求 | 100 / 500 |
+/// | 4 | 2026-03-20 | 消耗品の購入 | 600 / 100 |
+/// | 5 | 2026-03-31 | 4 の赤伝 | 600 / 100 |
+/// | 6 | 2026-05-10 | 振込手数料 | **700** / 100 |
+/// | 7 | 2026-05-20 | 6 の赤伝 | **700** / 100 |
+/// | 8 | 2026-05-30 | ★6 の赤伝（**二重訂正**）★ | **700** / 100 |
+///
+/// # なぜ二重訂正を土台に入れるのか（PR-H レビュー C-2）
+///
+/// `search.rs` / `ledger.rs` が `LEFT JOIN LATERAL ... LIMIT 1` を採った
+/// 理由が**まさにこれ**である（`DECISIONS.md` D-088）。素朴な `LEFT JOIN`
+/// に戻すと、6 が検索結果に2件・元帳に2行現れる。二重訂正が土台に1件も
+/// 無いと、その退行が**全テスト緑のまま**通ってしまう。
+///
+/// 8 は 6 に対する2件目の赤伝で、`reverse_entry::execute` の
+/// `allow_double_reversal: true` が作るものと同じ形（`reverses` が同じ
+/// 仕訳を指す行が2つ）である。`JournalEntry::reverse` 自体は二重訂正を
+/// 拒まない（拒むのはユースケース層）。
+///
+/// # 専用の科目（700）を使う理由
+///
+/// 100 / 500 / 600 の合計を動かすと、既存の検査の期待値がまとめて変わる。
+/// 二重訂正のためだけの科目を1つ足すことで、この土台の変更が
+/// **他の検査の意味を変えない**ようにしてある（100 の元帳だけは対照実装
+/// から計算しているので、行が増えても差分の性質は変わらない）。
 async fn seed(pool: &PgPool) -> Vec<JournalEntry> {
     let chart = chart();
     for def in chart.iter() {
@@ -285,6 +317,42 @@ async fn seed(pool: &PgPool) -> Vec<JournalEntry> {
         )
         .unwrap();
     entries.push(reversal);
+
+    // ★二重訂正★ 6件目を作り、それを2回取り消す（上の doc）。
+    let double_reversed = entry(
+        6,
+        6,
+        date(2026, 5, 10),
+        "振込手数料",
+        vec![
+            line("700", Side::Debit, 500, TagSet::new()),
+            line("100", Side::Credit, 500, TagSet::new()),
+        ],
+        &fy,
+        &chart,
+        &schema,
+    );
+    for (id, entry_no, day, reason) in [
+        (7_u128, 7_u32, 20_u8, "金額の誤り"),
+        // 2件目の赤伝。`allow_double_reversal: true` が作るのと同じ形。
+        (8, 8, 30, "二重に訂正されたもの"),
+    ] {
+        let reversal = double_reversed
+            .reverse(
+                EntryId::new(id),
+                EntryNumber::new(entry_no),
+                date(2026, 5, day),
+                reason.to_string(),
+                &fy,
+                &chart,
+                &schema,
+                &AllOpen,
+                &FixedClock(Timestamp::from_unix_nanos(0)),
+            )
+            .unwrap();
+        entries.push(reversal);
+    }
+    entries.insert(5, double_reversed);
 
     for e in &entries {
         insert_entry(pool, e).await;
@@ -612,6 +680,120 @@ async fn a_reversed_entry_and_its_reversal_are_both_visible_and_linked(
     assert!(plain.reversed_by.is_none());
 }
 
+/// ★二重訂正★ 同じ仕訳に赤伝が2件あっても、検索は**その仕訳を1件だけ**
+/// 返し、元帳は**その明細1行につき1行だけ**返す（`DECISIONS.md` D-088）。
+///
+/// # なぜこの1本が要るのか（PR-H レビュー C-2）
+///
+/// `search.rs` / `ledger.rs` が `LEFT JOIN LATERAL ... LIMIT 1` を採った
+/// 理由は「`allow_double_reversal` により同じ仕訳への赤伝が2件以上ありうる」
+/// である。素朴な `LEFT JOIN` に戻すと結合で行が増え、検索では
+/// `load_lines` が同じ仕訳を2度渡されて **`RepoError::Corrupt`**
+/// （応答は `{"error":"corrupt"}`）になり、元帳では同じ明細が2行出て
+/// **`rows` の数が `total_lines` と食い違う**。
+///
+/// 総件数（`total_matches`）と `total_lines` は結合より前で数えているので
+/// **狂わない**。壊れるのは行の側だけである（PR-H レビュー D-3）。
+#[sqlx::test]
+async fn a_doubly_reversed_entry_is_returned_once_by_search_and_once_per_line_by_the_ledger(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    let entries = seed(&roles.migrator).await;
+
+    // 対照: 6 を訂正している赤伝がちょうど2件ある（土台が変わっていない）。
+    let reversals: Vec<&JournalEntry> = entries
+        .iter()
+        .filter(|e| e.reverses() == Some(EntryId::new(6)))
+        .collect();
+    assert_eq!(reversals.len(), 2, "二重訂正が土台に無い");
+
+    // --- 検索 ---
+    let search = PgSearchEntriesQuery::new(roles.app.clone());
+    let mut params = params(100);
+    params.account = Some(code("700"));
+    let page = search.search_entries(&params).await.unwrap();
+
+    // 6・7・8 の3件（元仕訳と2件の赤伝）。**6 が2件になっていない。**
+    assert_eq!(page.total_matches, 3);
+    assert_eq!(page.entries.len(), 3, "同じ仕訳が2件返っている");
+    let occurrences = page
+        .entries
+        .iter()
+        .filter(|e| e.entry_id == EntryId::new(6))
+        .count();
+    assert_eq!(occurrences, 1, "二重訂正された仕訳が2件返っている");
+
+    // `reversed_by` は最も古い赤伝1件（並びは entry_date → entry_no → id）。
+    let original = page
+        .entries
+        .iter()
+        .find(|e| e.entry_id == EntryId::new(6))
+        .unwrap();
+    let marker = original.reversed_by.as_ref().expect("取り消されている");
+    assert_eq!(marker.entry_id, EntryId::new(7));
+    assert_eq!(marker.entry_date, date(2026, 5, 20));
+
+    // --- 元帳 ---
+    let ledger = PgLedgerQuery::new(roles.app.clone());
+    let page = ledger
+        .ledger(&ledger_params("700", date(2026, 1, 1), date(2026, 12, 31)))
+        .await
+        .unwrap();
+
+    // 6 の借方 500・7 の貸方 500・8 の貸方 500 の3行。
+    let expected = expected_rows(&entries, &code("700"), date(2026, 1, 1), date(2026, 12, 31));
+    assert_eq!(expected.len(), 3, "対照が変わっている");
+    assert_eq!(page.total_lines, 3);
+    assert_eq!(page.rows.len(), 3, "同じ明細が2行出ている");
+    assert_eq!(
+        page.rows.len() as u64,
+        page.total_lines,
+        "rows と total_lines が食い違う"
+    );
+    let occurrences = page
+        .rows
+        .iter()
+        .filter(|r| r.entry_id == EntryId::new(6))
+        .count();
+    assert_eq!(occurrences, 1, "二重訂正された仕訳の行が2行出ている");
+    // 費用（借方が正）。500 − 500 − 500 = −500。
+    assert_eq!(page.closing_balance.minor(), -500);
+}
+
+/// 検索の `account` に**勘定科目マスタに無い**コードを渡すと `NotFound`
+/// （0件の成功にしない。`get_ledger` と同じ規律。PR-H レビュー C-3）。
+#[sqlx::test]
+async fn searching_by_an_account_code_that_does_not_exist_is_not_found(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    seed(&roles.migrator).await;
+    let query = PgSearchEntriesQuery::new(roles.app.clone());
+
+    // 打ち間違い（"600" のつもりの "060"）は**エラー**。
+    let mut typo = params(100);
+    typo.account = Some(code("060"));
+    match query.search_entries(&typo).await {
+        Err(RepoError::NotFound { reason }) => {
+            assert!(reason.contains("060"), "{reason}");
+            // 次の手（`CLAUDE.md` §11）。
+            assert!(reason.contains("list_accounts"), "{reason}");
+        }
+        other => panic!("NotFound を期待したが: {other:?}"),
+    }
+
+    // 実在する科目に該当が無いだけなら**0件の成功**（対照実験）。
+    let mut empty = params(100);
+    empty.account = Some(code("700"));
+    empty.from = Some(date(2027, 1, 1));
+    let page = query.search_entries(&empty).await.unwrap();
+    assert_eq!(page.total_matches, 0);
+    assert!(page.entries.is_empty());
+}
+
 /// 0件は成功（空の一覧）。「見つからない」ではない。
 #[sqlx::test]
 async fn a_search_with_no_hits_succeeds_with_an_empty_page(
@@ -666,6 +848,144 @@ fn expected_rows<'a>(
         .collect();
     rows.sort_by_key(|(e, line_no, _)| (e.entry_date(), e.entry_no(), e.id().as_u128(), *line_no));
     rows
+}
+
+/// 対照実装: 期首残高・期間合計・期末残高・期間の行数を、構築済み仕訳を
+/// 順に見て求める（`(opening, debit, credit, closing, line_count)`）。
+///
+/// **`from` / `to` の当日を期間に含める**（両端を含む）。SQL 側の
+/// `entry_date >= from` / `entry_date <= to` と同じ意味であることを、
+/// この素朴な走査と突き合わせて確かめる。
+fn expected_totals(
+    entries: &[JournalEntry],
+    account: &AccountCode,
+    from: AccountingDate,
+    to: AccountingDate,
+    debit_normal: bool,
+) -> (i128, i128, i128, i128, u64) {
+    let (mut opening_debit, mut opening_credit) = (0_i128, 0_i128);
+    let (mut debit, mut credit) = (0_i128, 0_i128);
+    let mut line_count = 0_u64;
+
+    for e in entries {
+        for l in e.lines().iter().filter(|l| l.account() == account) {
+            let amount = l.amount().minor();
+            if e.entry_date() < from {
+                match l.side() {
+                    Side::Debit => opening_debit += amount,
+                    Side::Credit => opening_credit += amount,
+                }
+            } else if e.entry_date() <= to {
+                line_count += 1;
+                match l.side() {
+                    Side::Debit => debit += amount,
+                    Side::Credit => credit += amount,
+                }
+            }
+        }
+    }
+
+    let signed = |d: i128, c: i128| if debit_normal { d - c } else { c - d };
+    (
+        signed(opening_debit, opening_credit),
+        debit,
+        credit,
+        signed(opening_debit + debit, opening_credit + credit),
+        line_count,
+    )
+}
+
+/// ★期間の両端★ `from` / `to` に**明細のある日**を取ったときに、
+/// 4つの合計（`opening_balance` / `debit_total` / `credit_total` /
+/// `closing_balance`）と `total_lines` が対照実装と一致する。
+///
+/// # なぜこの1本が要るのか（PR-H レビュー C-1）
+///
+/// 他の元帳の差分は `from = 2026-01-01`（**その日に明細が無い**）を
+/// 使っているか、期首残高と先頭行しか照合していない。そのため
+/// `ledger.rs` の `e.entry_date >= $2` を `> $2` に書き換えても
+/// **全ての差分・e2e が緑のまま通る**（レビュアーが実測）。
+///
+/// 退行したときの壊れ方は「`from` 当日の明細が `rows` には出るのに
+/// `debit_total` にだけ入らない」——**行と合計が食い違う応答**である。
+/// そこでこの検査は合計を突き合わせるだけでなく、
+/// **返った行を数え直した値が合計と一致する**ことも見る。
+#[sqlx::test]
+async fn the_totals_include_the_lines_dated_exactly_on_from_and_to(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    let entries = seed(&roles.migrator).await;
+    let query = PgLedgerQuery::new(roles.app.clone());
+
+    // 借方が正の科目（現金）と貸方が正の科目（売上高）の両方で見る。
+    // どちらも `from` と `to` の当日に明細がある。
+    for (account, from, to, debit_normal) in [
+        ("100", date(2026, 2, 1), date(2026, 5, 20), true),
+        ("500", date(2026, 2, 1), date(2026, 2, 1), false),
+    ] {
+        let code = code(account);
+        let (opening, debit, credit, closing, line_count) =
+            expected_totals(&entries, &code, from, to, debit_normal);
+
+        // 対照が「両端に明細がある」条件を満たしていることを先に確かめる
+        // （満たしていなければ、この検査は境界を見ていない）。
+        for edge in [from, to] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.entry_date() == edge
+                        && e.lines().iter().any(|l| l.account() == &code)),
+                "{account} の {} に明細が無い。境界の検査になっていない",
+                edge.to_iso_string()
+            );
+        }
+
+        let page = query
+            .ledger(&ledger_params(account, from, to))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            page.opening_balance.minor(),
+            opening,
+            "{account}: 期首残高（{from:?} より前）が食い違う"
+        );
+        assert_eq!(
+            page.debit_total.minor(),
+            debit,
+            "{account}: 借方合計が食い違う（from / to 当日の明細が落ちていないか）"
+        );
+        assert_eq!(
+            page.credit_total.minor(),
+            credit,
+            "{account}: 貸方合計が食い違う（from / to 当日の明細が落ちていないか）"
+        );
+        assert_eq!(
+            page.closing_balance.minor(),
+            closing,
+            "{account}: 期末残高が食い違う"
+        );
+        assert_eq!(page.total_lines, line_count, "{account}: 期間の行数");
+
+        // ★行と合計が食い違わない★ 返った行を数え直した値が合計に一致する
+        // （全件が1ページに収まっていることを確かめてから数える）。
+        assert!(page.next_cursor.is_none(), "{account}: 1ページに収まる想定");
+        assert_eq!(page.rows.len() as u64, page.total_lines);
+        let (mut row_debit, mut row_credit) = (0_i128, 0_i128);
+        for row in &page.rows {
+            match row.side {
+                Side::Debit => row_debit += row.amount.minor(),
+                Side::Credit => row_credit += row.amount.minor(),
+            }
+        }
+        assert_eq!(
+            (row_debit, row_credit),
+            (page.debit_total.minor(), page.credit_total.minor()),
+            "{account}: rows を数え直した値と合計が食い違う"
+        );
+    }
 }
 
 /// 主戦場: 元帳の行・並び・残高の累計・期間合計が、ドメインモデルを順に
@@ -894,6 +1214,10 @@ async fn the_ledger_marks_rows_of_reversed_entries_and_keeps_both_sides(
         .as_ref()
         .expect("取り消されたことが分かる");
     assert_eq!(marker.entry_id, EntryId::new(5));
+    assert!(
+        reversed_row.reverse_reason.is_none(),
+        "元仕訳は赤伝ではない"
+    );
 
     let red_row = page
         .rows
@@ -901,6 +1225,8 @@ async fn the_ledger_marks_rows_of_reversed_entries_and_keeps_both_sides(
         .find(|r| r.entry_id == EntryId::new(5))
         .expect("赤伝の行も残る");
     assert_eq!(red_row.reverses, Some(EntryId::new(4)));
+    // 赤伝の行だけを見て「なぜ取り消されたか」が読める（D-088 の表）。
+    assert_eq!(red_row.reverse_reason.as_deref(), Some("数量の誤り"));
     assert_eq!(red_row.side, Side::Credit, "赤伝は貸借が入れ替わる");
 }
 
