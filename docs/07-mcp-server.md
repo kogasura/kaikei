@@ -3,9 +3,18 @@
 **このプロジェクトの差別化の本体。**
 AI エージェントが会計操作を安全に行うための標準インタフェース。
 
-> **この文書の版**: Phase 3 **PR-F**（dispatch 層 + 書き込み系ツール2件）時点
-> （`DECISIONS.md` D-085 まで。**レビュー反映済み**）を反映している。
-> PR-F で**内容が変わったのは6箇所**:
+> **この文書の版**: Phase 3 **PR-H**（`search_entries` / `get_ledger` と
+> その read model）時点（`DECISIONS.md` D-089 まで）を反映している。
+> PR-H で**内容が変わったのは4箇所**:
+>
+> | 節 | 変わった点 | 決定 |
+> |---|---|---|
+> | §2 | `search_entries` / `get_ledger` の説明を実装に合わせ、「read model の新設が要る」を**実装済み**に直した。件数の上限・ページング・取り消された仕訳の見え方を明記した | D-088 / D-089 |
+> | §3 | `search_entries` / `get_ledger` の入出力を追加した（この2つは §3 に無かった） | D-088 / D-089 |
+> | §4 | 「Phase 3 で新設が必要なもの」の read model の項を**完了**にした。`entry_detail` は**新設しない**（`get_entry` は `JournalRepo::find_entry` で足りる） | D-070 |
+> | §10 | MC-16 / MC-17 に実装した検査の置き場を書いた。MC-11 の総当たりの残りを7件（PR-G の担当）に更新した | — |
+>
+> 以下は PR-F 時点の注記である。PR-F で**内容が変わったのは6箇所**:
 >
 > | 節 | 変わった点 | 決定 |
 > |---|---|---|
@@ -109,18 +118,23 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 | `list_accounts` | **Phase 3** | 勘定科目一覧。科目コード・名称・5要素分類（`account_type`）・親科目（`parent`）・**記帳可否（`postable`）** を返す。`postable: false` は見出し科目で、記帳に使うと `NotPostable` になるため必ず返す。表示順（`sort`）は保持していないので返さない（並びは科目コード昇順。D-061） |
 | `get_entry` | **Phase 3** | 仕訳 1 件の詳細（明細・タグ）。証憑リンクは Phase 4 |
 | `get_trial_balance` | **Phase 3** | 試算表。集計期間（`from`/`to`、取引日ベース・両端含む）は**必須**。`group_by` には `aggregatable: true` のタグキーのみ指定可（それ以外は `NotAggregatable`。`CLAUDE.md` §4）。`from > to` は空の試算表ではなく**エラー**（入力ミスを「0件の空の試算表」として静かに成功させない）。集計対象の通貨が単一であることを要求する（D-042。帳簿通貨と異なる行があれば `currency_mismatch`）。**0行の期間でも `currency` を返す**（PR-B 2巡目）。入出力は §3 |
-| `search_entries` | **Phase 3** | 日付・金額・科目・取引先・摘要で仕訳検索。read model の新設が要る（下記） |
-| `get_ledger` | **Phase 3** | 総勘定元帳（科目別の明細）。read model の新設が要る（下記） |
+| `search_entries` | **Phase 3** | 取引日・金額・科目・タグ（取引先など）・摘要で仕訳検索。**PR-H で実装**（read model は `crates/kaikei-store/src/query/search.rs`）。**0件は成功**（空配列。エラーにしない）。件数に上限があり、切れたことは応答から読み取れる（`total_matches` / `returned` / `has_more` / `next_cursor` / `truncation_note`。D-089）。タグでの絞り込みは `aggregatable: true` のキーだけ（`group_by` と同じ規則。D-088）。**赤伝で取り消された仕訳も返る**が、`reversed_by` が付いてそれと分かる（D-088）。入出力は §3 |
+| `get_ledger` | **Phase 3** | 総勘定元帳（科目別の明細と残高の推移）。**PR-H で実装**（read model は `crates/kaikei-store/src/query/ledger.rs`）。集計期間（`from`/`to`、取引日ベース・両端含む）は**必須**。`from > to` は空の元帳ではなく**エラー**。**合計はページではなく期間全体**の値で、行ごとの `running_balance` は期首残高からの累計。**明細が0行の期間は成功**だが、**勘定科目マスタに無い科目コードは `not_found` のエラー**（打ち間違いと「取引が無い」を混同させない）。入出力は §3 |
 | `list_tax_categories` | **Phase 3** | 有効な税区分一覧（指定日時点）。該当する年度マスタが存在しない日付では**空配列ではなくエラー**を返し、有効期間を示す（例:「2026-01-01〜2026-12-31 のマスタのみ同梱されています。取引日を確認してください」）。`TaxRuleSets::for_date` は該当なしで `None` を返す（D-055）。**前工事は PR-B 3巡目で完了**: `TaxRuleSets::iter` / `len` / `is_empty`（保持するマスタの列挙）、`TaxCategoryTable::range_display`（`pub` 化）、`TaxRuleSets::available_ranges_display`（適用開始日の昇順に並べた有効期間）、`TaxRuleSets::require_for_date`（`None` を `JpError::NoApplicableTaxRuleSet` にし、有効期間を文言に含める）。**このエラー文言を MCP 層で書き起こさない**（D-072 と同じ理由で、同じ文言が複数ツールに散る）。**空マスタと未収録は意味が違う**——空配列を返すと AI が「この日は税区分が1つも無い」と誤解して税区分なしで記帳しようとする |
 | `get_settings` | **Phase 3** | 経理方式（`tax_mode`）／端数処理方式（`rounding`）／端数処理単位（`rounding_unit`）／課税事業者か（`is_taxable_business`）／簡易課税か（`simplified_taxation`）と、会計年度の区切り規則・帳簿通貨を返す。**帳簿通貨は `kaikei_app::context::BookSettings::book_currency` が保持する**（PR-B で追加。`Option` ではない必須フィールドで、既定で JPY にフォールバックしない。D-074）。`JpSettings` 側には持たせていないので、この応答は `JpSettings` と `BookSettings` の2つから組み立てる。**日付引数を取らない**（事業者設定は起動時に一度だけ合成され、取引日に応じて変わらない。D-057）。設定が未指定ならサーバは起動に失敗するので、このツールが既定値を返すことはない（§7） |
 | `get_statements` | Phase 4 以降 | B/S・P/L。**延期理由: D-031。** `TrialBalance` / `BalanceRow` は `kaikei-core` の外から構築できず（`GroupKey` に公開コンストラクタが無い）、DTO 経由で組み立て直す設計が要る |
 | `list_pending_transactions` | Phase 4 以降 | 未仕訳の取込明細。**延期理由: `kaikei-import` 未着手**（crate もテーブルも存在しない） |
 | `search_documents` | Phase 4 以降 | 証憑検索（日付・金額・取引先）。**延期理由: `kaikei-blob` 未着手**（`documents` / `entry_documents` は Phase 4 で設計する。`docs/03-database.md` §1 の注記） |
 
-`search_entries` / `get_ledger` / `get_entry` は read model が未実装。
-`crates/kaikei-store/src/query/` に `ledger.rs` / `search.rs` / `entry_detail.rs` を新設し、
-`kaikei-app::view` の DTO へ直行する（書き込み側 `Store`/`PgTx` を経由しない。
-`CLAUDE.md` §6・D-031）。実装方針は §4。
+**`search_entries` / `get_ledger` の read model は PR-H で新設した**
+（`crates/kaikei-store/src/query/search.rs` / `ledger.rs`。対応するポートは
+`kaikei_app::ports::{SearchEntriesQuery, LedgerQuery}`、DTO は
+`kaikei_app::view::{EntrySummaryView, LedgerPageView}`）。書き込み側
+`Store`/`PgTx` を経由せず SQL から DTO へ直行する（`CLAUDE.md` §6・D-031）。
+
+**`entry_detail.rs` は新設しない。** `get_entry` が扱うのは仕訳1件で、
+集約をそのまま返す `JournalRepo::find_entry` で足りる（集計も結合も無い経路に
+read model を増やすと、同じ復元処理が2箇所に育つ）。実装方針は §4。
 
 ### 書き込み系
 
@@ -662,6 +676,233 @@ AI の自己修正を一段速くする効果は大きいが、
 - **0件は成功。** 該当する仕訳が無い期間は `rows: []` を返し、エラーにしない
   （エラーにするのは `from > to` の入力ミスだけ）。
 
+### search_entries
+
+```json
+{
+  "from": "2026-01-01",
+  "to": "2026-12-31",
+  "account": "600",
+  "description": "A社",
+  "min_amount": "1000",
+  "max_amount": "5000",
+  "tags": { "counterparty": "CP0001" },
+  "limit": 20,
+  "cursor": "2026-04-15:1:019fc7cd-5b9d-75b1-95e6-c9814c075a53"
+}
+```
+
+**すべて省略可**（`{}` は全件検索）。複数指定した場合は**すべてを満たす**仕訳だけが返る。
+
+- `from` / `to` は**取引日**（`AccountingDate`）で**両端を含む**。片側だけの指定も、
+  両方の省略もできる（`get_ledger` と違い期間は必須ではない。理由は
+  `crates/kaikei-app/src/usecase/ledger.rs` の doc）。
+  `from > to` は空の結果ではなく**エラー**（`rejected`）。
+- `account` はその科目の明細を**含む**仕訳に絞る（明細だけを返すわけではない）。
+- `description` は摘要の**部分一致**（英字の大小を無視する）。検索語に含まれる
+  `%` / `_` / `\` は**ワイルドカードとして効かない**（エスケープする。効かせると
+  「多すぎる結果」が正しい結果として返る）。**空文字は拒否**する（全件一致に化けるため）。
+- `min_amount` / `max_amount` は**明細1行**の金額と比較する（仕訳の合計ではない）。
+  **文字列**で指定する（§5）。帳簿通貨建てとして解釈し、通貨が一致する明細だけを見る。
+- `tags` はキーも値も文字列。**`aggregatable: true` のタグキーだけ**が指定できる
+  （`get_trial_balance` の `group_by` と同じ規則。それ以外は `not_aggregatable`、
+  未登録キーは `unknown_tag_key`。D-088）。判定は仕訳単位で、
+  「キーごとにいずれかの明細が一致すればよい」（同じ1行が全部のタグを持つ必要はない）。
+- `limit` は既定 20・上限 100（`kaikei_app::usecase::search_entries::{DEFAULT_LIMIT, MAX_LIMIT}`）。
+  **上限を超える値は丸めずにエラー**（`rejected`）。
+- `cursor` は直前の応答の `next_cursor` を**そのまま**渡す。壊れた値は
+  「先頭から」にフォールバックせず `rejected`（D-089）。
+
+成功時（**実サーバの応答**。摘要に「請求」を含む3件）：
+
+```json
+{
+  "entries": [
+    {
+      "entry_id": "019fc7cd-5b9d-75b1-95e6-c9814c075a53",
+      "entry_no": 1,
+      "fiscal_year": 2026,
+      "entry_date": "2026-04-15",
+      "description": "A社への請求",
+      "lines": [
+        { "account": "135", "side": "debit",  "amount": "110000", "currency": "JPY", "tags": {} },
+        { "account": "500", "side": "credit", "amount": "100000", "currency": "JPY",
+          "tags": { "tax_category": "SALES_10" } },
+        { "account": "330", "side": "credit", "amount": "10000", "currency": "JPY",
+          "tags": { "tax_category": "SALES_10" } }
+      ]
+    },
+    {
+      "entry_id": "019fc7cd-5bc6-7a32-a8c1-19687f2a0529",
+      "entry_no": 3,
+      "fiscal_year": 2026,
+      "entry_date": "2026-05-08",
+      "description": "B社への請求",
+      "lines": [ /* 略 */ ],
+      "reversed_by": {
+        "entry_id": "019fc7cd-5bd8-7bd3-bb84-8cc0acab1c14",
+        "entry_no": 4,
+        "entry_date": "2026-05-10"
+      }
+    },
+    {
+      "entry_id": "019fc7cd-5bd8-7bd3-bb84-8cc0acab1c14",
+      "entry_no": 4,
+      "fiscal_year": 2026,
+      "entry_date": "2026-05-10",
+      "description": "【訂正】B社への請求",
+      "lines": [ /* 借方・貸方を入れ替えた明細 */ ],
+      "reverses": "019fc7cd-5bc6-7a32-a8c1-19687f2a0529",
+      "reverse_reason": "請求金額の誤り（税率の適用誤り）"
+    }
+  ],
+  "total_matches": 3,
+  "returned": 3,
+  "has_more": false
+}
+```
+
+- 並びは**取引日 → 仕訳番号 → 仕訳ID**の昇順。
+- `lines` は確定後の明細（自動生成された税額行を含む）。金額は**区切り無しの文字列**。
+- **`reverses` / `reverse_reason` / `reversed_by` は該当するときだけ現れる**
+  （`null` を置かない。D-088）。上の例では、**取り消された仕訳（`entry_no: 3`）にも
+  赤伝（`entry_no: 4`）にも** それと分かる欄が付いている。
+  帳簿は追記のみなので、取り消された仕訳も検索結果に残り続ける。
+- **0件は成功。** `entries: []` / `total_matches: 0` を返し、エラーにしない。
+
+上限で切れたとき（`limit: 1` の実応答。**切ったことが応答から分かる**）：
+
+```json
+{
+  "entries": [ /* 1件 */ ],
+  "total_matches": 4,
+  "returned": 1,
+  "has_more": true,
+  "next_cursor": "2026-04-15:1:019fc7cd-5b9d-75b1-95e6-c9814c075a53",
+  "truncation_note": "条件に一致した 4 件のうち 1 件を返しました。続きは cursor に next_cursor の値を渡して取得してください（1回に返す上限は 100 件です）。件数を絞りたい場合は期間や科目の条件を追加してください"
+}
+```
+
+`has_more` が偽のときは `next_cursor` も `truncation_note` も**キーごと出さない**。
+
+### get_ledger
+
+```json
+{
+  "account": "500",
+  "from": "2026-01-01",
+  "to": "2026-12-31",
+  "limit": 100,
+  "cursor": "2026-04-15:1:019fc7cd-5b9d-75b1-95e6-c9814c075a53:2"
+}
+```
+
+- `account` / `from` / `to` は**必須**。`from` / `to` は取引日で両端を含み、
+  `from > to` は空の元帳ではなく**エラー**（`rejected`）。
+  期間を必須にしている理由は「省略時の既定が『開設以来の全明細』になり、
+  実質的に上限で切られた先頭だけが返る」ため（`crates/kaikei-app/src/usecase/ledger.rs`）。
+- `limit` は既定 100・上限 500。上限超過は丸めずにエラー。
+- `cursor` は `search_entries` と同じ扱い。
+
+成功時（**実サーバの応答**。売上高の元帳。3件目が赤伝で取り消されている）：
+
+```json
+{
+  "account": "500",
+  "account_name": "売上高",
+  "account_type": "revenue",
+  "currency": "JPY",
+  "from": "2026-01-01",
+  "to": "2026-12-31",
+  "opening_balance": "0",
+  "debit_total": "50000",
+  "credit_total": "150000",
+  "closing_balance": "100000",
+  "total_lines": 3,
+  "returned": 3,
+  "has_more": false,
+  "rows": [
+    {
+      "entry_id": "019fc7cd-5b9d-75b1-95e6-c9814c075a53",
+      "entry_no": 1,
+      "entry_date": "2026-04-15",
+      "line_no": 2,
+      "description": "A社への請求",
+      "side": "credit",
+      "amount": "100000",
+      "currency": "JPY",
+      "running_balance": "100000",
+      "counter_accounts": ["135"],
+      "tags": { "tax_category": "SALES_10" }
+    },
+    {
+      "entry_id": "019fc7cd-5bc6-7a32-a8c1-19687f2a0529",
+      "entry_no": 3,
+      "entry_date": "2026-05-08",
+      "line_no": 2,
+      "description": "B社への請求",
+      "side": "credit",
+      "amount": "50000",
+      "currency": "JPY",
+      "running_balance": "150000",
+      "counter_accounts": ["135"],
+      "tags": { "tax_category": "SALES_10" },
+      "reversed_by": {
+        "entry_id": "019fc7cd-5bd8-7bd3-bb84-8cc0acab1c14",
+        "entry_no": 4,
+        "entry_date": "2026-05-10"
+      }
+    },
+    {
+      "entry_id": "019fc7cd-5bd8-7bd3-bb84-8cc0acab1c14",
+      "entry_no": 4,
+      "entry_date": "2026-05-10",
+      "line_no": 2,
+      "description": "【訂正】B社への請求",
+      "side": "debit",
+      "amount": "50000",
+      "currency": "JPY",
+      "running_balance": "100000",
+      "counter_accounts": ["135"],
+      "tags": { "tax_category": "SALES_10" },
+      "reverses": "019fc7cd-5bc6-7a32-a8c1-19687f2a0529"
+    }
+  ]
+}
+```
+
+- 並びは**取引日 → 仕訳番号 → 仕訳ID → 明細行番号**の昇順。
+- **合計はページではなく期間全体の値。** `opening_balance` / `debit_total` /
+  `credit_total` / `closing_balance` / `total_lines` は `limit` に関係なく
+  指定期間の全明細から求める。**ページの行を足しても `debit_total` にはならない**
+  （そう読ませないために、行側には合計を置いていない）。
+- `opening_balance` は **`from` より前のすべての明細**から求めた残高であり、
+  会計年度の期首ではない。収益・費用は決算振替でゼロに戻るため、期首日を
+  年度途中に取ると「その年度の期首からの累計」にはならない。
+- `running_balance` は**期首残高からの累計**。ページをまたいでも連続する
+  （ウィンドウ関数をカーソルで絞る前に計算している）。
+- 残高の符号は `account_type.is_debit_normal()` に従う（上の例は収益なので
+  貸方が正）。**負にもなりうる**（`"-500"`）。
+- `counter_accounts` は同じ仕訳の**反対側**にある科目コード（重複を除いた昇順）。
+- `reverses` / `reversed_by` は `search_entries` と同じ規則（D-088）。
+  **赤伝の行も元帳に残るので、残高は取り消し後の姿になる**（上の例は
+  150,000 → 100,000）。
+- **0行は成功。** その期間に明細が無いだけなので `rows: []` を返し、
+  `opening_balance` はその期間より前の累計として残る。
+
+失敗時（勘定科目マスタに無い科目コード。**実サーバの応答**）：
+
+```json
+{
+  "error": "not_found",
+  "message": "見つかりません: 勘定科目 99999 は勘定科目マスタにありません。list_accounts で登録済みの科目コードを確認してください"
+}
+```
+
+**「0行の元帳」を返さないこと。** 科目コードの打ち間違いと「その期間に取引が無い」は
+呼び出し元が取るべき次の手が違う（前者はコードを調べ直す、後者は期間を広げる）。
+
+
 ---
 
 ## 4. 実装方針
@@ -891,10 +1132,17 @@ D-071 の「ドメインのエラーは全てツール結果エラー」と両�
 
 ### Phase 3 で新設が必要なもの
 
-- `crates/kaikei-store/src/query/{search,ledger,entry_detail}.rs`（read model）。
-  対応するクエリ trait を `kaikei-app/src/ports.rs` に `TrialBalanceQuery` と同型で追加し、
-  DTO は `kaikei-app/src/view.rs` に置く（core の型は外から構築できない。D-031）。
-  `.sqlx` オフラインキャッシュの再生成が要る
+- ~~`crates/kaikei-store/src/query/{search,ledger,entry_detail}.rs`（read model）。~~
+  → **PR-H で完了**（`query/search.rs` / `query/ledger.rs`。`entry_detail.rs` は
+  §2 のとおり**作らない**）。クエリ trait は `kaikei-app/src/ports.rs` に
+  `TrialBalanceQuery` と同型で追加した（`SearchEntriesQuery` / `LedgerQuery` と
+  その条件構造体 `SearchEntriesParams` / `LedgerParams`）。DTO は
+  `kaikei-app/src/view.rs`（`EntrySummaryView` / `EntrySearchPageView` /
+  `LedgerRowView` / `LedgerPageView` / `ReversalRef` / `EntryCursor` /
+  `LedgerCursor`）。ユースケースは `kaikei-app/src/usecase/search_entries.rs` /
+  `ledger.rs`（`from > to` の拒否・`limit` の範囲・`aggregatable` の検証・
+  帳簿通貨との突き合わせを SQL 到達前に行う）。
+  `.sqlx` オフラインキャッシュも再生成した
   （`.github/workflows/database.yml` の `cargo sqlx prepare --workspace --check`）。
 - ~~`kaikei-app` の**勘定科目マスタ投入ユースケース**（D-070）。~~
   → **PR-E で完了**（`kaikei_app::usecase::import_chart` /
@@ -1979,8 +2227,8 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 | MC-13 | `list_accounts` | 科目種別（`account_type`）と**記帳可否（`postable`）**を含めて返す |
 | MC-14 | `get_entry` | 存在する仕訳の明細・タグを返す。存在しない ID では次の手が分かる NotFound を返し、**仕訳IDは UUID の正準表記**で示す（10進表記にしない。§3。`reverse_journal_entry` 側は PR-B で解決済み） |
 | MC-15 | `get_trial_balance` | 期間で絞り込める。`group_by` 指定が効く。借方合計＝貸方合計。`from > to` はエラー（空結果にしない） |
-| MC-16 | `search_entries` | 日付・金額・科目・摘要で絞り込める。**0件でも成功として空配列を返す**（エラーにしない） |
-| MC-17 | `get_ledger` | 科目別に借方・貸方・残高を返す。期間指定が効く |
+| MC-16 | `search_entries` | 日付・金額・科目・摘要・タグで絞り込める。**0件でも成功として空配列を返す**（エラーにしない）。**PR-H で実装**: `crates/kaikei-e2e/tests/mcp_search_ledger.rs`（実 DB・`dispatch::call` 経由）と `crates/kaikei-store/tests/search_ledger_differential.rs`（read model の差分）。上限で切ったことが応答から分かること・カーソルで続きを最後まで辿れること・取り消された仕訳が判別できること（D-088 / D-089）もここで見る |
+| MC-17 | `get_ledger` | 科目別に借方・貸方・残高を返す。期間指定が効く。**PR-H で実装**（同上）。合計が**ページではなく期間全体**の値であること、`running_balance` がページをまたいで連続すること、**0行の期間は成功で未登録の科目コードは `not_found`** であることを併せて見る |
 | MC-18 | `list_tax_categories` | 指定日時点で有効な区分のみを返す。取引日で切り替わる（D-050 / D-055）。該当マスタが無い日付では**エラー**で、メッセージに有効期間が含まれる |
 | MC-19 | `get_settings` | 起動時に合成した `JpSettings`（税抜/税込・端数処理・端数処理単位・課税事業者区分・簡易課税）をそのまま返す。日付引数を取らない |
 
@@ -2012,7 +2260,7 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 
 | # | ケース | 期待 |
 |---|---|---|
-| MC-11 | 全ツール呼び出しが audit_log に記録される | 1回のツール呼び出しにつき**同一 `request_id` で2行**（`status='started'` と `status='ok'\|'error'`）が残る。`tool` 列が呼び出したツール名と一致する。書き込み系は結果レコードの `entry_id` が返した仕訳IDと一致する。**Phase 3 の全11ツールに対して総当たりで確認する**（1ツールだけのサンプル検査にしない）。**PR-F で書き込み系2件を実装**（`crates/kaikei-e2e/tests/mcp_write_tools.rs`）。残り9件は PR-G / PR-H。なお**「総当たり」の性質そのものは PR-F で大部分が構造に移った**——ツールをレジストリに載せる経路が `ToolRegistry::with::<T: McpTool>` の1本しか無く、その中身が必ず `dispatch::call`（監査ログで挟む）である。ただし「監査ログを通らないツールを書けない」を成立させているのは**型だけではない**（`rmcp` を直接名指しすれば別のルータを作れる）。そこを閉じているのは `rmcp` を名指しできるファイルの許可リスト（`crates/kaikei-mcp/tests/audit_is_structural.rs` の `rmcp_is_named_only_in_the_files_allowed_to_name_it`。D-084 の訂正注記3）である。総当たりのテストは、その構造が守られていることを実 DB で追認するものになった |
+| MC-11 | 全ツール呼び出しが audit_log に記録される | 1回のツール呼び出しにつき**同一 `request_id` で2行**（`status='started'` と `status='ok'\|'error'`）が残る。`tool` 列が呼び出したツール名と一致する。書き込み系は結果レコードの `entry_id` が返した仕訳IDと一致する。**Phase 3 の全11ツールに対して総当たりで確認する**（1ツールだけのサンプル検査にしない）。**PR-F で書き込み系2件を実装**（`crates/kaikei-e2e/tests/mcp_write_tools.rs`）。**PR-H で読み取り系2件**（`search_entries` / `get_ledger`。`crates/kaikei-e2e/tests/mcp_search_ledger.rs` と、実バイナリ経由の `tests/mcp_stdio_server.rs`）。残り7件は PR-G。なお**「総当たり」の性質そのものは PR-F で大部分が構造に移った**——ツールをレジストリに載せる経路が `ToolRegistry::with::<T: McpTool>` の1本しか無く、その中身が必ず `dispatch::call`（監査ログで挟む）である。ただし「監査ログを通らないツールを書けない」を成立させているのは**型だけではない**（`rmcp` を直接名指しすれば別のルータを作れる）。そこを閉じているのは `rmcp` を名指しできるファイルの許可リスト（`crates/kaikei-mcp/tests/audit_is_structural.rs` の `rmcp_is_named_only_in_the_files_allowed_to_name_it`。D-084 の訂正注記3）である。総当たりのテストは、その構造が守られていることを実 DB で追認するものになった |
 | MC-20 | 開始レコードの書き込みが失敗する状況（audit 用接続を落とす、または `REVOKE INSERT ON audit_log FROM kaikei_app`）で post | ツールは `isError: true` を返し、**帳簿には1件も入っていない**（fail-closed） |
 | MC-21 | 結果レコードの書き込みだけが失敗 | 記帳は成功として返り、警告が添えられる。開始レコードだけが残り「結果不明」として識別できる（fail-open） |
 | MC-22 | 記帳が失敗（貸借不一致等）してトランザクションが rollback される | **開始レコードは audit_log に残る。** D-070 の存在理由そのもの（同一トランザクションで書く実装に退行したら、このテストだけが落ちる） |
@@ -2036,7 +2284,8 @@ PR-C の同名テストは `AuditSink` と `with_tx` を直接組み合わせて
 （`an_unbalanced_entry_is_rejected_with_a_hint_while_the_audit_rows_survive`）。
 
 MC-11 のうち「**Phase 3 の全11ツールに対して総当たり**」は、書き込み系2件が
-PR-F で済み、残り9件が PR-G / PR-H の担当として残る。
+PR-F、読み取り系のうち `search_entries` / `get_ledger` の2件が PR-H で済み、
+残り7件が PR-G の担当として残る。
 
 ### Phase 4 以降に延期したケース（行を消さない）
 

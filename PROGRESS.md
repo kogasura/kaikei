@@ -472,7 +472,7 @@ Phase 2 で実際に起きたことを、脚色せずに記録する。
 
 ## Phase 3 — kaikei-mcp
 
-実装中（PR-F まで完了）。完了時に他 Phase と同じ節構成で記録する。
+実装中（PR-F・PR-H まで完了。PR-G と並行）。完了時に他 Phase と同じ節構成で記録する。
 
 ### 実装中の申し送り
 
@@ -499,11 +499,35 @@ Phase 2 で実際に起きたことを、脚色せずに記録する。
   全て記録する」と定めている。読み取り系は `ToolSuccess::with_entry_id` を
   付けないだけで、経路は書き込み系と同じである。
 
-- **MC-11 の「全11ツール総当たり」は書き込み系2件まで済み。**
-  残り9件は PR-G / PR-H で `crates/kaikei-e2e/tests/mcp_write_tools.rs` と
-  同じ形（`dispatch::call` を直接呼び、`audit_log` を SELECT する）で足す。
+- **MC-11 の「全11ツール総当たり」は書き込み系2件（PR-F）と
+  `search_entries` / `get_ledger`（PR-H）まで済み。**
+  残り7件は PR-G で `crates/kaikei-e2e/tests/mcp_write_tools.rs` /
+  `mcp_search_ledger.rs` と同じ形（`dispatch::call` を直接呼び、
+  `audit_log` を SELECT する）で足す。
   読み取り専用のツールなら `kaikei-mcp` 側の `pg-tests` でも書けるが、
   `audit_log` を読むには SQL が要るので `kaikei-e2e` 側になる。
+
+- **【PR-H の申し送り】上限とページングの規律を読み取り系で揃えること。**
+  `search_entries` / `get_ledger` は keyset カーソルで、
+  上限を超える `limit` は**丸めずに拒否**し、切ったことを
+  `total_matches`（`total_lines`）/ `returned` / `has_more` / `next_cursor` /
+  `truncation_note` で必ず示す（`DECISIONS.md` D-089）。
+  PR-G の `list_accounts` / `list_tax_categories` は現状すべて返す設計だが、
+  **返す件数が帳簿の大きさに比例するツールを足すときは同じ形にすること**
+  （無言の truncation は「全部見た」と読める）。
+
+- **【PR-H の申し送り】読み取り系は「取り消された仕訳」を隠さない。**
+  赤伝で訂正された仕訳も検索・元帳に残り、`reversed_by` / `reverses` /
+  `reverse_reason` で判別できる（`DECISIONS.md` D-088）。
+  `get_entry`（PR-G）でも同じ欄を返すこと——**取り消し済みであることが
+  読み取れないと、AI は同じ仕訳をもう一度訂正しようとする**
+  （`reverse_journal_entry` は `allow_double_reversal` を明示すれば通る）。
+
+- **【PR-H の申し送り】「0件」と「見つからない」を混同しないこと。**
+  `search_entries` の0件・`get_ledger` の0行は**成功**（空配列）で、
+  `get_ledger` に未登録の科目コードを渡した場合だけ `not_found` の
+  エラーである。前者は条件を緩める、後者はコードを調べ直すという
+  別の次の手になる（`CLAUDE.md` §11）。
 
 - **`accounts.active` / `accounts.sort_order` は現在どこからも読まれていない。**
   `kaikei-store` の `load_chart`（`crates/kaikei-store/src/chart.rs`）が
