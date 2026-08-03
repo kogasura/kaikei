@@ -2653,7 +2653,7 @@ PR-I 以前、MC-04 / MC-05 / MC-09 / MC-10 は `dispatch::call` を直接呼ぶ
 | MC-08 | `suggest_tax_category` | `mcp_stdio_server.rs` の `the_read_tools_answer_through_the_real_binary_and_are_audited`（帳簿が動かないこと）／`an_ai_keeps_the_books_end_to_end_...`（候補を絞らないこと） | `suggest_tax_category.rs` の `every_candidate_carries_a_non_empty_reason` ほか3本 |
 | MC-09 | 金額を JSON number で渡す | **PR-I で追加**（`the_refusals_keep_their_next_step_through_the_real_binary`。`rmcp` のトランスポートを通る経路で、この呼び出しも `audit_log` に2行残ることまで見る） | `wire.rs` の単体／`mcp_write_tools.rs` の `an_amount_given_as_a_json_number_is_rejected_in_japanese_and_still_audited` |
 | MC-10 | 存在させないツール4件 | **PR-I で追加**（`the_forbidden_tools_are_invisible_and_unreachable_through_the_protocol`。`tools/list` の応答と `tools/call` の拒否、`audit_log` が0行であることを見る） | `kaikei-mcp/tests/forbidden_tools.rs`（レジストリ側） |
-| MC-11 | 全11ツールが audit_log に2行 | `an_ai_keeps_the_books_end_to_end_...` が**1本の通しで11ツール全てを踏み**、呼び出した順の `(tool, status)` を突き合わせる。**一覧は `server::registered_tool_names` から導出する**ので、ツールを足して通しで呼ばなければ落ちる | `mcp_write_tools.rs` / `mcp_search_ledger.rs` / `mcp_stdio_server.rs` |
+| MC-11 | 全11ツールが audit_log に2行 | `an_ai_keeps_the_books_end_to_end_...` が**1本の通しで11ツール全てを踏み**、呼び出した順の `(tool, status)` を突き合わせる。**一覧は `server::registered_tool_names` から導出する**ので、ツールを足して通しで呼ばなければ落ちる。ツール別の内訳は `mcp_stdio_server.rs`（読み取り・提案系7件と書き込み・逆仕訳） | `mcp_write_tools.rs` / `mcp_search_ledger.rs`（`dispatch::call` を直接呼び `audit_log` を SELECT する） |
 | MC-12 | 訂正理由が空・空白のみ | `mcp_stdio_server.rs` の `reversing_through_the_real_binary_goes_through_the_same_audited_path`（空白のみ） | `mcp_write_tools.rs` の `a_blank_reverse_reason_is_rejected_before_any_io`（空文字・空白・全角スペース） |
 
 **MC-06 / MC-07 は「未実装」ではなく「延期」である。** `close_period` は

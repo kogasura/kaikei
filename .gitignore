@@ -1,5 +1,12 @@
 /target
 .env
+
+# MCP クライアント（Claude Code 等）の設定。README「5分で動かす」の手順4が
+# リポジトリ直下に作らせる。DB パスワードが平文で入るファイルであり、
+# .env と同じ扱いにする。利用者の作業として残すと、worktree のときと同じく
+# `git add -A` で誤ってコミットされる（.gitignore の下の注記を参照）。
+.mcp.json
+
 *.sqlite
 *.sqlite3
 .DS_Store

@@ -87,6 +87,11 @@ pub const ENV_CLOSING_TAX_CATEGORY: &str = "KAIKEI_CLOSING_TAX_CATEGORY";
 /// 名指ししている**ためである。実装とテストが緑のまま `.env.example` だけが
 /// 欠けると、起動失敗メッセージの誘導先が嘘になる（`DECISIONS.md` D-047
 /// 「手で維持する一覧は腐る」と同型）。
+///
+/// **誘導先は項目名だけではない。** README の**節名**も同じ性質を持つので、
+/// `the_readme_section_named_by_the_failure_message_exists`（このファイルの
+/// [`README_SECTION`]）と `the_readme_sections_named_by_the_env_example_exist`
+/// （`.env.example` が本文で名指しする節）が突き合わせる。
 pub const REQUIRED_ENV_VARS: &[&str] = &[
     ENV_APP_DATABASE_URL,
     ENV_BOOK_CURRENCY,
@@ -697,6 +702,94 @@ mod tests {
                 .contains(README_SECTION),
             "メッセージが README_SECTION を経由していません"
         );
+    }
+
+    /// `.env.example` の本文から `README「…」` の形の参照を全部拾う。
+    ///
+    /// 定数に1つだけ書き写す形にしないのは、**参照が増えたときに検査から
+    /// 漏れる**のを防ぐため（漏れた参照はまさに「実装は緑のまま誘導先だけが
+    /// 嘘になる」経路である）。
+    fn readme_sections_named_by(text: &str) -> Vec<&str> {
+        let mut found = Vec::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("README「") {
+            let after = &rest[at + "README「".len()..];
+            match after.find('」') {
+                Some(end) => {
+                    found.push(&after[..end]);
+                    rest = &after[end..];
+                }
+                None => break,
+            }
+        }
+        found
+    }
+
+    // ★`.env.example` が名指しする節も誘導先である★
+    //
+    // `README_SECTION`（起動失敗メッセージの誘導先）は
+    // `the_readme_section_named_by_the_failure_message_exists` が見ているが、
+    // **もう1つの参照元である `.env.example` は対象外**だった。実際 PR-I が
+    // README を書き直したとき、`.env.example` が名指ししていた節
+    // 「ローカル開発環境」は消えたまま残っていた。利用者が最初に開くファイル
+    // （手順1 の `cp .env.example .env`）に、存在しない節への案内が載る。
+    #[test]
+    fn the_readme_sections_named_by_the_env_example_exist() {
+        let sections = readme_sections_named_by(ENV_EXAMPLE);
+        assert!(
+            !sections.is_empty(),
+            "`.env.example` から README「…」の参照が1つも読み取れません。\
+             参照の書き方を変えたなら readme_sections_named_by も直すこと\
+             （検査が黙って無意味になります）"
+        );
+        for section in sections {
+            assert!(
+                README
+                    .lines()
+                    .any(|line| line.starts_with('#') && line.contains(section)),
+                "`.env.example` が案内する README の節「{section}」が見出しとして\
+                 存在しません。README の見出しを変えたなら、同じ PR で\
+                 `.env.example` の参照も直すこと"
+            );
+        }
+    }
+
+    // 上のテストが「参照を1つも見つけられないまま緑」にならない
+    // （＝ガードのガード）。
+    #[test]
+    fn a_readme_reference_is_actually_extracted_from_the_text() {
+        assert_eq!(
+            readme_sections_named_by("… README「テスト」を参照。README「事業者設定」も"),
+            vec!["テスト", "事業者設定"]
+        );
+        assert!(readme_sections_named_by("README を参照").is_empty());
+    }
+
+    // 事業者設定は `.env.example` に**値を入れて**配らない（D-057 / D-082）。
+    //
+    // `cp .env.example .env` して CHANGE_ME を置換しただけで起動できると、
+    // 利用者は税抜経理か・課税事業者かを一度も宣言しないまま記帳を始める。
+    // 「既定値にフォールバックしない」という決定が、配り方の側で骨抜きに
+    // なるのを防ぐ（接続文字列 `APP_DATABASE_URL` は事業者設定ではなく、
+    // かつ CHANGE_ME を置換しないと使えないので対象外）。
+    #[test]
+    fn the_env_example_ships_the_business_settings_commented_out() {
+        for name in REQUIRED_ENV_VARS {
+            if *name == ENV_APP_DATABASE_URL {
+                continue;
+            }
+            let assigned = ENV_EXAMPLE.lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with('#') && line.starts_with(&format!("{name}="))
+            });
+            assert!(
+                !assigned,
+                "{name} が .env.example で有効な行として値を持っています。\
+                 事業者設定はコメントアウトして配ること——値を入れて配ると、\
+                 CHANGE_ME を置換しただけの利用者が、税抜経理か・課税事業者かを\
+                 一度も宣言しないまま起動できてしまいます（D-057 / D-082）"
+            );
+        }
     }
 
     // 空文字は「設定した」ことにしない（未設定と同じく起動を止める）。
