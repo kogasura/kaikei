@@ -242,6 +242,90 @@ jobs:
           fi
           echo "OK: $DEPS"
 
+      - name: kaikei-mcp の依存は最小限（MC-30）
+        run: |
+          set -euo pipefail
+          # docs/07-mcp-server.md §4 の申し送り / §10 MC-30。
+          #
+          # PR-B は「下流が線上表現（金額の文字列化・仕訳IDの表記・タグ値の
+          # 変換・エラーコードの写像）を再発明せずに済む」ことを狙って
+          # kaikei-app / kaikei-jp に入口を用意し、それを
+          # crates/{kaikei-app,kaikei-jp}/tests/contract_from_downstream.rs が
+          # 検証している。しかし**プローブでは下流の依存が増えないことを
+          # 検査できない**（統合テストのターゲットにはその crate の
+          # dev-dependencies までリンクされるため、uuid / rust_decimal を
+          # 直接使っても通ってしまう。PR-B で実測済み）。
+          # kaikei-mcp が実在してはじめて、その Cargo.toml を機械的に見られる。
+          #
+          # ★禁止リストではなく許可リストにする★
+          # 「uuid と rust_decimal さえ無ければよい」ではない。線上表現を
+          # kaikei-app / kaikei-jp から取る限りこの層に依存が増える理由は無く、
+          # 増えたこと自体が「MCP は薄い層」（docs/07 §4）を疑うべき兆候である。
+          # 一覧を広げるときは、その PR で「なぜこの層に必要か」を説明すること。
+          #
+          # ★`cargo tree` ではなく `cargo metadata --no-deps` を読む★
+          # `cargo tree` は既定で**ホストターゲットに解決される依存しか見ない**。
+          # このジョブは ubuntu-latest で走るので、
+          #   [target.'cfg(windows)'.dependencies] uuid = "1"
+          # のように target 指定の下に置かれた依存は検査を素通りする（実測）。
+          # 有効化されていない optional 依存も同様に見えない。
+          # D-078 が塞いだつもりの「dev-dependency の抜け道」と同型の穴なので、
+          # 宣言そのもの（Cargo.toml の記載）を読む。
+          # `cargo metadata --no-deps` の packages[].dependencies[] は
+          # **kind（normal/dev/build）・target 指定・optional を問わず全て**
+          # 列挙されるため、抜け道が残らない。`jq` は ubuntu-latest に同梱。
+          #
+          # kaikei-store が許可リストに入っているのは、kaikei-mcp が本番で
+          # 最初の**合成ルート**であり、PgStore の結線が要るため（docs/07 §4）。
+          # 逆に sqlx は入れない——sqlx の型を kaikei-mcp が直接触りたくなったら、
+          # それは kaikei-store の公開 API が足りていないという別の問題である。
+          if [ ! -d crates/kaikei-mcp ]; then
+            echo "OK: crates/kaikei-mcp が存在しません"
+            exit 0
+          fi
+          ALLOWED="kaikei-core kaikei-app kaikei-jp kaikei-store rmcp tokio serde serde_json schemars"
+          if ! METADATA=$(cargo metadata --no-deps --format-version 1); then
+            echo "::error::cargo metadata が失敗しました"
+            exit 1
+          fi
+          # `tr -d '\r'` は Windows の開発機で手元検証できるようにするため。
+          # Git Bash の jq.exe は stdout をテキストモードで開くので各行に `\r` が
+          # 付き、下の `case " $ALLOWED " in *" $d "*)` の完全一致が全滅して
+          # 健全な状態でも全依存が「禁止された依存」になる（実測）。
+          # ubuntu-latest の jq は `\r` を出さないので CI 側の挙動は変わらない。
+          DEPS=$(echo "$METADATA" \
+                 | jq -r '.packages[] | select(.name == "kaikei-mcp") | .dependencies[].name' \
+                 | tr -d '\r' \
+                 | sort -u)
+          if [ -z "$DEPS" ]; then
+            echo "::error::kaikei-mcp の依存を1つも取得できませんでした（検査が働いていません）"
+            exit 1
+          fi
+          FAIL=0
+          for d in $DEPS; do
+            # ★完全一致で照合する★
+            # `grep -qw` は `-` を単語構成文字として扱わないため、
+            # `core` / `app` / `jp` / `store` / `kaikei` という名前の crate を
+            # 直接依存に足しても許可リストの成分名に一致して緑になる（実測）。
+            case " $ALLOWED " in
+              *" $d "*) ;;
+              *)
+                echo "::error::kaikei-mcp に禁止された依存: $d"
+                FAIL=1
+                ;;
+            esac
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "kaikei-mcp は薄い presentation 層です（docs/07-mcp-server.md §4）。"
+            echo "uuid / rust_decimal / sqlx を足したくなったら、まず"
+            echo "kaikei_app::{amount,wire,id,currency} と kaikei_jp::{tags,tax} に"
+            echo "同じことをする入口が無いか確認してください（DECISIONS.md D-072）。"
+            echo "許可リストを広げる場合は、その PR で理由を説明すること。"
+            exit 1
+          fi
+          echo "OK: $DEPS"
+
       - name: rehydrate の呼び出しは1箇所に限定
         run: |
           set -euo pipefail

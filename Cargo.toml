@@ -13,13 +13,17 @@ members = [
     # Phase 2 PR-8: 合成ルートを模したE2Eテスト専用crate（DECISIONS.md D-068）。
     # 他のどのcrateからも依存されない（architecture.yml が検査する）。
     "crates/kaikei-e2e",
+    # Phase 3 PR-D: MCP サーバー（stdio）。members に入れないと
+    # `cargo test --workspace` / `cargo clippy --workspace` の対象にすらならない。
+    # rust-version だけは workspace 既定（1.80）を継承せず個別宣言している
+    # （rmcp の MSRV。DECISIONS.md D-071 / D-078）。
+    "crates/kaikei-mcp",
     # Phase 1 以降で追加
     # "crates/kaikei-blob",
     # "crates/kaikei-import",
     # "crates/kaikei-import-data",
     # "crates/kaikei-report",
     # "crates/kaikei-api",
-    # "crates/kaikei-mcp",
 ]
 
 [workspace.package]
@@ -56,6 +60,20 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
+
+# ---- Phase 3: MCP サーバー（kaikei-mcp のみが使う） ----
+# 公式 Rust SDK。default-features を切り、使うトランスポート（stdio）と
+# サーバ機能だけを明示する（DECISIONS.md D-071）。HTTP/SSE 系の feature を
+# 有効にしない＝ソケットを開く経路をビルドに含めない。
+rmcp = { version = "3", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+    "schemars",
+] }
+# ツールの input_schema 生成。rmcp が公開シグネチャで使うバージョンに合わせる
+# （ずれると `JsonSchema` の実装が別トレイトになりコンパイルが通らない）。
+schemars = "1"
 
 # ---- dev ----
 proptest = "1"

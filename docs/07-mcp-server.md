@@ -3,8 +3,10 @@
 **このプロジェクトの差別化の本体。**
 AI エージェントが会計操作を安全に行うための標準インタフェース。
 
-> **この文書の版**: Phase 3 **PR-C** 時点（`DECISIONS.md` D-077 まで）を
-> 反映している。§9（監査ログ）は PR-C で実装済みの内容に更新した。
+> **この文書の版**: Phase 3 **PR-D**（`kaikei-mcp` の骨組み）時点
+> （`DECISIONS.md` D-080 まで）を反映している。§9（監査ログ）は
+> PR-C で実装済みの内容に更新済み（D-077 まで）。
+> それ以前は PR-B **2巡目**（D-074 まで、D-072〜D-074 の訂正注記を含む）だった。
 > D-072 以降の決定でここに書かれた内容が覆った場合、**決定を入れた PR の中で
 > この文書も直すこと**。設計書は一度書いたら終わりではなく、直さないと
 > 「却下済みの設計を後続の実装者に指示する文書」に劣化する
@@ -652,7 +654,23 @@ AI の自己修正を一段速くする効果は大きいが、
 - ~~線上の `tags` → `TagSet` の変換、税区分マスタの列挙~~
   → **PR-B 3巡目で完了**（`kaikei_jp::tags::TagCatalog` と
   `kaikei_jp::tax::TaxRuleSets::{iter, available_ranges_display, require_for_date}`）。
-- **【PR-D への申し送り】`kaikei-mcp` の依存が最小限であることを CI で検査する。**
+- ~~**【PR-D への申し送り】`kaikei-mcp` の依存が最小限であることを CI で検査する。**~~
+  → **PR-D で完了。** `.github/workflows/architecture.yml` の
+  `dependency-direction` ジョブに「kaikei-mcp の依存は最小限（MC-30）」
+  ステップを追加した（**新しいジョブは作っていない**ので必須チェックの
+  登録＝ブランチ保護の変更は不要。`CLAUDE.md` §13）。**禁止リストではなく
+  許可リスト**にしてある（`kaikei-core` / `kaikei-app` / `kaikei-jp` /
+  `kaikei-store` / `rmcp` / `tokio` / `serde` / `serde_json` / `schemars`）。
+  依存の取得は **`cargo metadata --no-deps`**（`packages[].dependencies[].name`）で
+  行う。`cargo tree` は既定でホストターゲットに解決される依存しか見ないため、
+  `[target.'cfg(windows)'.dependencies]` の下に `uuid` を置くと ubuntu-latest の
+  CI を素通りする（レビュー2巡目で実測）。`cargo metadata` の宣言一覧は
+  **kind（normal / dev / build）・target 指定・optional を問わず全て**現れるので、
+  **dev-dependency 経由の抜け道も target-cfg 経由の抜け道も塞がる**（D-078）。
+  許可リストとの照合は `case " $ALLOWED " in *" $d "*)` による**完全一致**。
+  `grep -qw` は `-` を単語構成文字として扱わないため、`kaikei` / `core` /
+  `app` のような**成分名の crate** を足すと緑のまま通ってしまう（同じく実測）。
+  以下は申し送り当時の記述:
   §3 の表と2本のプローブ（`crates/{kaikei-app,kaikei-jp}/tests/contract_from_downstream.rs`）は
   「線上表現を MCP 層で再発明しない」ことを狙っているが、**プローブでは
   下流の依存が増えないことを検査できない**（統合テストにはその crate の
@@ -663,6 +681,13 @@ AI の自己修正を一段速くする効果は大きいが、
   `.github/workflows/architecture.yml` の依存方向チェックと同型の
   ステップで機械的に検査できる。**新しいジョブを足したら必須チェックへの
   登録も同じ PR で行うこと**（`CLAUDE.md` §13）。
+- **【PR-D で完了】`JpError` → 分類コードの対応表**（§6）。
+  `crates/kaikei-mcp/src/error.rs` の `jp_error_code`（網羅 `match`）。
+- **【PR-D で完了】ツールレジストリと「存在させないツール」の検査**（§10 MC-10）。
+  `crates/kaikei-mcp/src/server.rs` と `crates/kaikei-mcp/tests/forbidden_tools.rs`。
+- **【PR-D で完了】金額を number で渡したときの日本語エラー**（§5・MC-09 の (1)）。
+  `crates/kaikei-mcp/src/wire.rs` の `AmountStr`。
+  (2)（`isError: true` で返ること）は rmcp が担保し、(3)（audit_log）は PR-F。
 
 **`kaikei-mcp` が新しく書かなくてよいもの**（§3 の表を再掲）: エラーコードの
 対応表、金額の文字列化、`side` / `account_type` / `severity` /
@@ -675,13 +700,13 @@ AI の自己修正を一段速くする効果は大きいが、
 
 ```
 kaikei-mcp/src/
-├── main.rs               起動（設定ロード → 合成 → stdio サーバ）
-├── startup.rs            合成ルート。kaikei_jp::compose::compose + PgStore の結線
-├── config.rs             事業者設定の読み込みと必須検証（欠けていたら起動失敗。§7）
-├── audit.rs              audit_log。別コネクション・2回書き・fail-closed/fail-open（§9）
-├── amount.rs             §5 の金額文字列 ⇄ Money 変換を1箇所に閉じる
-├── server.rs             tool_router の合成、rmcp の ServerHandler 実装
-├── error.rs              AppError → CallToolResult::error（isError: true）への変換（§6）
+├── main.rs               起動（設定ロード → 合成 → stdio サーバ）        ← PR-E
+├── startup.rs            合成ルート。kaikei_jp::compose::compose + PgStore の結線 ← PR-E
+├── config.rs             事業者設定の読み込みと必須検証（欠けていたら起動失敗。§7） ← PR-E
+├── audit.rs              audit_log。別コネクション・2回書き・fail-closed/fail-open（§9） ← PR-F
+├── wire.rs               線上の DTO（AmountStr 等）。★整形は書かない★       ← PR-D で新設
+├── server.rs             tool_router の合成、rmcp の ServerHandler 実装     ← PR-D で新設
+├── error.rs              JpError → 分類コード、ToolError → CallToolResult::structured_error（§6） ← PR-D で新設
 └── tools/
     ├── list_accounts.rs
     ├── get_entry.rs
@@ -695,6 +720,11 @@ kaikei-mcp/src/
     ├── suggest_tax_category.rs
     └── validate_invoice_number.rs
 ```
+
+**`amount.rs` は作らない**（初版の構成案にはあったが、PR-B 2巡目で整形手段が
+`kaikei_app::amount` に置かれたため、同じ整形が2箇所に育つだけになる。§5）。
+線上の金額の型（`AmountStr`。number を日本語のエラーで拒否する）は `wire.rs` に
+置き、文字列化は `money_to_plain_string` に委ねる（D-079）。
 
 `tools/` というフォルダ名は `CLAUDE.md` §6 に反しない。§6 が禁じるのは
 `entities/` / `value_objects/` のような DDD のパターン名（技術的分類）であり、
@@ -753,13 +783,27 @@ Phase 3 で却下した。D-013 の訂正注記を参照）。
 
 実装形:
 
-- 金額フィールドは専用の newtype（例 `AmountStr`）にし、`Deserialize` を**手書き**して
-  number / bool / null を受けたら `de::Error::custom` で日本語のメッセージを返す。
-  例:「金額は文字列で渡してください（例: `"110000"`）。JSON の number は
-  倍精度浮動小数点のため、会計金額には使えません」。
+- 金額フィールドは専用の newtype（`AmountStr`。`kaikei-mcp/src/wire.rs`）にし、
+  `Deserialize` を**手書き**して number / bool / null を受けたら
+  `de::Error::custom` で日本語のメッセージを返す。
   素の `String` にしておくと AI には `invalid type: integer 110000, expected a string`
   という英語の型エラーしか届かず、`CLAUDE.md` §11 を満たさない
   （D-019 が `{:?}` の英語バリアント名を禁じたのと同型の問題）。
+  **実装済み**（PR-D）。実際の出力:
+
+  ```
+  金額は文字列で渡してください（例: "110000"、USD なら "1234.56"）。
+  JSON の number は倍精度浮動小数点のため、会計金額には使えません
+  ```
+
+  **手書きの形は「独自 Visitor」ではなく「一度 `serde_json::Value` として
+  受けてから判定」にした**（D-079）。`deserializer.deserialize_str` では
+  serde 側が `invalid_type` を組み立ててしまい custom メッセージが無視される、
+  という当初の指摘は正しい。しかし独自 Visitor で `visit_f64` を実装すると
+  ソースに浮動小数点の型名が現れ、`.github/workflows/architecture.yml` の
+  「f64 が金額に使われていない」ステップ（コメント行以外の該当語を全て落とす）
+  が赤になる。`Value` 経由なら型名を書かずに number / bool / null / 配列 /
+  オブジェクトのすべてを同じ日本語メッセージで拒否できる。
 - `JsonSchema` は `#[schemars(with = "String")]` 等で `"type": "string"` を出す。
   スキーマ上 number も許されているように見えると、AI が number を送る動機を作る。
 - **`as_f64()` を書かない。** `.github/workflows/architecture.yml` の
@@ -982,7 +1026,7 @@ AI が取るべき次の手が違う。
 使っており、同じコードにすると AI が「入力を直せばよいのか」
 「サーバ都合で今は実行できないのか」を区別できず、無意味な作り直しを繰り返す。
 
-#### まだ埋まっていない写像元: `JpError`
+#### `JpError` の写像元（**PR-D で実装済み**）
 
 **上の表は `kaikei-app` から見えるエラーだけを覆う。**
 §4 の呼び出し経路 (c)（`list_tax_categories` / `get_settings` /
@@ -1000,7 +1044,55 @@ AI が取るべき次の手が違う。
 `kaikei-app` の `codes` モジュールの定数を再利用し、**同じ意味には同じコードを
 使う**こと（例: `JpError::InvoiceRegNo*` 系には `invoice_*` の新しいコードを
 起こしてよいが、`unknown_tax_category` のように既に語彙がある概念に別名を
-作らない）。この作業は `kaikei-mcp` を新設する PR の担当。
+作らない）。
+
+**PR-D で実装した**（`crates/kaikei-mcp/src/error.rs` の `jp_error_code`。
+`JpError` は `#[non_exhaustive]` ではないので**網羅 `match`** にしてあり、
+バリアント追加はこの関数のコンパイルを壊す）。
+
+| `JpError` | コード | 出所 |
+|---|---|---|
+| `Core(_)` | 中身の `CoreError` へ委譲 | `kaikei_app::error::core_error_code` |
+| `UnregisteredTagKey` | `unknown_tag_key` | 既存（`CoreError::UnknownTagKey` と同義） |
+| `InvalidTagValue` | `tag_type_mismatch` | 既存（`CoreError::TagTypeMismatch` と同義） |
+| `DuplicateTagKeyInInput` | `duplicate_tag_key` | **新規** |
+| `NoApplicableTaxRuleSet` | `no_applicable_rule_set` | 既存（`PolicyError` と同義） |
+| `UnknownTaxCategoryCode` | `unknown_tax_category` | 既存（`PolicyError` と同義） |
+| `InvoiceRegNoMissingPrefix` | `invoice_reg_no_missing_prefix` | **新規** |
+| `InvoiceRegNoWrongLength` | `invoice_reg_no_wrong_length` | **新規** |
+| `InvoiceRegNoNonDigit` | `invoice_reg_no_non_digit` | **新規** |
+| `InvoiceRegNoCheckDigit` | `invoice_reg_no_check_digit` | **新規** |
+| `InvalidSettingCode` | `invalid_setting_code` | **新規** |
+| `InvalidBusinessRatio` | `invalid_value` | 既存 |
+| `InvalidHouseholdSplitTotal` | `invalid_amount` | 既存 |
+| `InvalidChart` | `invalid_chart` | 既存（`CoreError::InvalidChart` と同義） |
+| `YamlParse` / `Io` / `InvalidTaxCategoryTable` / `OverlappingTaxPeriods` / `InvalidTagSchema` / `MissingClosingAccount` / `NotPostableClosingAccount` / `DuplicateClosingAccount` / `ClosingTagSchemaMismatch` | `invalid_policy_data` | 既存 |
+
+登録番号の4件を別コードにしているのは、検証順が「先頭文字 → 桁数 → 文字種 →
+チェックデジット」に固定されており（D-053）、**最初に失敗した観点だけが返る**
+ため。1つに潰すと AI は何を直せばよいかを本文の日本語から推測するしかない。
+
+`InvalidChart` だけをロード失敗の集約から外しているのは、`invalid_chart`
+（「勘定科目表そのものが不正」）が既に語彙にあり、`CoreError::InvalidChart` が
+そちらに写像されているため。`JpError::InvalidChart` は
+`ChartOfAccounts::new` が返した `CoreError::InvalidChart` を包み直したものを
+**含む**（`crates/kaikei-jp/src/chart.rs` の `from_raw`）ので、集約に入れると
+**同一の条件が経路によって2つのコードになる**——このセクションが禁じている
+「既に語彙がある概念に別名を作る」そのものになる（レビュー2巡目で是正）。
+
+この一致は散文ではなく検査で固定してある。
+`crates/kaikei-mcp/src/error.rs` の
+`jp_and_core_invalid_chart_resolve_to_the_same_code` が
+`jp_error_code(&JpError::InvalidChart { .. })` と
+`kaikei_app::error::core_error_code(&CoreError::InvalidChart { .. })` の
+**戻り値**を突き合わせるので、`kaikei-app` 側が `CoreError::InvalidChart` の
+写像を変えたら落ちる（レビュー3巡目で追加）。
+
+最後の9件を1つにまとめているのは、いずれも**サーバ側の同梱マスタ・起動設定が
+不正**で、呼び出し元の入力を直しても解消しない——つまり
+`PolicyError::InvalidPolicyData`（「policy が構築時に受け取ったデータが不正」）
+と意味が一致するため（別名を作らない）。なお通常これらはツール応答に現れない
+（設定・マスタの不備は起動時に検出して**起動を中止する**。§7）。
 
 ---
 
@@ -1399,13 +1491,13 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 
 | # | ケース | 期待 |
 |---|---|---|
-| MC-09 | 金額を number で渡す | **エラー（整数でも受理しない）。** (1) メッセージが「金額は文字列で渡してください。例: `"amount": "110000"`」という次の手を含む、(2) `isError: true` のツール結果として返る、(3) この呼び出しも audit_log に残る。金額フィールドを素の `String` にするだけでは (1) を満たせない（§5 の実装形を参照） |
-| MC-10 | 存在させないツール4件 | `tools/list` の応答に `delete_journal_entry` / `update_journal_entry` / `execute_sql` / `reopen_period` のいずれも現れず、それらの名前で `tools/call` すると未知ツールとして拒否される。**禁止リストをテスト側の定数にして4件すべてをループで検査する**（1件だけの検査では他が復活しても緑のまま通る） |
+| MC-09 | 金額を number で渡す | **エラー（整数でも受理しない）。** (1) メッセージが「金額は文字列で渡してください。例: `"amount": "110000"`」という次の手を含む、(2) `isError: true` のツール結果として返る、(3) この呼び出しも audit_log に残る。金額フィールドを素の `String` にするだけでは (1) を満たせない（§5 の実装形を参照）。**PR-D で (1) を実装**（`kaikei_mcp::wire::AmountStr`。`crates/kaikei-mcp/src/wire.rs` のテスト）。(2) は rmcp が担保する（`ToolRouter::call` が `failed to deserialize parameters:` で始まる `INVALID_PARAMS` を `CallToolResult::error` に変換する。rmcp 3.1.0 の実装を確認済み）。(3) は PR-F |
+| MC-10 | 存在させないツール4件 | `tools/list` の応答に `delete_journal_entry` / `update_journal_entry` / `execute_sql` / `reopen_period` のいずれも現れず、それらの名前で `tools/call` すると未知ツールとして拒否される。**禁止リストをテスト側の定数にして4件すべてをループで検査する**（1件だけの検査では他が復活しても緑のまま通る）。**PR-D で実装済み**（`crates/kaikei-mcp/tests/forbidden_tools.rs`）。検査はレジストリ（`ToolRouter`）から導出しており、`tools/list` が返す集合と同一。`tools/call` 側は `ServerHandler::get_tool` と `ToolRouter::has_route` で見る（`rmcp::service::Peer::new` が `pub(crate)` で `RequestContext` を外部 crate から組み立てられないため、`call` を直接叩けない）。**許可リスト側（Phase 3 の11件）からも閉じてある**——禁止4件だけを見張ると新しい名前の破壊的ツールが素通りする |
 | MC-26 | ドメインエラー（貸借不一致等） | JSON-RPC のプロトコルエラーではなく `isError: true` のツール結果として返る（D-071） |
 | MC-27 | 出力の金額 | 全て JSON 文字列である（入力だけでなく出力側も number にしない。§5） |
 | MC-24 | 事業者設定（`is_taxable_business` / `simplified_taxation` 等）を与えずに起動 | 既定値にフォールバックせず**起動が失敗**し、不足項目を名指しするメッセージが出る（§7。D-057） |
 | MC-29 | 未登録のタグキー（例: `tax_cat`）で post | **エラー**（黙って落とさない）。メッセージに**有効なタグキー一覧**が含まれる（§3。`CLAUDE.md` §4・§11）。型に合わない値（`business_ratio: "3割"`）も同様に、期待する書式を示すエラー |
-| MC-30 | `kaikei-mcp` の依存 | `Cargo.toml` が `kaikei-app` / `kaikei-jp` / `kaikei-core` / MCP SDK / 非同期ランタイム / シリアライズ以外に依存していない（`uuid` / `rust_decimal` を自前で足していない）。**CI のジョブとして機械的に検査する**（§4 の申し送り。プローブでは検査できない） |
+| MC-30 | `kaikei-mcp` の依存 | `Cargo.toml` が `kaikei-app` / `kaikei-jp` / `kaikei-core` / MCP SDK / 非同期ランタイム / シリアライズ以外に依存していない（`uuid` / `rust_decimal` を自前で足していない）。**CI で機械的に検査する**（§4 の申し送り。プローブでは検査できない）。**PR-D で実装済み**: 既存ジョブ `dependency-direction` への**ステップ追加**（新しいジョブではないので必須チェックの登録は不要。`CLAUDE.md` §13）。依存の取得は `cargo metadata --no-deps` の `packages[].dependencies[].name`（`cargo tree` はホストターゲットの依存しか見ず、`[target.'cfg(...)'.dependencies]` を素通りする）、許可リストとの照合は `case` による完全一致（`grep -qw` は `kaikei` のような成分名を通す）。`uuid` を normal / dev / target-cfg のいずれで足しても、また `kaikei` という名前の crate を足しても落ちることを実測した（照合部分は ubuntu:24.04 コンテナでも同じ結果を確認）。`jq` の出力は `tr -d '\r'` を通す——Git Bash の `jq.exe` は stdout をテキストモードで開くため、これが無いと Windows の開発機では**健全な状態でも全依存が「禁止された依存」になる**（手元で回せない検査は回されなくなる）。許可リストは「足してよい上限」であって「足さねばならない一覧」ではないので、実際の `Cargo.toml` と一致していなくてよい（PR-D 時点では `tokio` を宣言していない。使うのは合成ルートを置く PR-E） |
 
 ### 監査ログ
 

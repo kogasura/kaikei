@@ -2789,6 +2789,7 @@ docs/07 §3 が挙げた3案のうち (a)）。
 （`UnregisteredTagKey` / `InvalidTagValue` / `DuplicateTagKeyInInput` /
 `NoApplicableTaxRuleSet`）に対する分類コードは、`JpError` 用の対応表ごと
 `kaikei-mcp` 側に置く（D-072 トレードオフの項、`docs/07-mcp-server.md` §6）。
+→ **PR-D で完了**（D-080）。
 
 ---
 
@@ -3068,3 +3069,261 @@ documents / imported_transactions 用として予約していたが、その番�
 **トレードオフ**: `pg-tests` の実行時間が約15秒増える（`#[sqlx::test]` は
 テストごとに使い捨てDBを作りマイグレーションを再適用する）。
 実 DB でしか検証できない性質なので受け入れる。
+
+
+---
+
+## D-078 `kaikei-mcp` の「してはいけないこと」は許可リストと禁止リストの両方で閉じる
+
+**決定**: Phase 3 PR-D（`kaikei-mcp` の骨組み）で、この層に対する機械的な歯止めを
+2つ置く。どちらも**許可リストと禁止リストの両方**から閉じる。
+
+1. **ツールレジストリ**（`docs/07-mcp-server.md` §10 MC-10）
+   - 禁止側: `delete_journal_entry` / `update_journal_entry` / `execute_sql` /
+     `reopen_period` の4件を**テスト側の定数**にして**ループで**検査する
+     （`crates/kaikei-mcp/tests/forbidden_tools.rs`）。
+   - 許可側: 登録されているツールが `docs/07-mcp-server.md` §2 の
+     **Phase 3 の11件**のいずれかであることも検査する。
+   - 検査対象はレジストリ（`ToolRouter`）から導出する。実装側のツール名の
+     一覧をテストに書き写さない。
+2. **依存の最小性**（同 §10 MC-30）
+   - `.github/workflows/architecture.yml` の既存ジョブ `dependency-direction` に
+     **ステップを追加**する（新しいジョブは作らない）。
+   - **許可リスト**方式にする: `kaikei-core` / `kaikei-app` / `kaikei-jp` /
+     `kaikei-store` / `rmcp` / `tokio` / `serde` / `serde_json` / `schemars`。
+   - 依存の取得は **`cargo metadata --no-deps`** の
+     `packages[].dependencies[].name`（＝ `Cargo.toml` の宣言そのもの）。
+   - 許可リストとの照合は `case " $ALLOWED " in *" $d "*)` による**完全一致**。
+
+**訂正注記（レビュー2巡目）**: 当初は `cargo tree`（`--edges` 指定なし）+
+`grep -qw` で書いたが、**どちらにも抜け道が残っていた**。
+
+- `cargo tree` は既定で**ホストターゲットに解決される依存しか見ない**。
+  CI は ubuntu-latest なので、`[target.'cfg(windows)'.dependencies]` の下に
+  `uuid` を置くと検査を素通りする（実測: `cfg(target_os = "linux")` 配下の
+  `uuid` は Windows ホストの `cargo tree` から見えず、`cargo metadata` からは
+  見える）。この決定が塞いだつもりの「dev-dependency の抜け道」と**同型**。
+  `cargo metadata --no-deps` の `dependencies[]` は kind（normal / dev /
+  build）・target 指定・optional を問わず全て列挙されるので、`--edges` の
+  指定が不要になり、target-cfg の穴も同時に閉じる。
+- `grep -qw` の `-w` は `-` を**単語構成文字として扱わない**。そのため
+  `kaikei` / `core` / `app` / `jp` / `store` という名前の crate を直接依存に
+  足すと、`kaikei-core` 等の**成分名**に一致して緑のまま通る（実測）。
+  `case` の完全一致に変えた。
+
+**この訂正の範囲は `kaikei-mcp` のステップだけ**にする。同じジョブの
+`kaikei-core` / `kaikei-policy` / `kaikei-jp-data` のステップも `cargo tree` +
+`grep -qw` で書かれており同じ性質を持つが、凍結層の検査を同じ PR で
+書き換えると影響範囲が広がりすぎる（`CLAUDE.md` §9「1コミット1論点」）。
+**別 Issue として起票する。**
+
+**訂正注記2（レビュー3巡目）**: 上の `case` による完全一致は、**Windows の
+開発機で手元実行すると健全な状態でも全滅する**。Git Bash の `jq.exe` は
+stdout をテキストモードで開くため各依存名の末尾に `\r` が付き、
+`" $ALLOWED "` に `"kaikei-app\r"` は含まれないので、7件すべてが
+「禁止された依存」になって exit 1 になる（実測）。**push 前に手元で回せない
+検査は回されなくなる**ので、`jq` の出力に `tr -d '\r'` を1つ挟んだ。
+ubuntu-latest の `jq` は `\r` を出さないため CI 側の挙動は変わらない。
+
+**許可リストと実際の依存は一致していなくてよい**。許可リストは「足してよい
+上限」であって「足さねばならない一覧」ではない。PR-D 時点の
+`crates/kaikei-mcp/Cargo.toml` からは `tokio` を外してある（この crate の
+`src/` から参照が0件で、`docs/07-mcp-server.md` §4 が掲げる「依存は最小限」の
+実物として未使用の1件が残るのを避けるため）。実際に要るのは合成ルート
+（`#[tokio::main]`）を置く PR-E なので、**使う PR で足す**。許可リストからは
+外していない——外すと PR-E が「CI を緩める PR」になり、この決定の最後の
+却下理由（`kaikei-store` の行）と同じ問題を招く。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 禁止4件のうち代表1件だけを検査する | `docs/07-mcp-server.md` §10 が明示的に禁じている。1件だけの検査では他の3件が復活しても緑のまま通る。4件は**理由が同じではない**（D-014 の3件と、締めが Phase 4 以降だから作りようがない `reopen_period`）ので、片方の理由が変わったときに巻き添えで検査が消えるのも避けたい |
+| 禁止リストだけで閉じる（許可リストを作らない） | `drop_journal_entries` のような**新しい名前**の破壊的ツールが増えても緑のまま通る。禁止リストは「既に思いついた名前」しか守れない |
+| 許可リストだけで閉じる（禁止リストを作らない） | 禁止4件は「なぜ無いのか」の記録そのものである。一覧が消えると実装者が善意で復活させる（`docs/07-mcp-server.md` §10 の「行を消さない」と同じ理由） |
+| 実装側のツール名一覧をテストに手で持つ | 「手で維持する一覧は必ず腐る」（`PROGRESS.md` Phase 1 の教訓6）。許可リストは**設計書 §2 の写し**なので手で持つが、**実装側の一覧は必ずレジストリから導出する** |
+| MC-10 を実プロセスの stdio ハンドシェイク（`tools/list` の JSON）で検査する | `tools/call` を直接叩くには `RequestContext` が要り、その構築に必要な `rmcp::service::Peer::new` は `pub(crate)` で外部 crate から組み立てられない。実プロセスで見るには起動バイナリ（＝合成ルート。PR-E）と実 DB が要る。`#[tool_handler]` が生成する `list_tools` / `get_tool` は同じ `ToolRouter` を引くので、レジストリを見る検査と結果は同一である |
+| 依存検査を**禁止リスト**（`uuid` / `rust_decimal` を弾く）にする | 「uuid と rust_decimal さえ無ければよい」ではない。線上表現を `kaikei-app` / `kaikei-jp` から取る限りこの層に依存が増える理由は無く、増えたこと自体が「MCP は薄い層」（`docs/07-mcp-server.md` §4）を疑うべき兆候である。次に何が生えるかを先に列挙できない |
+| 依存検査を `--edges normal` で行う（他のステップと揃える） | `uuid` を **dev-dependency** として足してテストで使う抜け道が残る（D-047 の注記、`kaikei-e2e` のステップと同型の穴）。実測でも `--edges normal` では dev-dependency の `rust_decimal` が見えず、既定の edges では検出できた |
+| 依存検査を `cargo tree`（`--edges` 指定なし）のまま続ける | ホストターゲットに解決される依存しか見ないため、`[target.'cfg(windows)'.dependencies]` 配下が ubuntu-latest の CI を素通りする（上の訂正注記。実測）。`--target` を並べて全ターゲットを網羅する案もあるが、「次にどの `cfg` が使われるか」を先に列挙できない点で禁止リスト方式と同じ弱さを持つ |
+| 許可リストとの照合を `grep -qw` のまま続ける | `-w` が `-` を単語構成文字として扱わないため、`kaikei` という名前の crate を足すだけで `kaikei-core` に一致して通る（上の訂正注記。実測） |
+| 照合を `grep -Fxq`（固定文字列の完全一致）にする | 許可リストが空白区切りの1変数なので、行に分解する前処理が要る。`case` なら追加のプロセスも前処理もなく完全一致になる。**`jq` 以外の外部コマンドを増やさない**方が、CI と手元で挙動が分かれる余地も小さい |
+| `cargo metadata` の JSON を `grep` で読む（`jq` を使わない） | 依存名以外の文字列（`description` に crate 名が出る等）に当たる。`jq` は ubuntu-latest に同梱されており、依存の追加にはならない |
+| 依存検査を新しい CI ジョブにする | 新しいジョブは必須チェックへの登録（ブランチ保護の変更）が要り、登録を忘れると「失敗してもマージできる」状態になる（`CLAUDE.md` §13）。既存ジョブへのステップ追加なら、その日から `dependency-direction` の一部として必須チェックに含まれる |
+| `sqlx` を許可リストに入れる | `kaikei-mcp` は合成ルートなので `PgStore` は要るが、接続の生成（`connect_app`）も含めて `kaikei-store` が公開している。sqlx の型を MCP 層が直接触りたくなったら、それは `kaikei-store` の公開 API が足りていないという**別の問題**であり、ここで許可して隠してはいけない |
+| `kaikei-store` を許可リストから外す（PR-E で足させる） | `kaikei-mcp` が本番で最初の合成ルートになることは `docs/07-mcp-server.md` §4 で決まっており、`Arc<PgStore>` を持つのは既定路線である。ここで外すと PR-E が「CI を緩める PR」になり、検査を緩めること自体が普通の作業に見えてしまう。**判断はこの決定で済ませ、PR-E は CI を触らない** |
+
+**理由**: この層で守りたいのは「AI に開いてよい操作の集合」と「薄さ」の2つで、
+どちらも**書き忘れではなく書き足しによって壊れる**性質を持つ。
+書き足しを検出するには、既知の悪い名前を並べるだけでは足りない。
+
+**トレードオフ**: 許可リストが2箇所（テストの `PHASE_3_TOOLS` と CI の
+`ALLOWED`）に増えた。前者は設計書 §2 の写しなので、ツールを増やす PR は
+設計書とテストの両方を触ることになる（これは意図した摩擦である）。
+後者は依存を増やす PR に説明を強制する。どちらも「増やすとき」にだけ効く
+コストで、日常の作業には現れない。
+
+---
+
+## D-079 線上の金額は `wire.rs` の `AmountStr` にし、`serde_json::Value` 経由で number を拒否する
+
+**決定**:
+
+1. 金額の線上型は `crates/kaikei-mcp/src/wire.rs` の **`AmountStr`**（newtype）にする。
+   **`kaikei-mcp/src/amount.rs` は作らない**（`docs/07-mcp-server.md` §5）。
+   文字列化は `kaikei_app::amount::money_to_plain_string` に委ね、
+   この層は詰め替えだけを行う。
+2. `Deserialize` は手書きし、**一度 `serde_json::Value` として受けてから**
+   文字列かどうかを判定する。文字列以外（number / bool / null / 配列 /
+   オブジェクト）はすべて同じ**日本語**のメッセージで拒否する。
+3. `JsonSchema` は `#[schemars(with = "String")]` で `"type": "string"` を出す。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 素の `String` フィールドにする | serde が組み立てる `invalid type: integer 110000, expected a string` という**英語の型エラー**しか AI に届かない。`CLAUDE.md` §11 を満たさない（D-019 が `{:?}` の英語バリアント名を禁じたのと同型） |
+| `deserializer.deserialize_str(..)` + 独自 Visitor | number を受け取った時点で **serde 側が** `invalid_type` を組み立ててしまい、Visitor に制御が渡らない。custom メッセージが無視される（実測） |
+| `deserialize_any` + 独自 Visitor（`visit_i64` / `visit_f64` …） | 機能的には成立するが、`visit_f64` の引数型としてソースに浮動小数点の型名が現れ、`.github/workflows/architecture.yml` の「f64 が金額に使われていない」ステップ（コメント行以外の該当語を全て落とす）が**必ず赤になる**。この CI は `CLAUDE.md` §8 の中核であり、迂回のために緩めない |
+| 整数の number だけ受理する（警告を添える） | D-013 の訂正注記で Phase 3 が却下済み。サーバに届いた時点では、クライアント側で既に倍精度に丸められたかどうかを**サーバから検出できない**。受理すれば「警告付きで壊れた金額を記帳する」ことになる |
+| `kaikei-mcp/src/amount.rs` に整形も含めて置く（初版の構成案） | 同じ整形が `kaikei-app` と2箇所に育つ。`kaikei-api`（Phase 4）も同じ形式を返す必要があり、presentation 層ごとに持つと必ずずれる（`docs/07-mcp-server.md` §5・D-072） |
+| `Money` に `Serialize` / `Deserialize` を実装する | `kaikei-core` への serde 参照は CI が機械的に禁じている。上位層の都合で凍結層に依存を足さない（`CLAUDE.md` §1） |
+
+**理由**: 「number を弾く」は仕様だが、**どう弾くか**が `CLAUDE.md` §11 と §8 の
+両方に触れる。§11（日本語で次の手を示す）を満たそうとして §8 の CI（f64 禁止）を
+踏む、という組み合わせが実在したため、両方を満たす形を決定として残す。
+
+**トレードオフ**: `serde_json::Value` を1度経由するぶん、自己記述的でない
+シリアライズ形式では使えない。MCP の入力は常に JSON なので実害は無いが、
+将来 `kaikei-api` が別形式を受けるようになったらここは再検討になる。
+また `AmountStr` は**書式の検証をしない**（`Money::parse` に通すまで
+「金額として妥当か」は分からない）。通貨ごとに小数桁が違う以上、通貨を
+伴わずに検証はできないので、これは意図した分業である。
+
+---
+
+## D-080 `JpError` の分類コードは既存語彙を最優先で再利用し、ロード失敗は1つに集約する
+
+**決定**: `crates/kaikei-mcp/src/error.rs` に `jp_error_code`（**網羅 `match`**）を置く。
+`kaikei-app` は `kaikei-jp` に依存できない（`CLAUDE.md` §1）ため、
+`JpError` の写像表はここが唯一の置き場になる（`docs/07-mcp-server.md` §6）。
+
+- **既存語彙を再利用する**: `UnregisteredTagKey` → `unknown_tag_key`、
+  `InvalidTagValue` → `tag_type_mismatch`、`NoApplicableTaxRuleSet` →
+  `no_applicable_rule_set`、`UnknownTaxCategoryCode` → `unknown_tax_category`、
+  `InvalidBusinessRatio` → `invalid_value`、`InvalidHouseholdSplitTotal` →
+  `invalid_amount`、`Core(_)` は中身の `CoreError` へ委譲。
+- **新しく起こすのは6件だけ**: `invoice_reg_no_missing_prefix` /
+  `invoice_reg_no_wrong_length` / `invoice_reg_no_non_digit` /
+  `invoice_reg_no_check_digit` / `duplicate_tag_key` / `invalid_setting_code`。
+- **`InvalidChart` は既存の `invalid_chart` に寄せる**（下の訂正注記1）。
+- **マスタ・設定のロード失敗9件は `invalid_policy_data` に集約する**
+  （`YamlParse` / `Io` / `InvalidTaxCategoryTable` / `OverlappingTaxPeriods` /
+  `InvalidTagSchema` / `MissingClosingAccount` /
+  `NotPostableClosingAccount` / `DuplicateClosingAccount` /
+  `ClosingTagSchemaMismatch`）。
+- 応答は `ToolError` にまとめ、**`CallToolResult::structured_error`**
+  （`isError: true` + `structuredContent` + 同じ JSON のテキスト）で返す。
+
+**訂正注記1（レビュー2巡目）— `InvalidChart` を集約から外す**:
+当初は `JpError::InvalidChart` もロード失敗10件の1つとして
+`invalid_policy_data` に入れていたが、これは**この決定自身に反していた**。
+`kaikei_app::error::codes::INVALID_CHART`（`"invalid_chart"`、doc は
+「勘定科目表そのものが不正」）が既にあり、`CoreError::InvalidChart` は
+そちらに写像されている。そして `JpError::InvalidChart` は
+`ChartOfAccounts::new` が返した `CoreError::InvalidChart` を包み直したものを
+**含む**（`crates/kaikei-jp/src/chart.rs` の `from_raw` が `CoreError` の
+`Display` を `reason` に詰める）。つまり「親科目が存在しない科目表を読んだ」
+という**同一の条件**が、`kaikei-app` 経由なら `invalid_chart`、`kaikei-jp`
+直呼び（`docs/07-mcp-server.md` §4 の経路 (c)）なら `invalid_policy_data` に
+なっていた。「既に語彙がある概念に別名を作らない」に寄せて `INVALID_CHART` に
+統一する。
+
+`InvalidTagSchema` を集約に残すのは、`codes` に「タグスキーマそのものが不正」に
+相当する語彙が**無い**ため（`unknown_tag_key` / `tag_type_mismatch` はどちらも
+**入力側**の誤りを指す。同じ意味の既存語彙が無いものは集約側に残す）。
+
+**訂正注記2（レビュー2巡目）— `from_jp_error` と `from_app_error` の非対称**:
+`ToolError::from_app_error` は `AppError::public_message()` を使い、`Display` を
+線上に載せない（`Display` は `RepoError::Backend { reason }` に下位層が返した
+生の文字列——接続文字列やロール名が混じりうる——を抱えるため）。一方
+`ToolError::from_jp_error` は `JpError` の `Display` を**そのまま**線上に載せる。
+
+**この非対称は意図したものである。** `JpError` の文言は `kaikei-jp` が
+AI 向けに自分で書いたもので（有効なキー一覧・有効期間・期待する書式を含む）、
+外部クレートのメッセージを抱え込む口を持たない。言い換えは
+`docs/07-mcp-server.md` §6 が禁じている。
+
+ただし「口を持たない」は放置すると崩れる性質なので、`kaikei-mcp` 側の
+`jp_error_display_is_self_authored` が **`crates/kaikei-jp/src/error.rs` の
+ソースを読んで**、`#[error(...)]` に `{source}` を書いている／
+`#[error(transparent)]` で丸ごと委ねているバリアントの集合が、理由付きの
+明示リスト（`Io` / `YamlParse` / `Core`）と一致することを検査する。
+
+**サーバ側の情報が線上に出る唯一の例外が `JpError::Io`** で、読めなかった
+ファイルのパスを含む。運用者が直すための情報であり（`CLAUDE.md` §11）、かつ
+マスタ・設定の不備は起動時に検出して**起動を中止する**（同 §7）ため、通常
+ツール応答には現れない。
+
+**訂正注記3（レビュー2巡目）— 検査を構造で閉じる**:
+初版は次の2つが「主張はあるが検査が無い」状態だった。
+
+1. `into_call_tool_result()` を呼ぶテストが1本も無かった。
+   `CallToolResult::structured_error` を隣接する `structured`
+   （`is_error: Some(false)`）に取り違えても**全テストが緑のまま通り**、
+   結果として**全てのドメインエラーが「成功」として AI に届く**。
+   `isError == Some(true)` / `structuredContent` に本文が入ること /
+   **`content` のテキストにも本文が載ること**（構造化コンテンツを
+   モデルに見せないクライアントにも届く、という上の却下表の主張）の
+   3点を検査する。
+2. `jp_error_code` の網羅性テストが参照する `all_jp_errors()` が
+   **手書きの一覧**で、新しいバリアントに `codes::INTERNAL` を割り当てても
+   一覧に載っていない限り発火しなかった（`PROGRESS.md` Phase 1 の教訓6
+   「手で維持する一覧は必ず腐る」）。`crates/kaikei-jp/src/error.rs` を
+   `include_str!` で読んでバリアント名を抽出し、一覧と突き合わせる
+   （`crates/kaikei-jp/tests/chart_drift.rs`／D-051 と同じ手法）。
+   値を作れない `YamlParse`（`serde_norway::Error` のコンストラクタが
+   非公開）は**理由付きの除外リスト**に置く。抽出パターンが当たらなく
+   なったときに「0件を突き合わせて全件一致」で無言で通らないよう、
+   件数の下限を番人として置く。
+
+**訂正注記4（レビュー3巡目）— 訂正注記1を散文でなく検査で固定する**:
+「`JpError::InvalidChart` と `CoreError::InvalidChart` が同じコードになる」は
+訂正注記1と `docs/07-mcp-server.md` §6 の散文にしか無く、将来 `kaikei-app` 側が
+`CoreError::InvalidChart` の写像を変えれば**無言で再発**する状態だった。
+`crates/kaikei-mcp/src/error.rs` の
+`jp_and_core_invalid_chart_resolve_to_the_same_code` で、**両方の写像関数を
+実際に通してその結果が一致すること**を検査する。定数どうし
+（`codes::INVALID_CHART` と `codes::INVALID_CHART`）を比べても自明に等しい
+だけで何も固定できないので、`jp_error_code` と
+`kaikei_app::error::core_error_code` の**戻り値**を突き合わせる。
+テストは `kaikei-mcp` 側に置く（`kaikei-app` の公開契約は触らない）。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `JpError` にも層ごとの接頭辞付きコードを新しく起こす（`jp_unknown_tag_key` 等） | 層ごとの接頭辞を付けないのが D-072 の規約。AI が読むのは「何が起きたか」であって「どの crate が返したか」ではない。同じ意味に2つの綴りがあると、AI の分岐が両方を知らないと動かなくなる |
+| 登録番号の4件を1つのコード（`invalid_invoice_reg_no`）にまとめる | 検証順は「先頭文字 → 桁数 → 文字種 → チェックデジット」に固定されており、**最初に失敗した観点だけ**が返る（D-053）。1つに潰すと、AI は何を直すのかを本文の日本語から推測するしかない。分類コードを機械可読にしている意味が消える |
+| `DuplicateTagKeyInInput` を `unknown_tag_key` に寄せる | 次の手が違う（綴りを直すのではなく、重複した指定を1つにまとめる）。`invalid_entry_id` を `not_found` と分けたのと同型の判断（D-072） |
+| `InvalidChart` もロード失敗の集約（`invalid_policy_data`）に入れる | 初版はこうしていたが、`invalid_chart` が既にあり `CoreError::InvalidChart` がそちらに写像されている。`JpError::InvalidChart` はその `CoreError::InvalidChart` を包み直したものを含むので、同じ条件が経路によって2つのコードになる（訂正注記1） |
+| `from_jp_error` にも `public_message()` 相当を用意して `Display` を言い換える | `JpError` の文言は有効なキー一覧・有効期間・期待する書式を含む「次の手」そのものであり、言い換えると情報が落ちる（`docs/07-mcp-server.md` §6 が明示的に禁じている）。`AppError` と違って下位層の生メッセージを抱える口が無いことは、ソースを読む検査で維持する（訂正注記2） |
+| `all_jp_errors()` を手書きの一覧のまま運用ルールで守る | 「手で維持する一覧は必ず腐る」（`PROGRESS.md` Phase 1 教訓6 / D-047）。同じ形で3回失敗している |
+| `JpError` に `strum` 等を足してバリアントを列挙する | `kaikei-jp` に依存が1つ増える。凍結層に近い層の依存を、下流のテストの都合で増やさない（`CLAUDE.md` §1）。ソースを読む方式なら依存はゼロで済む |
+| マスタ・設定のロード失敗に新しいコード（`master_data_invalid` 等）を起こす | `PolicyError::InvalidPolicyData` が既に「policy が構築時に受け取ったデータが不正」であり、意味が一致する。**既に語彙がある概念に別名を作らない**（`docs/07-mcp-server.md` §6）。なおこれらは通常ツール応答に現れない——設定・マスタの不備は起動時に検出して起動を中止する（同 §7） |
+| ロード失敗を `internal` に潰す | `internal` は**下流が知らないバリアントに出会ったときの受け皿**であり、既知のエラーに使う値ではない（`kaikei_app::error::codes::INTERNAL` の doc） |
+| ロード失敗を `backend` に寄せる（`Io` は I/O 失敗だから） | `backend` は `RepoError::Backend`＝**永続化層**の失敗である。同梱 YAML が読めないことに対して「時間をおいて再試行するか管理者に連絡」と案内するのは誤診で、D-038 が潰したのと同じクラスの欠陥になる |
+| `jp_error_code` にワイルドカードの腕を置く | `JpError` は `#[non_exhaustive]` ではない（意図的。`kaikei-jp/src/error.rs` の doc）。受け皿があるとバリアント追加時にコンパイルが壊れず、新しいバリアントが黙って既定コードになる（D-072 訂正注記と同じ理由） |
+| 応答を `CallToolResult::error`（テキストのみ）で返す | 構造化コンテンツを読むクライアントに対して `error` / `message` を機械的に取り出す経路が無くなる。逆に `structured` だけにすると、構造化コンテンツをモデルに見せないクライアントで本文が AI に届かない。`structured_error` は**同じ JSON をテキストとしても**載せるので両方を満たす |
+| ドメインのエラーを JSON-RPC のプロトコルエラーで返す | D-071 で却下済み。プロトコルエラーを使うのは未知のツール名など、ツール呼び出しに到達できない異常に限る |
+
+**理由**: 分類コードは AI の分岐に使われる**安定した識別子**であり、
+増やすこと自体にコストがある（`audit_log.error_code` を読む側も追随が要る）。
+一方で、意味の違うものを同じコードに潰すと AI が誤った次の手に進む。
+「既存語彙を最優先で再利用し、次の手が違うものだけ新しく起こす」を判断基準にする。
+
+**トレードオフ**: `invalid_policy_data` に9バリアントが集まったため、
+このコードだけを見ても「YAML の構文エラー」なのか「決算科目の設定ミス」なのかは
+分からない。ただし区別が要るのは**運用者**であって AI ではなく、運用者向けの
+情報は `message`（`JpError` の `Display`。どのファイルの何が悪いかを含む）と
+サーバのログに残っている。
