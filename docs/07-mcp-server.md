@@ -98,8 +98,8 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 | `get_trial_balance` | **Phase 3** | 試算表。集計期間（`from`/`to`、取引日ベース・両端含む）は**必須**。`group_by` には `aggregatable: true` のタグキーのみ指定可（それ以外は `NotAggregatable`。`CLAUDE.md` §4）。`from > to` は空の試算表ではなく**エラー**（入力ミスを「0件の空の試算表」として静かに成功させない）。集計対象の通貨が単一であることを要求する（D-042） |
 | `search_entries` | **Phase 3** | 日付・金額・科目・取引先・摘要で仕訳検索。read model の新設が要る（下記） |
 | `get_ledger` | **Phase 3** | 総勘定元帳（科目別の明細）。read model の新設が要る（下記） |
-| `list_tax_categories` | **Phase 3** | 有効な税区分一覧（指定日時点）。該当する年度マスタが存在しない日付では**空配列ではなくエラー**を返し、有効期間を示す（例:「2026-01-01〜2026-12-31 のマスタのみ同梱されています。取引日を確認してください」）。`TaxRuleSets::for_date` は該当なしで `None` を返す（D-055）。**空マスタと未収録は意味が違う**——空配列を返すと AI が「この日は税区分が1つも無い」と誤解して税区分なしで記帳しようとする |
-| `get_settings` | **Phase 3** | 経理方式（`tax_mode`）／端数処理方式（`rounding`）／端数処理単位（`rounding_unit`）／課税事業者か（`is_taxable_business`）／簡易課税か（`simplified_taxation`）と、会計年度の区切り規則・帳簿通貨を返す。**日付引数を取らない**（事業者設定は起動時に一度だけ合成され、取引日に応じて変わらない。D-057）。設定が未指定ならサーバは起動に失敗するので、このツールが既定値を返すことはない（§7） |
+| `list_tax_categories` | **Phase 3** | 有効な税区分一覧（指定日時点）。該当する年度マスタが存在しない日付では**空配列ではなくエラー**を返し、有効期間を示す（例:「2026-01-01〜2026-12-31 のマスタのみ同梱されています。取引日を確認してください」）。`TaxRuleSets::for_date` は該当なしで `None` を返す（D-055）。**前工事が要る**: 有効期間を組み立てる公開 API が現状無い（`TaxRuleSets` の公開メソッドは `from_embedded` / `new` / `for_date` の3つのみで、保持する表を列挙できない。`TaxCategoryTable::range_display` は `pub(super)`）。`kaikei-jp` に列挙用の公開 API を足すこと。**空マスタと未収録は意味が違う**——空配列を返すと AI が「この日は税区分が1つも無い」と誤解して税区分なしで記帳しようとする |
+| `get_settings` | **Phase 3** | 経理方式（`tax_mode`）／端数処理方式（`rounding`）／端数処理単位（`rounding_unit`）／課税事業者か（`is_taxable_business`）／簡易課税か（`simplified_taxation`）と、会計年度の区切り規則・帳簿通貨を返す。**帳簿通貨を保持する場所は現状どこにも無い**（`BookSettings` は `fiscal_year_rule` のみ、`JpSettings` は通貨を持たない）。PR-B で追加する。**日付引数を取らない**（事業者設定は起動時に一度だけ合成され、取引日に応じて変わらない。D-057）。設定が未指定ならサーバは起動に失敗するので、このツールが既定値を返すことはない（§7） |
 | `get_statements` | Phase 4 以降 | B/S・P/L。**延期理由: D-031。** `TrialBalance` / `BalanceRow` は `kaikei-core` の外から構築できず（`GroupKey` に公開コンストラクタが無い）、DTO 経由で組み立て直す設計が要る |
 | `list_pending_transactions` | Phase 4 以降 | 未仕訳の取込明細。**延期理由: `kaikei-import` 未着手**（crate もテーブルも存在しない） |
 | `search_documents` | Phase 4 以降 | 証憑検索（日付・金額・取引先）。**延期理由: `kaikei-blob` 未着手**（`documents` / `entry_documents` は Phase 4 で設計する。`docs/03-database.md` §1 の注記） |
@@ -120,7 +120,7 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 | `attach_document` | Phase 4 以降 | 証憑を仕訳に紐付け | **延期理由: `kaikei-blob` 未着手。** 現状 `PgTx::insert_entry` は `document_refs` が非空なら `RepoError::Unsupported` を返す（D-041） |
 | `upsert_counterparty` | Phase 4 以降 | 取引先マスタ更新 | **延期理由: ポートに書き込みメソッドが無い**（`ChartRepo` は `load_chart` / `load_counterparties` のみ）。DB 権限（`GRANT ... UPDATE ON counterparties`）は既にある |
 | `upsert_journalize_rule` | Phase 4 以降 | 仕訳化ルール更新 | **延期理由: `kaikei-import` 未着手** |
-| `close_period` | Phase 4 以降 | 期間を締める | **延期理由: checksum の計算式が未確定。** 締めスナップショットの checksum は Phase 5 の `kaikei verify`（`ROADMAP.md` Phase 5）と**同一の計算式**である必要があるが、その式はどこにも定義されていない（`0007_period_snapshots.sql` は `checksum TEXT NOT NULL -- 対象仕訳のハッシュ連鎖` とコメントするのみ）。仕様が固まる前に不可逆操作を実装しない（D-070）。`confirm: true` 必須・不可逆という要件は実装時に維持する。仕様案は付録 A |
+| `close_period` | Phase 4 以降 | 期間を締める | **延期理由: 前工事が大きい。** `ROADMAP.md` の Phase 3 成果物に `close_period` は無い。実装するには `period_snapshots` の NOT NULL 列（`balances` JSONB / `entry_count` / `last_entry_no` / `checksum`）を埋める必要があり、**期間内の仕訳を列挙するポートが存在しない**（`JournalRepo` は `find_entry` / `find_reversal_of` / `insert_entry` のみ）。canonical JSON の正規化・ハッシュ連鎖・新ユースケース・append-only の権限テストが芋づるで要る。`dry_run` 応答の `pending_transactions` は Phase 4（`kaikei-import`）依存。なお **checksum の計算式自体は `docs/03-database.md` §2「checksum の計算方法」に定義済み**（`h_i = sha256(h_{i-1} || canonical_json(entry_i))`）。ただし `canonical_json` が対象とする仕訳の JSON 形は未定義であり、Phase 5 の `kaikei verify` と揃える必要がある（D-070）。`confirm: true` 必須・不可逆という要件は実装時に維持する。仕様案は付録 A |
 
 **勘定科目マスタの投入は MCP ツールではない。**
 `kaikei-app` に専用のユースケースを新設して行う（D-070）。
@@ -145,16 +145,22 @@ execute_sql            ← D-014
 reopen_period          ← 締めの取り消しを行う経路は現時点で提供しない
 ```
 
-これは「Phase 4 以降に回す」ではなく、**将来も作らない**という意味である
-（D-014）。テストで機械的に不在を検査する（§9 MC-10）。
+上の4件は理由が同じではない。**混ぜないこと。**
 
-`reopen_period` について: 締め（`close_period`）自体が Phase 4 以降であり、
-締めの取り消し手段は**CLI を含めて存在しない**（リポジトリのバイナリは
+- `delete_journal_entry` / `update_journal_entry` / `execute_sql` は
+  **D-014 により将来も作らない。** 「Phase 4 以降に回す」ではない
+- `reopen_period` は **D-014 の対象ではない**（D-014 の決定文が名指しするのは
+  削除・更新・SQL 実行の3件）。締め（`close_period`）自体が Phase 4 以降なので
+  **今は作りようがない**、というだけ。取り消し手段を設けるかどうかは
+  `close_period` を実装する Phase で決める
+
+いずれも Phase 3 では**存在しない**ことをテストで機械的に検査する（§10 MC-10）。
+
+締めの取り消しの現状: 手段は**CLI を含めて存在しない**（リポジトリのバイナリは
 `crates/kaikei-store/src/bin/kaikei-migrate.rs` のみ。`kaikei-cli` は存在しない）。
 `period_snapshots` は `kaikei_app` に `SELECT, INSERT` しか付与されていないため
 （`0007_period_snapshots.sql`）、仮に CLI を作っても `kaikei_app` 接続では取り消せず、
-DB 所有者権限での手動操作以外に手段は無い。取り消し手段を設けるかどうかは
-`close_period` を実装する Phase で改めて決める。
+DB 所有者権限での手動操作以外に手段は無い。
 
 ---
 
@@ -196,7 +202,9 @@ DB 所有者権限での手動操作以外に手段は無い。取り消し手�
   `RepoError::Unsupported` で拒否する（D-041）。
 - `tags` の**値の型付けは未確定**。`TagSet` の値は型付き（`TagValue::Code/Text/Decimal/Date`）
   だが、平文文字列から `TagValue` を作るにはキーごとの `value_type` が要り、
-  `TagSchema` は `defs` が private で公開 API は `validate` / `is_aggregatable` のみ。
+  `TagSchema` の `defs` は private で、公開 API は `new` / `empty` / `validate` /
+  `is_aggregatable` の4つ。**既存の `TagSchema` からキーの `value_type` を引き戻す
+  手段が無い**（`new` は組み立て用で、逆引きには使えない）。
   PR-B で次のいずれかに決める:
   (a) `kaikei-jp::tags::load_*` が `TagSchema` と併せて `Vec<(TagKey, TagDef)>` を返す
   （`kaikei-core` を変更せずに済む最小案）、
@@ -230,6 +238,12 @@ DB 所有者権限での手動操作以外に手段は無い。取り消し手�
 ```
 
 - `entry_id` は **UUID の正準表記**（ハイフン付き36文字。生成は UUID v7）。
+
+  **未解決（PR-B で直す）**: `reverse_journal_entry` の NotFound だけはこの契約を破る。
+  `kaikei-app` が `format!("仕訳が見つかりません（仕訳ID: {}）", input.original_id.as_u128())`
+  と組み立てており（`crates/kaikei-app/src/usecase/reverse_entry.rs`）、AI が送った UUID 文字列と
+  突き合わせられない39桁の10進数が返る。**app 層のエラーをそのまま写像するだけでは
+  MC-14 を満たせない。**
   `EntryId` の内部表現は `u128` だが、`as_u128()` の10進表記では返さない。
   `reverse_journal_entry` の `original_id` も同じ表記。
 - `entry_no` / `fiscal_year` は JSON number（金額ではないため文字列にしない。§5）。
@@ -329,7 +343,7 @@ JSON-RPC のエラー応答は使わない。D-071）：
 ```json
 {
   "error": "already_reversed",
-  "message": "この仕訳は既に訂正済みです（元仕訳 No.42 / 逆仕訳 No.43）。同じ仕訳を再度訂正する場合は allow_double_reversal: true を指定してください。"
+  "message": "仕訳 42 は既に取消（逆仕訳 43）済みです。二重取消を許可する場合は allow_double_reversal を指定してください"
 }
 ```
 
@@ -400,7 +414,7 @@ JSON-RPC のエラー応答は使わない。D-071）：
   `.sqlx` オフラインキャッシュの再生成が要る
   （`.github/workflows/database.yml` の `cargo sqlx prepare --workspace --check`）。
 - `kaikei-app` の**勘定科目マスタ投入ユースケース**（D-070）。
-- **audit_log 書き込みポート**（§8）。
+- **audit_log 書き込みポート**（§9）。
 - `post_entry::execute` の戻り値拡張（`PolicyNote` を返す。§3）。
 
 ### ディレクトリ構成
@@ -410,7 +424,7 @@ kaikei-mcp/src/
 ├── main.rs               起動（設定ロード → 合成 → stdio サーバ）
 ├── startup.rs            合成ルート。kaikei_jp::compose::compose + PgStore の結線
 ├── config.rs             事業者設定の読み込みと必須検証（欠けていたら起動失敗。§7）
-├── audit.rs              audit_log。別コネクション・2回書き・fail-closed/fail-open（§8）
+├── audit.rs              audit_log。別コネクション・2回書き・fail-closed/fail-open（§9）
 ├── amount.rs             §5 の金額文字列 ⇄ Money 変換を1箇所に閉じる
 ├── server.rs             tool_router の合成、rmcp の ServerHandler 実装
 ├── error.rs              AppError → CallToolResult::error（isError: true）への変換（§6）
@@ -564,7 +578,7 @@ JSON-RPC のプロトコルエラー（rmcp では `Err(ErrorData)`）は使わ�
 `AppError` → `error` コードの対応表を1箇所に持つ。写像元は次の3つ:
 
 - `AppError`（`Repo` / `Policy` / `Core` / `AlreadyReversed` / `Inconsistent` / `Rejected`）
-- `CoreError`（16 バリアント）
+- `CoreError`（15 バリアント）
 - `PolicyError`（8 バリアント）
 
 `AppError` は `#[non_exhaustive]` なので、**網羅 `match` ではなく `_ =>` の受け皿を
@@ -856,7 +870,7 @@ CREATE INDEX ON audit_log (occurred_at);
 
 | # | ケース | 状態 |
 |---|---|---|
-| MC-06 | `close_period` を confirm なし → dry_run | **Phase 4 以降に延期**（checksum の計算式が Phase 5 の `kaikei verify` と同一である必要があり、仕様確定前に不可逆操作を実装しない。D-070） |
+| MC-06 | `close_period` を confirm なし → dry_run | **Phase 4 以降に延期**（期間内の仕訳を列挙するポートが無く前工事が大きい。D-070） |
 | MC-07 | `close_period` を confirm あり → 締まる | 同上 |
 | MC-08（旧） | `suggest_journal_entry` の reasoning が空でない | **Phase 4 で復活**（`kaikei-import` 未着手。MC-08 は `suggest_tax_category` に差し替えた） |
 

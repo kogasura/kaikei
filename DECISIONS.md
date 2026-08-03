@@ -2215,7 +2215,7 @@ Phase 3 では MCP に登録しない（登録しないツールは AI からは
 | 延期するツール | 延期理由 |
 |---|---|
 | `get_statements` / `explain_balance` | `TrialBalance` / `BalanceRow` を `kaikei-core` の外から構築できない（D-031。`GroupKey` に公開コンストラクタが無い） |
-| `close_period` | 締めスナップショットの `checksum` が Phase 5 の `kaikei verify` と**同一の計算式**である必要があるが、その式が未定義（`0007_period_snapshots.sql` は「対象仕訳のハッシュ連鎖」とコメントするのみ）。仕様が固まる前に不可逆操作を実装しない |
+| `close_period` | `ROADMAP.md` の Phase 3 成果物に無い。`period_snapshots` の NOT NULL 列を埋めるには**期間内の仕訳を列挙するポートが必要だが存在しない**（`JournalRepo` は find/insert のみ）。canonical JSON 正規化・ハッシュ連鎖・新ユースケース・権限テストが芋づるで要り、`dry_run` の `pending_transactions` は Phase 4 依存。**checksum の計算式自体は `docs/03-database.md` §2 に定義済み**だが、`canonical_json` が対象とする仕訳の JSON 形は未定義で、Phase 5 の `kaikei verify` と揃える必要がある |
 | `list_pending_transactions` / `journalize_transaction` / `ignore_transaction` / `upsert_journalize_rule` / `suggest_journal_entry` | `kaikei-import` が未着手（crate もテーブルも存在しない） |
 | `search_documents` / `attach_document` | `kaikei-blob` が未着手（`documents` / `entry_documents` は Phase 4 で設計する） |
 | `upsert_counterparty` | `ChartRepo` に書き込みメソッドが無い（DB 権限は既にある） |
@@ -2249,7 +2249,7 @@ Phase 3 では MCP に登録しない（登録しないツールは AI からは
 
 | 候補 | 却下理由 |
 |---|---|
-| `docs/07-mcp-server.md` の22ツールをそのまま Phase 3 の対象として実装する | 半数は依存する crate（`kaikei-import` / `kaikei-blob`）もテーブルも存在せず、`get_statements` / `explain_balance` は D-031 により core の外から `TrialBalance` を構築できないため原理的に実装できない。ROADMAP の「読み取り系ツール全部」と表を併読した実装者が、必ず実装不能なツールに着手する |
+| `docs/07-mcp-server.md` の22ツールをそのまま Phase 3 の対象として実装する | 半数は依存する crate（`kaikei-import` / `kaikei-blob`）もテーブルも存在せず、`get_statements` / `explain_balance` は D-031 により core の外から `TrialBalance` を構築できず、`StatementPolicy` へ橋を架けるには core の公開 API 拡大（`CLAUDE.md` §9 により人間の承認が要る）か、集約を全部ロードする形（`CLAUDE.md` §6 が戒める）しかない。ROADMAP の「読み取り系ツール全部」と表を併読した実装者が、必ず実装不能なツールに着手する |
 | 延期するツールの節・行を設計書から**削除**する | 「なぜ無いのか」が失われ、後の実装者が善意で復活させる。とくに `suggest_journal_entry` の「`reasoning` と `similar_entries` を必須にする」という設計意図は、このプロジェクトの差別化そのものであり、消すと再発明できない。**残したうえで Phase を明記する**方が安全 |
 | `close_period` を Phase 3 に入れ、`checksum` は暫定の式で実装しておく | 締めは不可逆操作であり、後から式を変えると**既に締めた記録を検証できなくなる**。`kaikei verify`（Phase 5）と式が一致しない締めスナップショットは、検証機能から見れば「壊れた記録」と区別できない |
 | `search_entries` / `get_ledger` を Phase 5 に送り（`query/mod.rs` の現行注記に従う）、Phase 3 は `get_trial_balance` だけにする | Phase 3 は「自分の帳簿を付け始める」ドッグフーディングの起点（`ROADMAP.md`）であり、記帳した仕訳を引けないと記帳の誤りに気づけない。検索と元帳が無い状態で帳簿を付け始めるのは、`post` の誤りを検出する手段を持たないまま運用を始めることを意味する |
