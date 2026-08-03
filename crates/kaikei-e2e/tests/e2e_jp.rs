@@ -34,8 +34,9 @@
 mod common;
 
 use kaikei_app::context::{BookSettings, FiscalYearRule};
-use kaikei_app::ports::{IdGenerator, JournalRepo};
+use kaikei_app::ports::{ChartRepo, IdGenerator, JournalRepo};
 use kaikei_app::tx::{with_tx, with_tx_err};
+use kaikei_app::usecase::import_chart;
 use kaikei_app::usecase::post_entry::{self, PostEntryFailure, PostEntryInput, PostEntryOutput};
 use kaikei_app::usecase::report::{self, ReportInput};
 use kaikei_core::{
@@ -51,7 +52,6 @@ use kaikei_jp::tax::{
     JpSettingsOverrides, TaxCategory, TaxCategoryTable, TaxDirection, TaxRuleSets,
 };
 use kaikei_policy::{ClosingPolicy, CounterpartyIndex, StatementPolicy, TaxContext, TaxPolicy};
-use kaikei_store::convert::account_type_to_i16;
 use kaikei_store::pool::PgStore;
 use kaikei_store::query::PgTrialBalanceQuery;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -128,62 +128,42 @@ fn default_compose_options() -> ComposeOptions {
     }
 }
 
-/// `chart` の全科目を `accounts` テーブルに投入する（`migrator` ロールで行う）。
+/// `chart` の全科目を `accounts` テーブルに投入する。
 ///
 /// `post_entry::execute` は `tx.load_chart()` で DB を読むため、コード内で
-/// `ChartOfAccounts` を組み立てて渡すだけでは記帳できない。親科目コードの
-/// 参照（`parent_code`）が科目コードの辞書順と一致しない科目表でも壊れない
-/// よう、まず全科目を `parent_code = NULL` で投入してから、`parent` を持つ
-/// 科目だけ2パス目で `UPDATE` する（同梱の `sole_proprietor.yaml` は
-/// フラットな科目表なので実際には2パス目は素通りする）。
+/// `ChartOfAccounts` を組み立てて渡すだけでは記帳できない。
+///
+/// # ★テスト用シードと本番の投入経路を二重管理にしない★
+///
+/// PR-E 以前、この関数は `migrator` ロールで生 SQL（2パスの INSERT +
+/// UPDATE）を発行していた。本番の合成ルートは `kaikei_app` ロールで繋ぐ
+/// （`docs/07-mcp-server.md` §8）ため、**その経路は本番では使えず、
+/// 「テストは通るのに本番では1件も記帳できない」を許してしまう形**だった
+/// （`DECISIONS.md` D-070 の決定2）。
+///
+/// PR-E で `kaikei_app::usecase::import_chart` を新設したので、この
+/// フィクスチャは**本番と同じ経路をそのまま呼ぶ**（`DECISIONS.md` D-047
+/// 「手で維持する一覧・複製は腐る」/ D-081）。したがって既存の各 E2E
+/// テストは「本番の投入経路を通した後に記帳が通る」ことの証明も兼ねる。
 async fn seed_chart(pool: &PgPool, chart: &ChartOfAccounts) {
-    // 科目1件ずつ INSERT すると、同梱の科目表（約60件）でテストごとに
-    // 60往復する。`kaikei-store` の明細一括 INSERT（`DECISIONS.md` D-040）と
-    // 同じく UNNEST で1文にまとめる。
-    //
-    // 2パスに分けるのは `accounts.parent_code` が `accounts(code)` への
-    // 自己参照 FK を持つため（親より先に子を入れると FK 違反になる）。
-    // 1パス目は親を NULL で入れ、2パス目でまとめて更新する。
-    let codes: Vec<String> = chart.iter().map(|d| d.code.as_str().to_string()).collect();
-    let names: Vec<String> = chart.iter().map(|d| d.name.clone()).collect();
-    let types: Vec<i16> = chart
-        .iter()
-        .map(|d| account_type_to_i16(d.account_type))
-        .collect();
-    let postables: Vec<bool> = chart.iter().map(|d| d.postable).collect();
-
-    sqlx::query(
-        "INSERT INTO accounts (code, name, account_type, parent_code, postable)          SELECT code, name, account_type, NULL, postable          FROM UNNEST($1::text[], $2::text[], $3::smallint[], $4::bool[])               AS t(code, name, account_type, postable)",
-    )
-    .bind(&codes)
-    .bind(&names)
-    .bind(&types)
-    .bind(&postables)
-    .execute(pool)
+    let store = PgStore::new(pool.clone());
+    let outcome = with_tx(&store, |tx| {
+        let chart = chart.clone();
+        Box::pin(async move { import_chart::execute(tx, &chart).await })
+    })
     .await
-    .unwrap_or_else(|e| panic!("accounts の一括投入に失敗しました: {e}"));
+    .unwrap_or_else(|e| panic!("勘定科目マスタの投入に失敗しました: {e}"));
 
-    let child_codes: Vec<String> = chart
-        .iter()
-        .filter(|d| d.parent.is_some())
-        .map(|d| d.code.as_str().to_string())
-        .collect();
-    if child_codes.is_empty() {
-        return;
-    }
-    let parent_codes: Vec<String> = chart
-        .iter()
-        .filter_map(|d| d.parent.as_ref().map(|p| p.as_str().to_string()))
-        .collect();
-
-    sqlx::query(
-        "UPDATE accounts SET parent_code = t.parent_code          FROM UNNEST($1::text[], $2::text[]) AS t(code, parent_code)          WHERE accounts.code = t.code",
-    )
-    .bind(&child_codes)
-    .bind(&parent_codes)
-    .execute(pool)
-    .await
-    .unwrap_or_else(|e| panic!("accounts.parent_code の一括更新に失敗しました: {e}"));
+    assert_eq!(
+        outcome.inserted_rows,
+        chart.iter().count(),
+        "空のテストDBなので全科目が投入されるはず"
+    );
+    assert!(
+        outcome.kept_existing.is_empty(),
+        "空のテストDBに既存科目との差異は発生しないはず: {:?}",
+        outcome.kept_existing
+    );
 }
 
 /// 明細を1行組み立てる。
@@ -260,7 +240,7 @@ async fn condition_1_exclusive_accounting_generates_tax_line_on_taxable_sale(
 ) {
     let roles = common::roles(pool_opts, conn_opts).await;
     let composition = compose(default_compose_options()).unwrap();
-    seed_chart(&roles.migrator, &composition.chart).await;
+    seed_chart(&roles.app, &composition.chart).await;
 
     let store = PgStore::new(roles.app.clone());
     let ids = Arc::new(SequentialIdGenerator::starting_at(1));
@@ -325,7 +305,7 @@ async fn condition_2_reduced_rate_tax_free_and_out_of_scope_categories_are_handl
 ) {
     let roles = common::roles(pool_opts, conn_opts).await;
     let composition = compose(default_compose_options()).unwrap();
-    seed_chart(&roles.migrator, &composition.chart).await;
+    seed_chart(&roles.app, &composition.chart).await;
 
     let store = PgStore::new(roles.app.clone());
     let ids = Arc::new(SequentialIdGenerator::starting_at(1));
@@ -403,7 +383,7 @@ async fn condition_3_non_qualified_transitional_measure_is_expressed_in_yaml(
 ) {
     let roles = common::roles(pool_opts, conn_opts).await;
     let composition = compose(default_compose_options()).unwrap();
-    seed_chart(&roles.migrator, &composition.chart).await;
+    seed_chart(&roles.app, &composition.chart).await;
 
     let store = PgStore::new(roles.app.clone());
     let ids = Arc::new(SequentialIdGenerator::starting_at(1));
@@ -497,7 +477,7 @@ async fn condition_4_household_split_produces_a_three_line_entry(
 ) {
     let roles = common::roles(pool_opts, conn_opts).await;
     let composition = compose(default_compose_options()).unwrap();
-    seed_chart(&roles.migrator, &composition.chart).await;
+    seed_chart(&roles.app, &composition.chart).await;
 
     let store = PgStore::new(roles.app.clone());
     let ids = Arc::new(SequentialIdGenerator::starting_at(1));
@@ -605,7 +585,7 @@ async fn condition_5_yearly_master_switch_is_based_on_entry_date(
     let mut options = default_compose_options();
     options.rule_sets = rule_sets;
     let composition = compose(options).unwrap();
-    seed_chart(&roles.migrator, &composition.chart).await;
+    seed_chart(&roles.app, &composition.chart).await;
 
     let store = PgStore::new(roles.app.clone());
     let ids = Arc::new(SequentialIdGenerator::starting_at(1));
@@ -702,7 +682,7 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     let composition = compose(default_compose_options()).unwrap();
 
     // 1. 科目表をDBに投入する。
-    seed_chart(&roles.migrator, &composition.chart).await;
+    seed_chart(&roles.app, &composition.chart).await;
 
     let store = PgStore::new(roles.app.clone());
     let ids = Arc::new(SequentialIdGenerator::starting_at(1));
@@ -928,5 +908,144 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
         income_statement.total.is_zero(),
         "決算振替後の当期純利益は0になっているはず: {:?}",
         income_statement.total
+    );
+}
+
+// ---- Phase 3 PR-E: 勘定科目マスタの投入経路 ----
+
+/// PR-E: 本番の投入経路（`import_chart::execute`）を**2回**流しても2回目は
+/// 1行も追加されず、そのうえで実際に記帳が通る。
+///
+/// # なぜこのテストが要るのか
+///
+/// 合成ルート（`kaikei-mcp`）は**起動のたびに**投入経路を通る。「2回目の
+/// 起動で科目が重複する」「2回目の起動で科目名がテンプレートに戻る」の
+/// どちらも会計上の実害になる（`DECISIONS.md` D-081）。
+///
+/// あわせて、`PROGRESS.md` Phase 2 の教訓2「構築は通るが記帳できない」への
+/// 直接の回答として、**投入した後に `post_entry::execute` が通る**ところまでを
+/// 1つのテストで見る（他の各テストも `seed_chart` 経由で同じ経路を通るが、
+/// 「2回目」を踏むのはこのテストだけ）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn chart_import_is_idempotent_and_posting_still_works(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    let composition = compose(default_compose_options()).unwrap();
+    let store = PgStore::new(roles.app.clone());
+
+    // 1回目（`seed_chart` が全件投入されたことまで検証する）。
+    seed_chart(&roles.app, &composition.chart).await;
+
+    // 2回目。同じテンプレートをもう一度流す＝サーバの再起動に相当する。
+    let second = with_tx(&store, |tx| {
+        let chart = composition.chart.clone();
+        Box::pin(async move { import_chart::execute(tx, &chart).await })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(second.inserted_rows, 0, "2回目に追加が起きてはいけない");
+    assert!(second.inserted.is_empty());
+    assert_eq!(
+        second.unchanged,
+        composition.chart.iter().count(),
+        "2回目は全件が「変更なし」になるはず"
+    );
+    assert!(
+        second.kept_existing.is_empty(),
+        "テンプレートと DB の内容が一致しているので差異は無いはず: {:?}",
+        second.kept_existing
+    );
+
+    // 科目が重複していないこと（DB から読み直して件数で見る）。
+    let reloaded = with_tx(&store, |tx| {
+        Box::pin(async move { Ok(tx.load_chart().await?) })
+    })
+    .await
+    .expect("load_chart が失敗しないこと");
+    assert_eq!(reloaded.iter().count(), composition.chart.iter().count());
+
+    // そして実際に記帳が通る（税抜経理・課税事業者なので税額行が付く）。
+    let ids = Arc::new(SequentialIdGenerator::starting_at(1));
+    let posted = run_post_entry(
+        &store,
+        composition.tax_policy.clone(),
+        composition.tag_catalog.schema().clone(),
+        ids,
+        PostEntryInput {
+            entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
+            description: "投入経路を2回通した後の記帳".to_string(),
+            lines: vec![
+                line("135", Side::Debit, 110_000, TagSet::new()),
+                line("500", Side::Credit, 100_000, tags_with_category("SALES_10")),
+            ],
+            auto_tax_lines: true,
+        },
+    )
+    .await
+    .expect("投入後は記帳が通るはず")
+    .entry;
+
+    assert_eq!(posted.lines().len(), 3, "入力2行 + 税額行1行のはず");
+    assert!(find_entry(&store, posted.id()).await.is_some());
+}
+
+/// PR-E: 既存の科目定義がテンプレートと異なっていても、投入経路は
+/// **上書きせず既存を残す**（ユーザーが編集した科目名が起動のたびに
+/// 消えない。`DECISIONS.md` D-081）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn chart_import_never_overwrites_a_user_edited_account_name(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    let composition = compose(default_compose_options()).unwrap();
+    let store = PgStore::new(roles.app.clone());
+
+    seed_chart(&roles.app, &composition.chart).await;
+
+    // ユーザーが科目名を編集した状態を作る。`accounts` は帳簿本体と違い
+    // append-only ではなく、`kaikei_app` に UPDATE 権限がある
+    // （`0002_accounts.sql`）。編集経路そのもの（ツール）は Phase 4 以降だが、
+    // 「編集された後にサーバを再起動する」状況はここで再現できる。
+    sqlx::query("UPDATE accounts SET name = $1 WHERE code = $2")
+        .bind("現金（手許）")
+        .bind("100")
+        .execute(&roles.app)
+        .await
+        .expect("accounts の科目名を編集できること");
+
+    let outcome = with_tx(&store, |tx| {
+        let chart = composition.chart.clone();
+        Box::pin(async move { import_chart::execute(tx, &chart).await })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.inserted_rows, 0);
+    assert_eq!(outcome.kept_existing.len(), 1);
+    let diff = &outcome.kept_existing[0];
+    assert_eq!(diff.code.as_str(), "100");
+    assert_eq!(diff.fields, vec!["name"]);
+    assert!(
+        diff.describe().contains("現金（手許）"),
+        "診断に既存の内容が出るはず: {}",
+        diff.describe()
+    );
+
+    // 編集した名称が残っている（テンプレートで戻されていない）。
+    let reloaded = with_tx(&store, |tx| {
+        Box::pin(async move { Ok(tx.load_chart().await?) })
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        reloaded
+            .get(&AccountCode::parse("100").unwrap())
+            .unwrap()
+            .name,
+        "現金（手許）"
     );
 }
