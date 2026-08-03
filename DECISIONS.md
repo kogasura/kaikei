@@ -2230,6 +2230,8 @@ Phase 3 では MCP に登録しない（登録しないツールは AI からは
    （`kaikei-store/src/query/{search,ledger,entry_detail}.rs`）を Phase 3 で新設し、
    `crates/kaikei-store/src/query/mod.rs` の「Phase 5 で実装する」という注記を
    Phase 3 に直す。
+   → **`entry_detail.rs` は新設しない**（下の訂正注記1。`get_entry` は
+   `JournalRepo::find_entry` で足りる）。**この項をそのまま実装しないこと。**
 2. **勘定科目マスタの投入は MCP ツールにしない。** `kaikei-app` に専用の
    ユースケースを新設して行う（`ChartRepo` の doc が言う「マスタの編集は本 crate
    のユースケースの対象外」はこの範囲で改める）。現状これが無いため
@@ -2270,6 +2272,29 @@ Phase 3 の作業量は大きい。ただしこれは見積もりが実態に合
 染み出す（`CLAUDE.md` §1・§6 の違反）ため、先に置き場を決める方を選んだ。
 また audit_log の2行構成は書き込み回数が倍になるが、単一ユーザー・自己ホスト
 前提（D-015）の規模では問題にならないと判断した。
+
+### 訂正注記1（Phase 3 PR-H）: `entry_detail.rs` は**新設しない**
+
+上の**決定1** は read model の置き場として
+`kaikei-store/src/query/{search,ledger,entry_detail}.rs` の**3本**を挙げているが、
+**`entry_detail.rs` は作らない。** PR-H で新設したのは `search.rs` と
+`ledger.rs` の2本である。
+
+理由: `get_entry`（仕訳1件の取得）は**既存の `JournalRepo::find_entry` で足りる**。
+read model は「Repository を通さず SQL から DTO へ直行する」ための層であって
+（`CLAUDE.md` §6）、集計も結合も要らない単一集約の取得はドメインモデルを
+そのまま返せばよい。read model を作ると、同じ仕訳の復元経路が
+`JournalRepo` と `entry_detail` の2つになり、**片方だけ直る**という形の
+食い違いが生まれる（タグの復元・通貨の復元・`reverses` の扱いが典型）。
+
+**この訂正注記が無いと事故が再発する。** `get_entry` を実装するのは PR-G で
+あり、PR-H とは別の実装者が D-070 を読む。決定記録が
+「`entry_detail.rs` を新設する」と書いたままだと、そのとおりに作られる——
+これは `PROGRESS.md` Phase 2 の教訓1「**設計書が却下済みの設計を後続の
+実装者に指示する**」そのものである（PR-H レビュー C-4）。
+
+同じ訂正は `docs/07-mcp-server.md` §4「Phase 3 で新設が必要なもの」と
+`crates/kaikei-store/src/query/mod.rs` にも入れてある。
 
 ---
 
@@ -3903,6 +3928,10 @@ target ディレクトリのロックで詰まりうるので、テストは tar
 
    いずれも `Option` であり、**該当しないときはキーごと出さない**
    （`null` を置くと「取り消されていない」と「情報が無い」の区別が曖昧になる）。
+   **3つとも `search_entries` と `get_ledger` の両方に出す**
+   （`reverse_reason` は当初 `get_ledger` に無く、赤伝の行を見た読み手が
+   「なぜ取り消されたか」を `search_entries` に引き直さないと読めなかった。
+   PR-H レビュー D-2 で `LedgerRowView` にも足した）。
    DTO は `kaikei_app::view::{EntrySummaryView, LedgerRowView, ReversalRef}`。
    同じ規律をツールの説明文（`tools/list` に出る `DESCRIPTION`）にも書く:
    「取り消し済みの仕訳には `reversed_by` が付くので、それをもう一度訂正しないでください」。
@@ -3913,6 +3942,22 @@ target ディレクトリのロックで詰まりうるので、テストは tar
    検証は `kaikei_app::usecase::search_entries::execute` が SQL 到達前に行い、
    `get_trial_balance` の `group_by` と**同じ関数**
    （`TagSchema::is_aggregatable`）を引く。
+
+3. **勘定科目マスタに無い科目コードは、`search_entries` の `account` でも
+   `not_found` で拒否する**（PR-H レビュー C-3）。
+
+   | 状況 | 応答 | 呼び出し元の次の手 |
+   |---|---|---|
+   | 実在する科目に該当が無い | **0件の成功**（`entries: []`） | 期間や条件を広げる |
+   | 科目コードが勘定科目マスタに無い | **`not_found` のエラー** | `list_accounts` でコードを調べ直す |
+
+   初版は `get_ledger` だけがこの区別をしており、`search_entries` は同じ
+   打ち間違い（`"690"` と `"609"`）を**空の成功**にしていた。
+   **この PR 自身が繰り返し書いている「打ち間違いと『取引が無い』は次の手が
+   違う」という規律が、2つのツールで食い違っていた。**
+   判定は read model（`crates/kaikei-store/src/query/search.rs` の
+   `ensure_account_exists`）に置き、文言も `ledger.rs` と同じにする
+   （同じ打ち間違いに違う案内を返さない）。
 
 **却下した選択肢**:
 
@@ -3934,8 +3979,29 @@ target ディレクトリのロックで詰まりうるので、テストは tar
 
 SQL 側では `LEFT JOIN LATERAL ... LIMIT 1` で赤伝を1件だけ引く。素朴な
 `LEFT JOIN` にしないのは、`allow_double_reversal` により**同じ仕訳に対する
-赤伝が2件以上ありうる**ためで、そのまま結合すると検索結果に同じ仕訳が
-2行現れる（総件数も狂う）。
+赤伝が2件以上ありうる**ためで、そのまま結合すると行が増える。
+
+**壊れ方を正確に書く**（PR-H レビュー D-3。初版は「総件数も狂う」と
+書いていたが**誤り**である）。総件数（`total_matches`）は `matched` の CTE
+から数えており**結合より前**なので狂わない。`get_ledger` の `total_lines` も
+別の SQL 文で求めているので狂わない。狂うのは**行の側だけ**である:
+
+| ツール | 素朴な `LEFT JOIN` にしたときの実際の壊れ方 |
+|---|---|
+| `search_entries` | `page` が同じ仕訳を2行返し、明細をまとめて引く `load_lines` が2行目に明細を渡せず **`RepoError::Corrupt`**（応答は `{"error":"corrupt"}`）になる |
+| `get_ledger` | 同じ明細が2行出て、`rows` の数が `total_lines` と食い違う（残高の累計もその行の分だけずれる） |
+
+どちらも「総件数が違う」より**気づきにくい**。前者は正常なサーバを
+「壊れている」と誤診させ（D-038 の誤診クラス）、後者は行と合計が
+食い違ったまま**成功**として返る。
+
+**この壊れ方は検査で押さえてある**（PR-H レビュー C-2）。二重訂正された
+仕訳を差分テストの土台（`crates/kaikei-store/tests/search_ledger_differential.rs`
+の `seed`。科目 700）と e2e の土台
+（`crates/kaikei-e2e/tests/mcp_search_ledger.rs` の `post_sample_entries`。
+科目 620）に1件ずつ置いてある。素朴な `LEFT JOIN` に戻すと差分テストが
+7本落ちる（実測）。**土台に二重訂正が1件も無いと、この退行は全テスト緑の
+まま通る。**
 
 **理由**（決定2）: 規則を1つに保つ。緩める方向（後から絞り込み専用の宣言を
 足す）は非破壊的に行えるが、いったん自由にしたものを絞るのは破壊的変更になる。
@@ -3969,14 +4035,62 @@ SQL 側では `LEFT JOIN LATERAL ... LIMIT 1` で赤伝を1件だけ引く。素
    `total_matches`（`get_ledger` は `total_lines`）/ `returned` /
    `has_more` / `next_cursor` / `truncation_note` の5つを返す。
    続きが無いときは `next_cursor` と `truncation_note` をキーごと出さない。
+   `truncation_note` は**何が件数を決めたのか**を述べる——呼び出し元の
+   `limit` で切れたのか、サーバの上限で切れたのかで**次の手が違う**
+   （前者は `limit` を上げれば1回で取れる。後者は条件を絞るかカーソルで
+   辿るしかない）。初版は上限だけを述べていたため、`limit: 1` で呼んだ側に
+   「1回に返す上限は 100 件です」としか返らず、**自分の指定で切れたことが
+   読み取れなかった**（PR-H レビュー D-4）。
 4. **壊れたカーソルは「先頭から」にフォールバックせず拒否する**
    （`rejected`。本文は「直前の応答の next_cursor をそのまま渡してください」）。
 5. `get_ledger` の合計（`opening_balance` / `debit_total` / `credit_total` /
    `closing_balance` / `total_lines`）は**ページではなく期間全体**の値である。
    行ごとの `running_balance` は期首残高からの累計なので、2ページ目の先頭行の
    残高も正しい（ウィンドウ関数をカーソルで絞る**前**に計算する）。
+6. **読み取り系の `audit_log.output` は応答本文ではなく要約にする**
+   （PR-H レビュー C-5）。要約は応答本文から**明細（`entries` / `rows`）と
+   説明文（`truncation_note`）を落とした残り**であり、問い合わせ条件・
+   期間全体の合計・件数（`total_matches` / `total_lines` / `returned` /
+   `has_more`）・読み終わった位置（`next_cursor`）は残る。
+   **書き込み系は応答本文をそのまま残す**（既定）。
+   実装は `kaikei_mcp::dispatch::ToolSuccess::with_audit_summary` で、
+   要約は各ツールが応答本文から導く（別に組み立てないので値が食い違わない）。
+
+**理由**（決定6）: 監査ログにおける読み取りの目的は
+「**誰がいつ何を読んだか**」であり、**返した内容そのものは
+(問い合わせ条件 = `audit_log.input` + その時点の帳簿) から再現できる**。
+帳簿は追記のみ（`CLAUDE.md` §2）なので、過去の時点の状態は
+`recorded_at` を使って再構成できる。書き込み系は逆で、**結果そのものが
+変更の記録**（どの仕訳がどの明細で確定したか）なので縮めない。
+**この非対称は意図的である。**
+
+規模の実測（PR-H レビュー C-5 の指摘と、`kaikei-e2e` の
+`a_read_records_a_summary_in_the_audit_log_while_a_write_records_the_whole_body`）:
+
+| 呼び出し | 応答本文 | `audit_log.output` |
+|---|---|---|
+| `search_entries`（8件） | 3,307 バイト | **49 バイト** |
+| `get_ledger`（3行） | 1,327 バイト | **262 バイト** |
+
+本文は件数に比例して伸びる（上限の 100 件 / 500 行まで返すと1回で
+数十〜百数十 KB）が、要約は**件数に依らず一定**である。しかも
+**読み取りは AI が最も多く呼ぶ操作**であり、`audit_log` は append-only で
+消せない（D-075）。
 
 **却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 読み取り系も本文をそのまま残す | 上の実測のとおり `audit_log` が帳簿本体より速く膨らむ。しかも増える分は**帳簿から再現できる情報の複製**である |
+| 読み取り系は `audit_log` に記録しない（開始レコードだけ、または行を残さない） | `ROADMAP.md` Phase 3 の完了条件は「**全操作**が audit_log に記録される」。「誰がいつ何を読んだか」は監査の主目的そのもので、これを落とすと読み取りの記録が消える |
+| 本文を N バイトで切り詰めて残す | 切れた JSON は再パースできず、**壊れた記録**になる。しかも「切ったこと」を記録側から読み取れない——本 PR が応答について繰り返し避けている無言の truncation を、監査ログの中でやることになる |
+| 要約をツールとは別に組み立てる（`audit_summary` を独自に構成する） | 応答と要約で値が食い違いうる（`total_matches` が2箇所で計算される）。応答本文から**落とす**形にすれば、残った値は定義上一致する |
+
+**トレードオフ**（決定6）: 「AI に何を見せたか」を監査ログだけで完全に
+再生することはできない。再生には `input` の条件と、その時点の帳簿の状態が
+要る。読み取りが帳簿を変えない以上、この復元は常に可能である
+（帳簿が append-only であることに依存している。**この前提が崩れたら
+決定6も見直すこと**）。
 
 | 候補 | 却下理由 |
 |---|---|
