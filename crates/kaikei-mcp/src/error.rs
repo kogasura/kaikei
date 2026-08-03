@@ -70,18 +70,38 @@ pub mod jp_codes {
 /// | `UnknownTaxCategoryCode` | [`codes::UNKNOWN_TAX_CATEGORY`] | `PolicyError::UnknownTaxCategory` と同義 |
 /// | `InvalidBusinessRatio` | [`codes::INVALID_VALUE`] | 値そのものが範囲外 |
 /// | `InvalidHouseholdSplitTotal` | [`codes::INVALID_AMOUNT`] | 金額が不正 |
-/// | マスタ・設定のロード失敗（10バリアント） | [`codes::INVALID_POLICY_DATA`] | 下表 |
+/// | `InvalidChart` | [`codes::INVALID_CHART`] | `CoreError::InvalidChart` と同義（勘定科目表そのものが不正） |
+/// | マスタ・設定のロード失敗（9バリアント） | [`codes::INVALID_POLICY_DATA`] | 下表 |
+///
+/// # `InvalidChart` を `invalid_policy_data` に入れない理由
+///
+/// [`codes::INVALID_CHART`]（「勘定科目表そのものが不正」）が既にあり、
+/// `CoreError::InvalidChart` はそちらに写像されている
+/// （`kaikei_app::error::core_error_code`）。そして `JpError::InvalidChart` は
+/// `kaikei_core::ChartOfAccounts::new` が返した `CoreError::InvalidChart` を
+/// 包み直したものを**含む**（`crates/kaikei-jp/src/chart.rs` の `from_raw` が
+/// `CoreError` の `Display` を `reason` に詰める）。
+///
+/// つまり「勘定科目表の親科目が存在しない」という**同一の条件**が、
+/// `kaikei-app` 経由なら `invalid_chart`、`kaikei-jp` 直呼び（§4 の経路 (c)）なら
+/// `invalid_policy_data` という**2つのコード**になる。同じ意味に2つの綴りを
+/// 作らないという本モジュールの方針（`docs/07-mcp-server.md` §6 /
+/// `DECISIONS.md` D-080）にそのまま反するため、`INVALID_CHART` に寄せる。
 ///
 /// # マスタ・設定のロード失敗をまとめる理由
 ///
 /// `YamlParse` / `Io` / `InvalidTaxCategoryTable` / `OverlappingTaxPeriods` /
-/// `InvalidChart` / `InvalidTagSchema` / `MissingClosingAccount` /
+/// `InvalidTagSchema` / `MissingClosingAccount` /
 /// `NotPostableClosingAccount` / `DuplicateClosingAccount` /
 /// `ClosingTagSchemaMismatch` は、いずれも**サーバ側の同梱マスタ・起動設定が
 /// 不正**であることを示す。呼び出し元（AI）の入力を直しても解消しない点で
 /// 同じ分類であり、`PolicyError::InvalidPolicyData`（「policy が構築時に
 /// 受け取ったデータが不正」）と意味が一致する。**同じ意味には同じコードを
 /// 使う**（`docs/07-mcp-server.md` §6）。
+///
+/// `InvalidTagSchema` をここに残すのは、`codes` に「タグスキーマそのものが
+/// 不正」に相当する語彙が**無い**ため（`unknown_tag_key` /
+/// `tag_type_mismatch` はどちらも**入力側**の誤りを指す）。
 ///
 /// なお通常これらはツール応答に現れない。設定・マスタの不備は起動時に
 /// 検出して**起動を中止する**（同 §7）ため、ツール呼び出しには到達しない。
@@ -110,12 +130,15 @@ pub fn jp_error_code(err: &JpError) -> &'static str {
         JpError::InvalidHouseholdSplitTotal { .. } => codes::INVALID_AMOUNT,
         JpError::InvalidSettingCode { .. } => jp_codes::INVALID_SETTING_CODE,
 
+        // 勘定科目表そのものが不正。`CoreError::InvalidChart` と同じ条件を
+        // 含むため、同じコードにする（別名を作らない。上の doc を参照）。
+        JpError::InvalidChart { .. } => codes::INVALID_CHART,
+
         // サーバ側のマスタ・設定が不正（入力を直しても解消しない）。
         JpError::YamlParse { .. }
         | JpError::Io { .. }
         | JpError::InvalidTaxCategoryTable { .. }
         | JpError::OverlappingTaxPeriods { .. }
-        | JpError::InvalidChart { .. }
         | JpError::InvalidTagSchema { .. }
         | JpError::MissingClosingAccount { .. }
         | JpError::NotPostableClosingAccount { .. }
