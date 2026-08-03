@@ -18,8 +18,22 @@
 //! （残り3層は DB ロール権限・トリガ・`JournalRepo` のポート定義。同 §1 ①）。
 //! ここで閉じるのはその1層だけである。
 
-use kaikei_mcp::server::KaikeiServer;
-use rmcp::ServerHandler;
+//! # なぜサーバーを組み立てないのか
+//!
+//! `KaikeiServer` は実行時依存（`Runtime`）を必須で持つ（`src/server.rs`）。
+//! レジストリに何が載っているかは DB にも設定にも依存しない性質なので、
+//! それを見るために DB 接続を要求しない。検査は
+//! `kaikei_mcp::server` の自由関数（`registered_tool_names` /
+//! `is_registered_tool` / `tool_definition`）を通す。3つとも
+//! サーバー本体と**同じ `tool_router()`** から導出しており、
+//! `#[tool_handler]` が生成する `list_tools` / `call_tool` / `get_tool` が
+//! 引くのと同じ集合を見る（対応表は `src/server.rs` のモジュール doc）。
+//!
+//! 本物の `KaikeiServer`（`ServerHandler::get_tool` 経由）でも同じ結果に
+//! なることは、`Runtime` を組み立てられる `tests/startup_pg.rs`
+//! （`pg-tests`）が確かめる。
+
+use kaikei_mcp::server::{is_registered_tool, registered_tool_names, tool_definition};
 
 /// **存在させないツール**（`docs/07-mcp-server.md` §2）。
 const FORBIDDEN_TOOLS: [&str; 4] = [
@@ -49,12 +63,11 @@ const PHASE_3_TOOLS: [&str; 11] = [
 
 // MC-10 (1): `tools/list` の応答に4件のいずれも現れない。
 //
-// `KaikeiServer::tool_names` はレジストリ（`ToolRouter::list_all`）から
+// `registered_tool_names` はレジストリ（`ToolRouter::list_all`）から
 // 導出しており、`#[tool_handler]` が生成する `list_tools` が返す集合と同一。
 #[test]
 fn forbidden_tools_are_absent_from_the_tool_list() {
-    let server = KaikeiServer::new();
-    let registered = server.tool_names();
+    let registered = registered_tool_names();
 
     // 空ループで緑になっていないことを先に確かめる（`PROGRESS.md` Phase 1 の
     // 教訓: 検査が実際には1度も走っていなかった、という事故を防ぐ）。
@@ -83,12 +96,12 @@ fn forbidden_tools_are_absent_from_the_tool_list() {
 // `rmcp::service::Peer::new` は `pub(crate)` のため外部 crate からは組み立て
 // られない。そこで、同じレジストリを引く2つの入口を検査する:
 //
-// - `ServerHandler::get_tool`（`#[tool_handler]` が生成。`tool_router.get(name)`）
-// - `KaikeiServer::has_tool`（`tool_router.has_route(name)`。`call` が
+// - `tool_definition`（`tool_router.get(name)`。`#[tool_handler]` が生成する
+//   `get_tool` の実体と同じ）
+// - `is_registered_tool`（`tool_router.has_route(name)`。`call` が
 //   「tool not found」を返すかどうかを決めているのはこの述語）
 #[test]
 fn calling_a_forbidden_tool_is_rejected_as_an_unknown_tool() {
-    let server = KaikeiServer::new();
     assert_eq!(
         FORBIDDEN_TOOLS.len(),
         4,
@@ -97,11 +110,11 @@ fn calling_a_forbidden_tool_is_rejected_as_an_unknown_tool() {
 
     for forbidden in FORBIDDEN_TOOLS {
         assert!(
-            !server.has_tool(forbidden),
+            !is_registered_tool(forbidden),
             "存在させないツールがレジストリに登録されています: {forbidden}"
         );
         assert!(
-            ServerHandler::get_tool(&server, forbidden).is_none(),
+            tool_definition(forbidden).is_none(),
             "存在させないツールの定義が引けてしまいます: {forbidden}"
         );
     }
@@ -115,6 +128,7 @@ fn calling_a_forbidden_tool_is_rejected_as_an_unknown_tool() {
 // 確かめる。
 #[test]
 fn the_registry_predicates_actually_observe_registered_tools() {
+    use kaikei_mcp::server::KaikeiServer;
     use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
     use rmcp::model::{CallToolResult, Tool};
     use std::sync::Arc;
@@ -140,8 +154,7 @@ fn the_registry_predicates_actually_observe_registered_tools() {
 // 破壊的ツールが増えても緑のまま通る。許可リスト側からも閉じる。
 #[test]
 fn every_registered_tool_is_one_of_the_eleven_phase_3_tools() {
-    let server = KaikeiServer::new();
-    for name in server.tool_names() {
+    for name in registered_tool_names() {
         assert!(
             PHASE_3_TOOLS.contains(&name.as_str()),
             "Phase 3 の11ツールに無いツールが登録されています: {name}\

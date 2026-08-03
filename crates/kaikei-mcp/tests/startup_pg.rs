@@ -23,8 +23,9 @@ use kaikei_app::ports::ChartRepo;
 use kaikei_app::tx::with_tx;
 use kaikei_app::usecase::import_chart;
 use kaikei_mcp::config::{ServerConfig, ENV_APP_DATABASE_URL};
-use kaikei_mcp::server::KaikeiServer;
+use kaikei_mcp::server::{registered_tool_names, KaikeiServer};
 use kaikei_mcp::startup;
+use rmcp::ServerHandler;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -118,7 +119,33 @@ async fn assembling_twice_succeeds_and_leaves_the_chart_unchanged() {
 
     // 合成した依存がサーバーに渡ること（PR-F 以降のツールはここから取る）。
     let server = KaikeiServer::with_runtime(Arc::clone(&first.runtime));
-    assert!(server.runtime().is_some());
+    assert!(
+        Arc::ptr_eq(server.runtime(), &first.runtime),
+        "合成ルートが組み立てた Runtime がそのままサーバーに渡ること"
+    );
+
+    // `tests/forbidden_tools.rs` は DB を要さない自由関数
+    // （`registered_tool_names` / `tool_definition`）でレジストリを見る。
+    // それが**本物のサーバー**（`ServerHandler` 経由）と同じ集合を指して
+    // いることを、`Runtime` を組み立てられるここで突き合わせる
+    // （自由関数だけを見ていると、サーバー側が別のルータを持つように
+    // なっても両方緑のまま通る）。
+    for name in registered_tool_names() {
+        assert!(
+            ServerHandler::get_tool(&server, &name).is_some(),
+            "自由関数が挙げたツールを本物のサーバーが引けない: {name}"
+        );
+    }
+    for forbidden in [
+        "delete_journal_entry",
+        "update_journal_entry",
+        "execute_sql",
+    ] {
+        assert!(
+            ServerHandler::get_tool(&server, forbidden).is_none(),
+            "存在させないツールの定義が本物のサーバーから引けてしまいます: {forbidden}"
+        );
+    }
 }
 
 /// 接続ロールを `kaikei_migrator`（テーブル所有者）にすると起動を拒否する。
