@@ -335,8 +335,12 @@ migrations/
 下の注記が `0008` / `0009` を documents / imported_transactions 用として
 予約したまま、その番号が別の用途で埋まっていた）。
 一覧の網羅性は `crates/kaikei-store/tests/migrations.rs` の
-`every_migration_file_is_recorded` が**ディレクトリを数えて**検証する
-（期待値をリテラルで持たない）。
+`applied_migrations_match_the_expected_list` が、`_sqlx_migrations` の
+**バージョン番号と description の一覧**と突き合わせて検証する。
+「`migrations/` の `.sql` を数える」形にはしない——`#[sqlx::test]` が
+実行前に全件適用する以上、件数は原理的に常に一致し**赤になる経路が無い**
+（さらに `.down.sql` を置くと誤検出で赤になる）。マイグレーションを
+足したらこのテストが赤になるので、上の一覧と一緒に更新すること。
 
 ロールの作成・パスワード設定は `docker/postgres/init/01-roles.sql` に集約する
 （マイグレーションには書かない）。ロールはクラスタ単位のオブジェクトであり、
