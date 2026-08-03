@@ -711,6 +711,8 @@ pub async fn call<T: McpTool>(runtime: &Runtime, arguments: Option<Map<String, V
 | `ToolContext` を自作する | フィールドも `new` も private | 型 |
 | `ToolRegistry` に `McpTool` 以外を載せる | ツールを載せる口は `with::<T: McpTool>` だけで、内側の `ToolRouter` は private フィールド | 型 |
 | **別のルータ・別の `ServerHandler` を書き足す** | **`rmcp` を名指しできるファイルを `dispatch.rs` / `error.rs` の2つに限る許可リスト** | 検査 |
+| **走査の外にファイルを置く**（`#[path = "../foo.rs"]` / `include!("foo.inc")`） | `tests/source_scan/mod.rs` の `assert_no_out_of_tree_inclusion`（走査ヘルパは `audit_is_structural.rs` と `stdout_is_json_rpc_only.rs` で共有） | 検査（4巡目 B） |
+| **上の全部**（書き方に依らず、監査ログが2行残ること） | 実バイナリに `tools/call` を送り `audit_log` を数える（`crates/kaikei-e2e/tests/mcp_stdio_server.rs`） | **振る舞い検査**（4巡目 A） |
 | fail-open の警告を捨てる | `call` は `AuditedCall::into_result_noting_outcome(&mut notes)`（既定経路）しか使わず、警告を必ず応答の `warnings` に載せる。`into_parts_unchecked` はこの crate に1箇所も無い | 型＋走査 |
 | クライアント由来の名前が `audit_log.tool` に載る | `AuditCall` を組み立てるのは `dispatch.rs` の1箇所だけ（走査で担保）で、そこは `ToolName::resolve`（レジストリを引く。**登録済み以外を弾くことは型で閉じている**）を通す（§9） | 走査＋型 |
 
@@ -773,11 +775,52 @@ pub async fn call<T: McpTool>(runtime: &Runtime, arguments: Option<Map<String, V
 型で閉じられない残り（同一 crate 内から `with_audit` を呼ぶ、`dispatch.rs` の
 中で `ToolRouter` に別のツールを足す、`dispatch.rs` が `rmcp` の型を再輸出する）は
 `crates/kaikei-mcp/tests/audit_is_structural.rs` が見張る。
-一次の担保はファイル許可リスト
+走査の中での一次の担保はファイル許可リスト
 （`rmcp_is_named_only_in_the_files_allowed_to_name_it`）であり、識別子の
 閉じ込め（`ToolRouter` / `with_async_tool` / `AsyncTool` / `IntoToolRoute` /
-`CallToolHandler` …）は**再輸出という唯一の穴に対する second line** として
-残してある。**識別子の一覧が網羅であるとは主張しない。**
+`CallToolHandler` …）は**再輸出に対する second line** として残してある。
+**識別子の一覧が網羅であるとは主張しない。**
+
+> **★「唯一の穴」と書かないこと★**（PR-F レビュー4巡目 C-1）
+>
+> ここには以前「再輸出が許可リストの**唯一の**穴である」と書いてあったが、
+> **少なくとも3つある**。
+>
+> | 穴 | 何ができるか | 見張り |
+> |---|---|---|
+> | `dispatch.rs` が `rmcp` の型を再輸出する | 他のファイルが `rmcp` を名指しせずに登録経路へ届く | 識別子の閉じ込め（second line） |
+> | 走査の外にファイルを置く（`#[path = "../foo.rs"]` / `include!("foo.inc")`） | crate の一部なのに一度も読まれないファイルに何でも書ける | `assert_no_out_of_tree_inclusion`（4巡目 B で追加） |
+> | 許可された `dispatch.rs` の中に**別のプロトコル入口**を足す | `ServerHandler` は `call_tool` 以外にも既定実装を持つ（`read_resource` / `get_prompt` / `complete` / `get_task` / `update_task` / `cancel_task` …）。そこに書けば `tools/call` を通らずに操作できる | **無い**（設計上の想定内。diff には出る） |
+>
+> 3つ目は許可リストの内側なので、走査では原理的に見張れない。
+> **網羅を主張するのはやめる。網羅を担うのは走査ではなく振る舞い検査で
+> ある**（下記）。
+
+> **★網羅は振る舞いで担保する★**（PR-F レビュー4巡目 A）
+>
+> 走査は3巡続けて外側から破られた（1: 禁止識別子の一覧に無い API、
+> 2: `#[tool_handler]` の条件付き生成、3: `#[path]` / `include!` で走査の外に
+> ファイルを置く）。3巡目の再現では、監査ログを通らない別の `ServerHandler`
+> を `main.rs` から**実際に待ち受けさせた**状態で `cargo build` /
+> `clippy -D warnings` / `fmt --check` / `cargo test -p kaikei-mcp` が全緑
+> だった。**走査は「ソースがどう書かれているか」しか見られない。**
+>
+> そこで `crates/kaikei-e2e/tests/mcp_stdio_server.rs` に、
+> **実バイナリを子プロセスとして起動し、stdio で `initialize` →
+> `tools/call` を送る**検査を置いた（`pg-tests`。使い捨てDBを作り、
+> `journal_entries` と `audit_log` を SQL で数える）。
+>
+> | 見るもの | 期待 |
+> |---|---|
+> | `post_journal_entry`（成功） | 帳簿1件・`audit_log` に `started` / `ok` の2行・`entry_id` が応答と一致 |
+> | `post_journal_entry`（貸借不一致） | `isError: true`・帳簿0件・`audit_log` に `started` / `error` の2行 |
+> | `reverse_journal_entry`（成功・失敗） | 同じ経路を通る（ツールごとに迂回できない） |
+>
+> 識別子が何であれ、ファイルがどこに在ろうと、別の入口から来ようと、
+> **監査ログが2行無ければ落ちる**。走査は「書いた瞬間に、DB 無しで、手元で
+> 落ちる」二線目として残す。
+
+
 
 **`rmcp` のツールマクロ（`#[tool]` / `#[tool_router]`）は使わない。**
 マクロで書くとハンドラ本体をその場に書くことになり、`dispatch::call` を

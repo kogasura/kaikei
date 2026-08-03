@@ -109,6 +109,15 @@ jobs:
         # feature ゲートした pg-tests のテストは対象外になる。ここで拾う。
         run: cargo clippy -p kaikei-store --features pg-tests --all-targets -- -D warnings
 
+      - name: kaikei-mcp のバイナリをビルド（kaikei-e2e の stdio 検査が起動する）
+        # crates/kaikei-e2e/tests/mcp_stdio_server.rs は**実バイナリ**を子プロセス
+        # として起動し、stdio で initialize → tools/call を送って
+        # 「journal_entries が増える／増えない」と「audit_log に2行残る」を見る。
+        # `CARGO_BIN_EXE_<name>` は同じ package のテストにしか渡らないので、
+        # kaikei-e2e 側からは使えない（テストは target ディレクトリから辿る）。
+        # cargo を入れ子で起動させない代わりに、ここで先にビルドしておく。
+        run: cargo build -p kaikei-mcp
+
       - name: kaikei-e2e の pg-tests を実行
         # Phase 2 PR-8: kaikei-jp（JpTaxPolicy 等）を実際に注入して記帳する
         # E2Eテスト（crates/kaikei-e2e）。kaikei-store とは別crateだが、同じ

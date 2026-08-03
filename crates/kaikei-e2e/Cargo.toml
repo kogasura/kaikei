@@ -56,3 +56,13 @@ required-features = ["pg-tests"]
 name = "mcp_write_tools"
 path = "tests/mcp_write_tools.rs"
 required-features = ["pg-tests"]
+
+# Phase 3 PR-F レビュー4巡目: **実バイナリを stdio で起動して tools/call を
+# 通す**振る舞い検査。ソース走査が3巡続けて外側から破られたことへの回答で
+# あり、監査ログが2行残ることをプロトコルの入口から確かめる唯一の経路。
+# 実行前に `cargo build -p kaikei-mcp` が要る（CARGO_BIN_EXE_* は同じ package の
+# テストにしか渡らない。テスト側が理由を書いて落ちる）。
+[[test]]
+name = "mcp_stdio_server"
+path = "tests/mcp_stdio_server.rs"
+required-features = ["pg-tests"]

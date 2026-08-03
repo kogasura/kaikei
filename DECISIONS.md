@@ -3560,6 +3560,8 @@ pub async fn call<T: McpTool>(runtime: &Runtime, arguments: Option<Map<String, V
 | 3 | `ToolContext` を自作する | フィールドも `new` も private。作れるのは `dispatch` モジュールだけ |
 | 4 | `ToolRegistry` に `McpTool` 以外を載せる | 載せる口は `with::<T: McpTool>` だけで、内側の `ToolRouter` は private フィールド（訂正注記1） |
 | 4b | **別のルータ・別の `ServerHandler` を書き足す** | **型では閉じない。** `rmcp` を名指しできるファイルを `dispatch.rs` / `error.rs` の2つに限る**許可リスト**（訂正注記3） |
+| 4c | **走査の外にファイルを置く**（`#[path = "../foo.rs"]` / `include!("foo.inc")`） | **走査の穴だった**（訂正注記4）。`src/` 配下を拡張子で絞らず全部読み、さらに `#[path` / `include!(` が現れないことを検査する（`tests/source_scan/mod.rs`） |
+| 4d | **上の全部**（ソースの書き方に依らず、監査ログが2行残ること） | **振る舞い検査**（訂正注記4）。実バイナリを stdio で起動して `tools/call` を送り、`journal_entries` と `audit_log` を数える（`crates/kaikei-e2e/tests/mcp_stdio_server.rs`） |
 | 5 | fail-open の警告を捨てる | `call` は `AuditedCall::into_result_noting_outcome(&mut notes)`（既定経路）しか使わず、積まれた警告を必ず応答の `warnings` に載せる。`into_parts_unchecked`（逃げ道。D-076）はこの crate に1箇所も無い |
 | 6 | クライアント由来のツール名が `audit_log.tool` に載る | `AuditCall` を組み立てるのは `dispatch.rs` の1箇所だけ（**走査で担保**）で、そこは `ToolName::resolve`（`server::is_registered_tool` ＝`tools/list` と同じレジストリを引く）を通す。**型で閉じているのは「登録済み以外から `ToolName` を作れない」ことである**（訂正注記2） |
 
@@ -3684,8 +3686,9 @@ MCP のツールを登録・実行する能力はすべて `rmcp` の API から
 `server.rs` に残るのは「どのツールを登録するか」と「AI に何と名乗るか」だけで、
 `rmcp` の型は `dispatch` が再輸出する `ServerInfo` / `Tool` /
 `Implementation` / `ServerCapabilities` を借りる（**登録経路に関わる型は
-再輸出しない**。そこが許可リストの唯一の穴であり、識別子の閉じ込め
-`CONFINED` を second line として残してある）。
+再輸出しない**。識別子の閉じ込め `CONFINED` をその second line として
+残してある。**これが「唯一の穴」だという当時の記述は誤りだった**——
+訂正注記4 の表を参照）。
 
 **「型で閉じた」という記述をすべて撤回する**（3巡目 C-1）。`rmcp` は
 `kaikei-mcp` の直接依存で `ToolRouter` は `pub` であり、**同一 crate の他
@@ -3718,6 +3721,102 @@ MCP のツールを登録・実行する能力はすべて `rmcp` の API から
 `actor='mcp'`）が残った。2巡目の迂回が示した「1件・0行」と対照になる。
 未登録のツール名は `-32602 tool not found`（§6 が認める唯一のプロトコル
 エラー）のままである。
+
+**訂正注記4（レビュー4巡目 A / B / C-1 / D。担保の主役を走査から
+振る舞いへ移す）**:
+
+訂正注記3 で「どの API を使う迂回であっても `rmcp` の名前が必要なので、
+迂回は必ず許可された2ファイルのどちらかに現れる」と書いたが、**それは
+走査がそのファイルを読んだ場合の話だった**。3巡目の迂回は
+
+```rust
+#[path = "../probe_handler.rs"] mod probe_handler;   // src/ の外
+include!("probe_handler.inc");                        // .rs ですらない
+```
+
+で、当時の走査（`CARGO_MANIFEST_DIR/src` を再帰し `.rs` だけを読む）は
+**その2つのファイルを一度も読まなかった**。監査ログを通らない別の
+`ServerHandler` を `main.rs` から**実際に待ち受けさせた**状態で、
+`cargo build` / `clippy -D warnings` / `fmt --check` /
+`cargo test -p kaikei-mcp` が全緑だった。**独立した2名のレビュアーが同じ穴に
+到達している。**
+
+3巡とも同じ失敗である——**ソース走査で「書けない形」を作ろうとし、そのたびに
+走査の外側から破られた**。走査は「ソースがどう書かれているか」しか見られない
+ので、書き方を変える迂回に対して原理的に後手に回る。
+
+そこで**網羅の担い手を走査から振る舞い検査へ移した**。
+`crates/kaikei-e2e/tests/mcp_stdio_server.rs`（`pg-tests`）が
+
+1. `#[sqlx::test]` で使い捨てDBを作り、
+2. **実バイナリ**（`cargo build -p kaikei-mcp` の成果物）を子プロセスとして
+   起動し、`APP_DATABASE_URL` でそのDBを指させ、
+3. stdio で `initialize` → `notifications/initialized` → `tools/call` を送り、
+4. `journal_entries` と `audit_log` を **SQL で数える**
+
+という形で、プロトコルの入口から監査ログまでを1本に通す。
+
+| 見るもの | 期待 |
+|---|---|
+| `post_journal_entry`（成功） | 帳簿1件・`audit_log` に `started` / `ok` の2行・`entry_id` が応答と一致 |
+| `post_journal_entry`（貸借不一致） | `isError: true`・帳簿0件・`audit_log` に `started` / `error` の2行 |
+| `reverse_journal_entry`（成功・失敗） | 同じ経路を通る（ツールごとに迂回できない） |
+
+識別子が何であれ、ファイルがどこに在ろうと、別の入口から来ようと、
+**監査ログが2行無ければ落ちる**。走査は「**書いた瞬間に、DB 無しで、手元で
+落ちる**」二線目として残す（`PROGRESS.md` Phase 2 の教訓「手元で回せない
+検査は回されなくなる」）。
+
+置き場が `kaikei-e2e` なのは `kaikei-mcp` が `sqlx` を持てない（MC-30）ため
+であり、その代償として **`CARGO_BIN_EXE_kaikei-mcp` が使えない**
+（同じ package のテストにしか渡らない）。`cargo` を入れ子で起動すると
+target ディレクトリのロックで詰まりうるので、テストは target ディレクトリ
+から実行ファイルを辿り、**無い場合・`crates/kaikei-mcp/` のどのファイルより
+古い場合はその旨を書いて落ちる**（古いバイナリに対して緑になると、この検査は
+何も保証しない）。CI は `database.yml` に `cargo build -p kaikei-mcp` の
+ステップを足して直前でビルドする。
+
+**走査の穴も塞いだ**（4巡目 B）:
+
+- 走査対象を `src/` 配下の**全ファイル**に広げた（拡張子で絞らない）
+- それでも `#[path]` は `src/` の外を指せるので、**`#[path` と `include!(` が
+  crate に現れないこと**を別に検査する（空白を落としてから見るので
+  `#[ path = ".." ]` / `include !(..)` も捕まる。`include_str!` /
+  `include_bytes!` は資源の埋め込みなので落とさない）
+- 同じ走査が `audit_is_structural.rs` と `stdout_is_json_rpc_only.rs` に
+  **複製**されており、片方の穴を塞いでももう片方に残る形だった。
+  `crates/kaikei-mcp/tests/source_scan/mod.rs` に集約し、両方が使う
+  （stdio では stdout に1行混ざれば接続ごと壊れるので、`println!` を走査の外の
+  ファイルに置ければ同じ事故が起きる）
+
+**「許可リストの唯一の穴」という記述を撤回する**（4巡目 C-1）。
+穴は少なくとも3つある。
+
+| 穴 | 何ができるか | 見張り |
+|---|---|---|
+| `dispatch.rs` が `rmcp` の型を再輸出する | 他のファイルが `rmcp` を名指しせずに登録経路へ届く | `CONFINED`（second line） |
+| 走査の外にファイルを置く | crate の一部なのに一度も読まれないファイルに何でも書ける | `assert_no_out_of_tree_inclusion`（今回追加） |
+| 許可された `dispatch.rs` の中に**別のプロトコル入口**を足す | `ServerHandler` は `call_tool` 以外にも既定実装を持つ（`read_resource` / `get_prompt` / `complete` / `get_task` / `update_task` / `cancel_task` …）。そこに書けば `tools/call` を通らずに操作を書ける | **無い**（`dispatch.rs` を全面的に許すという判断の帰結。設計上の想定内で diff には出る） |
+
+3つ目は許可リストの内側なので走査では原理的に見張れない。
+**網羅は主張しない。網羅を担うのは振る舞い検査である。**
+
+`crates/kaikei-mcp/src/dispatch.rs` 冒頭の表にも「手段」列を足した
+（4巡目 D。`docs/07-mcp-server.md` §4 と本項の表には既に足してあったが、
+**上から読む読者が最初に読む**その表だけが「呼び忘れる形が存在しない」で
+無条件に締めていた）。
+
+**実測**（3巡分の迂回をそれぞれ実際に書き、`cargo build -p kaikei-mcp` し
+直したうえで振る舞い検査を走らせた。確認後は復元済み）:
+
+| 迂回 | 走査 | 振る舞い検査 |
+|---|---|---|
+| `dispatch.rs` の `call_tool` を手書きで差し替え、`with_tx_err` + `post_entry::execute` で直接記帳（2巡目の形。**許可リストの内側**） | **緑のまま**（`dispatch.rs` は `rmcp` を名指してよいファイル） | **落ちる**（帳簿1件・`audit_log` 0行） |
+| `#[path = "../probe_handler.rs"] mod probe_handler;` で走査の外に別の `ServerHandler` を置き、`main.rs` からそれを待ち受けさせる（3巡目の形） | 落ちる（`#[path` の検査。**4巡目で追加した分**） | **落ちる**（帳簿1件・`audit_log` 0行） |
+| 同じものを `include!("probe_handler.inc")` で取り込む（3巡目の形） | 落ちる（`include!(` の検査。**4巡目で追加した分**） | **落ちる**（帳簿1件・`audit_log` 0行） |
+
+1行目が「走査は緑・振る舞いは赤」になっていることが、**担い手を移した理由
+そのもの**である。
 
 ---
 

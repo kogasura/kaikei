@@ -8,15 +8,27 @@
 //!
 //! 実際に起動して確かめる検査は別にある（`tests/startup_config.rs` の
 //! 「起動失敗時に stdout が空」、`tests/startup_pg.rs` の「起動後の stdout が
-//! JSON-RPC の行だけ」）。ここで見るのは**書いた瞬間に落ちる**方の検査で、
-//! DB も設定も要らずに走る。
+//! JSON-RPC の行だけ」、`crates/kaikei-e2e/tests/mcp_stdio_server.rs` の
+//! 「`tools/call` の往復が最後まで JSON-RPC で成立する」）。
+//! ここで見るのは**書いた瞬間に落ちる**方の検査で、DB も設定も要らずに走る。
 //!
 //! `.github/workflows/architecture.yml` に grep のステップを増やすのではなく
 //! テストにしたのは、ローカルで `cargo test` を回すだけで踏めるようにする
 //! ため（`PROGRESS.md` Phase 2 の教訓「手元で回せない検査は回されなくなる」）。
+//!
+//! # 走査ヘルパは `audit_is_structural.rs` と共有する（4巡目 B）
+//!
+//! 以前はここと `tests/audit_is_structural.rs` に**同じ走査が複製**されて
+//! いた（`CARGO_MANIFEST_DIR/src` を再帰し `.rs` だけを読む）。そのため
+//! 3巡目に見つかった穴——`#[path = "../foo.rs"]` と `include!("foo.inc")` で
+//! 走査の外にファイルを置く——が、あちらを直しても**こちらに残る**形に
+//! なっていた。stdio では stdout に1行混ざれば接続ごと壊れるので、
+//! `println!` を走査の外のファイルに置ければ同じ事故が起きる。
+//! 走査は `tests/source_scan/mod.rs` に集約した。
 
-use std::fs;
-use std::path::{Path, PathBuf};
+mod source_scan;
+
+use source_scan::{assert_no_out_of_tree_inclusion, contains_call, is_comment, sources};
 
 /// stdout に書く可能性がある呼び出しの断片。
 ///
@@ -31,73 +43,19 @@ const FORBIDDEN: &[&str] = &[
     "stdout()",
 ];
 
-fn source_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
-fn rust_sources(dir: &Path, found: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).expect("src/ を走査できること") {
-        let path = entry.expect("ディレクトリ項目を読めること").path();
-        if path.is_dir() {
-            rust_sources(&path, found);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            found.push(path);
-        }
-    }
-}
-
-/// コメント行（`//` `///` `//!` `*`）を除いた行だけを見る。
-///
-/// 「stdout に書かない」と**説明している doc コメント**が検査に引っかかって
-/// 落ちる誤検知は、このリポジトリで既に2回起きている
-/// （`PROGRESS.md` Phase 2 の教訓3）。同じ轍を踏まない。
-fn is_comment(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("//") || trimmed.starts_with('*')
-}
-
-/// 識別子の途中に現れた一致は数えない。
-///
-/// これが無いと **`eprintln!` が `println!` として検出される**——つまり
-/// 「stderr に出せ」と指示しておきながら、そのとおりに書いたコードが
-/// 落ちる検査になる。`.github/workflows/architecture.yml` の grep 群が
-/// `grep -qw` の単語境界で繰り返し嵌まったのと同型の問題
-/// （`DECISIONS.md` D-078）。
-fn contains_call(line: &str, needle: &str) -> bool {
-    let mut offset = 0;
-    while let Some(found) = line[offset..].find(needle) {
-        let start = offset + found;
-        let preceded_by_identifier_char = line[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        if !preceded_by_identifier_char {
-            return true;
-        }
-        offset = start + needle.len();
-    }
-    false
-}
-
 #[test]
 fn no_source_file_writes_to_stdout() {
-    let mut sources = Vec::new();
-    rust_sources(&source_root(), &mut sources);
-    assert!(
-        !sources.is_empty(),
-        "検査対象のソースが0件（検査が働いていない）"
-    );
+    let sources = sources();
 
     let mut hits: Vec<String> = Vec::new();
-    for path in &sources {
-        let text = fs::read_to_string(path).expect("ソースを読めること");
+    for (path, text) in &sources {
         for (index, line) in text.lines().enumerate() {
             if is_comment(line) {
                 continue;
             }
             for needle in FORBIDDEN {
                 if contains_call(line, needle) {
-                    hits.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+                    hits.push(format!("{path}:{}: {}", index + 1, line.trim()));
                 }
             }
         }
@@ -109,6 +67,20 @@ fn no_source_file_writes_to_stdout() {
          stdio トランスポートでは stdout が JSON-RPC 専用チャネルです\
          （docs/07-mcp-server.md §4）。診断は eprintln!（stderr）に出してください。\n{}",
         hits.join("\n")
+    );
+}
+
+/// **走査の外にソースを置く構文が使われていないこと**（4巡目 B）。
+///
+/// 上の検査は `src/` 配下のファイルしか読まない。`#[path = "../foo.rs"]` や
+/// `include!("foo.inc")` で取り込んだファイルの中の `println!` は
+/// **一度も読まれない**まま stdout に出る（そして stdio の接続が壊れる）。
+/// 走査対象は `.rs` 以外にも広げてあるが、`#[path]` は `src/` の外を指せる
+/// ので、それだけでは届かない。
+#[test]
+fn no_source_is_pulled_in_from_outside_the_scan() {
+    assert_no_out_of_tree_inclusion(
+        "この走査（stdout への書き込み）は src/ 配下のファイルしか読みません。",
     );
 }
 

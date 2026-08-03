@@ -8,15 +8,25 @@
 //! **同じ理由が MCP 層にも当てはまる。** 各ツールが `with_audit` を呼ぶ形に
 //! すると、11ツールのうち1つで呼び忘れても誰も気づかない。
 //!
-//! そこでこのモジュールは「呼び忘れる形が存在しない」ようにしてある。
+//! そこで**ツールを書く側からは呼び忘れる形が無い**ようにしてある。
 //!
-//! | 塞ぎ方 | 実体 |
-//! |---|---|
-//! | ツールは `CallToolResult` を組み立てられない | [`McpTool::run`] の戻り値は `Result<`[`ToolSuccess`]`, `[`ToolFailure`]`>` であり、応答（`isError` を含む）を組み立てるのは [`call`] だけ |
-//! | ツールは監査ログの記録先に触れない | [`McpTool::run`] が受け取るのは [`ToolContext`] で、[`kaikei_app::ports::AuditSink`] を**露出しない**。[`crate::startup::Runtime`] 自体が渡らない |
-//! | [`ToolContext`] を自分で作れない | フィールドも `new` も private。作れるのはこのモジュールだけ |
-//! | ツールが応答を組み立てる形にならない | [`ToolRegistry`] にツールを載せる口は [`ToolRegistry::with`]`::<T: `[`McpTool`]`>` だけで、その中身は必ず [`call`] である |
-//! | fail-open の警告を捨てられない | [`call`] は [`kaikei_app::audit::AuditedCall::into_result_noting_outcome`]（既定経路）しか使わず、積まれた警告を必ず応答の `warnings` に載せる。`into_parts_unchecked`（逃げ道）はこの crate に1箇所も無い |
+//! **どこまでが型で、どこからが検査かを混ぜないこと**（PR-F レビュー3巡目
+//! C-1 / 4巡目 D。この表には以前「手段」の列が無く、下の §「何が型で閉じて
+//! いて、何が閉じていないか」を読む前に**無条件の保証として読めて**しまった）。
+//!
+//! | 塞ぐもの | 実体 | 手段 |
+//! |---|---|---|
+//! | ツールは `CallToolResult` を組み立てられない | [`McpTool::run`] の戻り値は `Result<`[`ToolSuccess`]`, `[`ToolFailure`]`>` であり、応答（`isError` を含む）を組み立てるのは [`call`] だけ | 型 |
+//! | ツールは監査ログの記録先に触れない | [`McpTool::run`] が受け取るのは [`ToolContext`] で、[`kaikei_app::ports::AuditSink`] を**露出しない**。[`crate::startup::Runtime`] 自体が渡らない | 型 |
+//! | [`ToolContext`] を自分で作れない | フィールドも `new` も private。作れるのはこのモジュールだけ | 型 |
+//! | [`ToolRegistry`] に [`McpTool`] 以外を載せられない | 載せる口は [`ToolRegistry::with`]`::<T: `[`McpTool`]`>` だけで、その中身は必ず [`call`] である | 型 |
+//! | fail-open の警告を捨てられない | [`call`] は [`kaikei_app::audit::AuditedCall::into_result_noting_outcome`]（既定経路）しか使わず、積まれた警告を必ず応答の `warnings` に載せる | 型＋走査（`into_parts_unchecked` がこの crate に無いことは走査） |
+//! | **別のルータ・別の `ServerHandler`・別のプロトコル入口を書き足す** | `rmcp` を名指しできるファイルの許可リスト（`dispatch.rs` / `error.rs`） | **検査**（型では止まらない） |
+//! | **上の全部**（書き方に依らず、監査ログが2行残ること） | 実バイナリに `tools/call` を送り `audit_log` を見る（`crates/kaikei-e2e/tests/mcp_stdio_server.rs`） | **振る舞い検査** |
+//!
+//! 最後の2行は型ではない。**「呼び忘れる形が存在しない」は、ツールを追加する
+//! 実装者の視点での話であって、この crate に何でも書ける立場の人間に対する
+//! 保証ではない**（そちらを見ているのは検査である）。
 //!
 //! # ★このファイルは `rmcp` を名指しできる2ファイルのうちの1つである★
 //!
@@ -51,6 +61,26 @@
 //! `docs/07-mcp-server.md` §10 MC-30（依存の許可リスト）や
 //! `tests/forbidden_tools.rs` の許可リスト側検査と同じ形である。
 //!
+//! ## その許可リストも3巡目に破られた（4巡目 A）
+//!
+//! 許可リストが見ているのは**走査が読んだファイル**だけである。3巡目の
+//! 迂回は `#[path = "../probe_handler.rs"] mod probe_handler;` と
+//! `include!("probe_handler.inc")` で、当時の走査（`src/**/*.rs`）は
+//! **その2つのファイルを一度も読まなかった**。監査ログを通らない別の
+//! `ServerHandler` を `main.rs` から実際に待ち受けさせた状態で、
+//! `cargo build` / `clippy -D warnings` / `fmt --check` /
+//! `cargo test -p kaikei-mcp` が全緑だった。
+//!
+//! **走査は「ソースがどう書かれているか」しか見られない**ので、書き方を
+//! 変える迂回に対して原理的に後手に回る。そこで**網羅の担い手を走査から
+//! 振る舞い検査へ移した**:
+//! `crates/kaikei-e2e/tests/mcp_stdio_server.rs` が**実バイナリを stdio で
+//! 起動して `tools/call` を送り**、`journal_entries` と `audit_log` の行を
+//! 数える。識別子が何であれ、ファイルがどこに在ろうと、別の入口から来よう
+//! と、**監査ログが2行無ければ落ちる**。
+//! 走査（許可リスト・識別子の閉じ込め・`#[path]` / `include!` の禁止）は
+//! 「**書いた瞬間に、DB 無しで、手元で落ちる**」二線目として残してある。
+//!
 //! ## 何が型で閉じていて、何が閉じていないか（PR-F レビュー3巡目 C-1）
 //!
 //! **`rmcp` を「型として見えなくする」ことはできない。** `rmcp` は
@@ -67,10 +97,16 @@
 //! | [`ToolRegistry`] に `McpTool` 以外を載せられない | **型**（`with` の境界が `T: `[`McpTool`]、内側の `ToolRouter` は private フィールド） |
 //! | [`ToolContext`] を自作できない／[`kaikei_app::ports::AuditSink`] に触れない | **型**（private フィールド・private な `new`・`Runtime` を渡さない） |
 //! | 別のルータ・別の `ServerHandler`・別のハンドラを**書き足す** | **ファイル許可リスト**（`rmcp` を名指しできるのは2ファイル） |
+//! | 走査の外にファイルを置く（`#[path]` / `include!`） | **走査**（`tests/source_scan/mod.rs` の `assert_no_out_of_tree_inclusion`。4巡目 B） |
 //! | 同一 crate から `kaikei_app::audit::with_audit` を直接呼ぶ | **識別子の閉じ込め**（`tests/audit_is_structural.rs` の `CONFINED`） |
+//! | **このファイルの中に別のプロトコル入口を足す**（`ServerHandler` は `call_tool` 以外にも既定実装を持つ: `read_resource` / `get_prompt` / `complete` / `get_task` …） | **無い**（許可リストの内側なので走査では見えない。設計上の想定内で diff には出る） |
+//! | 上の全部を**振る舞いで**見る | **実バイナリへの `tools/call`**（`crates/kaikei-e2e/tests/mcp_stdio_server.rs`） |
 //!
-//! 3行目は型ではなく**検査**である。ここを型で閉じたと書かないこと
-//! （提供していない保証を書かない、は本 PR が繰り返し適用してきた規律）。
+//! 3〜6行目は型ではなく**検査**であり、6行目に至っては検査も無い。
+//! ここを型で閉じたと書かないこと。**穴が「1つだけ」だとも書かないこと**
+//! （4巡目 C-1。以前は「再輸出が唯一の穴」と書いていたが、上のとおり
+//! 少なくとも3つある）。提供していない保証を書かない、は本 PR が繰り返し
+//! 適用してきた規律である。
 //!
 //! # `AuditCall::tool` にはレジストリの名前しか載らない
 //!

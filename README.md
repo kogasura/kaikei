@@ -111,9 +111,20 @@ cargo test -p kaikei-store --features pg-tests
 
 ```sh
 set -a; . ./.env; set +a
+cargo build -p kaikei-mcp                      # ★先に必要（下記）
 cargo test -p kaikei-e2e --features pg-tests   # 合成ルートを模したE2E
 cargo test -p kaikei-mcp --features pg-tests   # MCP サーバーの起動（下記の注意）
 ```
+
+`kaikei-e2e` の `tests/mcp_stdio_server.rs` は **`kaikei-mcp` の実行ファイルを
+子プロセスとして起動**し、stdio で `initialize` → `tools/call` を送って
+「`journal_entries` が増える／増えない」と「`audit_log` に開始・結果の2行が
+残る」を確かめる（`DECISIONS.md` D-084 訂正注記4）。
+`CARGO_BIN_EXE_<name>` は同じ package のテストにしか渡らないので、
+このテストは `target/<profile>/` から実行ファイルを辿る。**先に
+`cargo build -p kaikei-mcp` しておくこと**（無い場合・`crates/kaikei-mcp/` の
+どのファイルより古い場合は、その旨を書いて落ちる）。
+`cargo test --workspace` を先に回していればビルド済みになっている。
 
 `kaikei-mcp` の `pg-tests` だけは**使い捨てDBを作らない**。この crate は
 `sqlx` に依存しない（`docs/07-mcp-server.md` §10 MC-30）ため `#[sqlx::test]`

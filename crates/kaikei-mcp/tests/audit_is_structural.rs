@@ -51,24 +51,54 @@
 //! 別のルータ・別の `ServerHandler` を**書き足す**ことを止めているのは
 //! 型ではなくこの許可リストである。
 //!
-//! # 識別子の閉じ込め（[`CONFINED`]）は second line として残す
+//! # 許可リストにも穴がある（4巡目 C-1。「唯一の穴」とは書かない）
 //!
-//! 許可リストの唯一の穴は「`dispatch.rs` が `rmcp` の型を再輸出し、
-//! 他のファイルがその再輸出経由で登録経路へ届く」形である。
-//! [`CONFINED`] はそこを見張る（`ToolRouter` / `ToolRoute` /
-//! `with_async_tool` … が許可された場所以外に現れない）。
-//! **網羅は主張しない**（3巡目 D-4）。網羅を担っているのは許可リストである。
+//! 以前ここには「許可リストの**唯一の**穴は再輸出である」と書いてあったが、
+//! **少なくとも3つある**:
+//!
+//! | 穴 | 何ができるか | 見張り |
+//! |---|---|---|
+//! | `dispatch.rs` が `rmcp` の型を再輸出する | 他のファイルが `rmcp` を名指しせずに登録経路へ届く | [`CONFINED`]（second line） |
+//! | 走査の外にファイルを置く（`#[path]` / `include!`） | crate の一部なのに一度も読まれないファイルに何でも書ける | [`no_source_is_pulled_in_from_outside_the_scan`]（4巡目 B） |
+//! | 許可された `dispatch.rs` の中に**別のプロトコル入口**を足す | `ServerHandler` は `call_tool` 以外にも既定実装を持つ（`on_custom_request` / `read_resource` / `get_prompt` / `complete` / `get_task` / `update_task` / `cancel_task` …）。そこに書けば `tools/call` を通らずに操作できる | **無い**（設計上の想定内。diff には出る） |
+//!
+//! 3つ目は許可リストの内側なので、走査では原理的に見張れない
+//! （`dispatch.rs` を全面的に許すという判断そのものの帰結である）。
+//! **網羅を主張するのはやめる。** 網羅を担っているのは
+//! `crates/kaikei-e2e/tests/mcp_stdio_server.rs` の振る舞い検査であり、
+//! そちらは「どの入口から来たか」に関係なく `audit_log` の行を見る。
+//!
 //! `with_audit` / `AuditCall` / `audit_sink` / `into_parts_unchecked` は
 //! `kaikei-app` 側の識別子なので、そもそも許可リストの守備範囲外であり
 //! [`CONFINED`] が一次の担保である。
 //!
-//! `.github/workflows/architecture.yml` に grep を足すのではなくテストに
-//! したのは、`tests/stdout_is_json_rpc_only.rs` と同じ理由——**手元で
-//! `cargo test` を回すだけで踏める**ようにするため
-//! （`PROGRESS.md` Phase 2 の教訓「手元で回せない検査は回されなくなる」）。
+//! # ★この走査は二線目である★（PR-F レビュー4巡目 A）
+//!
+//! 4巡目のレビューで、走査が**3巡続けて外側から破られた**ことが確認された
+//! （1: 禁止識別子の一覧に無い API、2: `#[tool_handler]` の条件付き生成、
+//! 3: `#[path = "../foo.rs"]` と `include!("foo.inc")` で走査の外にファイルを
+//! 置く）。走査は「ソースがどう書かれているか」しか見られないので、
+//! **書き方を変える迂回に対して原理的に後手に回る。**
+//!
+//! そこで網羅を担うのは
+//! `crates/kaikei-e2e/tests/mcp_stdio_server.rs`（**実バイナリを stdio で
+//! 起動して `tools/call` を送り、`journal_entries` と `audit_log` の行を
+//! 見る振る舞い検査**）にした。識別子が何であれ、ファイルがどこに在ろうと、
+//! **監査ログが2行無ければ落ちる**。
+//!
+//! このファイルが担うのは「**書いた瞬間に、DB 無しで、手元で落ちる**」ことで
+//! ある（`PROGRESS.md` Phase 2 の教訓「手元で回せない検査は回されなくなる」。
+//! `.github/workflows/architecture.yml` に grep を足すのではなくテストにした
+//! のも同じ理由）。**網羅は主張しない。**
+//!
+//! 走査ヘルパ（`src/` の読み出し・コメント判定・識別子境界）は
+//! `tests/source_scan/mod.rs` に置いて `tests/stdout_is_json_rpc_only.rs` と
+//! 共有する。同じ実装が2つに複製されていたため、片方で見つかった穴
+//! （**`.rs` 以外を読まない**）がもう片方に残っていた（4巡目 B）。
 
-use std::fs;
-use std::path::{Path, PathBuf};
+mod source_scan;
+
+use source_scan::{assert_no_out_of_tree_inclusion, is_comment, mentions, sources};
 
 /// **`rmcp` という識別子を書いてよい `src/` 配下のファイル。**
 ///
@@ -206,67 +236,6 @@ const CONFINED: &[Confined] = &[
     },
 ];
 
-fn source_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
-fn rust_sources(dir: &Path, root: &Path, found: &mut Vec<(String, String)>) {
-    for entry in fs::read_dir(dir).expect("src/ を走査できること") {
-        let path = entry.expect("ディレクトリ項目を読めること").path();
-        if path.is_dir() {
-            rust_sources(&path, root, found);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            let relative = path
-                .strip_prefix(root)
-                .expect("src/ 配下のはず")
-                .to_string_lossy()
-                .replace('\\', "/");
-            let text = fs::read_to_string(&path).expect("ソースを読めること");
-            found.push((relative, text));
-        }
-    }
-}
-
-fn sources() -> Vec<(String, String)> {
-    let root = source_root();
-    let mut found = Vec::new();
-    rust_sources(&root, &root, &mut found);
-    assert!(
-        found.len() >= 5,
-        "src/ から .rs を {} 件しか集められませんでした。走査が働いていません",
-        found.len()
-    );
-    found
-}
-
-/// コメント行（`//` `///` `//!` `*`）は見ない。
-///
-/// 「なぜこれを1箇所に閉じるのか」を**説明している doc コメント**が検査に
-/// 引っかかって落ちる誤検知は、このリポジトリで既に3回起きている
-/// （`PROGRESS.md` Phase 2 の教訓3）。
-fn is_comment(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("//") || trimmed.starts_with('*')
-}
-
-/// 識別子として現れているか（前後が識別子構成文字でない）。
-///
-/// 素の `contains` だと `ToolRoute` が `ToolRouter` に一致してしまい、
-/// **`ToolRouter` を使っているだけのファイルが誤検知される**。
-fn mentions(line: &str, token: &str) -> bool {
-    let bytes = line.as_bytes();
-    line.match_indices(token).any(|(at, _)| {
-        let before_ok = at == 0 || !is_ident_byte(bytes[at - 1]);
-        let after = at + token.len();
-        let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
-        before_ok && after_ok
-    })
-}
-
-fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
 // ---------------------------------------------------------------------------
 // ★主役★ `rmcp` を名指しできるファイルの許可リスト（3巡目 B）
 // ---------------------------------------------------------------------------
@@ -277,7 +246,11 @@ fn is_ident_byte(byte: u8) -> bool {
 /// どの API を使う迂回であっても `rmcp` の名前が必要になる。
 /// この1本で、`ToolRouter::add_route` / `merge`、`IntoToolRoute` の各 impl、
 /// `CallToolHandlerExt`、`ServerHandler::call_tool` の手書き、`#[tool_handler]`
-/// のマクロ差し替え、そして**まだ誰も見つけていない経路**が同時に落ちる。
+/// のマクロ差し替えが同時に落ちる。
+///
+/// **ただし「走査が読むファイルに書かれた場合」に限る**（4巡目 B）。
+/// 走査の外にファイルを置く形（`#[path]` / `include!`）は
+/// [`no_source_is_pulled_in_from_outside_the_scan`] が別に見張る。
 ///
 /// コメント行を見ないのは [`is_comment`] の doc のとおり
 /// （「なぜここに閉じるのか」を説明する doc コメントが自分で落ちる誤検知は
@@ -310,6 +283,27 @@ fn rmcp_is_named_only_in_the_files_allowed_to_name_it() {
          足りなければ dispatch.rs 側に足すこと（登録経路に関わる型は再輸出しない）:\n{}",
         RMCP_ALLOWED_FILES.join(" / "),
         violations.join("\n")
+    );
+}
+
+/// **走査の外にソースを置く構文が使われていないこと**（4巡目 B）。
+///
+/// 3巡目の迂回は `#[path = "../probe_handler.rs"] mod probe_handler;` と
+/// `include!("probe_handler.inc")` だった。当時の走査は
+/// `CARGO_MANIFEST_DIR/src` 配下の **`.rs` だけ**を読んでいたので、
+/// どちらのファイルも**一度も読まれなかった**。監査ログを通らない別の
+/// `ServerHandler` を `main.rs` から実際に待ち受けさせた状態で、
+/// `cargo build` / `clippy -D warnings` / `fmt --check` /
+/// `cargo test -p kaikei-mcp` が全緑だった。
+///
+/// 走査対象は `.rs` に限らず `src/` 配下の全ファイルに広げた
+/// （`tests/source_scan/mod.rs`）が、`#[path]` は `src/` の**外**を指せる
+/// ので、それだけでは届かない。**走査の外を指す構文そのものを禁じる。**
+#[test]
+fn no_source_is_pulled_in_from_outside_the_scan() {
+    assert_no_out_of_tree_inclusion(
+        "この走査（rmcp の許可リストと識別子の閉じ込め）は src/ 配下の\
+         ファイルしか読みません。",
     );
 }
 
@@ -500,6 +494,30 @@ fn the_detector_actually_flags_a_bypass() {
     assert!(is_comment("    /// with_audit に閉じてある"));
     assert!(is_comment("//! ToolRoute を直接組み立てない"));
     assert!(!is_comment("    let route = ToolRoute::new_dyn(..);"));
+
+    // ★3巡目の迂回★ 走査の外にソースを置く形（4巡目 B）。
+    for bypass in [
+        "#[path = \"../probe_handler.rs\"]",
+        "    #[ path = \"../probe_handler.rs\" ]",
+        "pub mod probe_handler { include!(\"../probe_handler.inc\"); }",
+        "    include !(\"probe.inc\");",
+    ] {
+        assert!(
+            source_scan::pulls_in_out_of_tree_source(bypass),
+            "検出できていない: {bypass}"
+        );
+    }
+    // 資源の埋め込みは落とさない（`kaikei-jp-data` が同梱 YAML でやっている形）。
+    for allowed in [
+        "    const TAGS: &str = include_str!(\"../data/tags.yaml\");",
+        "    let bytes = include_bytes!(\"../data/chart.bin\");",
+        "    let path = entry.path();",
+    ] {
+        assert!(
+            !source_scan::pulls_in_out_of_tree_source(allowed),
+            "誤検知している: {allowed}"
+        );
+    }
 }
 
 /// 閉じ込め規則そのものが空になっていないこと（規則を消して緑にできない）。
@@ -527,11 +545,14 @@ fn the_confinement_rules_are_not_empty() {
 /// `CallToolHandler` 規則には一致しない）が抜けていた。
 /// **手で維持する識別子の一覧が網羅であることは、原理的に主張できない。**
 ///
-/// 網羅を担っているのは
+/// 走査の中で一次の担保になっているのは
 /// [`rmcp_is_named_only_in_the_files_allowed_to_name_it`]（ファイル許可リスト）
-/// である。ここが担うのはその唯一の穴——**`dispatch.rs` が `rmcp` の型を
+/// である。ここが担うのはその穴の1つ——**`dispatch.rs` が `rmcp` の型を
 /// 再輸出したとき**——に対する second line であり、この検査が固定するのは
 /// 「一度入れた規則が黙って消えない」ことだけである。
+/// **許可リストの穴はこれ1つではない**（モジュール doc の表。4巡目 C-1）。
+/// 走査全体としての網羅は主張しない。網羅を担うのは
+/// `crates/kaikei-e2e/tests/mcp_stdio_server.rs` の振る舞い検査である。
 #[test]
 fn the_second_line_rules_for_rmcp_identifiers_are_still_present() {
     for token in [
