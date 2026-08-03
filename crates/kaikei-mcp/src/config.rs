@@ -42,7 +42,9 @@ use kaikei_jp::closing::ClosingAccounts;
 use kaikei_jp::tax::{
     round_mode_from_code, JpSettingsOverrides, RoundingUnit, TaxMode, ROUND_MODE_CODES,
 };
+use kaikei_store::pool::APP_DEFAULT_ACQUIRE_TIMEOUT;
 use std::fmt;
+use std::time::Duration;
 
 /// 接続文字列を渡す環境変数（`DECISIONS.md` D-048 の変数分離）。
 pub const ENV_APP_DATABASE_URL: &str = "APP_DATABASE_URL";
@@ -70,10 +72,21 @@ pub const ENV_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS: &str =
 /// 決算振替のゼロ化明細に付ける消費税区分コード。
 pub const ENV_CLOSING_TAX_CATEGORY: &str = "KAIKEI_CLOSING_TAX_CATEGORY";
 
-/// 必須の環境変数の一覧（`.env.example` / README と突き合わせる用）。
+/// 必須の環境変数の一覧。
 ///
-/// **この一覧はテストが [`ServerConfig::from_env`] の実挙動と突き合わせる**
-/// （`PROGRESS.md` Phase 1 の教訓6「手で維持する一覧は必ず腐る」）。
+/// テストが**3方向**と突き合わせる（`PROGRESS.md` Phase 1 の教訓6
+/// 「手で維持する一覧は必ず腐る」）:
+///
+/// | 突き合わせ先 | テスト |
+/// |---|---|
+/// | [`ServerConfig::from_lookup`] の実挙動 | `the_required_list_matches_what_from_lookup_actually_demands` |
+/// | `.env.example` | `every_required_variable_appears_in_the_env_example` |
+/// | `README.md` | `every_required_variable_appears_in_the_readme` |
+///
+/// 後ろの2つが要るのは、[`ConfigError`] の本文が**その2つを一次情報として
+/// 名指ししている**ためである。実装とテストが緑のまま `.env.example` だけが
+/// 欠けると、起動失敗メッセージの誘導先が嘘になる（`DECISIONS.md` D-047
+/// 「手で維持する一覧は腐る」と同型）。
 pub const REQUIRED_ENV_VARS: &[&str] = &[
     ENV_APP_DATABASE_URL,
     ENV_BOOK_CURRENCY,
@@ -108,6 +121,18 @@ pub struct ServerConfig {
     pub closing_accounts: ClosingAccounts,
     /// 決算振替のゼロ化明細に付ける消費税区分コード。
     pub closing_tax_category: String,
+
+    /// 起動時に DB への接続を確保できるまで待つ上限。
+    ///
+    /// **環境変数からは読まない**（[`REQUIRED_ENV_VARS`] に無い）。
+    /// 事業者設定ではなく運用上の待ち時間であり、既定値
+    /// （[`kaikei_store::pool::APP_DEFAULT_ACQUIRE_TIMEOUT`]）で困る場面が
+    /// 無いため、設定項目を増やしていない（増やせば「取り違えて 0 を書く」
+    /// という新しい事故を作る）。
+    ///
+    /// 公開フィールドにしてあるのは、**到達しない接続先を使うテスト**が
+    /// 30 秒待たされないようにするため（`tests/startup_config.rs`）。
+    pub connect_timeout: Duration,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -118,6 +143,7 @@ impl fmt::Debug for ServerConfig {
             .field("settings_overrides", &self.settings_overrides)
             .field("closing_accounts", &self.closing_accounts)
             .field("closing_tax_category", &self.closing_tax_category)
+            .field("connect_timeout", &self.connect_timeout)
             .finish()
     }
 }
@@ -314,6 +340,7 @@ impl ServerConfig {
                 owner_contributions: owner_contributions.expect(missing),
             },
             closing_tax_category: closing_tax_category.expect(missing),
+            connect_timeout: APP_DEFAULT_ACQUIRE_TIMEOUT,
         })
     }
 }
@@ -543,6 +570,58 @@ mod tests {
                 "{name} が指摘されていない"
             );
         }
+    }
+
+    /// リポジトリ直下の `.env.example`（`ConfigError` が誘導先として
+    /// 名指ししているファイル）。**コンパイル時に埋め込む**ので、
+    /// ファイルが消えればビルドが落ちる。
+    const ENV_EXAMPLE: &str = include_str!("../../../.env.example");
+
+    /// リポジトリ直下の `README.md`（同上）。
+    const README: &str = include_str!("../../../README.md");
+
+    // 必須項目が `.env.example` に書かれている。
+    //
+    // `REQUIRED_ENV_VARS` と `from_lookup` の実挙動は上のテストで
+    // 突き合わせてあるが、**利用者が読む側**とは繋がっていなかった。
+    // PR-F / PR-G で必須項目が増えたとき、実装とテストは緑のまま
+    // `.env.example` だけが欠けると、起動失敗メッセージの誘導先が嘘になる。
+    #[test]
+    fn every_required_variable_appears_in_the_env_example() {
+        for name in REQUIRED_ENV_VARS {
+            assert!(
+                ENV_EXAMPLE.contains(name),
+                "{name} が .env.example に載っていません。\
+                 起動に失敗したときのメッセージは .env.example を一次情報として\
+                 案内するため、項目を足したら同じ PR で .env.example にも足すこと"
+            );
+        }
+    }
+
+    // 必須項目が README に書かれている（同上）。
+    #[test]
+    fn every_required_variable_appears_in_the_readme() {
+        for name in REQUIRED_ENV_VARS {
+            assert!(
+                README.contains(name),
+                "{name} が README.md に載っていません。\
+                 起動に失敗したときのメッセージは README を一次情報として\
+                 案内するため、項目を足したら同じ PR で README にも足すこと"
+            );
+        }
+    }
+
+    // 誘導先の名前が実際のファイル名と一致している（メッセージの中の
+    // `.env.example` / README という綴りだけが古くなるのを防ぐ）。
+    #[test]
+    fn the_failure_message_points_at_files_that_exist() {
+        let text = ServerConfig::from_lookup(&|_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains(".env.example"), "{text}");
+        assert!(text.contains("README"), "{text}");
+        assert!(!ENV_EXAMPLE.is_empty());
+        assert!(!README.is_empty());
     }
 
     // 空文字は「設定した」ことにしない（未設定と同じく起動を止める）。

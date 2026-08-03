@@ -20,9 +20,11 @@
 //! `env!("CARGO_BIN_EXE_kaikei-mcp")` は cargo が統合テストに渡す、
 //! ビルド済みバイナリの絶対パス。
 
-use kaikei_mcp::config::REQUIRED_ENV_VARS;
+use kaikei_mcp::config::{ServerConfig, REQUIRED_ENV_VARS};
+use kaikei_mcp::startup;
 use std::collections::HashMap;
 use std::process::{Command, Output};
+use std::time::Duration;
 
 /// 全項目が揃った環境（接続先はローカルの実在しないポートでよい。
 /// このファイルのテストはいずれも DB 接続まで到達しない）。
@@ -138,27 +140,109 @@ fn an_invalid_value_aborts_the_startup_instead_of_falling_back() {
     assert!(output.stdout.is_empty());
 }
 
-/// 設定が揃っていても DB へ繋げなければ起動しない（ツール応答に到達させない。
-/// `docs/07-mcp-server.md` §7）。接続文字列そのものは出さない（§8）。
+/// 税区分マスタに無い消費税区分コードは、**空でないだけでは通さない**。
+///
+/// 12個の必須設定のうち `KAIKEI_CLOSING_TAX_CATEGORY` だけが語彙の検証を
+/// 受けておらず、存在しないコードでもサーバが正常に起動していた
+/// （`KAIKEI_TAX_MODE=zeinuki` は「有効な値: exclusive, inclusive」で
+/// 起動を中止するのと対照的だった）。Phase 3 には `close_period` が
+/// 無いので実害は出ないが、決算振替を実装した Phase で
+/// 「起動は通るのに決算だけが落ちる」形になる（`docs/07-mcp-server.md` §7）。
+///
+/// DB には到達しない（この検証は接続より前に終わる）。
 #[test]
-fn a_complete_configuration_still_aborts_when_the_database_is_unreachable() {
+fn an_unknown_closing_tax_category_aborts_the_startup_listing_the_valid_codes() {
     let mut env = complete_env();
-    // 到達しないポートを指す（PostgreSQL の既定ポートを避ける）。
-    env.insert(
-        "APP_DATABASE_URL",
-        "postgres://kaikei_app:dummy@127.0.0.1:1/kaikei",
+    env.insert("KAIKEI_CLOSING_TAX_CATEGORY", "NOPE");
+    let output = run_with(&env);
+    let stderr = stderr_of(&output);
+
+    assert!(
+        !output.status.success(),
+        "税区分マスタに無いコードで起動に成功した:\n{stderr}"
     );
+    assert!(stderr.contains("KAIKEI_CLOSING_TAX_CATEGORY"), "{stderr}");
+    assert!(stderr.contains("NOPE"), "{stderr}");
+    assert!(
+        stderr.contains("有効な値") && stderr.contains("NOT_APPLICABLE"),
+        "有効な値の一覧が示されること（他の項目と揃える。CLAUDE.md §11）:\n{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "stdout は空であること");
+}
+
+/// 決算科目のコードが勘定科目表に無い場合、**どの環境変数を直せばよいか**が
+/// 分かる。
+///
+/// `ComposeError` の文言そのものは言い換えない（`docs/07-mcp-server.md` §7）が、
+/// あの文言は「正しい科目コードを `JpSoleProprietorClosingPolicy::new` に
+/// 指定してください」という**利用者が触れない Rust の構築関数名**を次の手として
+/// 提示する。DB 接続の失敗が `APP_DATABASE_URL` を添えているのと同じ形で、
+/// 環境変数名と現在の値を後ろに足す（`CLAUDE.md` §11）。
+#[test]
+fn a_closing_account_that_is_missing_from_the_chart_names_the_environment_variable() {
+    let mut env = complete_env();
+    env.insert("KAIKEI_CLOSING_ACCOUNT_CAPITAL", "999");
     let output = run_with(&env);
     let stderr = stderr_of(&output);
 
     assert!(!output.status.success(), "{stderr}");
+    // ComposeError の本文（言い換えていない）。
+    assert!(stderr.contains("勘定科目表に見つかりません"), "{stderr}");
+    // 足した部分: どの環境変数のどの値が原因か。
     assert!(
-        stderr.contains("APP_DATABASE_URL"),
-        "どの環境変数を見ればよいかが分かること:\n{stderr}"
+        stderr.contains("KAIKEI_CLOSING_ACCOUNT_CAPITAL") && stderr.contains("999"),
+        "直すべき環境変数と現在の値が分かること:\n{stderr}"
     );
     assert!(
-        !stderr.contains("dummy"),
-        "接続文字列（パスワードを含む）を出さないこと:\n{stderr}"
+        stderr.contains("KAIKEI_CLOSING_ACCOUNT_OWNER_DRAWINGS")
+            && stderr.contains("KAIKEI_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS"),
+        "3科目のどれを直せばよいか対応が付くこと:\n{stderr}"
     );
     assert!(output.stdout.is_empty(), "stdout は空であること");
+}
+
+/// 設定が揃っていても DB へ繋げなければ起動しない（ツール応答に到達させない。
+/// `docs/07-mcp-server.md` §7）。接続文字列そのものは出さない（§8）。
+///
+/// # ここだけバイナリを起動しない
+///
+/// 到達しない接続先に対して、`sqlx` のプールは接続確保の待ち時間
+/// （既定 30 秒）が満了するまでリトライする。バイナリを起動して終了を待つと
+/// **このテスト1件で 30 秒**かかり、しかもこのファイルは `pg-tests` ゲートの
+/// 外にあるので、必須チェックの `quality` ジョブと開発者のローカル実行の
+/// 両方がその 30 秒を毎回払うことになる（実測: 該当スイート 30.31s、
+/// 他スイートは最大 0.43s）。
+///
+/// 待ち時間を短くして合成ルート（`startup::assemble`）を直接呼ぶ。
+/// **本番の待ち時間は縮めない**——混んでいるだけの DB に対して起動が
+/// 失敗するようになるため（`kaikei_store::pool::connect_app_with` の doc）。
+///
+/// `main.rs` がこの `Err` を握り潰さないことは、このファイルの他の3件
+/// （実際にバイナリを起動して終了コードと stdout を見る）が押さえている。
+#[tokio::test]
+async fn a_complete_configuration_still_aborts_when_the_database_is_unreachable() {
+    let mut vars = complete_env();
+    // 到達しないポートを指す（PostgreSQL の既定ポートを避ける）。
+    vars.insert(
+        "APP_DATABASE_URL",
+        "postgres://kaikei_app:dummy@127.0.0.1:1/kaikei",
+    );
+
+    let mut config = ServerConfig::from_lookup(&|name| vars.get(name).map(|v| (*v).to_string()))
+        .expect("設定は揃っていること");
+    config.connect_timeout = Duration::from_millis(500);
+
+    let Err(error) = startup::assemble(&config).await else {
+        panic!("DB へ接続できないのに起動が成功した");
+    };
+    let text = error.to_string();
+
+    assert!(
+        text.contains("APP_DATABASE_URL"),
+        "どの環境変数を見ればよいかが分かること:\n{text}"
+    );
+    assert!(
+        !text.contains("dummy"),
+        "接続文字列（パスワードを含む）を出さないこと:\n{text}"
+    );
 }

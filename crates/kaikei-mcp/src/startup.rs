@@ -20,11 +20,13 @@
 //! 起動時に落とすもの:
 //!
 //! 1. 事業者設定の不足（[`crate::config`]）
-//! 2. 同梱マスタのロード失敗・決算科目の不在（`compose`）
-//! 3. `defaults_as_of` に有効な税区分マスタが無い（`compose`）
-//! 4. DB へ接続できない
-//! 5. **接続ロールが帳簿への `UPDATE` / `DELETE` を持っている**（下記）
-//! 6. 勘定科目マスタの投入に失敗した
+//! 2. **決算振替の消費税区分コードが税区分マスタに無い**
+//!    （[`validate_closing_tax_category`]）
+//! 3. 同梱マスタのロード失敗・決算科目の不在（`compose`）
+//! 4. `defaults_as_of` に有効な税区分マスタが無い（`compose`）
+//! 5. DB へ接続できない
+//! 6. **接続ロールが帳簿への `UPDATE` / `DELETE` / `TRUNCATE` を持っている**（下記）
+//! 7. 勘定科目マスタの投入に失敗した
 //!
 //! # ログは stderr
 //!
@@ -34,18 +36,23 @@
 //! [`Startup::diagnostics`] として返し、出力先の判断は `main.rs` に
 //! 一本化する。
 
-use crate::config::{ServerConfig, ENV_APP_DATABASE_URL};
+use crate::config::{
+    ServerConfig, ENV_APP_DATABASE_URL, ENV_CLOSING_ACCOUNT_CAPITAL,
+    ENV_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS, ENV_CLOSING_ACCOUNT_OWNER_DRAWINGS,
+    ENV_CLOSING_TAX_CATEGORY,
+};
 use kaikei_app::clock::SystemClock;
 use kaikei_app::context::BookSettings;
 use kaikei_app::id::UuidV7IdGenerator;
 use kaikei_app::tx::with_tx;
 use kaikei_app::usecase::import_chart;
 use kaikei_core::{AccountingDate, Clock};
-use kaikei_jp::compose::{compose, ComposeOptions, Composition};
+use kaikei_jp::compose::{compose, ComposeError, ComposeOptions, Composition};
+use kaikei_jp::error::JpError;
 use kaikei_jp::tax::TaxRuleSets;
 use kaikei_store::audit::PgAuditSink;
 use kaikei_store::convert::{naive_date_to_accounting_date, timestamp_to_datetime};
-use kaikei_store::pool::{connect_app, inspect_journal_privileges, PgStore};
+use kaikei_store::pool::{connect_app_with, inspect_journal_privileges, PgStore};
 use std::fmt;
 use std::sync::Arc;
 
@@ -108,6 +115,10 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
             "同梱の消費税区分マスタを読み込めませんでした: {source}"
         ))
     })?;
+    // 決算振替の税区分コードは `compose` の先（`JpSoleProprietorClosingPolicy`）
+    // でもマスタと照合されないため、ここで語彙を検証する。詳細は
+    // [`validate_closing_tax_category`]。
+    validate_closing_tax_category(&rule_sets, as_of, &config.closing_tax_category)?;
     let composition = compose(ComposeOptions {
         rule_sets,
         settings_overrides: config.settings_overrides,
@@ -117,12 +128,16 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
     })
     .map_err(|source| {
         // `ComposeError` の日本語メッセージは言い換えずそのまま出す
-        // （`docs/07-mcp-server.md` §7）。
-        StartupError::new(format!("起動を中止しました: {source}"))
+        // （`docs/07-mcp-server.md` §7）。**言い換えない代わりに、その値を
+        // どの環境変数から渡したかを添える**（`CLAUDE.md` §11。
+        // `ComposeError` は `kaikei-jp` の語彙で書かれており、利用者が触れない
+        // Rust の構築関数名を「次の手」として提示してしまうため）。
+        let hint = closing_settings_hint(&source, config);
+        StartupError::new(format!("起動を中止しました: {source}{hint}"))
     })?;
 
     // 2. DB 接続（kaikei_app ロール）。
-    let pool = connect_app(&config.app_database_url)
+    let pool = connect_app_with(&config.app_database_url, config.connect_timeout)
         .await
         .map_err(|source| {
             // 接続文字列そのものは載せない（パスワードが平文で入る。
@@ -145,14 +160,19 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
     })?;
     if !privileges.is_append_only() {
         return Err(StartupError::new(format!(
-            "起動を中止しました: 接続ロール {} が帳簿（journal_entries）に対する \
-             UPDATE / DELETE 権限を持っています。\n\
+            "起動を中止しました: 接続ロール {role} が帳簿に対する次の権限を\
+             持っています: {granted}。\n\
              このサーバーは記帳した仕訳を更新・削除しない前提で作られており、\
              その前提を DB 権限の層でも守るために kaikei_app ロールで接続します。\n\
              環境変数 {ENV_APP_DATABASE_URL} が kaikei_app ロールを指しているか\
              確認してください（kaikei_migrator はテーブル所有者であり \
-             REVOKE をバイパスします）。",
-            privileges.role
+             REVOKE をバイパスします）。\n\
+             kaikei_app を指しているのにこの表示が出る場合は、その環境で\
+             帳簿のテーブルに GRANT が追加されています。\
+             crates/kaikei-store/migrations/0003_journal.sql の REVOKE と\
+             同じ状態に戻してください。",
+            role = privileges.role,
+            granted = privileges.describe_granted(),
         )));
     }
 
@@ -199,6 +219,104 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
         }),
         diagnostics,
     })
+}
+
+/// 決算振替のゼロ化明細に付ける消費税区分コードが、**その時点で有効な
+/// 消費税区分マスタに実在する**ことを起動時に確かめる。
+///
+/// # なぜ `compose` に任せられないのか
+///
+/// `JpSoleProprietorClosingPolicy::new` はこのコードを `TagSet` に詰めて
+/// タグスキーマの検証に通すが、スキーマが見るのは「`tax_category` キーが
+/// 登録済みで値が文字列であること」までで、**値がマスタに存在するかは
+/// 見ない**。したがってこの検証を入れないと、12個の必須設定のうち
+/// この1つだけが「空でないこと」しか検査されず、存在しない区分コードでも
+/// サーバが正常に起動してしまう。
+///
+/// Phase 3 には `close_period` が無いので実害は出ないが、決算振替を
+/// 実装した Phase で**「起動は通るのに決算だけが落ちる」**形になる。
+/// `docs/07-mcp-server.md` §7 が「設定・マスタの不備は起動時に検出して
+/// 起動を中止する」と定めているのは、まさにこの形を避けるためである。
+///
+/// # `as_of` に有効なマスタが無い場合はここで判定しない
+///
+/// その不備は `compose` が `NoApplicableRuleSetForDefaults` として報告する。
+/// 同じ原因で2つのメッセージを出すと、どちらを直せばよいか分からなくなる。
+fn validate_closing_tax_category(
+    rule_sets: &TaxRuleSets,
+    as_of: AccountingDate,
+    code: &str,
+) -> Result<(), StartupError> {
+    let Some(table) = rule_sets.for_date(as_of) else {
+        return Ok(());
+    };
+    if table.categories().any(|category| category.code == code) {
+        return Ok(());
+    }
+
+    let valid = table
+        .categories()
+        .map(|category| category.code.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(StartupError::new(format!(
+        "起動を中止しました: 環境変数 {ENV_CLOSING_TAX_CATEGORY} に指定された\
+         消費税区分コード（{code}）が消費税区分マスタに見つかりません。\n\
+         {as_of} 時点で有効なマスタ「{label}」（{range}）の有効な値: {valid}\n\
+         このコードは決算振替で収益・費用をゼロにする明細に付きます。\
+         どの区分を使うかの判断はこのサーバーでは行いません。",
+        as_of = as_of.to_iso_string(),
+        label = table.label(),
+        range = table.range_display(),
+    )))
+}
+
+/// `ComposeError` に添える「どの環境変数を直せばよいか」。
+///
+/// # 言い換えではなく追記である
+///
+/// `docs/07-mcp-server.md` §7 は `ComposeError` の文言をそのまま出すと
+/// 定めている（`kaikei-jp` が持つ理由の説明を presentation 層で書き直すと
+/// 必ずずれる）。一方で `ComposeError` は `kaikei-jp` の語彙で書かれており、
+/// 「正しい科目コードを `JpSoleProprietorClosingPolicy::new` に指定して
+/// ください」という**利用者が触れない Rust の構築関数名**を次の手として
+/// 提示する。そこで文言は変えず、**その値をどの環境変数から渡したか**を
+/// 後ろに足す（`CLAUDE.md` §11。DB 接続の失敗が
+/// `APP_DATABASE_URL` を添えているのと同じ形）。
+///
+/// 決算設定に由来しない失敗（同梱 YAML の破損、`defaults_as_of` に
+/// 有効なマスタが無い等）には何も足さない——直す先が環境変数ではないため。
+fn closing_settings_hint(error: &ComposeError, config: &ServerConfig) -> String {
+    let caused_by_closing_settings = matches!(
+        error,
+        ComposeError::Jp(
+            JpError::MissingClosingAccount { .. }
+                | JpError::NotPostableClosingAccount { .. }
+                | JpError::DuplicateClosingAccount { .. }
+                | JpError::ClosingTagSchemaMismatch { .. }
+        )
+    );
+    if !caused_by_closing_settings {
+        return String::new();
+    }
+
+    format!(
+        "\n決算処理の設定は次の環境変数から渡しています（= の右が現在の値）。\
+         該当するものを見直してください:\n\
+         \x20 {capital}（元入金）= {capital_value}\n\
+         \x20 {drawings}（事業主貸）= {drawings_value}\n\
+         \x20 {contributions}（事業主借）= {contributions_value}\n\
+         \x20 {tax_category}（ゼロ化明細の消費税区分）= {tax_category_value}\n\
+         勘定科目マスタ側を直す場合は、その科目を DB の accounts に追加してください。",
+        capital = ENV_CLOSING_ACCOUNT_CAPITAL,
+        capital_value = config.closing_accounts.capital.as_str(),
+        drawings = ENV_CLOSING_ACCOUNT_OWNER_DRAWINGS,
+        drawings_value = config.closing_accounts.owner_drawings.as_str(),
+        contributions = ENV_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS,
+        contributions_value = config.closing_accounts.owner_contributions.as_str(),
+        tax_category = ENV_CLOSING_TAX_CATEGORY,
+        tax_category_value = config.closing_tax_category,
+    )
 }
 
 /// 起動時点の日付（UTC）。
