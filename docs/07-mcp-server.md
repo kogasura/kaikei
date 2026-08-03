@@ -1076,6 +1076,14 @@ AI が取るべき次の手が違う。
 **同一の条件が経路によって2つのコードになる**——このセクションが禁じている
 「既に語彙がある概念に別名を作る」そのものになる（レビュー2巡目で是正）。
 
+この一致は散文ではなく検査で固定してある。
+`crates/kaikei-mcp/src/error.rs` の
+`jp_and_core_invalid_chart_resolve_to_the_same_code` が
+`jp_error_code(&JpError::InvalidChart { .. })` と
+`kaikei_app::error::core_error_code(&CoreError::InvalidChart { .. })` の
+**戻り値**を突き合わせるので、`kaikei-app` 側が `CoreError::InvalidChart` の
+写像を変えたら落ちる（レビュー3巡目で追加）。
+
 最後の9件を1つにまとめているのは、いずれも**サーバ側の同梱マスタ・起動設定が
 不正**で、呼び出し元の入力を直しても解消しない——つまり
 `PolicyError::InvalidPolicyData`（「policy が構築時に受け取ったデータが不正」）

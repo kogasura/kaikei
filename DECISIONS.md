@@ -2998,6 +2998,18 @@ AI 向けに自分で書いたもので（有効なキー一覧・有効期間�
    なったときに「0件を突き合わせて全件一致」で無言で通らないよう、
    件数の下限を番人として置く。
 
+**訂正注記4（レビュー3巡目）— 訂正注記1を散文でなく検査で固定する**:
+「`JpError::InvalidChart` と `CoreError::InvalidChart` が同じコードになる」は
+訂正注記1と `docs/07-mcp-server.md` §6 の散文にしか無く、将来 `kaikei-app` 側が
+`CoreError::InvalidChart` の写像を変えれば**無言で再発**する状態だった。
+`crates/kaikei-mcp/src/error.rs` の
+`jp_and_core_invalid_chart_resolve_to_the_same_code` で、**両方の写像関数を
+実際に通してその結果が一致すること**を検査する。定数どうし
+（`codes::INVALID_CHART` と `codes::INVALID_CHART`）を比べても自明に等しい
+だけで何も固定できないので、`jp_error_code` と
+`kaikei_app::error::core_error_code` の**戻り値**を突き合わせる。
+テストは `kaikei-mcp` 側に置く（`kaikei-app` の公開契約は触らない）。
+
 **却下した選択肢**:
 
 | 候補 | 却下理由 |

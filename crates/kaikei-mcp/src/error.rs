@@ -748,6 +748,34 @@ pub enum JpError {
         );
     }
 
+    // 同一条件が2つのコードにならない（`docs/07-mcp-server.md` §6 / D-080）。
+    //
+    // `JpError::InvalidChart` は `kaikei_core::ChartOfAccounts::new` が返した
+    // `CoreError::InvalidChart` を包んだものを含む。同じ「勘定科目表が不正」を
+    // 経路によって別コードで返すと、AI は分岐を2つ覚える必要が出る。
+    //
+    // 定数どうし（`codes::INVALID_CHART` と `codes::INVALID_CHART`）を比べても
+    // それは自明に等しいだけで何も固定できない。**両方の写像関数を実際に通し、
+    // その結果が一致すること**を見る。将来 `kaikei-app` 側が
+    // `CoreError::InvalidChart` の写像を変えたら、ここが落ちる。
+    #[test]
+    fn jp_and_core_invalid_chart_resolve_to_the_same_code() {
+        let via_jp = jp_error_code(&JpError::InvalidChart {
+            label: "chart.yaml".to_string(),
+            reason: "親科目が存在しません".to_string(),
+        });
+        let via_core = core_error_code(&kaikei_core::CoreError::InvalidChart {
+            reason: "親科目が存在しません".to_string(),
+        });
+        assert_eq!(
+            via_jp, via_core,
+            "同じ「勘定科目表が不正」が経路によって別コードになっています\
+             （JpError 経由 = {via_jp} / CoreError 経由 = {via_core}）。\n\
+             既に語彙がある概念に別名を作らない（docs/07-mcp-server.md §6 / D-080）。\
+             どちらかの写像を変えたなら、もう一方も合わせてください。"
+        );
+    }
+
     // 登録番号の4つの観点は別コードになる（D-053 の検証順が応答から読める）。
     #[test]
     fn the_four_invoice_checks_have_distinct_codes() {
