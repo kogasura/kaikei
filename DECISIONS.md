@@ -4023,6 +4023,29 @@ SQL 側では `LEFT JOIN LATERAL ... LIMIT 1` で赤伝を1件だけ引く。素
 **理由**（決定2）: 規則を1つに保つ。緩める方向（後から絞り込み専用の宣言を
 足す）は非破壊的に行えるが、いったん自由にしたものを絞るのは破壊的変更になる。
 
+**金額の範囲は通貨も突き合わせる**（PR-H レビュー3巡目 C-2）。
+`min_amount` / `max_amount` は「**同じ1行**が両方を満たす」で判定するので、
+`search.rs` はその `EXISTS` の中で
+`AND l.currency = $7 AND l.currency_minor_unit = $8` も見ている。
+`amount_minor` は最小通貨単位の整数なので、これが無いと
+**USD 250.00（`amount_minor` = 25,000）が JPY 25,000 と一致する**。
+
+この2行は実装が意図して置いた防御だが、差分テストも e2e も
+**土台が JPY 一色**だったため一度も効いておらず、
+丸ごと外しても両スイートが緑のまま通っていた（レビュアーが実測）。
+`post_journal_entry` は帳簿通貨で書き、`search_entries` の金額も帳簿通貨で
+解釈するので**現状 MCP 経路からは到達しない**が、
+「意図して置いた防御で、検査がゼロのもの」を read model に残さない。
+
+閉じたのは差分テスト側だけである
+（`crates/kaikei-store/tests/search_ledger_differential.rs` の
+`the_amount_range_compares_only_lines_in_the_same_currency`。
+土台に USD 建ての仕訳を1件足し、JPY で同じ最小通貨単位の値を指定しても
+当たらないことを見る）。**e2e では閉じられない**——MCP 経路では外貨の明細を
+作ることも外貨で絞ることもできないためである。
+元帳の複数通貨 `Unsupported`（D-042）は1つの科目に2通貨が混ざったときの
+**別経路**であり、この突き合わせの代わりにはならない。
+
 **トレードオフ**:
 
 - 2件目以降の赤伝は `reversed_by` に現れない（最も古い1件だけ）。二重訂正は
@@ -4142,6 +4165,30 @@ keyset を選んだのは、この帳簿が append-only でありながら**過�
 この `take` を落とすと決定3の `returned` / `truncation_note` が
 **`limit + 1` 行を「返した」と報告する**（合計も並びも正しいままなので、
 行数を見ていない検査は緑のまま通る）。
+
+**「残りがちょうど `limit` 件」の境界を直接主張する**（PR-H レビュー3巡目 C-1）。
+続きの有無は `headers.len() > params.limit`（`search.rs`）/
+`records.len() > params.limit`（`ledger.rs`）で決まる。この比較を `>=` に
+書き換えても**両スイートが緑のまま通っていた**（レビュアーが実測）。
+入ると、最終ページがちょうど `limit` 行だったときに `has_more: true` になり、
+`next_cursor` と `truncation_note` まで付く——**決定3の「上限で切ったことが
+応答から必ず読み取れる」が偽陽性になる。** AI は続きが無いのにもう一度呼び、
+0件のページを受け取る。
+
+緑のまま通っていた理由は、両スイートのページング検査が
+「`next_cursor` が無くなるまで辿る」形だったからである。
+余分な0件ページを1回踏んでも辿り終えた集合は変わらず、合計も並びも正しい。
+e2e は10件を `limit = 2` で辿っており**境界を通過しているのに**
+捕まえていなかった。そこで両スイートに1本ずつ、
+
+- **総件数（`total_lines`）と同じ `limit`** で呼んだページに
+  `next_cursor` / `has_more` / `truncation_note` が付かないこと
+- **割り切れる `limit`** で辿ったときのページ数がちょうど
+  `総件数 ÷ limit` であること（0件のページを踏まないこと）
+
+を主張する検査を置く
+（`a_last_page_that_exactly_fills_the_limit_has_no_next_cursor` /
+`a_page_that_exactly_fills_the_limit_is_not_reported_as_truncated`）。
 
 **トレードオフ**: 「N ページ目へ飛ぶ」ができない（keyset は順に辿るしかない）。
 AI の使い方（絞り込んで先頭から読む、足りなければ条件を足す）ではページ番号は

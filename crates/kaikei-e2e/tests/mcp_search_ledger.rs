@@ -491,6 +491,149 @@ async fn a_truncated_search_says_so_and_the_cursor_walks_the_rest(
     }
 }
 
+/// ★残りがちょうど `limit` 件のページは「切った」と言わない★
+/// （D-089。PR-H レビュー3巡目 C-1）
+///
+/// 続きの有無は「`limit + 1` 件取って `limit` 件より多く返ってきたか」で
+/// 決まる。これを `>=` にすると**残りがちょうど `limit` 件のページ**に
+/// `has_more: true` / `next_cursor` / `truncation_note` が付き、
+/// **上限で切ったことが応答から必ず読み取れる**という D-089 の中心的な
+/// 約束が偽陽性になる。AI は続きが無いのにもう一度呼び、空のページを受け取る。
+///
+/// 上の [`a_truncated_search_says_so_and_the_cursor_walks_the_rest`] は
+/// 10件を `limit=2`（ちょうど割り切れる）で辿っており**境界を通過している
+/// のに**捕まえていない。`next_cursor` が無くなるまで辿るだけなので、
+/// 余分な0件ページを1回踏んでも `seen` が変わらないためである。
+/// **そこで「最後のページは切られていない」を直接主張する。**
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_page_that_exactly_fills_the_limit_is_not_reported_as_truncated(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let runtime = runtime(&app).await;
+    let posted = post_sample_entries(&runtime).await;
+    let total = posted.len() as u64;
+    assert!(total >= 4 && total % 2 == 0, "土台が変わっている: {total}");
+
+    // --- search_entries: 総件数と同じ `limit` ---
+    let response = call::<SearchEntries>(&runtime, json!({ "limit": total })).await;
+    assert!(!is_error(&response), "{response}");
+    let page = body(&response);
+    assert_eq!(page["total_matches"], json!(total), "{page}");
+    assert_eq!(page["returned"], json!(total), "{page}");
+    assert_eq!(
+        page["has_more"],
+        json!(false),
+        "ちょうど収まったのに「続きがある」と言っています: {page}"
+    );
+    assert!(page.get("next_cursor").is_none(), "{page}");
+    assert!(
+        page.get("truncation_note").is_none(),
+        "切っていないのに切ったと言っています: {page}"
+    );
+
+    // --- search_entries: 割り切れる `limit` で辿る ---
+    // 最後のページもちょうど `limit` 件で、そこで終わる（空ページを踏まない）。
+    let half = total / 2;
+    let mut cursor: Option<String> = None;
+    let mut pages = 0_u64;
+    let mut seen = 0_u64;
+    loop {
+        let mut arguments = json!({ "limit": half });
+        if let Some(cursor) = &cursor {
+            arguments["cursor"] = json!(cursor);
+        }
+        let response = call::<SearchEntries>(&runtime, arguments).await;
+        assert!(!is_error(&response), "{response}");
+        let page = body(&response);
+        pages += 1;
+        let returned = page["returned"].as_u64().unwrap();
+        assert!(
+            returned > 0,
+            "0件のページを返しています（{pages} ページ目）: {page}"
+        );
+        seen += returned;
+
+        if page["has_more"] == json!(true) {
+            assert!(page["truncation_note"].is_string(), "{page}");
+            cursor = Some(page["next_cursor"].as_str().unwrap().to_string());
+        } else {
+            assert!(page.get("next_cursor").is_none(), "{page}");
+            assert!(page.get("truncation_note").is_none(), "{page}");
+            break;
+        }
+        assert!(pages <= total, "ページングが終わらない");
+    }
+    assert_eq!(seen, total);
+    assert_eq!(pages, 2, "余分なページを1回踏んでいます");
+
+    // --- get_ledger: `total_lines` と同じ `limit` ---
+    // 消耗品費（609）は3行（購入2件 + 赤伝1件）。
+    let all = call::<GetLedger>(
+        &runtime,
+        json!({ "account": "609", "from": "2026-01-01", "to": "2026-12-31" }),
+    )
+    .await;
+    assert!(!is_error(&all), "{all}");
+    let total_lines = body(&all)["total_lines"].as_u64().unwrap();
+    assert!(total_lines >= 3, "土台が変わっている: {total_lines}");
+
+    let response = call::<GetLedger>(
+        &runtime,
+        json!({ "account": "609", "from": "2026-01-01", "to": "2026-12-31",
+                "limit": total_lines }),
+    )
+    .await;
+    assert!(!is_error(&response), "{response}");
+    let page = body(&response);
+    assert_eq!(page["returned"], json!(total_lines), "{page}");
+    assert_eq!(
+        page["has_more"],
+        json!(false),
+        "ちょうど収まったのに「続きがある」と言っています: {page}"
+    );
+    assert!(page.get("next_cursor").is_none(), "{page}");
+    assert!(
+        page.get("truncation_note").is_none(),
+        "切っていないのに切ったと言っています: {page}"
+    );
+
+    // --- get_ledger: 1行ずつ辿っても最後のページで止まる ---
+    let mut cursor: Option<String> = None;
+    let mut pages = 0_u64;
+    let mut rows = 0_u64;
+    loop {
+        let mut arguments = json!({
+            "account": "609", "from": "2026-01-01", "to": "2026-12-31", "limit": 1
+        });
+        if let Some(cursor) = &cursor {
+            arguments["cursor"] = json!(cursor);
+        }
+        let response = call::<GetLedger>(&runtime, arguments).await;
+        assert!(!is_error(&response), "{response}");
+        let page = body(&response);
+        pages += 1;
+        let returned = page["returned"].as_u64().unwrap();
+        assert!(
+            returned > 0,
+            "0行のページを返しています（{pages} ページ目）: {page}"
+        );
+        rows += returned;
+
+        if page["has_more"] == json!(true) {
+            cursor = Some(page["next_cursor"].as_str().unwrap().to_string());
+        } else {
+            assert!(page.get("next_cursor").is_none(), "{page}");
+            assert!(page.get("truncation_note").is_none(), "{page}");
+            break;
+        }
+        assert!(pages <= total_lines, "ページングが終わらない");
+    }
+    assert_eq!(rows, total_lines);
+    assert_eq!(pages, total_lines, "余分なページを1回踏んでいます");
+}
+
 /// 壊れたカーソルは「先頭から」に落ちず、次の手を示して拒否される。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn a_malformed_cursor_is_rejected_instead_of_restarting_from_the_beginning(
@@ -1191,6 +1334,18 @@ async fn the_ledger_orders_and_accumulates_two_lines_of_the_same_account_in_one_
 /// min を満たす行と max を満たす行が別々でよいことにすると、
 /// 「4,000〜9,000 円の明細を含む仕訳」の検索に
 /// **3,000 円と 10,000 円しか持たない仕訳**が混ざる。
+///
+/// # 通貨の突き合わせはここでは見られない（PR-H レビュー3巡目 C-2）
+///
+/// `search.rs` は範囲の `EXISTS` の中で明細の通貨も突き合わせている
+/// （別通貨の 25,000 が JPY 25,000 と一致しないように）。しかし
+/// `search_entries` は `min_amount` / `max_amount` を**帳簿通貨**で解釈し、
+/// `post_journal_entry` も帳簿通貨でしか記帳できないので、
+/// **MCP 経路からは外貨の明細を作ることも外貨で絞ることもできない**。
+/// そのためこの退行は e2e では到達不能であり、read model の SQL を
+/// 直接突ける差分テスト
+/// （`kaikei-store/tests/search_ledger_differential.rs` の
+/// `the_amount_range_compares_only_lines_in_the_same_currency`）で閉じてある。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn the_amount_range_must_be_satisfied_by_one_single_line(
     _pool_opts: PgPoolOptions,

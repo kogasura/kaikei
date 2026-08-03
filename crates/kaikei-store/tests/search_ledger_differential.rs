@@ -87,6 +87,21 @@ fn line(account_code: &str, side: Side, amount: i128, tags: TagSet) -> JournalLi
     .unwrap()
 }
 
+/// 外貨（USD）建ての明細。`amount` は**最小通貨単位**（USD はセント）。
+///
+/// 金額の範囲の絞り込みが**通貨も突き合わせている**ことを見るために要る
+/// （[`the_amount_range_compares_only_lines_in_the_same_currency`]）。
+fn usd_line(account_code: &str, side: Side, amount: i128) -> JournalLine {
+    JournalLine::new(
+        code(account_code),
+        side,
+        Money::from_minor(amount, Currency::USD),
+        TagSet::new(),
+        None,
+    )
+    .unwrap()
+}
+
 fn counterparty(value: &str) -> TagSet {
     tags(&[("counterparty", value)])
 }
@@ -136,6 +151,12 @@ fn chart() -> ChartOfAccounts {
         account("800", "通信費", AccountType::Expense),
         account("810", "仮払消費税等", AccountType::Asset),
         account("820", "未払金", AccountType::Liability),
+        // ★外貨（USD）建ての仕訳だけに使う科目★
+        // 金額の範囲が通貨も突き合わせていることを見るために要る。
+        // 他の科目の元帳に USD が混ざると `D-042` の `Unsupported` に化けるので、
+        // **この2科目だけ**を USD 専用にしてある。
+        account("900", "外貨預金", AccountType::Asset),
+        account("910", "為替差益", AccountType::Revenue),
     ])
     .unwrap()
 }
@@ -287,6 +308,7 @@ async fn insert_entry(pool: &PgPool, entry: &JournalEntry, physical_order: Physi
 /// | 8 | 2026-05-30 | ★6 の赤伝（**二重訂正**）★ | **700** / 100 |
 /// | 9 | 2026-06-10 | ★通信費2回線＋仮払消費税（**4行**）★ | 810 + **800 + 800** / 820 |
 /// | 10 | 2026-06-20 | 郵便料金 | 800 / 820 |
+/// | 11 | 2026-07-01 | ★**USD 建て**の入金（250.00 ドル）★ | 900 / 910 |
 ///
 /// # なぜ実帳簿の形（9・10）を土台に入れるのか（PR-H レビュー2巡目）
 ///
@@ -296,10 +318,37 @@ async fn insert_entry(pool: &PgPool, entry: &JournalEntry, physical_order: Physi
 ///
 /// | 退行 | 9・10 が無いと何が起きないか |
 /// |---|---|
-/// | `array_agg(DISTINCT … ORDER BY …)` から `DISTINCT`/`ORDER BY` を落とす | 相手科目が1件しかないので重複も並び替えも起きない |
+/// | `array_agg(DISTINCT … ORDER BY …)` から `DISTINCT` を落とす | 相手科目が1件しかないので重複が起きない |
 /// | 残高の累計のウィンドウから `l.line_no` を落とす | 同じ仕訳に同じ科目の2行が無いので並びが一意に決まる |
 /// | 最終の `ORDER BY … line_no` を `line_no DESC` にする | 同上 |
 /// | 金額範囲の `EXISTS` を min 用・max 用の2つに割る | 1仕訳の明細金額が全て同額なので「min と max を別の行が満たす」が起きない |
+///
+/// **`array_agg` の `ORDER BY` を単独で落としても検出できない**
+/// （PR-H レビュー3巡目 D-1）。`array_agg(DISTINCT x ORDER BY x)` から
+/// `ORDER BY` **だけ**を外しても、PostgreSQL は集約 `DISTINCT` の重複排除で
+/// 入力をソートするため結果が変わらない（実測: 入力 820→810→800 に対して
+/// `array_agg(DISTINCT v)` は `{800,810,820}` を返す）。
+/// つまり相手科目の整列は `DISTINCT` 由来のソートに乗っており、
+/// **この土台で落ちるのは `DISTINCT` を外したとき**（と両方外したとき）である。
+///
+/// # なぜ USD 建ての仕訳（11）を土台に入れるのか（PR-H レビュー3巡目 C-2）
+///
+/// 1〜10 は**すべて JPY 一色**だったため、金額範囲の `EXISTS` から
+/// `AND l.currency = $7 AND l.currency_minor_unit = $8` を丸ごと外しても
+/// **両スイート緑のまま**通っていた。この2行は
+/// 「別通貨の 1000 と一致してしまうのを防ぐ」ために `search.rs` が
+/// **意図して置いた防御**であり、検査がゼロのまま read model に残っていた。
+///
+/// 11 は 900（外貨預金）/ 910（為替差益）の2行だけで、金額は
+/// **USD 250.00（最小通貨単位で 25,000）**である。`amount_minor` の値
+/// 25,000 と同じ値を持つ JPY の明細は土台に1行も無いので、
+/// **JPY で 25,000 を指定して当たったらそれは通貨を見ていない**ことになる
+/// （[`the_amount_range_compares_only_lines_in_the_same_currency`]）。
+///
+/// 既存の期待値を動かさないよう、**この仕訳だけが使う科目（900 / 910）**を
+/// 選んである。他の科目の元帳に USD が混ざると、金額範囲ではなく
+/// `D-042` の複数通貨 `Unsupported` の方に化けてしまう
+/// （あれは元帳の別経路であり、金額範囲の通貨突き合わせの代わりにならない）。
 ///
 /// 9 は 810（仮払消費税等 3,000）+ 800（通信費 10,000）+ 800（通信費 20,000）
 /// / 820（未払金 33,000）の4行で、
@@ -491,6 +540,22 @@ async fn seed(pool: &PgPool) -> Vec<JournalEntry> {
         &schema,
     ));
 
+    // ★USD 建て★ 金額の範囲が通貨も突き合わせていることを見るための1件
+    // （上の doc）。最小通貨単位の値 25,000 は JPY 側のどの明細とも一致しない。
+    entries.push(entry(
+        11,
+        11,
+        date(2026, 7, 1),
+        "ドル建ての入金",
+        vec![
+            usd_line("900", Side::Debit, 25_000),
+            usd_line("910", Side::Credit, 25_000),
+        ],
+        &fy,
+        &chart,
+        &schema,
+    ));
+
     for e in &entries {
         // 9 番だけ明細を逆順に INSERT する（[`PhysicalOrder`] の doc）。
         let physical_order = if e.id() == EntryId::new(9) {
@@ -518,6 +583,23 @@ fn params(limit: u32) -> SearchEntriesParams {
 }
 
 /// 対照実装の並び順（SQL の `ORDER BY entry_date, entry_no, id` と同じ）。
+///
+/// # `entry_id` / `m.id` を落としても緑になるのは等価変異である
+/// （PR-H レビュー3巡目 D-2。**検査の穴ではない**）
+///
+/// `search.rs` / `ledger.rs` の最終 `ORDER BY` から `entry_id`（`m.id`）を
+/// 落としても両スイートは緑のまま通る。これは
+/// `journal_entries` の `UNIQUE (fiscal_year, entry_no)` により
+/// **1つの年度の中で `entry_no` が一意**であり、`entry_date` はその年度の
+/// 内側にあるため、`(entry_date, entry_no)` の時点で行が既に一意に
+/// 定まっているからである（同順位が存在せず、第3キーが働く余地が無い）。
+///
+/// つまりこの並びは全順序として書いてあるが、**第3キーは冗長**である。
+/// 検査を足しても捕まえられない類の変異なので、
+/// 報告漏れと誤認されないようここに記録しておく
+/// （`ledger.rs` の第4キー `line_no` は冗長ではない。同じ仕訳に同じ科目の
+/// 明細が2行あるとき、そこで初めて順序が決まる——
+/// [`lines_of_the_same_account_in_one_entry_keep_their_order_balance_and_counter_accounts`]）。
 fn sorted_ids(entries: &[&JournalEntry]) -> Vec<String> {
     let mut sorted: Vec<&&JournalEntry> = entries.iter().collect();
     sorted.sort_by_key(|e| (e.entry_date(), e.entry_no(), e.id().as_u128()));
@@ -758,6 +840,102 @@ async fn the_amount_range_must_be_satisfied_by_one_single_line(
     );
 }
 
+/// ★金額の範囲は通貨も突き合わせる★（`search.rs` の金額の `EXISTS`。
+/// PR-H レビュー3巡目 C-2）
+///
+/// `min_amount` / `max_amount` は「同じ1行が両方を満たす」で判定するので、
+/// **その行の通貨も指定された金額の通貨と突き合わせる**。
+///
+/// # ここでしか落ちない退行
+///
+/// `search.rs` の
+/// `AND l.currency = $7::text AND l.currency_minor_unit = $8::smallint`
+/// を落とすと、比較は `amount_minor`（最小通貨単位の整数）だけで行われ、
+/// **USD 250.00（`amount_minor` = 25,000）が JPY 25,000 と一致する**。
+/// 土台が JPY 一色だとこの2行は一度も効かないため、
+/// 落としても両スイート緑のまま通る（レビュアーが実測）。
+///
+/// 元帳側の複数通貨 `Unsupported`（`DECISIONS.md` D-042）は**別の経路**で、
+/// あちらは1つの科目に2通貨が混ざったときの話である。ここで見るのは
+/// 「別の科目の別通貨の明細が、金額の絞り込みに引っかからない」ことである。
+///
+/// # e2e で閉じられない理由
+///
+/// MCP の `search_entries` は `min_amount` / `max_amount` を**帳簿通貨**で
+/// 解釈し、`post_journal_entry` も帳簿通貨でしか記帳できない。
+/// つまり MCP 経路からは USD の明細を作ることも、USD で絞り込むことも
+/// できず、**この退行に到達できない**。差分テストは `money_to_columns` で
+/// 明細を直接 INSERT しているので、read model の SQL だけを直接突ける。
+#[sqlx::test]
+async fn the_amount_range_compares_only_lines_in_the_same_currency(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    let entries = seed(&roles.migrator).await;
+    let query = PgSearchEntriesQuery::new(roles.app.clone());
+
+    // 最小通貨単位で見た「衝突する値」。USD 250.00 = 25,000 セント。
+    let colliding_minor = 25_000_i128;
+
+    // 対照: USD 建ての仕訳がちょうど1件あり、その明細の最小通貨単位が
+    // 上の値である（土台が変わっていない）。
+    let usd: Vec<&JournalEntry> = entries
+        .iter()
+        .filter(|e| e.currency() == Currency::USD)
+        .collect();
+    assert_eq!(usd.len(), 1, "USD 建ての仕訳が土台に無い");
+    assert!(
+        usd[0]
+            .lines()
+            .iter()
+            .all(|l| l.amount().minor() == colliding_minor),
+        "USD の明細の最小通貨単位が変わっている"
+    );
+
+    // 対照: JPY 側に同じ「最小通貨単位の値」を持つ明細は1行も無い。
+    // これが無いと、通貨を見ていなくても結果が一致してしまう。
+    assert!(
+        entries
+            .iter()
+            .filter(|e| e.currency() == Currency::JPY)
+            .flat_map(|e| e.lines())
+            .all(|l| l.amount().minor() != colliding_minor),
+        "JPY 側に同じ最小通貨単位の明細がある。検査にならない"
+    );
+
+    // ★JPY で 25,000 を指定しても、USD 250.00 は当たらない。★
+    let mut in_jpy = params(100);
+    in_jpy.min_amount = Some(Money::from_minor(colliding_minor, Currency::JPY));
+    in_jpy.max_amount = Some(Money::from_minor(colliding_minor, Currency::JPY));
+    let page = query.search_entries(&in_jpy).await.unwrap();
+    assert_eq!(
+        page.total_matches,
+        0,
+        "別通貨（USD 250.00）の明細が JPY 25,000 と一致しています: {:?}",
+        page.entries
+            .iter()
+            .map(|e| e.entry_no.as_u32())
+            .collect::<Vec<_>>()
+    );
+    assert!(page.entries.is_empty());
+
+    // 対照実験: 同じ値を USD で指定すれば、その仕訳だけが返る
+    // （通貨の条件が「常に偽」になっているだけではないことを示す）。
+    let mut in_usd = params(100);
+    in_usd.min_amount = Some(Money::from_minor(colliding_minor, Currency::USD));
+    in_usd.max_amount = Some(Money::from_minor(colliding_minor, Currency::USD));
+    let page = query.search_entries(&in_usd).await.unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|e| entry_id_to_uuid_string(e.entry_id))
+            .collect::<Vec<_>>(),
+        sorted_ids(&usd),
+    );
+    assert_eq!(page.total_matches, 1);
+}
+
 /// ★複数のタグは AND★（`search_entries.rs` の契約 /
 /// `docs/07-mcp-server.md` §3）
 ///
@@ -939,6 +1117,127 @@ async fn paging_yields_exactly_the_same_sequence_at_every_page_size(
 
         assert_eq!(collected, expected, "limit={limit}");
     }
+}
+
+/// ★残りがちょうど `limit` 件のページは「最後のページ」である★
+/// （`DECISIONS.md` D-089。PR-H レビュー3巡目 C-1）
+///
+/// # ここでしか落ちない退行
+///
+/// 続きの有無は「`limit + 1` 件取って `limit` 件より多く返ってきたか」で
+/// 決まる（`search.rs` の `headers.len() > params.limit`、
+/// `ledger.rs` の `records.len() > params.limit`）。これを `>=` にすると
+/// **残りがちょうど `limit` 件のページに `next_cursor` が付く**。
+///
+/// MCP から見ると `has_more: true` と `truncation_note`（「N 件のうち M 件を
+/// 返しました…続きは cursor に…」）まで付くので、
+/// **上限で切ったことが応答から必ず読み取れる**という D-089 の中心的な約束が
+/// **偽陽性**になる。AI は続きが無いのにもう一度呼び、0件のページを受け取る。
+///
+/// 上の [`paging_yields_exactly_the_same_sequence_at_every_page_size`] は
+/// この境界を**通過しているのに**捕まえられない。`next_cursor` が
+/// 無くなるまで辿るだけなので、余分な0件ページを1回踏んでも
+/// `collected` が変わらないためである（合計も並びも正しいまま）。
+/// **だから「最後のページに `next_cursor` が付かない」を直接主張する。**
+#[sqlx::test]
+async fn a_last_page_that_exactly_fills_the_limit_has_no_next_cursor(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    seed(&roles.migrator).await;
+
+    // --- 検索 ---
+    let search = PgSearchEntriesQuery::new(roles.app.clone());
+    // 現金（100）を含む仕訳だけに絞る。件数が偶数なので `limit` で割り切れる。
+    let by_account = |limit: u32| {
+        let mut params = params(limit);
+        params.account = Some(code("100"));
+        params
+    };
+    let all = search.search_entries(&by_account(100)).await.unwrap();
+    let total = all.total_matches;
+    assert!(total >= 4 && total % 2 == 0, "土台が変わっている: {total}");
+
+    // (1) 総件数と同じ `limit` で呼ぶ。**ちょうど収まったので続きは無い。**
+    let exact = by_account(u32::try_from(total).unwrap());
+    let page = search.search_entries(&exact).await.unwrap();
+    assert_eq!(page.entries.len() as u64, total);
+    assert!(
+        page.next_cursor.is_none(),
+        "残りがちょうど limit 件のページに next_cursor が付いています（\
+         MCP では has_more / truncation_note まで付く）"
+    );
+
+    // (2) 割り切れる `limit` で辿る。**最後のページもちょうど `limit` 件**で、
+    //     そこで終わる（0件のページを1回踏まない）。
+    let mut cursor: Option<EntryCursor> = None;
+    let mut pages = 0_u64;
+    let mut collected = 0_u64;
+    loop {
+        let mut params = by_account(2);
+        params.cursor = cursor;
+        let page = search.search_entries(&params).await.unwrap();
+        pages += 1;
+        assert!(
+            !page.entries.is_empty(),
+            "0件のページを返しています（{pages} ページ目）。\
+             残りがちょうど limit 件のページで続きがあると判定しています"
+        );
+        collected += page.entries.len() as u64;
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+        assert!(pages <= total, "ページングが終わらない");
+    }
+    assert_eq!(collected, total);
+    assert_eq!(pages, total / 2, "余分なページを1回踏んでいます");
+
+    // --- 元帳 ---
+    let ledger = PgLedgerQuery::new(roles.app.clone());
+    let from = date(2026, 1, 1);
+    let to = date(2026, 12, 31);
+    let all = ledger
+        .ledger(&ledger_params("100", from, to))
+        .await
+        .unwrap();
+    let total_lines = all.total_lines;
+    assert!(total_lines >= 4, "土台が変わっている: {total_lines}");
+
+    // (1) `total_lines` と同じ `limit`。
+    let mut exact = ledger_params("100", from, to);
+    exact.limit = u32::try_from(total_lines).unwrap();
+    let page = ledger.ledger(&exact).await.unwrap();
+    assert_eq!(page.rows.len() as u64, total_lines);
+    assert!(
+        page.next_cursor.is_none(),
+        "残りがちょうど limit 行のページに next_cursor が付いています"
+    );
+
+    // (2) 割り切れる `limit` で辿る。
+    let mut cursor: Option<LedgerCursor> = None;
+    let mut pages = 0_u64;
+    let mut collected = 0_u64;
+    loop {
+        let mut params = ledger_params("100", from, to);
+        params.limit = 2;
+        params.cursor = cursor;
+        let page = ledger.ledger(&params).await.unwrap();
+        pages += 1;
+        assert!(
+            !page.rows.is_empty(),
+            "0行のページを返しています（{pages} ページ目）"
+        );
+        collected += page.rows.len() as u64;
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+        assert!(pages <= total_lines, "ページングが終わらない");
+    }
+    assert_eq!(collected, total_lines);
+    assert_eq!(pages, total_lines / 2, "余分なページを1回踏んでいます");
 }
 
 /// 取り消された仕訳と赤伝が、どちらも**それと分かる形**で返る
@@ -1411,7 +1710,23 @@ async fn ledger_rows_and_running_balance_match_the_domain_model(
 /// | 残高の累計のウィンドウから `l.line_no` を落とす | 同じ仕訳の2行の間で `running_balance` と表示順が食い違う |
 /// | 最終の `ORDER BY … line_no` を `line_no DESC` にする | 同じ仕訳の2行が逆順に並ぶ |
 /// | `array_agg(DISTINCT c.account_code ORDER BY c.account_code)` から `DISTINCT` を落とす | 相手科目に同じコードが2度出る |
-/// | 同じく `ORDER BY` を落とす | 相手科目が記帳順（810 → 800）で出る |
+/// | 同じく **`DISTINCT` と `ORDER BY` の両方**を落とす | 同上（重複が出る） |
+///
+/// # `array_agg` の `ORDER BY` 単独では検出できない（PR-H レビュー3巡目 D-1）
+///
+/// 初版のこの表には「`ORDER BY` を落とすと相手科目が記帳順（810 → 800）で
+/// 出る」という行があったが、**これは再現しない**。
+/// `array_agg(DISTINCT x ORDER BY x)` から `ORDER BY` **だけ**を外しても、
+/// PostgreSQL は集約 `DISTINCT` の重複排除のために入力をソートするため、
+/// 結果は昇順のまま変わらない（実測: 入力 820→810→800 に対して
+/// `array_agg(DISTINCT v)` は `{800,810,820}` を返す）。
+///
+/// つまり**相手科目の整列は `DISTINCT` 由来のソートに乗っているだけ**であり、
+/// `ORDER BY` 単独の除去はこの土台では等価変異である。
+/// この検査が押さえているのは `DISTINCT` の側であって、
+/// 明示の `ORDER BY` の側ではない——そこを取り違えないよう明記しておく
+/// （`ORDER BY` は「`DISTINCT` を外したときに整列が消えない」ための保険であり、
+/// 意図を読み取れる形として残す価値はある）。
 ///
 /// 対照実装（[`expected_rows`] と素朴な `sort` / `dedup`）は
 /// 「仕訳を順に見る」だけなので、SQL 側の書き方と独立している。
