@@ -15,30 +15,59 @@
 //! 一覧だけが腐るということが起きない
 //! （`PROGRESS.md` Phase 1 の教訓6「手で維持する一覧は必ず腐る。構造で閉じる」）。
 
+use crate::startup::Runtime;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool_handler, ServerHandler};
+use std::sync::Arc;
 
 /// このサーバーが MCP クライアントに名乗る名前。
 pub const SERVER_NAME: &str = "kaikei-mcp";
 
 /// MCP サーバー本体。
 ///
-/// # 状態はまだ持たない
+/// # 実行時依存は合成ルートから受け取る
 ///
-/// 合成ルート（`kaikei_jp::compose::compose` の結果と `Arc<PgStore>`）を
-/// 保持するのは PR-E である。このPRの時点では、ツールレジストリだけを持つ。
+/// PR-E で [`KaikeiServer::with_runtime`] が入った。ツール（PR-F / PR-G）は
+/// [`KaikeiServer::runtime`] から `PgStore` / `PgAuditSink` /
+/// `JpTaxPolicy` / `TagCatalog` を取る。**ツールの中で `compose` を呼んだり
+/// プールを張り直したりしないこと**（起動時に一度だけ組み立てる、が
+/// `DECISIONS.md` D-025 / D-057 の前提）。
 #[derive(Clone)]
 pub struct KaikeiServer {
     tool_router: ToolRouter<Self>,
+    runtime: Option<Arc<Runtime>>,
 }
 
 impl KaikeiServer {
-    /// サーバーを組み立てる（ツールレジストリを合成する）。
+    /// **実行時依存を持たない**サーバーを組み立てる。
+    ///
+    /// ツールレジストリ（`tools/list` に出る集合）と `get_info` の検査だけを
+    /// 行うテスト用の構成。DB も設定も要らない代わりに、依存を要するツールは
+    /// 動かせない。本番の起動は [`with_runtime`] を使う。
+    ///
+    /// [`with_runtime`]: KaikeiServer::with_runtime
     pub fn new() -> Self {
         Self {
             tool_router: tool_router(),
+            runtime: None,
         }
+    }
+
+    /// 合成ルート（[`crate::startup::assemble`]）が組み立てた依存を持つ
+    /// サーバーを作る。
+    pub fn with_runtime(runtime: Arc<Runtime>) -> Self {
+        Self {
+            tool_router: tool_router(),
+            runtime: Some(runtime),
+        }
+    }
+
+    /// 実行時依存。[`new`] で作った構成では `None`。
+    ///
+    /// [`new`]: KaikeiServer::new
+    pub fn runtime(&self) -> Option<&Arc<Runtime>> {
+        self.runtime.as_ref()
     }
 
     /// 登録済みツール名の一覧を返す（`tools/list` に出るのと同じ集合）。
@@ -112,7 +141,8 @@ impl ServerHandler for KaikeiServer {
 /// 接続ごと落ちる。ログ・診断出力は必ず **stderr** に出すこと
 /// （`docs/07-mcp-server.md` §4）。
 ///
-/// 設定の読み込みと合成（`config.rs` / `startup.rs` / `main.rs`）は PR-E。
+/// 設定の読み込みと合成は [`crate::config`] / [`crate::startup`] /
+/// `src/main.rs`（PR-E）。
 ///
 /// # Errors
 ///
@@ -131,10 +161,18 @@ pub async fn serve_stdio(server: KaikeiServer) -> Result<(), Box<dyn std::error:
 mod tests {
     use super::*;
 
-    // このPRの時点ではツールを1つも登録していない（骨組みだけ）。
+    // このPRの時点ではツールを1つも登録していない（PR-E は前工事であり、
+    // ツールは PR-F / PR-G）。
     #[test]
     fn the_skeleton_registers_no_tools_yet() {
         assert!(KaikeiServer::new().tool_names().is_empty());
+    }
+
+    // 依存を持たない構成では `runtime()` が `None`（本番の起動は
+    // `with_runtime` を通る）。
+    #[test]
+    fn a_server_built_without_a_runtime_reports_it() {
+        assert!(KaikeiServer::new().runtime().is_none());
     }
 
     // サーバーは tools capability を名乗り、名前とバージョンを持つ。

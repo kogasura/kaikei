@@ -1,0 +1,633 @@
+//! 事業者設定と接続情報の読み込み、および**必須検証**
+//! （`docs/07-mcp-server.md` §7）。
+//!
+//! # 既定値にフォールバックしない
+//!
+//! **1つでも欠けていたら起動しない。** 課税事業者か・税抜経理か・端数を
+//! どう処理するかは、このソフトウェアが代わりに決めてよい種類の設定では
+//! ない（`CLAUDE.md` §10）。`DECISIONS.md` D-057 は
+//! `JpSettingsOverrides::is_taxable_business` を `Option` にしないと決めた際、
+//! 理由を「指定を忘れると免税事業者として扱われ税額行が生成されない、という
+//! 会計上の実害が大きい間違いを起こしやすい」と書いている。設定ファイル側で
+//! 省略を許して既定値に落とすと、**その `Option` 化をしなかった意味が
+//! そっくり消える**。
+//!
+//! `tax_mode` / `rounding` / `rounding_unit` も同様に必須にした
+//! （`DECISIONS.md` D-082。年度マスタの `settings_defaults` に暗黙で
+//! 落とさない）。
+//!
+//! # 読み取り元は環境変数
+//!
+//! MCP クライアントはサーバを**子プロセスとして spawn** する
+//! （`docs/07-mcp-server.md` §8）。設定を渡す標準の経路はクライアント設定
+//! ファイルの `env` であり、そこに書いた値は環境変数としてこのプロセスに
+//! 届く。専用の設定ファイル形式を別に発明すると、**同じ設定が2箇所に
+//! 書ける**状態になり、どちらが効いているか分からなくなる。
+//!
+//! # ここで組み立てるもの・組み立てないもの
+//!
+//! このモジュールは**文字列 → 値**の解釈と必須検証だけを行う。
+//! 値の語彙（`exclusive` / `floor` / `line` / `calendar_year` …）は
+//! `kaikei-jp` / `kaikei-app` が公開している `from_code` を通す
+//! （同じ綴りの表をこの層で作らない。`DECISIONS.md` D-072）。
+//!
+//! 実際の組み立て（YAML ロード → policy 構築 → DB 接続）は
+//! [`crate::startup`] の仕事である。
+
+use kaikei_app::context::BookSettings;
+use kaikei_app::currency::currency_from_code;
+use kaikei_app::wire::fiscal_year_rule_from_code;
+use kaikei_core::AccountCode;
+use kaikei_jp::closing::ClosingAccounts;
+use kaikei_jp::tax::{
+    round_mode_from_code, JpSettingsOverrides, RoundingUnit, TaxMode, ROUND_MODE_CODES,
+};
+use std::fmt;
+
+/// 接続文字列を渡す環境変数（`DECISIONS.md` D-048 の変数分離）。
+pub const ENV_APP_DATABASE_URL: &str = "APP_DATABASE_URL";
+/// 帳簿通貨のコード。
+pub const ENV_BOOK_CURRENCY: &str = "KAIKEI_BOOK_CURRENCY";
+/// 会計年度の区切り規則。
+pub const ENV_FISCAL_YEAR_RULE: &str = "KAIKEI_FISCAL_YEAR_RULE";
+/// 経理方式（税抜 / 税込）。
+pub const ENV_TAX_MODE: &str = "KAIKEI_TAX_MODE";
+/// 端数処理方式。
+pub const ENV_ROUNDING: &str = "KAIKEI_ROUNDING";
+/// 端数処理単位。
+pub const ENV_ROUNDING_UNIT: &str = "KAIKEI_ROUNDING_UNIT";
+/// 課税事業者かどうか。
+pub const ENV_IS_TAXABLE_BUSINESS: &str = "KAIKEI_IS_TAXABLE_BUSINESS";
+/// 簡易課税を選択しているかどうか。
+pub const ENV_SIMPLIFIED_TAXATION: &str = "KAIKEI_SIMPLIFIED_TAXATION";
+/// 決算科目（元入金）の科目コード。
+pub const ENV_CLOSING_ACCOUNT_CAPITAL: &str = "KAIKEI_CLOSING_ACCOUNT_CAPITAL";
+/// 決算科目（事業主貸）の科目コード。
+pub const ENV_CLOSING_ACCOUNT_OWNER_DRAWINGS: &str = "KAIKEI_CLOSING_ACCOUNT_OWNER_DRAWINGS";
+/// 決算科目（事業主借）の科目コード。
+pub const ENV_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS: &str =
+    "KAIKEI_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS";
+/// 決算振替のゼロ化明細に付ける消費税区分コード。
+pub const ENV_CLOSING_TAX_CATEGORY: &str = "KAIKEI_CLOSING_TAX_CATEGORY";
+
+/// 必須の環境変数の一覧（`.env.example` / README と突き合わせる用）。
+///
+/// **この一覧はテストが [`ServerConfig::from_env`] の実挙動と突き合わせる**
+/// （`PROGRESS.md` Phase 1 の教訓6「手で維持する一覧は必ず腐る」）。
+pub const REQUIRED_ENV_VARS: &[&str] = &[
+    ENV_APP_DATABASE_URL,
+    ENV_BOOK_CURRENCY,
+    ENV_FISCAL_YEAR_RULE,
+    ENV_TAX_MODE,
+    ENV_ROUNDING,
+    ENV_ROUNDING_UNIT,
+    ENV_IS_TAXABLE_BUSINESS,
+    ENV_SIMPLIFIED_TAXATION,
+    ENV_CLOSING_ACCOUNT_CAPITAL,
+    ENV_CLOSING_ACCOUNT_OWNER_DRAWINGS,
+    ENV_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS,
+    ENV_CLOSING_TAX_CATEGORY,
+];
+
+/// 起動に必要な設定一式。
+///
+/// # `Debug` は接続文字列を伏せる
+///
+/// `APP_DATABASE_URL` には DB パスワードが平文で入る
+/// （`docs/07-mcp-server.md` §8）。導出した `Debug` をどこかで
+/// `{:?}` に流すと、それがそのままログ・監査ログ・エラー本文に載る。
+/// 手書きの [`fmt::Debug`] 実装で伏せてある。
+pub struct ServerConfig {
+    /// `kaikei_app` ロールでの接続文字列。
+    pub app_database_url: String,
+    /// 帳簿全体の設定（帳簿通貨・会計年度の区切り規則）。
+    pub book_settings: BookSettings,
+    /// 事業者設定の上書き。**全項目が `Some`**（既定値に落とさない）。
+    pub settings_overrides: JpSettingsOverrides,
+    /// 決算処理に使う3科目。
+    pub closing_accounts: ClosingAccounts,
+    /// 決算振替のゼロ化明細に付ける消費税区分コード。
+    pub closing_tax_category: String,
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("app_database_url", &"(伏せ字)")
+            .field("book_settings", &self.book_settings)
+            .field("settings_overrides", &self.settings_overrides)
+            .field("closing_accounts", &self.closing_accounts)
+            .field("closing_tax_category", &self.closing_tax_category)
+            .finish()
+    }
+}
+
+impl ServerConfig {
+    /// 環境変数から読み込む。
+    ///
+    /// **不足・不正は最初の1件で打ち切らず、全部集めて返す。**
+    /// 1件ずつ潰させると、12個の設定を揃えるのに12回起動し直すことになる
+    /// （`CLAUDE.md` §11「次の手が分かる文言にする」）。
+    ///
+    /// # Errors
+    ///
+    /// 未設定・空文字・値が不正な項目が1つでもあれば [`ConfigError`]。
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(&|name| std::env::var(name).ok())
+    }
+
+    /// 任意の参照元から読み込む（テスト用。[`from_env`] の実体）。
+    ///
+    /// プロセスの環境変数は全テストで共有されるため、`std::env::set_var` を
+    /// 使うテストは並列実行で干渉する。参照元を差し替えられる形にして
+    /// おけば、その落とし穴を踏まずに済む。
+    ///
+    /// [`from_env`]: ServerConfig::from_env
+    pub fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut problems: Vec<String> = Vec::new();
+
+        let app_database_url = required(
+            lookup,
+            &mut problems,
+            ENV_APP_DATABASE_URL,
+            "kaikei_app ロールの接続文字列を設定してください\
+             （例: postgres://kaikei_app:******@localhost:5432/kaikei）。\
+             kaikei_migrator の接続文字列を渡すと、帳簿の追記のみという制約を \
+             DB 権限で守る層が無効になるため起動を拒否します",
+        );
+
+        let book_currency = required(
+            lookup,
+            &mut problems,
+            ENV_BOOK_CURRENCY,
+            "帳簿通貨のコードを設定してください（例: JPY）。\
+             通貨ごとに小数桁数が違うため、既定値では起動しません",
+        )
+        .and_then(|code| {
+            parse_with(
+                &mut problems,
+                ENV_BOOK_CURRENCY,
+                &code,
+                currency_from_code(&code),
+            )
+        });
+
+        let fiscal_year_rule = required(
+            lookup,
+            &mut problems,
+            ENV_FISCAL_YEAR_RULE,
+            "会計年度の区切り規則を設定してください（現在の対応値: calendar_year）",
+        )
+        .and_then(|code| {
+            parse_with(
+                &mut problems,
+                ENV_FISCAL_YEAR_RULE,
+                &code,
+                fiscal_year_rule_from_code(&code),
+            )
+        });
+
+        let tax_mode = required(
+            lookup,
+            &mut problems,
+            ENV_TAX_MODE,
+            &format!(
+                "経理方式を設定してください（{}）。\
+                 税抜経理か税込経理かで消費税額の行が生成されるかどうかが変わります",
+                TaxMode::CODES.join(" / ")
+            ),
+        )
+        .and_then(|code| {
+            parse_with(
+                &mut problems,
+                ENV_TAX_MODE,
+                &code,
+                TaxMode::from_code(&code),
+            )
+        });
+
+        let rounding = required(
+            lookup,
+            &mut problems,
+            ENV_ROUNDING,
+            &format!(
+                "端数処理方式を設定してください（{}）",
+                ROUND_MODE_CODES.join(" / ")
+            ),
+        )
+        .and_then(|code| {
+            parse_with(
+                &mut problems,
+                ENV_ROUNDING,
+                &code,
+                round_mode_from_code(&code),
+            )
+        });
+
+        let rounding_unit = required(
+            lookup,
+            &mut problems,
+            ENV_ROUNDING_UNIT,
+            &format!(
+                "端数処理の単位を設定してください（{}）",
+                RoundingUnit::CODES.join(" / ")
+            ),
+        )
+        .and_then(|code| {
+            parse_with(
+                &mut problems,
+                ENV_ROUNDING_UNIT,
+                &code,
+                RoundingUnit::from_code(&code),
+            )
+        });
+
+        let is_taxable_business = required_bool(
+            lookup,
+            &mut problems,
+            ENV_IS_TAXABLE_BUSINESS,
+            "課税事業者なら true、免税事業者なら false を設定してください。\
+             どちらであるかの判断はこのサーバーでは行いません。\
+             未設定のまま既定値で起動すると、誤った前提のまま\
+             消費税額の行が生成される（あるいは生成されない）ことになります",
+        );
+
+        let simplified_taxation = required_bool(
+            lookup,
+            &mut problems,
+            ENV_SIMPLIFIED_TAXATION,
+            "簡易課税を選択しているなら true、そうでなければ false を\
+             設定してください。どちらであるかの判断はこのサーバーでは行いません",
+        );
+
+        let capital = required_account_code(
+            lookup,
+            &mut problems,
+            ENV_CLOSING_ACCOUNT_CAPITAL,
+            "元入金の科目コードを設定してください（同梱テンプレートでは 400）",
+        );
+        let owner_drawings = required_account_code(
+            lookup,
+            &mut problems,
+            ENV_CLOSING_ACCOUNT_OWNER_DRAWINGS,
+            "事業主貸の科目コードを設定してください（同梱テンプレートでは 410）",
+        );
+        let owner_contributions = required_account_code(
+            lookup,
+            &mut problems,
+            ENV_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS,
+            "事業主借の科目コードを設定してください（同梱テンプレートでは 420）",
+        );
+
+        let closing_tax_category = required(
+            lookup,
+            &mut problems,
+            ENV_CLOSING_TAX_CATEGORY,
+            "決算振替のゼロ化明細に付ける消費税区分コードを設定してください\
+             （同梱の 2026 年度マスタに含まれる候補の1つは NOT_APPLICABLE）。\
+             どの区分を使うかの判断はこのサーバーでは行いません",
+        );
+
+        if !problems.is_empty() {
+            return Err(ConfigError { problems });
+        }
+
+        // ここに到達した時点で全項目が `Some`（`problems` が空である＝
+        // 1件も欠けていない）。`expect` の文言はその不変条件を述べる。
+        let missing = "必須項目が揃っていることは problems が空であることで保証される";
+        Ok(ServerConfig {
+            app_database_url: app_database_url.expect(missing),
+            book_settings: BookSettings {
+                fiscal_year_rule: fiscal_year_rule.expect(missing),
+                book_currency: book_currency.expect(missing),
+            },
+            settings_overrides: JpSettingsOverrides {
+                tax_mode: Some(tax_mode.expect(missing)),
+                rounding: Some(rounding.expect(missing)),
+                rounding_unit: Some(rounding_unit.expect(missing)),
+                is_taxable_business: is_taxable_business.expect(missing),
+                simplified_taxation: simplified_taxation.expect(missing),
+            },
+            closing_accounts: ClosingAccounts {
+                capital: capital.expect(missing),
+                owner_drawings: owner_drawings.expect(missing),
+                owner_contributions: owner_contributions.expect(missing),
+            },
+            closing_tax_category: closing_tax_category.expect(missing),
+        })
+    }
+}
+
+/// 未設定・空文字・値が不正な設定項目をまとめて表す。
+///
+/// **1件ずつではなく全部返す**。起動失敗の stderr を1回見れば、何を
+/// 設定すればよいかが全部分かる形にする。
+#[derive(Debug, Clone)]
+pub struct ConfigError {
+    problems: Vec<String>,
+}
+
+impl ConfigError {
+    /// 個々の問題（1項目1行）。
+    pub fn problems(&self) -> &[String] {
+        &self.problems
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "起動を中止しました: 事業者設定が揃っていません（既定値では起動しません）。"
+        )?;
+        writeln!(f)?;
+        for problem in &self.problems {
+            writeln!(f, "  - {problem}")?;
+        }
+        writeln!(f)?;
+        writeln!(
+            f,
+            "設定項目の一覧と例は .env.example と README「MCP サーバーを起動する」を\
+             参照してください。"
+        )?;
+        writeln!(
+            f,
+            "MCP クライアントから起動する場合は、クライアント設定（Claude Code なら \
+             .mcp.json）の env に書きます。"
+        )?;
+        write!(
+            f,
+            "課税事業者かどうか・税抜経理かどうかといった判断は、このサーバーでは\
+             行いません。既定値で起動すると誤った前提のまま記帳が進むため、\
+             1項目でも欠けている間は起動しません。"
+        )
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// 必須の文字列項目を読む。未設定・空白のみは `problems` に積んで `None`。
+fn required(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+    name: &str,
+    guidance: &str,
+) -> Option<String> {
+    match lookup(name) {
+        None => {
+            problems.push(format!("環境変数 {name} が未設定です。{guidance}"));
+            None
+        }
+        // 空文字が「設定した」ことになる事故（設定ファイルに `"KEY": ""` と
+        // 書く、シェルで `KEY=` と書く）は実際によく起きる。未設定と同じ
+        // 扱いにしつつ、文言では区別する（原因の特定が速くなる）。
+        Some(value) if value.trim().is_empty() => {
+            problems.push(format!(
+                "環境変数 {name} が空です（値が設定されていません）。{guidance}"
+            ));
+            None
+        }
+        Some(value) => Some(value.trim().to_string()),
+    }
+}
+
+/// `from_code` 系の結果を `problems` に写す。
+fn parse_with<T, E: fmt::Display>(
+    problems: &mut Vec<String>,
+    name: &str,
+    input: &str,
+    parsed: Result<T, E>,
+) -> Option<T> {
+    match parsed {
+        Ok(value) => Some(value),
+        Err(source) => {
+            problems.push(format!(
+                "環境変数 {name} の値が不正です（{input}）: {source}"
+            ));
+            None
+        }
+    }
+}
+
+/// 必須の真偽値項目を読む。`true` / `false` だけを受け付ける。
+///
+/// `1` / `0` / `yes` / `on` を受けないのは、**受け入れ方言が増えるほど
+/// 「設定したつもりで効いていない」事故が増える**ため。誤った綴りは
+/// 既定値に落とさずエラーにする。
+fn required_bool(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+    name: &str,
+    guidance: &str,
+) -> Option<bool> {
+    let raw = required(lookup, problems, name, guidance)?;
+    match raw.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        other => {
+            problems.push(format!(
+                "環境変数 {name} の値が不正です（{other}）: true または false を\
+                 設定してください。{guidance}"
+            ));
+            None
+        }
+    }
+}
+
+/// 必須の科目コード項目を読む。
+///
+/// **その科目が勘定科目表に実在するかどうかはここでは見ない。**
+/// 実在検証は `JpSoleProprietorClosingPolicy::new`（構築時に検証する。
+/// `DECISIONS.md` D-066）が行い、失敗すれば同じく起動が中止される。
+fn required_account_code(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+    name: &str,
+    guidance: &str,
+) -> Option<AccountCode> {
+    let raw = required(lookup, problems, name, guidance)?;
+    parse_with(problems, name, &raw, AccountCode::parse(&raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaikei_app::context::FiscalYearRule;
+    use kaikei_core::RoundMode;
+    use std::collections::HashMap;
+
+    /// 全項目が揃った参照元。
+    fn full() -> HashMap<String, String> {
+        [
+            (
+                ENV_APP_DATABASE_URL,
+                "postgres://kaikei_app:pw@localhost/kaikei",
+            ),
+            (ENV_BOOK_CURRENCY, "JPY"),
+            (ENV_FISCAL_YEAR_RULE, "calendar_year"),
+            (ENV_TAX_MODE, "exclusive"),
+            (ENV_ROUNDING, "floor"),
+            (ENV_ROUNDING_UNIT, "line"),
+            (ENV_IS_TAXABLE_BUSINESS, "true"),
+            (ENV_SIMPLIFIED_TAXATION, "false"),
+            (ENV_CLOSING_ACCOUNT_CAPITAL, "400"),
+            (ENV_CLOSING_ACCOUNT_OWNER_DRAWINGS, "410"),
+            (ENV_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS, "420"),
+            (ENV_CLOSING_TAX_CATEGORY, "NOT_APPLICABLE"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    fn load(vars: &HashMap<String, String>) -> Result<ServerConfig, ConfigError> {
+        ServerConfig::from_lookup(&|name| vars.get(name).cloned())
+    }
+
+    // 全項目が揃っていれば読める。
+    #[test]
+    fn a_complete_environment_produces_a_config() {
+        let config = load(&full()).unwrap();
+        assert_eq!(config.book_settings.book_currency.code(), "JPY");
+        assert_eq!(
+            config.book_settings.fiscal_year_rule,
+            FiscalYearRule::CalendarYear
+        );
+        assert_eq!(config.settings_overrides.tax_mode, Some(TaxMode::Exclusive));
+        assert_eq!(config.settings_overrides.rounding, Some(RoundMode::Floor));
+        assert_eq!(
+            config.settings_overrides.rounding_unit,
+            Some(RoundingUnit::Line)
+        );
+        assert!(config.settings_overrides.is_taxable_business);
+        assert!(!config.settings_overrides.simplified_taxation);
+        assert_eq!(config.closing_accounts.capital.as_str(), "400");
+        assert_eq!(config.closing_tax_category, "NOT_APPLICABLE");
+    }
+
+    // MC-24: どの1項目が欠けても起動用の設定は組み立てられず、
+    // メッセージがその項目を名指しする（既定値に落ちない）。
+    #[test]
+    fn every_required_variable_is_actually_required() {
+        for missing in REQUIRED_ENV_VARS {
+            let mut vars = full();
+            vars.remove(*missing);
+            let err = load(&vars).unwrap_err();
+            assert!(
+                err.problems().iter().any(|p| p.contains(missing)),
+                "{missing} を外したのに、その項目を名指しするメッセージが出ていない: {err}"
+            );
+            let text = err.to_string();
+            assert!(text.contains(missing), "{missing}: {text}");
+            assert!(
+                text.contains("既定値では起動しません"),
+                "既定値に落ちないことが読み取れる文言であること: {text}"
+            );
+        }
+    }
+
+    // `REQUIRED_ENV_VARS` が実装から乖離していないこと（手で維持する
+    // 一覧が腐るのを防ぐ。PROGRESS.md Phase 1 の教訓6）。
+    #[test]
+    fn the_required_list_matches_what_from_lookup_actually_demands() {
+        let err = ServerConfig::from_lookup(&|_| None).unwrap_err();
+        assert_eq!(
+            err.problems().len(),
+            REQUIRED_ENV_VARS.len(),
+            "何も設定していないときの指摘件数と REQUIRED_ENV_VARS の件数が\
+             一致すること: {err}"
+        );
+        for name in REQUIRED_ENV_VARS {
+            assert!(
+                err.problems().iter().any(|p| p.contains(name)),
+                "{name} が指摘されていない"
+            );
+        }
+    }
+
+    // 空文字は「設定した」ことにしない（未設定と同じく起動を止める）。
+    #[test]
+    fn an_empty_value_is_treated_as_missing() {
+        for name in REQUIRED_ENV_VARS {
+            let mut vars = full();
+            vars.insert((*name).to_string(), "   ".to_string());
+            let err = load(&vars).unwrap_err();
+            assert!(
+                err.problems()
+                    .iter()
+                    .any(|p| p.contains(name) && p.contains("空です")),
+                "{name} を空文字にしたのに空である旨が出ていない: {err}"
+            );
+        }
+    }
+
+    // 不足は1件で打ち切らず全部返す（12回起動し直させない）。
+    #[test]
+    fn all_missing_items_are_reported_at_once() {
+        let mut vars = full();
+        vars.remove(ENV_IS_TAXABLE_BUSINESS);
+        vars.remove(ENV_TAX_MODE);
+        vars.remove(ENV_CLOSING_TAX_CATEGORY);
+        let err = load(&vars).unwrap_err();
+        assert_eq!(err.problems().len(), 3, "{err}");
+    }
+
+    // 真偽値は true / false 以外を既定値に落とさずエラーにする。
+    #[test]
+    fn boolean_settings_reject_dialects_instead_of_guessing() {
+        for value in ["1", "0", "yes", "TRUE", "はい"] {
+            let mut vars = full();
+            vars.insert(ENV_IS_TAXABLE_BUSINESS.to_string(), value.to_string());
+            let err = load(&vars).unwrap_err();
+            assert!(
+                err.problems()
+                    .iter()
+                    .any(|p| p.contains(ENV_IS_TAXABLE_BUSINESS)),
+                "{value} が受理されている"
+            );
+        }
+    }
+
+    // 未知の通貨コードは桁数を推測せずエラーになる（CLAUDE.md §8）。
+    #[test]
+    fn an_unknown_currency_code_is_rejected_rather_than_guessed() {
+        let mut vars = full();
+        vars.insert(ENV_BOOK_CURRENCY.to_string(), "KWD".to_string());
+        let err = load(&vars).unwrap_err();
+        assert!(err.to_string().contains(ENV_BOOK_CURRENCY), "{err}");
+    }
+
+    // 語彙の誤りは、有効な値を列挙して返す（CLAUDE.md §11）。
+    #[test]
+    fn an_unknown_tax_mode_lists_the_valid_values() {
+        let mut vars = full();
+        vars.insert(ENV_TAX_MODE.to_string(), "zeinuki".to_string());
+        let err = load(&vars).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("exclusive"), "{text}");
+        assert!(text.contains("inclusive"), "{text}");
+    }
+
+    // 接続文字列は Debug に出さない（docs/07 §8。パスワードが平文で入る）。
+    #[test]
+    fn debug_output_never_contains_the_connection_string() {
+        let config = load(&full()).unwrap();
+        let text = format!("{config:?}");
+        assert!(!text.contains("pw"), "{text}");
+        assert!(!text.contains("postgres://"), "{text}");
+    }
+
+    // CLAUDE.md §10: 起動失敗の文言が税務判断を断定していないこと。
+    #[test]
+    fn the_failure_message_avoids_asserting_tax_conclusions() {
+        let err = ServerConfig::from_lookup(&|_| None).unwrap_err();
+        let text = err.to_string();
+        for forbidden in ["準拠", "法令対応", "JIIMA"] {
+            assert!(!text.contains(forbidden), "{forbidden}: {text}");
+        }
+        assert!(
+            text.contains("このサーバーでは") && text.contains("行いません"),
+            "判断を利用者に残していることが読み取れる文言であること: {text}"
+        );
+    }
+}

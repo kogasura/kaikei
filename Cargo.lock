@@ -802,10 +802,12 @@ dependencies = [
  "kaikei-app",
  "kaikei-core",
  "kaikei-jp",
+ "kaikei-store",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

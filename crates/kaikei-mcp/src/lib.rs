@@ -26,25 +26,34 @@
 //!   `kaikei-jp` に依存できないため、ここが唯一の置き場になる（同 §6）。
 //! - ツールレジストリ（[`server`]）。
 //!
-//! # このPR（Phase 3 PR-D）の範囲
+//! # このPR（Phase 3 PR-E）の範囲
 //!
-//! **ツールは1つも実装していない。** 骨組みだけである。
+//! **ツールはまだ1つも実装していない。** PR-E が足したのは
+//! 「サーバが起動でき、勘定科目が入っており、記帳が通せる状態」までである。
 //!
-//! | 後続 | 内容 |
-//! |---|---|
-//! | PR-E | 合成ルート（`config.rs` / `startup.rs` / `main.rs`） |
-//! | PR-F | 書き込み系ツールと `audit.rs`（監査ログの結線） |
-//! | PR-G | 読み取り系・提案系ツール |
+//! | PR | 内容 | 状態 |
+//! |---|---|---|
+//! | PR-D | `wire.rs` / `server.rs` / `error.rs`（骨組み） | 済 |
+//! | PR-E | 合成ルート（[`config`] / [`startup`] / `src/main.rs`） | **このPR** |
+//! | PR-F | 書き込み系ツールと `audit.rs`（監査ログの結線） | 未 |
+//! | PR-G | 読み取り系・提案系ツール | 未 |
 //!
 //! # stdout は JSON-RPC 専用チャネル
 //!
 //! stdio トランスポートでは、`println!` や stdout に出る `tracing` が1行でも
 //! 混ざるとプロトコルが壊れて接続ごと落ちる。ログ・診断出力は必ず **stderr**
 //! に出すこと（`docs/07-mcp-server.md` §4）。
+//!
+//! この crate は `tracing_subscriber` を持たない。購読者を登録しない限り
+//! `tracing` のイベントはどこにも出ないため、下位層の `tracing::warn!` が
+//! stdout に漏れることはない。**購読者を入れる場合は writer を stderr に
+//! 固定すること**（既定は stdout）。
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod config;
 pub mod error;
 pub mod server;
+pub mod startup;
 pub mod wire;
