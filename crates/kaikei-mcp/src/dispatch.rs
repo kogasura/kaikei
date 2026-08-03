@@ -99,7 +99,7 @@
 //! | 別のルータ・別の `ServerHandler`・別のハンドラを**書き足す** | **ファイル許可リスト**（`rmcp` を名指しできるのは2ファイル） |
 //! | 走査の外にファイルを置く（`#[path]` / `include!`） | **走査**（`tests/source_scan/mod.rs` の `assert_no_out_of_tree_inclusion`。4巡目 B） |
 //! | 同一 crate から `kaikei_app::audit::with_audit` を直接呼ぶ | **識別子の閉じ込め**（`tests/audit_is_structural.rs` の `CONFINED`） |
-//! | **このファイルの中に別のプロトコル入口を足す**（`ServerHandler` は `call_tool` 以外にも既定実装を持つ: `read_resource` / `get_prompt` / `complete` / `get_task` …） | **無い**（許可リストの内側なので走査では見えない。設計上の想定内で diff には出る） |
+//! | **このファイルの中に別のプロトコル入口を足す**（`ServerHandler` は `call_tool` 以外にも既定実装を持つ: `read_resource` / `get_prompt` / `complete` / `get_task` …） | 許可リストの内側なので走査では見えない。**振る舞い検査**が見る（`crates/kaikei-e2e/tests/mcp_stdio_server.rs` の `no_protocol_entry_point_other_than_tools_call_touches_the_ledger`） |
 //! | 上の全部を**振る舞いで**見る | **実バイナリへの `tools/call`**（`crates/kaikei-e2e/tests/mcp_stdio_server.rs`） |
 //!
 //! 3〜6行目は型ではなく**検査**であり、6行目に至っては検査も無い。

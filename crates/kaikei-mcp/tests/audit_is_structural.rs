@@ -501,6 +501,9 @@ fn the_detector_actually_flags_a_bypass() {
         "    #[ path = \"../probe_handler.rs\" ]",
         "pub mod probe_handler { include!(\"../probe_handler.inc\"); }",
         "    include !(\"probe.inc\");",
+        // 4巡目の指摘: `cfg_attr` 経由も `#[path]` と同じもの。
+        "#[cfg_attr(not(doc), path = \"../probe_handler.rs\")]",
+        "    #[cfg_attr(unix,path=\"../probe_handler.rs\")]",
     ] {
         assert!(
             source_scan::pulls_in_out_of_tree_source(bypass),
@@ -512,6 +515,9 @@ fn the_detector_actually_flags_a_bypass() {
         "    const TAGS: &str = include_str!(\"../data/tags.yaml\");",
         "    let bytes = include_bytes!(\"../data/chart.bin\");",
         "    let path = entry.path();",
+        // 属性の外の `path=` は落とさない（空白を落とすと `letpath=` になる）。
+        "    let path=\"../probe_handler.rs\";",
+        "    #[derive(Debug)] struct S { path: String }",
     ] {
         assert!(
             !source_scan::pulls_in_out_of_tree_source(allowed),

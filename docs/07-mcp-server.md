@@ -790,7 +790,7 @@ pub async fn call<T: McpTool>(runtime: &Runtime, arguments: Option<Map<String, V
 > |---|---|---|
 > | `dispatch.rs` が `rmcp` の型を再輸出する | 他のファイルが `rmcp` を名指しせずに登録経路へ届く | 識別子の閉じ込め（second line） |
 > | 走査の外にファイルを置く（`#[path = "../foo.rs"]` / `include!("foo.inc")`） | crate の一部なのに一度も読まれないファイルに何でも書ける | `assert_no_out_of_tree_inclusion`（4巡目 B で追加） |
-> | 許可された `dispatch.rs` の中に**別のプロトコル入口**を足す | `ServerHandler` は `call_tool` 以外にも既定実装を持つ（`read_resource` / `get_prompt` / `complete` / `get_task` / `update_task` / `cancel_task` …）。そこに書けば `tools/call` を通らずに操作できる | **無い**（設計上の想定内。diff には出る） |
+> | 許可された `dispatch.rs` の中に**別のプロトコル入口**を足す | `ServerHandler` は `call_tool` 以外にも既定実装を持つ（`read_resource` / `get_prompt` / `complete` / `get_task` / `update_task` / `cancel_task` …）。そこに書けば `tools/call` を通らずに操作できる | **振る舞い検査**（`mcp_stdio_server.rs` の `no_protocol_entry_point_other_than_tools_call_touches_the_ledger`。`tools/call` を1回も送らずに `resources/read` / `prompts/get` / `completion/complete` / `resources/subscribe` を送り、帳簿と `audit_log` が1行も動かないことを見る） |
 >
 > 3つ目は許可リストの内側なので、走査では原理的に見張れない。
 > **網羅を主張するのはやめる。網羅を担うのは走査ではなく振る舞い検査で

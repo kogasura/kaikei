@@ -3796,7 +3796,7 @@ target ディレクトリのロックで詰まりうるので、テストは tar
 |---|---|---|
 | `dispatch.rs` が `rmcp` の型を再輸出する | 他のファイルが `rmcp` を名指しせずに登録経路へ届く | `CONFINED`（second line） |
 | 走査の外にファイルを置く | crate の一部なのに一度も読まれないファイルに何でも書ける | `assert_no_out_of_tree_inclusion`（今回追加） |
-| 許可された `dispatch.rs` の中に**別のプロトコル入口**を足す | `ServerHandler` は `call_tool` 以外にも既定実装を持つ（`read_resource` / `get_prompt` / `complete` / `get_task` / `update_task` / `cancel_task` …）。そこに書けば `tools/call` を通らずに操作を書ける | **無い**（`dispatch.rs` を全面的に許すという判断の帰結。設計上の想定内で diff には出る） |
+| 許可された `dispatch.rs` の中に**別のプロトコル入口**を足す | `ServerHandler` は `call_tool` 以外にも既定実装を持つ（`read_resource` / `get_prompt` / `complete` / `get_task` / `update_task` / `cancel_task` …）。そこに書けば `tools/call` を通らずに操作を書ける | **振る舞い検査**（`mcp_stdio_server.rs` の `no_protocol_entry_point_other_than_tools_call_touches_the_ledger`。`tools/call` を1回も送らずに `resources/read` / `prompts/get` / `completion/complete` / `resources/subscribe` を送り、帳簿と `audit_log` が1行も動かないことを見る） |
 
 3つ目は許可リストの内側なので走査では原理的に見張れない。
 **網羅は主張しない。網羅を担うのは振る舞い検査である。**

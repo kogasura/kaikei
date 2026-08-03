@@ -162,11 +162,23 @@ pub fn contains_call(line: &str, needle: &str) -> bool {
 /// しては同じものであり、素の `contains` では素通りする。
 pub fn pulls_in_out_of_tree_source(line: &str) -> bool {
     let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-    // `#[path` は属性の開き括弧まで含めて見る（`path` というただの識別子・
-    // フィールド名を誤検知しない）。`include!(` は識別子境界を見る
-    // （`include_str!(` / `include_bytes!(` は資源の埋め込みであって
-    // ソースの取り込みではないので落とさない）。
-    squeezed.contains("#[path") || contains_call(&squeezed, "include!(")
+    // `include!(` は識別子境界を見る（`include_str!(` / `include_bytes!(` は
+    // 資源の埋め込みであってソースの取り込みではないので落とさない）。
+    if contains_call(&squeezed, "include!(") {
+        return true;
+    }
+    // 属性の中の `path = "..."` を見る。`#[path]` を直に書く形だけでなく
+    // `#[cfg_attr(cond, path = "...")]` も同じものなので、両方を1つの規則で
+    // 捕まえる（PR-F レビュー4巡目の指摘。`#[path` だけを見ていた版は
+    // `cfg_attr` 経由を素通りさせていた）。
+    if !squeezed.contains("#[") {
+        return false;
+    }
+    // `path` の直前が区切り文字であることを見る。これが無いと
+    // `let path = "x";`（空白を落とすと `letpath="x";`）を誤検知する。
+    squeezed
+        .match_indices("path=")
+        .any(|(at, _)| at > 0 && matches!(squeezed.as_bytes()[at - 1], b'[' | b'(' | b','))
 }
 
 /// `reason` には「この走査が何を守っているか」を渡す（失敗メッセージに出す）。

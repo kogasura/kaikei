@@ -298,6 +298,31 @@ impl McpServer {
         .await
     }
 
+    /// 応答でもエラーでも、**返ってきたメッセージをそのまま**返す。
+    ///
+    /// [`request_within`] は `error` が返ると panic するので、
+    /// 「この入口が何を返すか分からない」検査には使えない。
+    ///
+    /// [`request_within`]: McpServer::request_within
+    async fn raw_request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }))
+        .await;
+
+        loop {
+            let message = self.read_message(RESPONSE_TIMEOUT, method).await;
+            if message.get("id").and_then(Value::as_i64) == Some(id) {
+                return message;
+            }
+        }
+    }
+
     async fn request_within(&mut self, timeout: Duration, method: &str, params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
@@ -610,4 +635,65 @@ async fn reversing_through_the_real_binary_goes_through_the_same_audited_path(
         Some(reversal_id.as_str())
     );
     assert_eq!(rows[5].error_code.as_deref(), Some("empty_reverse_reason"));
+}
+
+/// `tools/call` **以外**のプロトコル入口が生えていない。
+///
+/// 上の3本は `tools/call` を通る操作しか見ないので、`ServerHandler` の
+/// 既定実装を持つ別のメソッド（`read_resource` / `get_prompt` / `complete`
+/// / タスク系）を `dispatch.rs` に足すと、監査ログを通らない書き込み経路に
+/// なる。許可リストの**内側**なので走査にも映らない
+/// （`DECISIONS.md` D-084 の穴の列挙表）。
+///
+/// rmcp 3.1 の `handle_request` はこれらを capability ゲート無しで
+/// ハンドラへ配るため、**宣言していない capability でも送れば届く**。
+///
+/// # 見るのは「返り方」ではなく「帳簿が動かないこと」
+///
+/// 既定実装の返し方は入口ごとに違う（`resources/read` は
+/// `-32601 method not found`、`completion/complete` は**空の成功**）。
+/// そこを固定すると rmcp の実装都合に縛られるだけで、守りたいものが
+/// 守れない。**守りたいのは「`tools/call` 以外から帳簿が動かない」こと**
+/// なので、返り方は問わず帳簿と `audit_log` を見る。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn no_protocol_entry_point_other_than_tools_call_touches_the_ledger(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    // rmcp 3.1 の `ServerHandler` で既定実装を持ち、かつ引数を受け取る入口。
+    // 増えたらここに足す（`dispatch.rs` に手書きした瞬間に落ちる）。
+    let entry_points = [
+        ("resources/read", json!({ "uri": "kaikei://probe" })),
+        ("prompts/get", json!({ "name": "probe" })),
+        (
+            "completion/complete",
+            json!({
+                "ref": { "type": "ref/prompt", "name": "probe" },
+                "argument": { "name": "probe", "value": "" }
+            }),
+        ),
+        ("resources/subscribe", json!({ "uri": "kaikei://probe" })),
+    ];
+
+    let app = common::app_pool(conn_opts.clone()).await;
+    let mut server = McpServer::start(&conn_opts).await;
+
+    for (method, params) in entry_points {
+        // 応答でもエラーでもよい。落ちずに返ってくることだけ確かめる。
+        let _ = server.raw_request(method, params).await;
+    }
+
+    server.shutdown().await;
+
+    assert_eq!(
+        journal_entry_count(&app).await,
+        0,
+        "tools/call 以外のプロトコル入口から記帳されています。\
+         dispatch.rs に ServerHandler のメソッドを足したなら、\
+         そこは with_audit を通っていません（DECISIONS.md D-084 の穴の列挙表）"
+    );
+    assert!(
+        audit_rows(&app).await.is_empty(),
+        "tools/call を1回も送っていないのに audit_log に行があります"
+    );
 }
