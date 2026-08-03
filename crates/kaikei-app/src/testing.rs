@@ -483,9 +483,17 @@ impl crate::ports::AuditSink for RecordingAuditSink {
             crate::audit::AuditOutcome::Succeeded { output_json } => {
                 (output_json.map(str::to_string), None)
             }
-            crate::audit::AuditOutcome::Failed { public_message, .. } => {
-                (None, Some(public_message.to_string()))
-            }
+            // 失敗時も応答本文（あれば）を残す。永続化層
+            // （`kaikei_store::audit`）と同じ非対称の解消
+            // （PR-F レビュー C-4）。
+            crate::audit::AuditOutcome::Failed {
+                public_message,
+                output_json,
+                ..
+            } => (
+                output_json.map(str::to_string),
+                Some(public_message.to_string()),
+            ),
         };
         self.rows
             .lock()

@@ -221,9 +221,21 @@ cargo run -p kaikei-mcp
 この設定ファイルには **DB パスワードが平文で置かれます**。ファイル権限に
 注意してください（`docs/07-mcp-server.md` §8）。
 
-**Phase 3 PR-E 時点でツールは1件も登録されていません**（`tools/list` は空）。
-記帳・照会のツールは PR-F / PR-G で追加します。現時点で確認できるのは
-「起動でき、勘定科目が入り、記帳できる状態になっている」ところまでです。
+**Phase 3 PR-F 時点で登録されているツールは2件です**（`tools/list` は
+`post_journal_entry` / `reverse_journal_entry` を返します）。
+
+| ツール | できること |
+|---|---|
+| `post_journal_entry` | 仕訳を1件起こす。金額は**文字列**で渡します（例: `"110000"`）。貸借が一致しない仕訳は記帳されず、差額と修正案（`hint`）が返ります |
+| `reverse_journal_entry` | 逆仕訳（赤伝）で訂正する。元の仕訳は書き換わりません |
+
+照会系・提案系（`get_trial_balance` / `search_entries` / `list_accounts` など
+残り9件）は PR-G / PR-H で追加します。
+
+**削除・更新のツールは存在しません**（`delete_journal_entry` /
+`update_journal_entry` / `execute_sql` / `reopen_period` は登録されておらず、
+DB のロール権限とトリガでも塞いであります）。
+すべてのツール呼び出しは `audit_log` に**開始・結果の2行**として記録されます。
 
 ## 仕訳番号と欠番
 

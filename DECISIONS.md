@@ -3535,7 +3535,13 @@ pub trait McpTool: Send + Sync + 'static {
         -> impl Future<Output = Result<ToolSuccess, ToolFailure>> + Send;
 }
 
-pub fn route<T: McpTool>() -> ToolRoute<KaikeiServer>;                  // 唯一の登録経路
+// ルータそのものを dispatch 層に閉じ込める（レビュー反映。下記の訂正注記1）
+pub struct ToolRegistry { /* rmcp の ToolRouter を包んで隠す */ }
+impl ToolRegistry {
+    pub fn new() -> Self;
+    pub fn with<T: McpTool>(self) -> Self;                              // 唯一の登録経路
+}
+
 pub async fn call<T: McpTool>(runtime: &Runtime, arguments: Option<Map<String, Value>>)
     -> CallToolResult;                                                  // 唯一の実行経路
 ```
@@ -3547,12 +3553,12 @@ pub async fn call<T: McpTool>(runtime: &Runtime, arguments: Option<Map<String, V
 | 1 | ツールが応答を組み立てる | `McpTool::run` の戻り値は `Result<ToolSuccess, ToolFailure>`。`CallToolResult`（`isError` を含む）を作れるのは `dispatch::call` と `ToolError` だけ |
 | 2 | ツールが監査ログを書く／書き忘れる | `run` が受け取る `ToolContext` は `AuditSink` を**露出しない**（`Runtime` 自体が渡らない）。監査ログを書く能力がツールに無い |
 | 3 | `ToolContext` を自作する | フィールドも `new` も private。作れるのは `dispatch` モジュールだけ |
-| 4 | 別経路でルータに載せる | `ToolRoute` を組み立てるのは `dispatch::route` だけで、その中身は必ず `dispatch::call` |
-| 5 | fail-open の警告を捨てる | `call` は `AuditedCall::into_result(&mut notes)`（既定経路）しか使わず、積まれた警告を必ず応答の `warnings` に載せる。`into_parts_unchecked`（逃げ道。D-076）はこの crate に1箇所も無い |
-| 6 | クライアント由来のツール名が `audit_log.tool` に載る | `AuditCall.tool` に渡せるのは `ToolName` だけで、その唯一の構築子 `ToolName::resolve` は `server::is_registered_tool`（＝`tools/list` と同じレジストリ）を通る |
+| 4 | 別経路でルータに載せる | **`rmcp` の `ToolRouter` が `dispatch` の外に出ない。** `server.rs` が持つのは `ToolRegistry` で、載せる口は `with::<T: McpTool>` だけ（訂正注記1） |
+| 5 | fail-open の警告を捨てる | `call` は `AuditedCall::into_result_noting_outcome(&mut notes)`（既定経路）しか使わず、積まれた警告を必ず応答の `warnings` に載せる。`into_parts_unchecked`（逃げ道。D-076）はこの crate に1箇所も無い |
+| 6 | クライアント由来のツール名が `audit_log.tool` に載る | `AuditCall` を組み立てるのは `dispatch.rs` の1箇所だけ（**走査で担保**）で、そこは `ToolName::resolve`（`server::is_registered_tool` ＝`tools/list` と同じレジストリを引く）を通す。**型で閉じているのは「登録済み以外から `ToolName` を作れない」ことである**（訂正注記2） |
 
 型で閉じられない残り（同一 crate 内から `kaikei_app::audit::with_audit` を
-呼ぶ、`ToolRoute` を直に組み立てる）は
+呼ぶ、`dispatch.rs` の中で `ToolRouter` に別のツールを足す）は
 `crates/kaikei-mcp/tests/audit_is_structural.rs` がソースを走査して見張る
 （識別子ごとに「現れてよいファイル」と理由を持つ表。対照実験付き）。
 
@@ -3585,9 +3591,43 @@ presentation 層でも「呼ぶ場所」を1つに閉じる必要がある。
 `DESCRIPTION` に書く（`CLAUDE.md` §10 / §11 の規律は同じく及ぶ）。
 1ツールあたり数行のコストで、11ツール分の書き忘れ経路が消える。
 
+**訂正注記1（レビュー B-1。この決定の中心的な主張が成立していなかった）**:
+初版は「`ToolRoute` を組み立てるのは `dispatch::route` だけ」で登録経路を
+閉じたつもりだったが、**閉じていなかった**。`rmcp` の `ToolRouter` は
+`with_route` のほかに `with_async_tool::<T>()` / `with_sync_tool::<T>()` を
+持ち、`ToolBase` + `AsyncTool` を実装した型はそこからハンドラ本体ごと
+ルータに載る。その形は `ToolRoute` / `CallToolResult` / `with_audit` /
+`AuditCall` / `audit_sink` / `tool_handler` / `#[tool(` の**どれも書かない**ので、
+`tests/audit_is_structural.rs` の走査を全て素通りする
+（レビュー2名が独立に再現。`get_settings` を名乗る probe が `tools/list` に
+載り、`tools/call` すると `audit_log` に1行も残さずに実 DB へ記帳できた）。
+しかも `rmcp` 3.1 の module doc は「1ツール1ファイルならこの形」と
+**勧めており**、PR-G / PR-H の実装者が最も踏みやすい経路だった。
+この決定の却下表は `AsyncTool` を「`invoke` の失敗値が `ErrorData` 固定」を
+理由に却下していたが、**却下しただけでは使えないままにならない**
+（読み取り系・成功前提のツールなら普通に書ける）。
+
+そこで **`ToolRouter` 自体を `dispatch.rs` に閉じ込め**、外には
+`dispatch::ToolRegistry`（ツールを載せる口が `with::<T: McpTool>` しか無い型）
+だけを見せる形に変えた。`server.rs` は `McpTool` の型を並べるだけになり、
+`McpTool` を実装していない型をルータに載せる方法が**型として存在しない**。
+`route` は private にした。走査（second line）にも `ToolRouter` /
+`with_async_tool` / `with_sync_tool` / `AsyncTool` / `SyncTool` / `ToolBase` /
+`IntoToolRoute` / `CallToolHandler` を追加した。
+
+**訂正注記2（レビュー C-6。提供していない保証を書いていた）**:
+初版の表 6 は「`AuditCall.tool` に渡せる型を `dispatch::ToolName` に限定した」と
+断定していたが、`AuditCall` は凍結済みの `kaikei-app` にあり、そのフィールドは
+`pub tool: &'a str` である（この PR で `kaikei-app` のこの型は変えていない）。
+`dispatch.rs` の中で `tool: T::NAME` と直接書くことは型としては妨げられて
+いない。実際の担保は「`AuditCall` という識別子を `dispatch.rs` に閉じ込める
+走査＋その1ファイル内で `ToolName::resolve` を通す慣行」であり、
+**型で閉じているのは `ToolName::resolve` が登録済み以外を弾くこと**である。
+表と `docs/07-mcp-server.md` §9 の記述を実態に合わせた。
+
 ---
 
-## D-085 ツールの入力は dispatch 層が操作の中でデシリアライズし、タグの重複キーは畳み込まない
+## D-085 ツールの入力は dispatch 層が操作の中でデシリアライズする（タグの重複キーは MCP 経由では検出できない）
 
 **決定**:
 
@@ -3598,9 +3638,11 @@ presentation 層でも「呼ぶ場所」を1つに閉じる必要がある。
    監査ログに残る**（`docs/07-mcp-server.md` §10 MC-09 の (3)）。
 2. 入力 DTO は **`#[serde(deny_unknown_fields)]`** にする。
    `post_journal_entry` に `document_ids` を渡すと拒否される（黙って捨てない）。
-3. 線上の `tags` は `Map<String, String>` ではなく
-   **`crate::wire::TagPairs`**（出現順のペアを保持する newtype）で受ける。
-   重複キーの判定は `kaikei_jp::tags::TagCatalog::parse_tag_set` に委ねる。
+3. 線上の `tags` は **`BTreeMap<String, String>`** で受ける。
+   **MCP 経由では重複キーを検出できない**（後勝ちになる）ことを制約として
+   `docs/07-mcp-server.md` §3 と `inputSchema` の説明文に明記する。
+   タグの型付けと未登録キーの判定は
+   `kaikei_jp::tags::TagCatalog::parse_tag_set` に委ねる（従来どおり）。
 
 **却下した選択肢**:
 
@@ -3608,8 +3650,9 @@ presentation 層でも「呼ぶ場所」を1つに閉じる必要がある。
 |---|---|
 | `Parameters<T>` で受ける（`rmcp` の標準的な書き方） | デシリアライズが**ツール本体に入る前**に走り、失敗は `dispatch::call` の外側で `CallToolResult::error`（テキストのみ）に変換される。つまり **audit_log に1行も残らない**。MC-09 の (3) は PR-F の担当と設計書に明記されている。構造化コンテンツ（`error` / `message`）で返せなくなるという副次的な損失もある |
 | 未知のフィールドを黙って無視する（serde の既定） | `document_ids` を付けて「証憑を紐付けたつもり」で記帳が成功する。証憑の紐付けは Phase 4（`attach_document`）であり、現状 `PgTx::insert_entry` は `document_refs` 非空を拒否する（D-041）。**入力を黙って落とさない**のは `CLAUDE.md` §4 と同じ姿勢である |
-| `tags` を `serde_json::Map<String, String>` で受ける | `Map` は同じキーが2回現れると**後勝ちで黙って上書き**する。PR-B 3巡目で `kaikei-jp` に足した `JpError::DuplicateTagKeyInInput`（「重複した指定を1つにまとめてください」）に**到達する経路が消える**。`CLAUDE.md` §4「`TagSet` はゴミ箱ではない。黙って落とさない」に反する |
-| 重複キーの検出を MCP 層で書く | 同じ判定が2箇所に育つ（D-072）。`TagCatalog::parse_tag_set` が既に持っているので、線上の形（重複を保持したペア列）だけを MCP 層が用意する |
+| `tags` を出現順のペア列（`TagPairs`）で受けて重複を保持する（初版の決定3） | **本番経路では一度も効いていなかった。** 訂正注記を参照 |
+| 重複キーの検出を MCP 層で書く | 同じ判定が2箇所に育つ（D-072）。`TagCatalog::parse_tag_set` が既に持っている。そもそも MCP 層には重複が届かない（訂正注記） |
+| 生の JSON テキストを MCP 層まで持ち込んで自前でパースする | `rmcp` の stdio トランスポートを自前に置き換えることになる。プロトコルの取り扱い（フレーミング・初期化の折衝・通知）を自分で持つ代償に対して、得られるのは「タグの重複キーを検出できる」1点だけである |
 | デシリアライズのエラー本文も日本語で書き起こす | 金額（`AmountStr`）のように**会計上の実害に直結するもの**は D-079 で日本語にしてある。一方「未知のフィールド」「必須フィールドの欠落」は serde が有効な候補を列挙した英語を返す。これを全て日本語にするには入力 DTO ごとに `Deserialize` を手書きすることになり、DTO が増えるほど腐る。**ツール名と「金額は文字列」を添えた日本語の包み**を付け、詳細は serde の文言のままにした（`CLAUDE.md` §11 の「次の手」は包みと `inputSchema` で満たす） |
 
 **理由**: 「AI が何をしようとしたか」を最も知りたいのは失敗したときである
@@ -3620,3 +3663,32 @@ presentation 層でも「呼ぶ場所」を1つに閉じる必要がある。
 （`schema_for_input::<T::Input>()`）。`rmcp` の `ToolBase` が
 `Parameters<Self::Parameter>` に対して生成するのと同じ結果になる
 （`Parameters<P>` の `JsonSchema` は `P` へ委譲する実装であることを確認済み）。
+
+**訂正注記（レビュー B-2。決定3を撤回する）**:
+初版の決定3（`TagPairs` で重複キーを保持し
+`JpError::DuplicateTagKeyInInput` に到達させる）は**成立していなかった**。
+`rmcp` の `CallToolRequestParams::arguments` は `Option<JsonObject>`
+（＝ `serde_json::Map`）で、**JSON-RPC メッセージ全体が `serde_json` で
+パースされる時点、つまり `dispatch::call` に入る前に重複が潰れる**。
+ツール側の受け型を何にしても、届く時点で既に1件になっている。
+実測では、両方とも有効な税区分を重複指定すると後勝ちで黙って採用され
+記帳が成功した（`SALES_10` → `SALES_8_REDUCED`。税率が無言で入れ替わる）。
+`audit_log.input` にも畳み込み後の値しか残らない。
+`wire.rs` の単体テストが緑だったのは `serde_json::from_str` に生のテキストを
+渡す**本番と違う入口**を通していたためである（本番経路を再現していない
+緑のテスト。**誤診は誤値と同じ実害を持つ**——`PROGRESS.md` Phase 1 の教訓3）。
+
+採った方針は「**提供できない保証を主張している記述と機構を消す**」である
+（PR-B が `contract_from_downstream.rs` の doc で提供できない保証を撤回したのと
+同じ判断）。
+
+- `crate::wire::TagPairs` を**削除**した。効いていない機構を残すと、
+  次の実装者が「重複は防がれている」と誤解する
+- `tags` は `BTreeMap<String, String>` で受ける
+- 制約（**MCP 経由では `tags` の重複キーを検出できない。後勝ちになる**／
+  **`JpError::DuplicateTagKeyInInput` は MCP 経由では到達不能**。他の
+  呼び出し元からは到達する）を `docs/07-mcp-server.md` §3 に明記した。
+  `inputSchema` の `tags` の説明文にも「同じキーを2回指定した場合、
+  後に書いた指定だけが使われます」と書いてある
+- `wire.rs` のテストは「重複キーは**この層に届く前に**畳み込まれている」ことを
+  固定するものに書き換え、**何を検証していないか**を doc に明記した

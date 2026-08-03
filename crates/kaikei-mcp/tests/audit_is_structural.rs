@@ -11,11 +11,20 @@
 //! - ツールは `AuditSink` に触れない（`ToolContext` が露出しない。
 //!   `Runtime` 自体が渡らない）
 //! - `ToolContext` は `dispatch` の外で作れない（フィールドも `new` も private）
+//! - **`rmcp` の `ToolRouter` は `dispatch` の外に出ない。**
+//!   `server.rs` が持つのは `dispatch::ToolRegistry` で、ツールを載せる口は
+//!   `with::<T: McpTool>` だけである（PR-F レビュー B-1。それ以前は
+//!   `ToolRouter::with_async_tool::<T>()` で `dispatch::call` を通らない
+//!   ツールを登録でき、しかもその形はこの走査を全て素通りしていた）
 //!
 //! 型で閉じられないのは「`ToolRoute` を直接組み立てる」「`with_audit` を
 //! ツール側で呼ぶ」という**書き足し**である（Rust の可視性はモジュール単位
 //! なので、同一 crate 内から `kaikei_app::audit::with_audit` を呼ぶこと自体は
 //! 止められない）。そこだけをこのテストが見張る。
+//!
+//! `rmcp` の別経路（`AsyncTool` / `SyncTool` / `with_async_tool` …）も
+//! **型で閉じたうえで**規則に入れてある。型の側が崩れたときに気づける
+//! second line であって、これが主ではない。
 //!
 //! `.github/workflows/architecture.yml` に grep を足すのではなくテストに
 //! したのは、`tests/stdout_is_json_rpc_only.rs` と同じ理由——**手元で
@@ -62,7 +71,7 @@ const CONFINED: &[Confined] = &[
         token: "into_parts_unchecked",
         allowed: &[],
         reason: "fail-open の警告を握り潰せる逃げ道（DECISIONS.md D-076）。\
-                 この crate では既定経路 into_result(&mut notes) だけを使い、\
+                 この crate では既定経路 into_result_noting_outcome(&mut notes) だけを使い、\
                  積まれた警告は必ず応答の warnings に載せる",
     },
     Confined {
@@ -71,6 +80,56 @@ const CONFINED: &[Confined] = &[
         reason: "ルータに載せる経路を1つに絞るための要（dispatch::route）。\
                  ここ以外で ToolRoute を組み立てると、監査ログを通らないツールを\
                  登録できてしまう",
+    },
+    Confined {
+        token: "ToolRouter",
+        allowed: &["dispatch.rs"],
+        reason: "rmcp の ToolRouter は with_route のほかに with_async_tool / with_sync_tool を\
+                 持ち、そこからは ToolRoute も CallToolResult も書かずにツールを載せられる。\
+                 ルータを持てる場所を dispatch 層に閉じ、外には dispatch::ToolRegistry\
+                 （載せる口が with::<T: McpTool> しか無い型）だけを見せる（D-084 の訂正注記）",
+    },
+    Confined {
+        token: "with_async_tool",
+        allowed: &[],
+        reason: "rmcp の AsyncTool 実装型をルータに直接載せる口。通ると dispatch::call を\
+                 経由しないツールができる（ハンドラ本体は rmcp の async_tool_wrapper が\
+                 組み立てるので CallToolResult すらソースに現れない）",
+    },
+    Confined {
+        token: "with_sync_tool",
+        allowed: &[],
+        reason: "with_async_tool と同じ（SyncTool 版）",
+    },
+    Confined {
+        token: "AsyncTool",
+        allowed: &[],
+        reason: "実装すると with_async_tool でルータに載せられる。rmcp 3.1 の module doc は\
+                 「1ツール1ファイルならこちら」とこの形を勧めているが、invoke の失敗値が\
+                 ErrorData 固定でありドメインのエラーをツール結果エラーで返せない（D-071）。\
+                 ツールは crate::dispatch::McpTool を実装すること",
+    },
+    Confined {
+        token: "SyncTool",
+        allowed: &[],
+        reason: "AsyncTool と同じ",
+    },
+    Confined {
+        token: "ToolBase",
+        allowed: &[],
+        reason: "AsyncTool / SyncTool の前提となる trait。実装する動機はこの crate に無い",
+    },
+    Confined {
+        token: "IntoToolRoute",
+        allowed: &[],
+        reason: "(Tool, handler) のタプルなどを with_route に渡せるようにしている trait。\
+                 ここを経由すると dispatch::route を通らないルートを組み立てられる",
+    },
+    Confined {
+        token: "CallToolHandler",
+        allowed: &[],
+        reason: "ツールのハンドラ本体をその場に書くための trait。dispatch::call 以外の\
+                 ハンドラが生まれる",
     },
     Confined {
         token: "CallToolResult",
@@ -252,8 +311,19 @@ fn the_detector_actually_flags_a_bypass() {
     ));
     assert!(mentions("use kaikei_app::audit::AuditCall;", "AuditCall"));
     assert!(mentions("ToolRoute::new_dyn(attr, handler)", "ToolRoute"));
+    // B-1 の実際の抜け道（型で閉じたうえで、走査でも見張る）。
+    assert!(mentions(
+        "    ToolRouter::new().with_async_tool::<Probe>()",
+        "with_async_tool"
+    ));
+    assert!(mentions(
+        "impl AsyncTool<KaikeiServer> for Probe {",
+        "AsyncTool"
+    ));
+    assert!(mentions("impl ToolBase for Probe {", "ToolBase"));
     // 識別子の途中には一致しない（`ToolRouter` を誤検知しない）。
     assert!(!mentions("ToolRouter::new()", "ToolRoute"));
+    assert!(!mentions("IntoToolRoute for (Tool, H)", "ToolRoute"));
     assert!(!mentions("let with_audit_log = 1;", "with_audit"));
     // コメント行は見ない。
     assert!(is_comment("    /// with_audit に閉じてある"));
@@ -264,13 +334,41 @@ fn the_detector_actually_flags_a_bypass() {
 /// 閉じ込め規則そのものが空になっていないこと（規則を消して緑にできない）。
 #[test]
 fn the_confinement_rules_are_not_empty() {
-    assert!(CONFINED.len() >= 7, "閉じ込め規則が減っています");
+    assert!(CONFINED.len() >= 15, "閉じ込め規則が減っています");
     for rule in CONFINED {
         assert!(!rule.token.is_empty());
         assert!(
             !rule.reason.is_empty(),
             "{}: 理由が書かれていません",
             rule.token
+        );
+    }
+}
+
+/// `rmcp` の別経路（`AsyncTool` / `SyncTool` / `with_async_tool` …）が
+/// **1つ残らず**規則に入っていること。
+///
+/// この一覧は手で維持しているので、`rmcp` の登録口を1つ書き落とすと
+/// そこだけが素通しになる（PR-F レビュー B-1 で実際に踏んだ形）。
+/// せめて「一度入れたものが黙って消えない」ことは固定する。
+#[test]
+fn every_known_rmcp_registration_path_is_confined() {
+    for token in [
+        "ToolRouter",
+        "ToolRoute",
+        "with_async_tool",
+        "with_sync_tool",
+        "AsyncTool",
+        "SyncTool",
+        "ToolBase",
+        "IntoToolRoute",
+        "CallToolHandler",
+        "tool_handler",
+    ] {
+        assert!(
+            CONFINED.iter().any(|rule| rule.token == token),
+            "{token} の閉じ込め規則が消えています。\
+             rmcp はこの経路からも dispatch::call を通らないツールを登録できます"
         );
     }
 }

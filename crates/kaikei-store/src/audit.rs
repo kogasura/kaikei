@@ -390,15 +390,38 @@ fn prepare_payload(field: &str, text: Option<&str>) -> Option<Value> {
     }
 }
 
-/// 失敗の結果レコードの `output` 列に入れる JSON を組み立てる。
+/// 失敗の結果レコードの `output` 列に入れる JSON を組み立てる
+/// （応答本文が渡されなかった場合の受け皿）。
 ///
 /// 入れるのは **AI に返した本文**（`public_message()`）だけである。
 /// `Display` は下位層の生メッセージ（接続文字列・ロール名・制約定義を
 /// 含みうる）を持つため転記しない（`docs/07-mcp-server.md` §9）。
-/// `kaikei_app::audit::AuditOutcome::Failed` が `public_message` しか
-/// 運べない形になっているので、ここに `Display` が届く経路は無い。
+/// `kaikei_app::audit::AuditOutcome::Failed` が運ぶのは `public_message` と
+/// presentation 層が組み立てた応答本文（`output_json`）だけなので、
+/// ここに `Display` が届く経路は無い。
 fn error_output(public_message: &str) -> Value {
     json!({ "message": public_message })
+}
+
+/// 失敗の結果レコードの `output` 列に入れる値。
+///
+/// **成功時と対称にする**（PR-F レビュー C-4）。成功時は応答 body 全体が
+/// `output` に載るのに、失敗時が `{"message": ...}` だけだと、AI に実際に
+/// 返した `hint` / `candidate_accounts` / `difference` / `policy_notes` /
+/// `line` が記録に残らない。とくに `hint` は**AI の次の記帳内容を直接決める
+/// 提案**であり、「サーバが何を返して次の一手を誘導したか」を後から追う
+/// という目的（D-070・`docs/07-mcp-server.md` §9）に対して失敗側だけ
+/// 情報が薄くなる。
+///
+/// 応答本文が JSON として読めない場合（presentation 層のバグ）は
+/// `public_message` だけを残す。ここで [`unparsable_placeholder`] に
+/// 差し替えると、**確実に持っている本文まで失う**ためである
+/// （`input` 側は代わりに残せるものが無いので扱いが違う）。
+fn failure_output(public_message: &str, output_json: Option<&str>) -> Value {
+    match output_json.map(serde_json::from_str::<Value>) {
+        Some(Ok(value)) => prepare_value("output", value),
+        Some(Err(_)) | None => prepare_value("output", error_output(public_message)),
+    }
 }
 
 #[async_trait]
@@ -421,11 +444,11 @@ impl AuditSink for PgAuditSink {
     async fn record_result(&self, record: &AuditResult<'_>) -> Result<(), RepoError> {
         let output = match record.outcome {
             AuditOutcome::Succeeded { output_json } => prepare_payload("output", output_json),
-            // 本文（public_message）にも NUL が混じりうる（入力に由来する
-            // 文字列を含む文言があるため）。同じ無害化を通す。
-            AuditOutcome::Failed { public_message, .. } => {
-                Some(prepare_value("output", error_output(public_message)))
-            }
+            AuditOutcome::Failed {
+                public_message,
+                output_json,
+                ..
+            } => Some(failure_output(public_message, output_json)),
         };
 
         self.append(AuditRow {
@@ -612,6 +635,42 @@ mod tests {
             json!("貸借不一致: 借方 110,000 / 貸方 100,000")
         );
         assert_eq!(value.as_object().unwrap().len(), 1);
+    }
+
+    // 応答本文が渡されていれば、失敗の結果レコードにも**そのまま**載る
+    // （成功時と対称。PR-F レビュー C-4）。
+    #[test]
+    fn failure_output_keeps_the_whole_response_body_when_it_is_given() {
+        let value = failure_output(
+            "貸借不一致: 借方 110,000 / 貸方 100,000",
+            Some(
+                r#"{"error":"unbalanced","message":"貸借不一致","difference":"10000","hint":{"suggested_lines":[]}}"#,
+            ),
+        );
+        assert_eq!(value["error"], json!("unbalanced"));
+        assert_eq!(value["difference"], json!("10000"));
+        assert!(value["hint"]["suggested_lines"].is_array());
+        // 加工していないので封筒は付かない。
+        assert!(value.get(AUDIT_NOTE_KEY).is_none());
+    }
+
+    // 応答本文の中の NUL も無害化される（`input` 側と同じ扱い）。
+    #[test]
+    fn failure_output_sanitizes_nul_characters_in_the_response_body() {
+        let value = failure_output("本文", Some("{\"message\":\"A\\u0000B\"}"));
+        assert_eq!(value[AUDIT_NOTE_KEY]["verbatim"], json!(false));
+        assert_eq!(value["value"]["message"], json!("A\u{FFFD}B"));
+        assert!(!value.to_string().contains('\0'));
+    }
+
+    // 応答本文が渡されない／JSON として読めない場合は public_message を残す
+    // （確実に持っている本文まで失わない）。
+    #[test]
+    fn failure_output_falls_back_to_the_public_message() {
+        for body in [None, Some("{壊れた")] {
+            let value = failure_output("貸借不一致", body);
+            assert_eq!(value["message"], json!("貸借不一致"), "{body:?}");
+        }
     }
 
     // 【C】42501 を AppendOnlyViolation のまま返さない。

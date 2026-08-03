@@ -34,22 +34,27 @@ use crate::wire::lines_to_json;
 /// `reverse_journal_entry`。
 pub struct ReverseJournalEntry;
 
-/// 線上の入力（`docs/07-mcp-server.md` §3）。
+// ★この構造体の doc コメントは `tools/list` の応答に出る★
+// 内部設計書への参照・crate 名・Markdown の強調記法を書かないこと
+// （PR-F レビュー D-2。形は `docs/07-mcp-server.md` §3）。
+/// 逆仕訳1件の入力。指定していないキーは受け付けません。
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReverseJournalEntryInput {
-    /// 訂正対象の仕訳ID（UUID の正準表記）。
+    /// 訂正対象の仕訳ID。post_journal_entry が返した entry_id
+    /// （ハイフン付き36文字の UUID）をそのまま指定します。
     pub original_id: String,
 
-    /// 逆仕訳の取引日（`YYYY-MM-DD`）。**会計年度はこの日付で決まる**
-    /// （元仕訳が別年度でも逆仕訳はこの日付の年度で採番される）。
+    /// 逆仕訳の取引日。YYYY-MM-DD の形式で指定します。会計年度はこの日付で
+    /// 決まります（元の仕訳が別の年度でも、逆仕訳はこの日付の年度に入ります）。
     pub reverse_date: String,
 
-    /// 訂正理由。**必須**（空文字・空白のみは拒否される）。
-    /// 受理した理由は加工せず、入力のまま帳簿に残す。
+    /// 訂正理由。必須です（空文字や空白のみは受け付けません）。
+    /// 入力したままの文言が帳簿に残ります。
     pub reason: String,
 
-    /// 既に赤伝済みの仕訳を再度訂正することを明示的に許可する。既定は `false`。
+    /// 既に訂正済みの仕訳をもう一度訂正することを明示的に許可します。
+    /// 既定は false で、そのままだと二重の訂正は拒否されます。
     #[serde(default)]
     pub allow_double_reversal: bool,
 }

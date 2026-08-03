@@ -138,72 +138,29 @@ impl<'de> Deserialize<'de> for AmountStr {
     }
 }
 
-/// 線上の `tags`（キーも値も文字列のマップ）。**重複キーを保持する。**
-///
-/// # なぜ `Map<String, String>` にしないのか
-///
-/// `serde_json` の `Map` は同じキーが2回現れると**後勝ちで黙って上書き**する。
-/// `{"tags": {"tax_category": "SALES_10", "tax_category": "SALES_8"}}` を
-/// `Map` として受けた時点で片方が消えるので、`kaikei-jp` が用意している
-/// [`kaikei_jp::error::JpError::DuplicateTagKeyInInput`]（「重複した指定を
-/// 1つにまとめてください」）に**到達する経路が無くなる**。
-/// `CLAUDE.md` §4「`TagSet` はゴミ箱ではない。黙って落とさない」に反する。
-///
-/// そこで出現順のペアをそのまま保持し、重複の検出は
-/// [`kaikei_jp::tags::TagCatalog::parse_tag_set`] に委ねる（判定を MCP 層に
-/// 書き直さない。`DECISIONS.md` D-072）。
-///
-/// `JsonSchema` 上は素直なオブジェクト（`{"キー": "値"}`）として見える。
-#[derive(Debug, Clone, Default, PartialEq, Eq, schemars::JsonSchema)]
-#[schemars(
-    with = "std::collections::BTreeMap<String, String>",
-    description = "タグ。キーも値も文字列で指定します（例: {\"tax_category\": \"SALES_10\"}）"
-)]
-pub struct TagPairs(Vec<(String, String)>);
-
-impl TagPairs {
-    /// 出現順のキーと値。
-    pub fn as_slice(&self) -> &[(String, String)] {
-        &self.0
-    }
-
-    /// 空かどうか。
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl<'de> Deserialize<'de> for TagPairs {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct PairsVisitor;
-
-        impl<'de> de::Visitor<'de> for PairsVisitor {
-            type Value = TagPairs;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("タグのオブジェクト（キーも値も文字列）")
-            }
-
-            fn visit_map<M>(self, mut access: M) -> Result<TagPairs, M::Error>
-            where
-                M: de::MapAccess<'de>,
-            {
-                let mut pairs = Vec::new();
-                // `MapAccess` は入力に現れた順で1組ずつ渡してくるので、
-                // 重複キーもここでは失われない（畳み込むのは呼び出し先）。
-                while let Some((key, value)) = access.next_entry::<String, String>()? {
-                    pairs.push((key, value));
-                }
-                Ok(TagPairs(pairs))
-            }
-        }
-
-        deserializer.deserialize_map(PairsVisitor)
-    }
-}
+// ---------------------------------------------------------------------------
+// 線上の `tags`
+// ---------------------------------------------------------------------------
+//
+// ★MCP 経由では重複キーを検出できない★（PR-F レビュー B-2。D-085 の訂正注記）
+//
+// 当初ここには `TagPairs`（出現順のペアを保持する手書き `Deserialize`）が
+// あり、「重複キーを畳み込まないので `JpError::DuplicateTagKeyInInput` に
+// 到達できる」と主張していた。**それは成立していなかった。**
+//
+// rmcp の `CallToolRequestParams::arguments` は `Option<JsonObject>`
+// （＝ `serde_json::Map`）であり、JSON-RPC メッセージ全体が `serde_json` で
+// パースされる時点——つまり `dispatch::call` に入るより前——で重複キーは
+// **後勝ちで畳み込まれている**。ツール側の受け型を何にしても、届く時点で
+// 既に1件になっている。`wire.rs` の単体テストが緑だったのは、本番と違う
+// 入口（`serde_json::from_str` に生のテキストを渡す）を通していたためで、
+// 本番経路を再現していなかった。
+//
+// 生の JSON テキストを MCP 層まで持ち込むには rmcp の stdio トランスポートを
+// 自前に置き換えることになり、得るものに対して代償が大きい。**提供できない
+// 保証を主張しない**ほうを採り、型ごと削除した（`tags` は
+// `BTreeMap<String, String>` で受ける）。制約は
+// `docs/07-mcp-server.md` §3 と D-085 に明記してある。
 
 /// [`TagSet`] を線上の `tags`（文字列マップ）にする。
 ///
@@ -359,34 +316,28 @@ mod tests {
         assert_eq!(json.get("type").and_then(|t| t.as_str()), Some("string"));
     }
 
-    // ★重複キーが畳み込まれない★
+    // ★MCP 経由では `tags` の重複キーを検出できない★（B-2）
     //
-    // `Map<String, String>` で受けていると後勝ちで1件に潰れ、
-    // `JpError::DuplicateTagKeyInInput` に到達する経路が消える。
+    // 本番経路では、JSON-RPC メッセージ全体が `serde_json` でパースされる
+    // 時点で重複キーが後勝ちで畳み込まれ、ツール層には既に1件になった
+    // `serde_json::Map` が届く。**このテストはその事実を固定するもので、
+    // 「重複を検出できる」ことを検証してはいない。**
+    //
+    // ここで `serde_json::from_str` に生のテキストを渡しているのは、
+    // 畳み込みが**どこで起きるか**（＝ MCP 層より前）を示すためである。
+    // 以前ここにあった `TagPairs` のテストは、同じ入口を使いながら
+    // 「重複キーが保持される」ことを主張しており、本番経路で成立しない
+    // 保証を緑のテストで裏書きしていた（誤診は誤値と同じ実害を持つ。
+    // `PROGRESS.md` Phase 1 の教訓3）。
     #[test]
-    fn tag_pairs_keep_duplicate_keys_in_input_order() {
-        let pairs: TagPairs =
-            serde_json::from_str(r#"{"tax_category":"SALES_10","tax_category":"SALES_8"}"#)
-                .unwrap();
-        assert_eq!(
-            pairs.as_slice(),
-            [
-                ("tax_category".to_string(), "SALES_10".to_string()),
-                ("tax_category".to_string(), "SALES_8".to_string()),
-            ]
-        );
-
-        // 対照: `Map` で受けると 1 件に潰れる（この差がこの型の存在理由）。
+    fn duplicate_tag_keys_are_already_collapsed_before_reaching_this_layer() {
         let collapsed: Map<String, Value> =
-            serde_json::from_str(r#"{"tax_category":"SALES_10","tax_category":"SALES_8"}"#)
+            serde_json::from_str(r#"{"tax_category":"SALES_10","tax_category":"SALES_8_REDUCED"}"#)
                 .unwrap();
-        assert_eq!(collapsed.len(), 1);
-    }
 
-    #[test]
-    fn tag_pairs_schema_is_an_object_of_strings() {
-        let schema = serde_json::to_value(schemars::schema_for!(TagPairs)).unwrap();
-        assert_eq!(schema.get("type").and_then(|t| t.as_str()), Some("object"));
+        assert_eq!(collapsed.len(), 1, "重複キーは畳み込まれる: {collapsed:?}");
+        // 後勝ち。前の指定は跡形も無い（＝MCP 層からは検出しようがない）。
+        assert_eq!(collapsed["tax_category"], json!("SALES_8_REDUCED"));
     }
 
     // 出力側の整形は `kaikei-app` / `kaikei-jp` に委ねている。
@@ -439,19 +390,22 @@ mod tests {
     }
 
     // 注記の文言は素通しし、severity は凍結済みの語彙を使う。
+    //
+    // 文言そのものは `kaikei-policy` の実装（`kaikei-jp`）が決める。
+    // ここで**実在する文言をリテラルで置くと、grep したときに
+    // 「その文言が実装されている」ように見えてしまう**ので、
+    // 明らかに検査用と分かる文字列を使う（実在する注記の生成経路と文言は
+    // `crates/kaikei-jp/src/tax/policy.rs` のテストが持つ）。
     #[test]
     fn policy_notes_to_json_passes_the_message_through_verbatim() {
         use kaikei_app::NoteSeverity;
 
         let notes = [PolicyNote {
             severity: NoteSeverity::Info,
-            message: "税込経理の設定のため税額行を生成していません".to_string(),
+            message: "（検査用の注記本文）".to_string(),
         }];
         let value = policy_notes_to_json(&notes);
         assert_eq!(value[0]["severity"], json!("info"));
-        assert_eq!(
-            value[0]["message"],
-            json!("税込経理の設定のため税額行を生成していません")
-        );
+        assert_eq!(value[0]["message"], json!("（検査用の注記本文）"));
     }
 }

@@ -15,12 +15,28 @@
 //! | ツールは `CallToolResult` を組み立てられない | [`McpTool::run`] の戻り値は `Result<`[`ToolSuccess`]`, `[`ToolFailure`]`>` であり、応答（`isError` を含む）を組み立てるのは [`call`] だけ |
 //! | ツールは監査ログの記録先に触れない | [`McpTool::run`] が受け取るのは [`ToolContext`] で、[`kaikei_app::ports::AuditSink`] を**露出しない**。[`crate::startup::Runtime`] 自体が渡らない |
 //! | [`ToolContext`] を自分で作れない | フィールドも `new` も private。作れるのはこのモジュールだけ |
-//! | ルータに載せる経路が1つしかない | [`route`] だけが [`rmcp::handler::server::router::tool::ToolRoute`] を作り、その中身は必ず [`call`] である |
-//! | fail-open の警告を捨てられない | [`call`] は [`kaikei_app::audit::AuditedCall::into_result`]（既定経路）しか使わず、積まれた警告を必ず応答の `warnings` に載せる。`into_parts_unchecked`（逃げ道）はこの crate に1箇所も無い |
+//! | ルータに載せる経路が1つしかない | [`ToolRegistry`] が `rmcp` の `ToolRouter` を**包んで隠す**（下記）。ツールを載せる口は [`ToolRegistry::with`]`::<T: `[`McpTool`]`>` だけで、その中身は必ず [`call`] である |
+//! | fail-open の警告を捨てられない | [`call`] は [`kaikei_app::audit::AuditedCall::into_result_noting_outcome`]（既定経路）しか使わず、積まれた警告を必ず応答の `warnings` に載せる。`into_parts_unchecked`（逃げ道）はこの crate に1箇所も無い |
 //!
-//! 型で閉じられない残り（`ToolRoute` を直に組み立てる、`with_audit` を
-//! ツール側で呼ぶ）は `tests/audit_is_structural.rs` がソースを走査して
-//! 見張る。**「型で閉じる → 残りをソース走査で見張る」の順番**であって、
+//! # ルータそのものを閉じ込める（PR-F レビュー B-1）
+//!
+//! **`route` を1本にするだけでは足りなかった。** `rmcp` の `ToolRouter` は
+//! `with_route` のほかに `with_async_tool::<T>()` / `with_sync_tool::<T>()` を
+//! 持ち、`ToolBase` + `AsyncTool` を実装した型はそこから**ハンドラ本体ごと**
+//! ルータに載る。その経路は `ToolRoute` も `CallToolResult` も `with_audit` も
+//! 書かずに済むため、ソース走査を全て素通りする——`rmcp` 3.1 の module doc は
+//! 「1ツール1ファイルならこちら」とその形を勧めてすらいる。
+//!
+//! そこで **`ToolRouter` を持てるのはこのモジュールだけ**にした。
+//! [`crate::server`] が触るのは [`ToolRegistry`] で、そこには
+//! `with::<T: McpTool>` / `list_all` / `get` / `has_route` / `call` しか無い。
+//! **`McpTool` を実装していない型をルータに載せる方法が型として存在しない**
+//! （`ToolRouter` を名指しできない以上、`with_async_tool` を呼ぶ相手が無い）。
+//!
+//! 型で閉じられない残り（同一 crate 内から `with_audit` を呼ぶ、
+//! `dispatch.rs` の中で `ToolRouter` に別のツールを足す）は
+//! `tests/audit_is_structural.rs` がソースを走査して見張る。
+//! **「型で閉じる → 残りをソース走査で見張る」の順番**であって、
 //! ソース走査が主ではない。
 //!
 //! # `AuditCall::tool` にはレジストリの名前しか載らない
@@ -38,6 +54,17 @@
 //! である。**登録済みの名前以外から [`ToolName`] を作る方法が存在しない**ので、
 //! `tool` 列に入るのは常にサーバが知っている有限個の文字列になる。
 //!
+//! **担保の内訳を正確に書く**（PR-F レビュー C-6）。`AuditCall` は凍結済みの
+//! `kaikei-app` にあり、そのフィールドは `pub tool: &'a str` である。
+//! つまり「`AuditCall::tool` に渡せる型が [`ToolName`] に限られている」わけ
+//! ではない——このモジュールの中で `tool: T::NAME` と書くことは型としては
+//! 妨げられていない。実際の担保は次の2つの重ね合わせである:
+//!
+//! 1. `AuditCall` という識別子が `dispatch.rs` にしか現れないことを
+//!    `tests/audit_is_structural.rs` が走査で見張る（＝組み立てるのは1箇所）
+//! 2. その1箇所（[`call`]）が [`ToolName::resolve`] を通す。
+//!    **`resolve` が登録済み以外を弾くこと自体は型で閉じている**
+//!
 //! なお未登録の名前で `tools/call` された場合、`rmcp` の `ToolRouter` は
 //! この経路に**到達させない**（`has_route` が偽なら
 //! `invalid_params: tool not found` を返す）。`docs/07-mcp-server.md` §6 が
@@ -54,9 +81,9 @@ use kaikei_app::id::UuidV7IdGenerator;
 use kaikei_core::EntryId;
 use kaikei_jp::compose::Composition;
 use kaikei_store::pool::PgStore;
-use rmcp::handler::server::router::tool::ToolRoute;
+use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
 use rmcp::handler::server::tool::{schema_for_input, ToolCallContext};
-use rmcp::model::{CallToolResult, Tool};
+use rmcp::model::{CallToolResponse, CallToolResult, Tool};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
@@ -206,6 +233,22 @@ impl AuditableError for ToolFailure {
     fn audit_public_message(&self) -> String {
         self.0.message().to_string()
     }
+
+    /// **AI に返した失敗応答の本文をそのまま記録する**（PR-F レビュー C-4）。
+    ///
+    /// 成功時は応答 body 全体が `audit_log.output` に載るのに、失敗時が
+    /// `{"message": ...}` だけだと、`hint.suggested_lines` /
+    /// `candidate_accounts` / `difference` / `policy_notes` / `line` が
+    /// 記録に残らない。**`hint` は AI の次の記帳内容を直接決める提案**であり、
+    /// 「サーバが何を返して次の一手を誘導したか」を後から追う目的
+    /// （`DECISIONS.md` D-070 / `docs/07-mcp-server.md` §9）に対して
+    /// 失敗側だけ情報が薄くなる。
+    ///
+    /// [`ToolError::to_json`] の `message` は `public_message()` 由来であり、
+    /// `Display`（下位層の生メッセージ）はここに入らない。
+    fn audit_output_json(&self) -> Option<String> {
+        Some(self.0.to_json().to_string())
+    }
 }
 
 /// Phase 3 のツール1件。**1ツール1ファイル**（`src/tools/<ツール名>.rs`）。
@@ -293,6 +336,7 @@ pub async fn call<T: McpTool>(
         &runtime.clock,
         &audit_call,
         || async {
+            reject_nul_in_input::<T>(arguments.as_ref())?;
             let input = deserialize_input::<T>(arguments)?;
             let ctx = ToolContext::new(runtime);
             T::run(&ctx, input).await
@@ -320,8 +364,13 @@ pub async fn call<T: McpTool>(
 
     // ★fail-open★ 警告を受け取る唯一の既定経路。`into_parts_unchecked`
     // （逃げ道）はこの crate では使わない（`docs/07-mcp-server.md` §9）。
+    //
+    // `into_result` ではなく `into_result_noting_outcome` を使う。
+    // 応答がここでは成功にも失敗にもなるので、拒否応答に
+    // 「操作は完了しました……やり直さないでください」が載ると、同じ応答が
+    // 示している次の手（入力を直して再送）と矛盾する（`CLAUDE.md` §11）。
     let mut warnings: Vec<String> = Vec::new();
-    match audited.into_result(&mut warnings) {
+    match audited.into_result_noting_outcome(&mut warnings) {
         Ok(success) => {
             let mut body = success.body;
             insert_warnings(&mut body, warnings);
@@ -338,14 +387,161 @@ pub async fn call<T: McpTool>(
 }
 
 /// fail-open の警告を応答へ載せる（無ければキーごと出さない）。
+///
+/// # 予約キーの衝突で**何も失わせない**（PR-F レビュー D-3）
+///
+/// 素朴に `body.insert(WARNINGS_KEY, ..)` と書くと、ツールが `warnings` を
+/// 使っていた場合にその値が黙って消える。しかも消えるのは**fail-open の
+/// ときだけ**なので、正常系のテストでは永久に検出できない。
+///
+/// そこで2段で手当てする。
+///
+/// 1. [`ToolSuccess::new`] / [`ToolError::to_json`] を通った body に
+///    `warnings` があれば、警告の有無に関わらず `debug_assert!` で落とす
+///    （[`assert_warnings_key_is_free`]）。開発中・テスト中の**毎回**の
+///    呼び出しで踏むので、fail-open を再現しなくても気づける
+/// 2. それでも release で衝突した場合は**併合する**。既存の配列には
+///    後ろに足し、配列でない値は先頭要素として残す。監査ログの警告も
+///    ツールの値も捨てない
 fn insert_warnings(body: &mut Map<String, Value>, warnings: Vec<String>) {
+    assert_warnings_key_is_free(body);
     if warnings.is_empty() {
         return;
     }
-    body.insert(
-        WARNINGS_KEY.to_string(),
-        Value::Array(warnings.into_iter().map(Value::String).collect()),
+    let mut merged = match body.remove(WARNINGS_KEY) {
+        Some(Value::Array(existing)) => existing,
+        Some(other) => vec![other],
+        None => Vec::new(),
+    };
+    merged.extend(warnings.into_iter().map(Value::String));
+    body.insert(WARNINGS_KEY.to_string(), Value::Array(merged));
+}
+
+/// ツールが予約キー `warnings` を使っていないことを**毎回**確かめる。
+///
+/// `debug_assert!` にしてあるのは、これが**サーバ側の実装の誤り**であって
+/// 呼び出し元（AI）が直せるものではないためである。記帳が成功している
+/// 応答をこの理由でエラーに変えるのは実害が大きい（既に確定した記帳の
+/// 結果を AI に渡せなくなる）。開発・テストでは必ず落ちる。
+fn assert_warnings_key_is_free(body: &Map<String, Value>) {
+    debug_assert!(
+        !body.contains_key(WARNINGS_KEY),
+        "ツールの応答本文が予約キー \"{WARNINGS_KEY}\" を使っています。\
+         このキーは dispatch 層が fail-open の警告を載せるために予約しています\
+         （crates/kaikei-mcp/src/dispatch.rs）。別のキー名にしてください"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 入力に混じった U+0000 の受け皿
+// ---------------------------------------------------------------------------
+
+/// 入力に **U+0000（NUL）** が混じっていたら、**どこに入っているか**を添えて
+/// 拒否する（PR-F レビュー C-3）。
+///
+/// # なぜここで見るのか
+///
+/// U+0000 は JSON としても JSON-RPC としても正当だが、PostgreSQL の
+/// `text` にも `jsonb` にも格納できない。素通しすると `description` に
+/// 1文字混ざっただけで帳簿側の INSERT が `RepoError::Corrupt` になり、
+/// その `public_message()` は
+/// 「この操作は完了していません。**入力を変えても解消しません**。
+/// サーバのログを添えて管理者に連絡してください」——**断定が事実と逆**である
+/// （実際には1文字取り除けば通る）。`docs/07-mcp-server.md` §9 が D-038 の
+/// 誤診クラスとして名指しで避けている形（正常なサーバを「壊れている」と
+/// 誤診させ、AI が原因である自分の1文字に辿り着けない）が帳簿側で再発する。
+///
+/// 監査ログ側は D-075 のとおり無害化して**記録を残す**のが正しい
+/// （記録できない入力でも「誰が何をしようとしたか」は残す）。
+/// 帳簿側は**保存できないものを受理しない**のが正しい。
+/// この関数は後者だけを担い、[`with_audit`] の操作の中で走るので、
+/// この呼び出しも監査ログには2行残る。
+///
+/// # Errors
+///
+/// いずれかの文字列（オブジェクトのキーを含む）に U+0000 があれば
+/// [`codes::REJECTED`]（入力を直せば通る拒否）。
+fn reject_nul_in_input<T: McpTool>(
+    arguments: Option<&Map<String, Value>>,
+) -> Result<(), ToolFailure> {
+    let Some(arguments) = arguments else {
+        return Ok(());
+    };
+    let Some(found) = find_nul_in_object(arguments, "") else {
+        return Ok(());
+    };
+
+    Err(ToolError::new(
+        codes::REJECTED,
+        format!(
+            "入力の {location} に制御文字 U+0000（NUL）が含まれています\
+             （{position} 文字目）。この文字は帳簿に保存できないため、\
+             {tool} は実行していません。帳簿は変更されていません。\
+             該当箇所からその1文字を取り除いて送り直してください\
+             （他の箇所は直す必要がありません）",
+            location = found.location,
+            position = found.char_position,
+            tool = T::NAME,
+        ),
+    )
+    .with_detail("field", json_string(&found.location))
+    .into())
+}
+
+/// U+0000 が見つかった位置。
+struct NulLocation {
+    /// 入力の中の場所（`description` / `lines[1].memo` / `tags` のキーなど）。
+    location: String,
+    /// その文字列の何文字目か（1 始まり。`char` 単位）。
+    char_position: usize,
+}
+
+fn json_string(text: &str) -> Value {
+    Value::String(text.to_string())
+}
+
+/// 子要素の場所を親の場所に連ねる（`lines` + `[1]` + `.memo`）。
+fn join_location(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.trim_start_matches('.').to_string()
+    } else {
+        format!("{parent}{child}")
+    }
+}
+
+fn find_nul(value: &Value, location: &str) -> Option<NulLocation> {
+    match value {
+        Value::String(text) => nul_position(text).map(|char_position| NulLocation {
+            location: location.to_string(),
+            char_position,
+        }),
+        Value::Array(items) => items.iter().enumerate().find_map(|(index, item)| {
+            find_nul(item, &join_location(location, &format!("[{index}]")))
+        }),
+        Value::Object(map) => find_nul_in_object(map, location),
+        _ => None,
+    }
+}
+
+fn find_nul_in_object(map: &Map<String, Value>, location: &str) -> Option<NulLocation> {
+    map.iter().find_map(|(key, value)| {
+        // キー自体に混じっている場合も見る（JSONB のキーにも入らない）。
+        if let Some(char_position) = nul_position(key) {
+            // 場所を示す文字列に U+0000 をそのまま入れない
+            // （応答も監査ログも同じ文字で詰まる）。
+            let shown = key.replace('\0', "\\u0000");
+            return Some(NulLocation {
+                location: join_location(location, &format!(".{shown}（キー名）")),
+                char_position,
+            });
+        }
+        find_nul(value, &join_location(location, &format!(".{key}")))
+    })
+}
+
+/// 文字列の何文字目に U+0000 があるか（1 始まり。無ければ `None`）。
+fn nul_position(text: &str) -> Option<usize> {
+    text.chars().position(|c| c == '\0').map(|index| index + 1)
 }
 
 /// 受け取った引数を入力 DTO にする。
@@ -380,18 +576,101 @@ fn deserialize_input<T: McpTool>(
 // レジストリへの登録（唯一の経路）
 // ---------------------------------------------------------------------------
 
-/// ツールを `rmcp` のルータに載せる形にする。**唯一の登録経路。**
+/// `tools/list` と `tools/call` が引くレジストリ。**`rmcp` の `ToolRouter` を
+/// 包んで隠す唯一の型。**
 ///
-/// ハンドラの中身は必ず [`call`] であり、ツール本体はそこから呼ばれる。
-/// `ToolRoute` をここ以外で組み立てないこと
-/// （`tests/audit_is_structural.rs` が見張る）。
+/// # なぜ包むのか（PR-F レビュー B-1）
 ///
-/// # Panics
+/// `ToolRouter` を [`crate::server`] に持たせていたときは、そこで
+/// `with_async_tool::<T>()` / `with_sync_tool::<T>()`（`rmcp` が `ToolBase` +
+/// `AsyncTool` の実装型に対して用意している登録口）を呼べば、
+/// **[`call`] を通らないツールをルータに載せられた**。その形は `ToolRoute` も
+/// `CallToolResult` も `with_audit` も書かないので、ソース走査では捕まらない。
 ///
-/// `T::Input` から `input_schema` を生成できない場合（`schemars` が
-/// オブジェクト以外のスキーマを返す型を入力に使った場合）。起動時に
-/// レジストリを組み立てた時点で必ず露見するので、ツール応答には現れない。
-pub fn route<T: McpTool>() -> ToolRoute<KaikeiServer> {
+/// この型はツールを載せる口を [`ToolRegistry::with`]（境界が
+/// `T: `[`McpTool`]）だけにし、内側の `ToolRouter` を外に出さない。
+/// **`McpTool` を実装していない型を載せる方法が型として存在しない。**
+///
+/// 残りの3メソッド（[`ToolRegistry::call`] / [`ToolRegistry::list_all`] /
+/// [`ToolRegistry::get`]）は `rmcp` の `#[tool_handler]` が生成する
+/// `call_tool` / `list_tools` / `get_tool` が呼ぶ委譲である
+/// （マクロは `router = <式>` の式に対してこの3つを呼ぶ）。
+#[derive(Clone)]
+pub struct ToolRegistry {
+    router: ToolRouter<KaikeiServer>,
+}
+
+impl ToolRegistry {
+    /// 空のレジストリ。
+    #[must_use]
+    pub fn new() -> Self {
+        ToolRegistry {
+            router: ToolRouter::new(),
+        }
+    }
+
+    /// ツールを1件載せる。**唯一の登録経路。**
+    ///
+    /// ハンドラの中身は必ず [`call`]（＝監査ログで挟む経路）である。
+    ///
+    /// # Panics
+    ///
+    /// `T::Input` から `input_schema` を生成できない場合（`schemars` が
+    /// オブジェクト以外のスキーマを返す型を入力に使った場合）。起動時に
+    /// レジストリを組み立てた時点で必ず露見するので、ツール応答には現れない。
+    #[must_use]
+    pub fn with<T: McpTool>(mut self) -> Self {
+        self.router = self.router.with_route(route::<T>());
+        self
+    }
+
+    /// `tools/call`（`#[tool_handler]` が生成する `call_tool` の実体）。
+    ///
+    /// 未登録の名前には `invalid_params: tool not found`
+    /// （`docs/07-mcp-server.md` §6 が認める唯一のプロトコルエラー）を返す。
+    ///
+    /// # Errors
+    ///
+    /// `rmcp` が返すプロトコルエラー（未登録のツール名など）。
+    pub async fn call(
+        &self,
+        context: ToolCallContext<'_, KaikeiServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        self.router.call(context).await
+    }
+
+    /// `tools/list`（`#[tool_handler]` が生成する `list_tools` の実体）。
+    #[must_use]
+    pub fn list_all(&self) -> Vec<Tool> {
+        self.router.list_all()
+    }
+
+    /// ツール定義を名前で引く（`get_tool` の実体）。
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&Tool> {
+        self.router.get(name)
+    }
+
+    /// そのツール名が登録されているか（[`ToolRegistry::call`] が
+    /// 「tool not found」を返すかどうかを決めている述語）。
+    #[must_use]
+    pub fn has_route(&self, name: &str) -> bool {
+        self.router.has_route(name)
+    }
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// ツールを `rmcp` のルータに載せる形にする。
+///
+/// **private。** 外から使う口は [`ToolRegistry::with`] だけである
+/// （`ToolRoute` を作れる場所を1箇所に保つ。
+/// `tests/audit_is_structural.rs` が見張る）。
+fn route<T: McpTool>() -> ToolRoute<KaikeiServer> {
     ToolRoute::new_dyn(
         tool_attr::<T>(),
         |ctx: ToolCallContext<'_, KaikeiServer>| {
@@ -458,5 +737,140 @@ mod tests {
     #[test]
     fn a_nul_character_in_the_tool_name_never_reaches_the_audit_log() {
         assert!(ToolName::resolve("post_journal_entry\u{0}").is_none());
+    }
+
+    // ---- 入力に混じった U+0000（PR-F レビュー C-3）----
+
+    /// 検査用のツール型（`reject_nul_in_input` はツール名しか使わない）。
+    struct ProbeTool;
+
+    impl McpTool for ProbeTool {
+        type Input = Value;
+        const NAME: &'static str = "post_journal_entry";
+        const DESCRIPTION: &'static str = "検査用";
+        async fn run(_: &ToolContext<'_>, _: Self::Input) -> Result<ToolSuccess, ToolFailure> {
+            unreachable!("この検査では呼ばない")
+        }
+    }
+
+    fn reject_nul(arguments: Value) -> Option<ToolError> {
+        let arguments = arguments.as_object().cloned().expect("オブジェクト");
+        reject_nul_in_input::<ProbeTool>(Some(&arguments))
+            .err()
+            .map(|failure| failure.0)
+    }
+
+    // 「入力を変えても解消しません」と誤診しない。**自分の1文字**に辿り着ける。
+    #[test]
+    fn a_nul_in_the_input_is_rejected_with_the_position_that_carries_it() {
+        let error = reject_nul(serde_json::json!({
+            "entry_date": "2026-04-15",
+            "description": "A\u{0}B"
+        }))
+        .expect("U+0000 は拒否される");
+
+        assert_eq!(error.code(), codes::REJECTED);
+        let message = error.message();
+        assert!(message.contains("description"), "{message}");
+        assert!(message.contains("2 文字目"), "{message}");
+        assert!(message.contains("U+0000"), "{message}");
+        // 次の手（`CLAUDE.md` §11）。
+        assert!(message.contains("取り除いて送り直して"), "{message}");
+        assert!(message.contains("帳簿は変更されていません"), "{message}");
+        // ★誤診しない★ 入力を直せば通るのに「解消しません」と言わない。
+        assert!(!message.contains("入力を変えても解消しません"), "{message}");
+        assert!(!message.contains("管理者に連絡"), "{message}");
+        assert_eq!(
+            error.to_json()["field"],
+            Value::String("description".into())
+        );
+    }
+
+    // 入れ子（明細の memo・タグの値・タグのキー）でも場所が分かる。
+    #[test]
+    fn a_nul_deep_in_the_input_reports_the_path_to_it() {
+        let error = reject_nul(serde_json::json!({
+            "lines": [
+                { "account": "100", "memo": "ok" },
+                { "account": "500", "memo": "A\u{0}" }
+            ]
+        }))
+        .expect("U+0000 は拒否される");
+        assert!(
+            error.message().contains("lines[1].memo"),
+            "{}",
+            error.message()
+        );
+
+        let error = reject_nul(serde_json::json!({
+            "lines": [ { "tags": { "counterparty": "CP\u{0}1" } } ]
+        }))
+        .expect("U+0000 は拒否される");
+        assert!(
+            error.message().contains("lines[0].tags.counterparty"),
+            "{}",
+            error.message()
+        );
+
+        let error = reject_nul(serde_json::json!({ "ta\u{0}gs": "x" }))
+            .expect("キー名の U+0000 も拒否される");
+        assert!(error.message().contains("キー名"), "{}", error.message());
+        // 場所の表示に U+0000 をそのまま入れない。
+        assert!(!error.message().contains('\0'), "{}", error.message());
+    }
+
+    // U+0000 を含まない入力は素通りする（「常に拒否」で緑になっていない）。
+    #[test]
+    fn an_input_without_a_nul_passes_through() {
+        assert!(reject_nul(serde_json::json!({
+            "entry_date": "2026-04-15",
+            "description": "A社への請求",
+            "lines": [ { "account": "135", "amount": "110000" } ]
+        }))
+        .is_none());
+        assert!(reject_nul_in_input::<ProbeTool>(None).is_ok());
+    }
+
+    // ---- fail-open の警告を載せるキー（PR-F レビュー D-3）----
+
+    // 警告が無ければキーごと出さない。
+    #[test]
+    fn no_warnings_key_appears_when_there_is_nothing_to_warn_about() {
+        let mut body = Map::new();
+        body.insert("entry_no".to_string(), Value::from(1));
+        insert_warnings(&mut body, Vec::new());
+        assert!(body.get(WARNINGS_KEY).is_none());
+    }
+
+    // ツールが `warnings` を使っていても**何も失わない**（併合する）。
+    //
+    // 予約キーの衝突は debug ビルドでは `debug_assert!` が落とすので、
+    // ここでは release での併合だけを見る（`debug_assert!` が有効な
+    // テストビルドでは併合経路に入る前に落ちる）。
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn a_tool_supplied_warnings_value_is_merged_instead_of_being_dropped() {
+        let mut body = Map::new();
+        body.insert(
+            WARNINGS_KEY.to_string(),
+            Value::Array(vec![Value::String("ツールの警告".to_string())]),
+        );
+        insert_warnings(&mut body, vec!["監査ログの警告".to_string()]);
+
+        let merged = body[WARNINGS_KEY].as_array().expect("配列");
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged[0], Value::String("ツールの警告".to_string()));
+        assert_eq!(merged[1], Value::String("監査ログの警告".to_string()));
+    }
+
+    // 予約キーの衝突は**警告の有無に関わらず**毎回落ちる
+    // （fail-open を再現しないと気づけない、という形にしない）。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "予約キー")]
+    fn using_the_reserved_warnings_key_fails_loudly_even_without_a_warning() {
+        let mut body = Map::new();
+        body.insert(WARNINGS_KEY.to_string(), Value::from("ツールが置いた値"));
+        insert_warnings(&mut body, Vec::new());
     }
 }

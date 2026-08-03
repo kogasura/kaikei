@@ -28,6 +28,9 @@
 //! | MC-27 | 出力の金額が全て JSON 文字列 |
 //! | MC-29 | 未登録のタグキーはエラーで、有効なキー一覧が本文に出る |
 //! | — | 逆仕訳が通り、元仕訳と逆仕訳の両方が残る（**元仕訳は書き換わらない**） |
+//! | C-1 | 税込経理で貸借不一致になったとき、**なぜ税額行が無いのか**が応答に載る |
+//! | C-3 | `description` の U+0000 は位置を添えて拒否され、**誤診しない** |
+//! | C-4 | 失敗応答の本文（`hint` を含む）が `audit_log.output` に残る |
 //!
 //! MC-20 / MC-21 / MC-31 / MC-32（fail-closed / fail-open / 無害化）は
 //! PR-C が `crates/kaikei-store/tests/audit_log.rs` で実証済みなので重ねない。
@@ -69,15 +72,20 @@ fn book_settings() -> BookSettings {
 
 /// 課税事業者・税抜経理（同梱 2026 年度マスタの既定）で組み立てる。
 fn compose_options() -> ComposeOptions {
+    compose_options_with(JpSettingsOverrides {
+        tax_mode: None,
+        rounding: None,
+        rounding_unit: None,
+        is_taxable_business: true,
+        simplified_taxation: false,
+    })
+}
+
+/// 事業者設定を差し替えて組み立てる（税込経理・免税事業者の検査用）。
+fn compose_options_with(settings_overrides: JpSettingsOverrides) -> ComposeOptions {
     ComposeOptions {
         rule_sets: TaxRuleSets::from_embedded().unwrap(),
-        settings_overrides: JpSettingsOverrides {
-            tax_mode: None,
-            rounding: None,
-            rounding_unit: None,
-            is_taxable_business: true,
-            simplified_taxation: false,
-        },
+        settings_overrides,
         defaults_as_of: AccountingDate::new(2026, 4, 1).unwrap(),
         closing_accounts: ClosingAccounts {
             capital: AccountCode::parse("400").unwrap(),
@@ -95,7 +103,11 @@ fn compose_options() -> ComposeOptions {
 /// 環境変数として受け取る（＝使い捨てDBを指せない）ためである。
 /// 組み立ての中身（`compose` / `PgStore` / `PgAuditSink`）は同じものを使う。
 async fn runtime(app: &PgPool) -> Runtime {
-    let composition = compose(compose_options()).expect("合成に失敗しました");
+    runtime_with(app, compose_options()).await
+}
+
+async fn runtime_with(app: &PgPool, options: ComposeOptions) -> Runtime {
+    let composition = compose(options).expect("合成に失敗しました");
     seed_chart(app, &composition.chart).await;
     Runtime {
         store: Arc::new(PgStore::new(app.clone())),
@@ -405,11 +417,145 @@ async fn an_unbalanced_entry_is_rejected_with_a_hint_while_the_audit_rows_surviv
     assert_two_rows(&rows, "post_journal_entry", "error");
     assert_eq!(rows[1].error_code.as_deref(), Some("unbalanced"));
     assert!(rows[1].entry_id.is_none());
-    // 結果レコードの output には `public_message()` が入る。
-    assert!(rows[1].output.as_ref().unwrap()["message"]
-        .as_str()
-        .unwrap()
-        .contains("貸借不一致"));
+    // 結果レコードの output には **AI に返した応答本文がそのまま**入る
+    // （成功時と対称。PR-F レビュー C-4）。
+    let output = rows[1].output.as_ref().unwrap();
+    assert!(output["message"].as_str().unwrap().contains("貸借不一致"));
+    assert_eq!(output["error"], json!("unbalanced"));
+    assert_eq!(output["difference"], json!("10000"));
+    // ★hint は AI の次の記帳内容を直接決める提案★ 記録に残っていること。
+    assert_eq!(
+        &output["hint"], hint,
+        "AI に返した hint が audit_log.output に残っていない"
+    );
+    assert!(output["policy_notes"].is_array(), "{output}");
+}
+
+/// PR-F レビュー C-1: **税込経理では「次の手がゼロ」にならない。**
+///
+/// `tax_mode=inclusive` では `derive_tax_lines` が税額行を生成しないので、
+/// 税抜の明細をそのまま渡すと貸借不一致になる。このとき AI に差額しか
+/// 届かないと、**金額を書き換える**という誤った修正に進む
+/// （`docs/07-mcp-server.md` §3 / §1 ③）。
+///
+/// `auto_tax_lines` の true / false どちらでも理由が届くことを見る。
+/// 文言を組み立てているのは `kaikei-jp`（policy）であり、MCP 層はそれを
+/// 運んでいるだけである。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_unbalanced_entry_under_tax_inclusive_settings_explains_why_no_tax_lines_appear(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::roles(pool_opts, conn_opts).await.app;
+    let runtime = runtime_with(
+        &app,
+        compose_options_with(JpSettingsOverrides {
+            tax_mode: Some(kaikei_jp::tax::TaxMode::Inclusive),
+            rounding: None,
+            rounding_unit: None,
+            is_taxable_business: true,
+            simplified_taxation: false,
+        }),
+    )
+    .await;
+
+    for auto_tax_lines in [true, false] {
+        let response = call::<PostJournalEntry>(
+            &runtime,
+            json!({
+                "entry_date": "2026-04-15",
+                "description": "A社への請求",
+                "lines": [
+                    { "account": "135", "side": "debit",  "amount": "110000" },
+                    { "account": "500", "side": "credit", "amount": "100000",
+                      "tags": { "tax_category": "SALES_10" } }
+                ],
+                "auto_tax_lines": auto_tax_lines
+            }),
+        )
+        .await;
+
+        assert!(is_error(&response), "{response}");
+        let body = body(&response);
+        assert_eq!(body["error"], json!("unbalanced"));
+        assert_eq!(body["difference"], json!("10000"));
+
+        // ★差額だけで終わらせない★ 応答のどこかに「なぜ税額行が無いのか」が出る。
+        let rendered = body.to_string();
+        assert!(
+            rendered.contains("税込経理の設定のため税額行を生成していません"),
+            "auto_tax_lines={auto_tax_lines}: 設定の事実が応答に無い: {body:#}"
+        );
+        // 税務判断は書かない（`CLAUDE.md` §10）。
+        assert!(!rendered.contains("損金"), "{body:#}");
+
+        assert_eq!(journal_entry_count(&app).await, 0);
+    }
+}
+
+/// PR-F レビュー C-3: `description` に U+0000 を入れても**誤診しない**。
+///
+/// 素通しすると帳簿側の INSERT が `RepoError::Corrupt` になり、応答は
+/// 「入力を変えても解消しません。管理者に連絡してください」——実際には
+/// 1文字取り除けば通るので**断定が事実と逆**である（D-038 の誤診クラス）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_nul_character_in_the_description_points_at_the_offending_character(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::roles(pool_opts, conn_opts).await.app;
+    let runtime = runtime(&app).await;
+
+    let response = call::<PostJournalEntry>(
+        &runtime,
+        json!({
+            "entry_date": "2026-04-15",
+            "description": "A\u{0}社への請求",
+            "lines": [
+                { "account": "135", "side": "debit",  "amount": "1000" },
+                { "account": "500", "side": "credit", "amount": "1000",
+                  "tags": { "tax_category": "SALES_10" } }
+            ]
+        }),
+    )
+    .await;
+
+    assert!(is_error(&response), "{response}");
+    let body = body(&response);
+    // 「入力を直せば通る」拒否である（サーバ都合の失敗と混同させない）。
+    assert_eq!(body["error"], json!("rejected"));
+    let text = message(&response);
+    assert!(text.contains("description"), "{text}");
+    assert!(text.contains("2 文字目"), "{text}");
+    assert!(text.contains("U+0000"), "{text}");
+    assert!(text.contains("取り除いて送り直して"), "{text}");
+    // ★誤診しない★
+    assert!(!text.contains("入力を変えても解消しません"), "{text}");
+    assert!(!text.contains("管理者に連絡"), "{text}");
+    assert_eq!(body["field"], json!("description"));
+
+    // 帳簿は空。監査ログには2行残る（`input` は無害化されて記録される）。
+    assert_eq!(journal_entry_count(&app).await, 0);
+    let rows = audit_rows(&app).await;
+    assert_two_rows(&rows, "post_journal_entry", "error");
+    assert_eq!(rows[1].error_code.as_deref(), Some("rejected"));
+
+    // 1文字取り除けば通る（「解消しません」が嘘であることの実証）。
+    let ok = call::<PostJournalEntry>(
+        &runtime,
+        json!({
+            "entry_date": "2026-04-15",
+            "description": "A社への請求",
+            "lines": [
+                { "account": "135", "side": "debit",  "amount": "1000" },
+                { "account": "500", "side": "credit", "amount": "1000",
+                  "tags": { "tax_category": "SALES_10" } }
+            ]
+        }),
+    )
+    .await;
+    assert!(!is_error(&ok), "{ok}");
+    assert_eq!(journal_entry_count(&app).await, 1);
 }
 
 /// MC-04: 存在しない科目コードには候補（`hint`）を返す。

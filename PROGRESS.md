@@ -477,12 +477,23 @@ Phase 2 で実際に起きたことを、脚色せずに記録する。
 ### 実装中の申し送り
 
 - **【PR-G / PR-H への申し送り】ツールは `dispatch::McpTool` を実装して
-  `dispatch::route` で登録すること。** `rmcp` の `#[tool]` /
+  `dispatch::ToolRegistry::with` で登録すること。** `rmcp` の `#[tool]` /
   `#[tool_router]` マクロは使わない（`DECISIONS.md` D-084、
   `docs/07-mcp-server.md` §4）。ツールに渡る `ToolContext` は
   `AuditSink` を露出しないので、監査ログを自分で書くことも書き忘れることも
   できない。`crates/kaikei-mcp/tests/audit_is_structural.rs` が
   型で閉じられない残り（`ToolRoute` を直に組み立てる等）を見張っている。
+
+- **応答本文で `warnings` キーを使わないこと。** fail-open の警告
+  （監査ログの結果記録に失敗したときの注記）を載せるために dispatch 層が
+  予約している。`dispatch::call` が `debug_assert!` で毎回検査するので、
+  使うと `cargo test` が落ちる（release では値を捨てずに併合する）。
+
+- **`tags` の重複キーは MCP 経由では検出できない**（後勝ちになる）。
+  `rmcp` のトランスポートが JSON をパースする時点で畳み込まれるためで、
+  受け型を工夫しても直らない。`JpError::DuplicateTagKeyInInput` は
+  MCP 経由では到達不能である（`DECISIONS.md` D-085 の訂正注記）。
+  タグを受け取るツールを増やすときに「重複は弾かれる」と前提しないこと。
 
 - **読み取り系ツールも `dispatch::call` を通す。** §9 は「読み取り系も含めて
   全て記録する」と定めている。読み取り系は `ToolSuccess::with_entry_id` を

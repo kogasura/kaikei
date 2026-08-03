@@ -15,26 +15,35 @@
 //! 一覧だけが腐るということが起きない
 //! （`PROGRESS.md` Phase 1 の教訓6「手で維持する一覧は必ず腐る。構造で閉じる」）。
 //!
+//! # このモジュールは `rmcp` の `ToolRouter` を持たない
+//!
+//! 保持するのは [`crate::dispatch::ToolRegistry`]（`ToolRouter` を包んで
+//! 隠す型）である。`ToolRouter` をここに置くと
+//! `with_async_tool::<T>()` / `with_sync_tool::<T>()` で
+//! **[`crate::dispatch::call`] を通らないツールを登録できてしまう**
+//! （`DECISIONS.md` D-084 の訂正注記）。`ToolRegistry` にツールを載せる口は
+//! `with::<T: McpTool>` だけなので、その形は型として存在しない。
+//!
 //! # レジストリの検査に [`KaikeiServer`] を組み立てない
 //!
 //! この3つを**自由関数**にしてあるのは、[`KaikeiServer`] が実行時依存
 //! （[`Runtime`]）を必須で持つためである。レジストリに何が載っているかは
 //! DB にも設定にも依存しない性質なので、それを見るために DB 接続を要求する
-//! のは筋が悪い。3つとも [`tool_router`]（サーバー本体が使うのと**同じ
+//! のは筋が悪い。3つとも [`tool_registry`]（サーバー本体が使うのと**同じ
 //! 構築関数**）から導出しており、`#[tool_handler]` が生成する
 //! `list_tools` / `call_tool` / `get_tool` が引くのと同じ集合を見る:
 //!
 //! | 生成されるメソッド | 実体 | 対応する自由関数 |
 //! |---|---|---|
-//! | `list_tools` | `tool_router.list_all()` | [`registered_tool_names`] |
-//! | `call_tool` | `tool_router.call(...)`（未登録名は `has_route` が偽） | [`is_registered_tool`] |
-//! | `get_tool` | `tool_router.get(name).cloned()` | [`tool_definition`] |
+//! | `list_tools` | `tool_registry.list_all()` | [`registered_tool_names`] |
+//! | `call_tool` | `tool_registry.call(...)`（未登録名は `has_route` が偽） | [`is_registered_tool`] |
+//! | `get_tool` | `tool_registry.get(name).cloned()` | [`tool_definition`] |
 //!
 //! 両者が実際に一致することは、`Runtime` を組み立てられる側
 //! （`tests/startup_pg.rs`）が本物の [`KaikeiServer`] に対して確かめる。
 
+use crate::dispatch::ToolRegistry;
 use crate::startup::Runtime;
-use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo, Tool};
 use rmcp::{tool_handler, ServerHandler};
 use std::collections::BTreeSet;
@@ -64,7 +73,7 @@ pub const SERVER_NAME: &str = "kaikei-mcp";
 /// 組み立てる必要はない）。
 #[derive(Clone)]
 pub struct KaikeiServer {
-    tool_router: ToolRouter<Self>,
+    tools: ToolRegistry,
     runtime: Arc<Runtime>,
 }
 
@@ -73,7 +82,7 @@ impl KaikeiServer {
     /// サーバーを作る。**これが唯一の入口である。**
     pub fn with_runtime(runtime: Arc<Runtime>) -> Self {
         Self {
-            tool_router: tool_router(),
+            tools: tool_registry(),
             runtime,
         }
     }
@@ -86,27 +95,27 @@ impl KaikeiServer {
 
 /// 登録済みツール名の一覧（`tools/list` に出るのと同じ集合）。
 ///
-/// `#[tool_handler]` が生成する `list_tools` は `tool_router.list_all()` を
+/// `#[tool_handler]` が生成する `list_tools` は `tool_registry.list_all()` を
 /// そのまま返すので、この関数が見ている集合と `tools/list` の応答は同一で
 /// ある。
 pub fn registered_tool_names() -> Vec<String> {
     registered_name_set().iter().cloned().collect()
 }
 
-/// 登録済みツール名の集合（[`tool_router`] から一度だけ導出してキャッシュする）。
+/// 登録済みツール名の集合（[`tool_registry`] から一度だけ導出してキャッシュする）。
 ///
 /// キャッシュするのは、[`is_registered_tool`] が**ツール呼び出しのたびに**
 /// 呼ばれるためである（`crate::dispatch::ToolName::resolve`）。毎回
-/// [`tool_router`] を組み立てると、入力スキーマの生成とルート表の構築が
+/// [`tool_registry`] を組み立てると、入力スキーマの生成とルート表の構築が
 /// 1呼び出しあたり11回走る。
 ///
-/// **導出元は変えていない。** ここで見るのも `tool_router().list_all()` で
+/// **導出元は変えていない。** ここで見るのも `tool_registry().list_all()` で
 /// あり、`#[tool_handler]` が生成する `list_tools` と同じ集合である
 /// （ツールの登録は起動前に確定し、実行中に増減しない）。
 fn registered_name_set() -> &'static BTreeSet<String> {
     static NAMES: OnceLock<BTreeSet<String>> = OnceLock::new();
     NAMES.get_or_init(|| {
-        tool_router()
+        tool_registry()
             .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())
@@ -122,17 +131,17 @@ fn registered_name_set() -> &'static BTreeSet<String> {
 /// `docs/07-mcp-server.md` §6 が認めている唯一の例外
 /// （「ツール呼び出しに到達できない異常」）である。`call` が
 /// 「tool not found」を返すかどうかを決めているのはこの述語
-/// （`ToolRouter::has_route`）である。
+/// （`ToolRegistry::has_route`）である。
 pub fn is_registered_tool(name: &str) -> bool {
     registered_name_set().contains(name)
 }
 
 /// ツール定義（`tools/list` の1要素）を名前で引く。
 ///
-/// `#[tool_handler]` が生成する `get_tool` は `tool_router.get(name).cloned()`
-/// であり、この関数と同じものを返す。
+/// `#[tool_handler]` が生成する `get_tool` は
+/// `tool_registry.get(name).cloned()` であり、この関数と同じものを返す。
 pub fn tool_definition(name: &str) -> Option<Tool> {
-    tool_router().get(name).cloned()
+    tool_registry().get(name).cloned()
 }
 
 /// クライアント（＝AI）が最初に受け取るサーバー情報。
@@ -156,32 +165,33 @@ pub fn server_info() -> ServerInfo {
 /// Phase 3 の11ツールを合成する。
 ///
 /// 1ツール1ファイル（`src/tools/<ツール名>.rs`）とし、ここでは
-/// [`crate::dispatch::route`] に型を渡して並べるだけにする
+/// [`ToolRegistry::with`] に型を並べるだけにする
 /// （`docs/07-mcp-server.md` §4）。
 ///
-/// # ★ここに `ToolRoute` を直接書かないこと★
+/// # ★ここは `McpTool` の型を並べる場所である★
 ///
-/// [`crate::dispatch::route`] が**唯一の登録経路**であり、そこを通った
-/// ハンドラは必ず [`crate::dispatch::call`]（＝監査ログで挟む経路）に入る。
-/// `ToolRoute::new_dyn` や `#[tool]` マクロでここに別のルートを足すと、
-/// **監査ログを通らないツールが作れてしまう**（`DECISIONS.md` D-084）。
-/// `tests/audit_is_structural.rs` がソースを走査して見張っている。
+/// [`ToolRegistry::with`]（境界は `T: McpTool`）が**唯一の登録経路**であり、
+/// そこを通ったハンドラは必ず [`crate::dispatch::call`]（＝監査ログで挟む
+/// 経路）に入る。`rmcp` の `ToolRouter` はこのモジュールから**見えない**ので、
+/// `with_route` / `with_async_tool` / `with_sync_tool` で別のルートを足すことは
+/// できない（`DECISIONS.md` D-084 の訂正注記。それが可能だった間は
+/// **監査ログを通らないツールを書けた**）。`tests/audit_is_structural.rs` が
+/// second line として同じ識別子をソース走査でも見張っている。
 ///
 /// **このPR（Phase 3 PR-F）では2件**（書き込み系）。読み取り系・提案系は
 /// PR-G / PR-H。追加してよいのは `docs/07-mcp-server.md` §2 の表で
 /// **Phase 3** と書かれた11件だけで、「存在させないツール」の4件を
 /// ここに足してはならない。
-pub fn tool_router() -> ToolRouter<KaikeiServer> {
-    use crate::dispatch::route;
+pub fn tool_registry() -> ToolRegistry {
     use crate::tools::post_journal_entry::PostJournalEntry;
     use crate::tools::reverse_journal_entry::ReverseJournalEntry;
 
-    ToolRouter::new()
-        .with_route(route::<PostJournalEntry>())
-        .with_route(route::<ReverseJournalEntry>())
+    ToolRegistry::new()
+        .with::<PostJournalEntry>()
+        .with::<ReverseJournalEntry>()
 }
 
-#[tool_handler(router = self.tool_router)]
+#[tool_handler(router = self.tools)]
 impl ServerHandler for KaikeiServer {
     fn get_info(&self) -> ServerInfo {
         server_info()
@@ -227,22 +237,22 @@ mod tests {
         }
     }
 
-    // キャッシュした名前の集合と `ToolRouter::has_route`（`call` が
+    // キャッシュした名前の集合と `ToolRegistry::has_route`（`call` が
     // 「tool not found」を返すかどうかを決めている述語）が一致すること。
     //
-    // `is_registered_tool` は呼び出しごとにルータを組み立てないよう
+    // `is_registered_tool` は呼び出しごとにレジストリを組み立てないよう
     // `OnceLock` の集合を引く。導出元が同じであることを実際に突き合わせないと、
     // 「キャッシュだけが古い」状態を検出できない。
     #[test]
-    fn the_cached_name_set_agrees_with_the_router() {
-        let router = tool_router();
+    fn the_cached_name_set_agrees_with_the_registry() {
+        let registry = tool_registry();
         for name in registered_tool_names() {
-            assert!(router.has_route(&name), "{name}");
+            assert!(registry.has_route(&name), "{name}");
             assert!(is_registered_tool(&name), "{name}");
         }
         for absent in ["delete_journal_entry", "execute_sql", ""] {
             assert_eq!(
-                router.has_route(absent),
+                registry.has_route(absent),
                 is_registered_tool(absent),
                 "{absent}"
             );
@@ -266,6 +276,78 @@ mod tests {
                 Some("object"),
                 "{name} の inputSchema がオブジェクトではない"
             );
+        }
+    }
+
+    /// `inputSchema` の中に現れる全ての `description` を集める
+    /// （プロパティ・配列要素・`$defs` の入れ子を含む）。
+    fn schema_descriptions(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(text) = map.get("description").and_then(|d| d.as_str()) {
+                    out.push(text.to_string());
+                }
+                for nested in map.values() {
+                    schema_descriptions(nested, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    schema_descriptions(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ★`inputSchema` の説明文も AI が読む面である★（PR-F レビュー D-2）
+    //
+    // 入力 DTO の doc コメントは `schemars` がそのまま `description` に載せる
+    // ので、`tools/list` の実応答に**内部設計書への参照**（`docs/07-...` /
+    // `CLAUDE.md` §7 / crate 名）や Markdown の強調記法がそのまま届く。
+    // トップレベルの `description` だけを検査していたので、プロパティ側は
+    // §10 / §11 の検査を一度も通っていなかった。
+    #[test]
+    fn every_input_schema_description_is_written_for_the_caller() {
+        // AI に見せる面に出してはいけない語（内部の置き場・記法）。
+        const INTERNAL_ONLY: &[&str] = &[
+            "docs/",
+            "CLAUDE.md",
+            "DECISIONS.md",
+            "PROGRESS.md",
+            "kaikei-core",
+            "kaikei-app",
+            "kaikei-jp",
+            "kaikei-mcp",
+            "kaikei_core",
+            "kaikei_app",
+            ".rs",
+            "**",
+            "`",
+        ];
+
+        for name in registered_tool_names() {
+            let tool = tool_definition(&name).unwrap_or_else(|| panic!("{name} の定義が引けない"));
+            let schema = serde_json::to_value(&tool.input_schema).expect("スキーマは JSON");
+            let mut descriptions = Vec::new();
+            schema_descriptions(&schema, &mut descriptions);
+            assert!(
+                !descriptions.is_empty(),
+                "{name} の inputSchema に説明文が1つも無い（AI が引数の意味を読めない）"
+            );
+
+            for text in descriptions {
+                for forbidden in ["準拠", "法令対応", "JIIMA"] {
+                    assert!(!text.contains(forbidden), "{name}: {forbidden} / {text}");
+                }
+                for internal in INTERNAL_ONLY {
+                    assert!(
+                        !text.contains(internal),
+                        "{name} の inputSchema の説明文に内部向けの記述が出ています\
+                         （{internal}）。ここは tools/list の応答として AI に届く面です:\n  {text}"
+                    );
+                }
+            }
         }
     }
 

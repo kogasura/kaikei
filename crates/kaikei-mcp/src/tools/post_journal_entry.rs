@@ -12,8 +12,11 @@
 //! `docs/07-mcp-server.md` §3 が定める形。`auto_tax_lines: false` で
 //! 貸借不一致になった場合に限り、**同じ明細を `auto_tax_lines: true` にして
 //! [`kaikei_app::usecase::post_entry::preview`]（dry-run）を呼び直す**。
-//! `Ok` なら確定後の明細を `hint.suggested_lines` に載せ、`Err` なら
-//! `hint` を返さない（税額行を足しても解決しないため）。
+//! `Ok` なら確定後の明細を `hint.suggested_lines` に載せる。
+//! `Err` でも、policy が積んだ注記があれば `hint.policy_notes` として渡す
+//! （税込経理・免税事業者の設定では税額行が生成されないので `preview` も
+//! 失敗するが、その**理由**は注記に入っている。渡さないと AI に届くのは
+//! 差額だけになる。PR-F レビュー C-1）。注記も無ければ `hint` を返さない。
 //!
 //! **MCP 層で `with_tx` を開いて `load_posting_context` を呼び `TaxContext` を
 //! 自前で組み立てない**（同 §3・§4。PR-B 1巡目で実際にそう書けてしまい、
@@ -34,11 +37,12 @@ use kaikei_jp::compose::Composition;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 
 use crate::dispatch::{McpTool, ToolContext, ToolFailure, ToolSuccess};
 use crate::error::ToolError;
 use crate::tools::{core_error, parse_date};
-use crate::wire::{lines_to_json, policy_notes_to_json, AmountStr, TagPairs};
+use crate::wire::{lines_to_json, policy_notes_to_json, AmountStr};
 
 /// 存在しない科目コードに対して挙げる候補の上限。
 ///
@@ -50,55 +54,81 @@ const MAX_ACCOUNT_CANDIDATES: usize = 5;
 /// `post_journal_entry`。
 pub struct PostJournalEntry;
 
-/// 線上の入力（`docs/07-mcp-server.md` §3）。
-///
-/// **`document_ids` は無い。** 証憑の紐付けは Phase 4 の `attach_document` で
-/// 行う。知らないキーは黙って捨てず拒否する（`deny_unknown_fields`）——
-/// 捨てると「証憑を付けたつもり」で記帳が成功してしまう。
+// ★この構造体の doc コメントは `tools/list` の応答に出る★
+//
+// `schemars` は doc コメントをそのまま `inputSchema` の `description` に
+// 載せるので、ここに書いた文章は**AI が読む面**である。内部設計書への参照
+// （`docs/...` / `CLAUDE.md` §n）・crate 名・Markdown の強調記法を書かない
+// こと（PR-F レビュー D-2。`server.rs` の
+// `every_input_schema_description_is_written_for_the_caller` が検査する）。
+// 実装上の理由は、doc ではなくこの形の `//` コメントに書く。
+//
+// - `document_ids` は無い。証憑の紐付けは Phase 4 の `attach_document`。
+//   知らないキーを黙って捨てると「証憑を付けたつもり」で記帳が成功して
+//   しまうので `deny_unknown_fields` で拒否する（D-085）。
+// - 形は `docs/07-mcp-server.md` §3。
+/// 仕訳1件の入力。指定していないキーは受け付けません。
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PostJournalEntryInput {
-    /// 取引日（`YYYY-MM-DD`）。**記帳日ではない**（`CLAUDE.md` §7）。
+    // 記帳日ではない（`CLAUDE.md` §7）。
+    /// 取引日。YYYY-MM-DD の形式で指定します。仕訳を記録した日ではなく、
+    /// 取引そのものが発生した日です。
     pub entry_date: String,
 
-    /// 摘要。空文字は `kaikei-core` が拒否する。
+    // 空文字・空白のみは `kaikei-core` が拒否する。
+    /// 摘要。空文字や空白のみは受け付けません。
     pub description: String,
 
-    /// 仕訳明細（2行以上）。税抜経理で `auto_tax_lines` を使う場合は
-    /// 税額行を含まない元の明細を渡す。
+    /// 仕訳明細。2行以上を指定します。auto_tax_lines を使う場合は、
+    /// 消費税額の行を含まない元の明細だけを渡します。
     pub lines: Vec<PostJournalEntryLine>,
 
-    /// `true` にすると消費税額の行を自動生成する。
-    ///
-    /// 生成されるかどうかは事業者設定（税抜/税込・課税事業者か）で決まる。
+    /// true にすると消費税額の行の生成を試みます。生成されるかどうかは
+    /// 帳簿の設定（税抜経理か税込経理か・課税事業者か）で決まります。
+    /// 生成されなかった場合は応答の policy_notes にその旨が入ります。
     #[serde(default)]
     pub auto_tax_lines: bool,
 }
 
-/// 線上の明細1行。
+/// 仕訳明細1行。
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PostJournalEntryLine {
-    /// 勘定科目コード。
+    /// 勘定科目コード。list_accounts で取得できるコードを指定します。
     pub account: String,
 
-    /// 借方 / 貸方（`debit` / `credit`）。
+    /// 借方なら debit、貸方なら credit を指定します。
     pub side: String,
 
-    /// 金額。**文字列**で指定する（`docs/07-mcp-server.md` §5）。
+    /// 金額。文字列で指定します（例: "110000"）。JSON の number は
+    /// 受け付けません。
     pub amount: AmountStr,
 
-    /// 通貨コード。省略すると帳簿通貨を使う。
+    /// 通貨コード（例: "JPY"）。省略すると帳簿の通貨を使います。
+    /// 1つの仕訳の中で通貨を混在させることはできません。
     #[serde(default)]
     pub currency: Option<String>,
 
-    /// 明細ごとの備考。
+    /// この明細だけに付ける備考。
     #[serde(default)]
     pub memo: Option<String>,
 
-    /// タグ（`tax_category` / `counterparty` など）。
+    // ★重複キーは検出できない★（PR-F レビュー B-2）
+    //
+    // MCP のリクエストは rmcp の stdio トランスポートが受け取った時点で
+    // `serde_json` により丸ごとパースされており、`CallToolRequestParams`
+    // の `arguments` は既に `serde_json::Map` である。つまり
+    // `{"tax_category":"SALES_10","tax_category":"SALES_8_REDUCED"}` の
+    // ような重複キーは**この層に届く前に後勝ちで畳み込まれている**。
+    // ここで受け型を工夫しても検出できない（生の JSON テキストが無い）。
+    // `JpError::DuplicateTagKeyInInput` は MCP 経由では到達不能であり、
+    // 他の呼び出し元（CLI / kaikei-api）からのみ到達する。
+    // 詳細は `DECISIONS.md` D-085 と `docs/07-mcp-server.md` §3。
+    /// タグ。キーも値も文字列で指定します（例: {"tax_category": "SALES_10"}）。
+    /// 同じキーを2回指定した場合、後に書いた指定だけが使われます。
     #[serde(default)]
-    pub tags: TagPairs,
+    pub tags: BTreeMap<String, String>,
 }
 
 /// 記帳に渡す値のうち、失敗したときの `hint` 組み立てにも要るもの。
@@ -237,16 +267,16 @@ fn build_line(
         None => settings.book_currency,
     };
     let amount = line.amount.to_money(currency).map_err(core_error)?;
-    // タグの型付け・未登録キー・重複キーの判定は `kaikei-jp` が持つ
+    // タグの型付けと未登録キーの判定は `kaikei-jp` が持つ
     // （同じ判定を MCP 層に書き直さない。D-072）。
+    //
+    // 重複キーの判定（`JpError::DuplicateTagKeyInInput`）も同じ関数が
+    // 持っているが、**MCP 経由では到達しない**。重複は rmcp の
+    // トランスポートが JSON をパースする時点で既に畳み込まれているためで、
+    // ここで受け型を工夫しても検出できない（B-2。D-085 の訂正注記）。
     let tags = composition
         .tag_catalog
-        .parse_tag_set(
-            line.tags
-                .as_slice()
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str())),
-        )
+        .parse_tag_set(line.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .map_err(|error| ToolError::from_jp_error(&error))?;
 
     JournalLine::new(account, side, amount, tags, line.memo.clone()).map_err(core_error)
@@ -293,6 +323,10 @@ async fn describe_failure(
                     error = error.with_detail("hint", hint);
                 }
             }
+            // `auto_tax_lines: true` で不一致だった場合は、税額行を足す提案が
+            // できない。そのときに AI へ渡せるのは
+            // `failure.notes`（policy が積んだ注記）であり、それは上の
+            // `policy_notes` に既に載っている。
         }
         AppError::Core(CoreError::UnknownAccount { code }) => {
             if let Some(hint) = account_hint(ctx, code).await {
@@ -306,9 +340,24 @@ async fn describe_failure(
     error
 }
 
-/// 「税額行を自動生成すれば貸借が一致する」ときだけ `hint` を返す。
+/// `auto_tax_lines: false` で貸借不一致になったときの `hint`。
 ///
 /// 帳簿には一切触れない（`preview` は採番も INSERT も行わない）。
+///
+/// # 税額行が生成されない設定でも「次の手ゼロ」にしない
+///
+/// `preview`（`auto_tax_lines: true` の dry-run）が成功すれば、確定後の明細を
+/// `suggested_lines` として返す。**失敗しても、policy が積んだ注記があれば
+/// それを返す**——税込経理・免税事業者の設定では `derive_tax_lines` が
+/// 税額行を生成しないため `preview` も同じ貸借不一致で失敗するが、
+/// そのとき `PostEntryFailure::notes` には
+/// 「税込経理の設定のため税額行を生成していません」が積まれている。
+/// これを渡さないと、AI に届くのは差額だけになり、**金額を書き換える**という
+/// 誤った修正に進む（`docs/07-mcp-server.md` §3。PR-F レビュー C-1）。
+///
+/// **判定そのものを MCP 層に書かない。** 「どういう設定なら税額行が
+/// 生成されないか」を知っているのは `kaikei-jp` であり、ここは
+/// その注記を運ぶだけである（`DECISIONS.md` D-072）。
 async fn tax_line_hint(ctx: &ToolContext<'_>, request: &PostRequest) -> Option<Value> {
     let composition = ctx.composition();
     let settings = ctx.book_settings();
@@ -333,20 +382,30 @@ async fn tax_line_hint(ctx: &ToolContext<'_>, request: &PostRequest) -> Option<V
             .await
         })
     })
-    .await
-    .ok()?;
+    .await;
 
-    Some(json!({
-        "message": "auto_tax_lines を true にして同じ明細を渡すと、\
-                    下の suggested_lines の内容で貸借が一致します。\
-                    この明細をそのまま lines に指定して auto_tax_lines を false の\
-                    ままにしても同じ結果になります。どちらにするかの判断は\
-                    このサーバーでは行いません",
-        "suggested_lines": lines_to_json(&preview.lines),
-        "debit_total": AmountStr::from_money(&preview.debit_total).as_str(),
-        "credit_total": AmountStr::from_money(&preview.credit_total).as_str(),
-        "policy_notes": policy_notes_to_json(&preview.notes),
-    }))
+    match preview {
+        Ok(preview) => Some(json!({
+            "message": "auto_tax_lines を true にして同じ明細を渡すと、\
+                        下の suggested_lines の内容で貸借が一致します。\
+                        この明細をそのまま lines に指定して auto_tax_lines を false の\
+                        ままにしても同じ結果になります。どちらにするかの判断は\
+                        このサーバーでは行いません",
+            "suggested_lines": lines_to_json(&preview.lines),
+            "debit_total": AmountStr::from_money(&preview.debit_total).as_str(),
+            "credit_total": AmountStr::from_money(&preview.credit_total).as_str(),
+            "policy_notes": policy_notes_to_json(&preview.notes),
+        })),
+        // 税額行を足しても一致しない。理由（注記）があるならそれを渡す。
+        Err(failure) if !failure.notes.is_empty() => Some(json!({
+            "message": "auto_tax_lines を true にしても貸借は一致しません。\
+                        この帳簿の設定について policy から次の注記が出ています。\
+                        金額の見直しが必要か、消費税額の行を lines に明示する必要が\
+                        あるかの判断はこのサーバーでは行いません",
+            "policy_notes": policy_notes_to_json(&failure.notes),
+        })),
+        Err(_) => None,
+    }
 }
 
 /// 存在しない科目コードに対する候補（`docs/07-mcp-server.md` §10 MC-04）。
@@ -441,7 +500,7 @@ mod tests {
         assert_eq!(input.entry_date, "2026-04-15");
         assert!(input.auto_tax_lines);
         assert_eq!(input.lines.len(), 2);
-        assert_eq!(input.lines[1].tags.as_slice().len(), 2);
+        assert_eq!(input.lines[1].tags.len(), 2);
         assert_eq!(input.lines[0].amount.as_str(), "110000");
     }
 
