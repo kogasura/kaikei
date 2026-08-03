@@ -298,7 +298,7 @@ async fn failed_posting_rolls_back_the_ledger_but_keeps_both_audit_rows(
     .await
     .expect("開始レコードは書けるはず");
 
-    let (result, warning) = audited.into_parts();
+    let (result, warning) = audited.into_parts_unchecked();
     assert!(warning.is_none(), "結果レコードは書けているはず");
     let err = result.expect_err("操作は失敗するはず");
     assert_eq!(err.code(), codes::REJECTED);
@@ -599,7 +599,7 @@ async fn a_nul_character_in_the_error_message_still_records_the_result_row(
     .await
     .expect("開始レコードは書けるはず");
 
-    let (result, warning) = audited.into_parts();
+    let (result, warning) = audited.into_parts_unchecked();
     assert!(result.is_err());
     assert!(
         warning.is_none(),
@@ -755,7 +755,7 @@ async fn audit_output_never_carries_the_connection_string_from_a_backend_error(
     .await
     .expect("開始レコードは書けるはず");
 
-    let (result, _warning) = audited.into_parts();
+    let (result, _warning) = audited.into_parts_unchecked();
     assert!(result.is_err());
 
     let rows = audit_rows(&app, request_id).await;

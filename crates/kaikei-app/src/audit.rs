@@ -115,9 +115,25 @@ impl RequestId {
 pub struct AuditCall<'a> {
     /// このツール呼び出しのID。開始レコードと結果レコードで同じ値を使う。
     pub request_id: RequestId,
-    /// 呼び出し経路（[`actor`] の定数）。
+    /// 呼び出し経路（[`actor`] の定数）。**定数以外を入れないこと**（下記）。
     pub actor: &'a str,
-    /// ツール名（MCP に登録した名前）。
+    /// ツール名（**MCP のレジストリに登録済みの名前だけ**）。
+    ///
+    /// # クライアント由来の文字列をそのまま載せない（PR-F への申し送り）
+    ///
+    /// `tool` / `actor` は `audit_log` の **TEXT 列**に入り、
+    /// `input` / `output`（JSONB）に掛かる無害化
+    /// （`kaikei_store::audit` の U+0000 置換・プレースホルダ差し替え）を
+    /// **通らない**。差し替えの再試行も `input` / `output` しか触らないので
+    /// 救済されない。
+    ///
+    /// MCP の `tools/call` はツール名がクライアント（AI）由来である。
+    /// 未知の名前をそのまま載せる実装にすると、`tool` に U+0000 を1文字
+    /// 入れられただけで開始レコードが書けず fail-closed になり、
+    /// D-075 が JSONB 側で塞いだ「入力1文字で操作が実行できない」が
+    /// TEXT 側で再発する。**未知のツール名は audit に載せる前に弾くこと**
+    /// （`tools/list` に無いツールとして拒否する）。
+    /// 詳細は `docs/07-mcp-server.md` §9。
     pub tool: &'a str,
     /// ツールに渡された入力の JSON テキスト。
     ///
@@ -392,12 +408,17 @@ impl AuditResultNotRecorded {
 /// - [`AuditedCall::into_result`][]（**既定**）: 警告があれば注記の
 ///   `Vec<String>` に本文を積んでから結果を返す。呼び出し側は注記の入れ物を
 ///   渡さないと結果を受け取れない
-/// - [`AuditedCall::into_parts`][]: 結果と警告を**同時に**取り出す
-///   （警告を自前で組み立てる presentation 層向け。捨てるには
-///   `let (result, _) = ...` と明示的に書く必要があり、grep で見つかる）
+/// - [`AuditedCall::into_parts_unchecked`][]: 結果と警告を**同時に**取り出す
+///   （警告を自前で組み立てる presentation 層向け）
+///
+/// 後者は**逃げ道であり、名前にそう書いてある**。`let (result, _) = ...` は
+/// 警告ゼロで通る（[`AuditResultNotRecorded`] の `#[must_use]` はタプル分解に
+/// 効かない）ので、「警告を応答に載せる責任を自分で負った」ことが
+/// 呼び出し側のコードから読める名前にしてある（`_unchecked` を grep すれば
+/// 逃げ道を使っている箇所が全て出る）。
 #[derive(Debug)]
 #[must_use = "操作は実行済みです。結果と fail-open の警告を \
-              into_result / into_parts で取り出してください"]
+              into_result（既定）/ into_parts_unchecked で取り出してください"]
 pub struct AuditedCall<T, E> {
     request_id: RequestId,
     result: Result<T, E>,
@@ -426,11 +447,20 @@ impl<T, E> AuditedCall<T, E> {
         self.result
     }
 
-    /// 結果と警告を**同時に**取り出す。
+    /// 結果と警告を**同時に**取り出す（**逃げ道**）。
     ///
-    /// 警告の載せ方を自分で決める場合（`isError` の扱いを変える等）に使う。
-    /// 既定は [`AuditedCall::into_result`]。
-    pub fn into_parts(self) -> (Result<T, E>, Option<AuditResultNotRecorded>) {
+    /// **既定は [`AuditedCall::into_result`]。** こちらを使ってよいのは、
+    /// 警告の載せ方を自分で決める場合（`isError` の扱いを変える、注記の
+    /// 文言を組み立て直す等）だけであり、そのとき呼び出し側は
+    /// **[`AuditResultNotRecorded::public_message`] を応答へ載せる責任を
+    /// 自分で負う**。
+    ///
+    /// `_unchecked` はその責任の所在を名前に出したものである。
+    /// `let (result, _) = ...` と書けば警告は**警告ゼロで消える**
+    /// （[`AuditResultNotRecorded`] の `#[must_use]` はタプル分解に効かない）。
+    /// 型では止められない以上、せめて **grep で見つかる名前**にしてある。
+    /// 握り潰すと「結果不明」の行が誰にも気づかれないまま残る。
+    pub fn into_parts_unchecked(self) -> (Result<T, E>, Option<AuditResultNotRecorded>) {
         (self.result, self.warning)
     }
 }
@@ -443,8 +473,24 @@ impl<T, E> AuditedCall<T, E> {
 ///   `operation` はクロージャで受け取っており、呼ばれなければ future すら
 ///   構築されない。
 /// - 結果レコードが書けなくても操作の結果はそのまま返す
-///   （警告は [`AuditedCall::into_result`] / [`AuditedCall::into_parts`] で
-///   受け取る。捨てられない形にしてある）。
+///   （警告は [`AuditedCall::into_result`]（既定）/
+///   [`AuditedCall::into_parts_unchecked`] で受け取る。捨てられない形にしてある）。
+///
+/// # 事前条件: `call.tool` はレジストリに登録済みのツール名だけ
+///
+/// **`AuditCall::tool` / `AuditCall::actor` は TEXT 列にそのまま入り、
+/// `input` / `output`（JSONB）のような無害化を通らない。**
+/// `PgAuditSink` の差し替え再試行は `input` / `output` しか差し替えないので、
+/// `tool` に U+0000 が混じると救済されず、開始レコードが書けずに
+/// fail-closed（＝**入力1文字で操作が実行できない**）になる。
+///
+/// したがって呼び出し側（presentation 層）は、
+/// **レジストリに登録済みのツール名以外を `tool` に載せてはならない**。
+/// MCP の `tools/call` はツール名がクライアント（AI）由来なので、
+/// 未知の名前は `with_audit` に入る前に弾き、`tools/list` に無いツールとして
+/// 拒否すること（`docs/07-mcp-server.md` §9「`tool` / `actor` は
+/// 無害化を通らない」。**PR-F（`kaikei-mcp` の結線）への申し送り**）。
+/// `actor` は [`actor`] の定数だけを使う。
 ///
 /// # 引数
 ///
@@ -615,7 +661,7 @@ mod tests {
         .await
         .expect("開始レコードは書けるはず");
 
-        let (result, warning) = audited.into_parts();
+        let (result, warning) = audited.into_parts_unchecked();
         assert!(result.is_err());
         assert!(warning.is_none());
         let rows = sink.rows();
@@ -744,9 +790,9 @@ mod tests {
     }
 
     // AUD-05b（fail-open の規律を構造で閉じる。D-076）:
-    // 結果を取り出す口は into_result / into_parts の2つだけで、どちらも
-    // 警告を必ず手渡す。`audited.result` のようにフィールドを直接読んで
-    // 警告を捨てる書き方はコンパイルが通らない
+    // 結果を取り出す口は into_result（既定）と into_parts_unchecked（逃げ道）の
+    // 2つだけで、どちらも警告を必ず手渡す。`audited.result` のようにフィールドを
+    // 直接読んで警告を捨てる書き方はコンパイルが通らない
     // （このテストは「口が2つとも警告を運ぶ」ことを固定する）。
     #[tokio::test]
     async fn the_only_ways_to_take_the_result_also_hand_over_the_warning() {
@@ -762,11 +808,11 @@ mod tests {
         .await
         .expect("開始レコードは書けるはず");
 
-        let (result, warning) = audited.into_parts();
+        let (result, warning) = audited.into_parts_unchecked();
         assert_eq!(result.unwrap(), 1);
         assert!(
             warning.is_some(),
-            "into_parts でも警告が同時に手渡されること"
+            "into_parts_unchecked でも警告が同時に手渡されること"
         );
     }
 
@@ -791,7 +837,7 @@ mod tests {
         .await
         .expect("開始レコードは書けるはず");
 
-        let (result, _warning) = audited.into_parts();
+        let (result, _warning) = audited.into_parts_unchecked();
         assert!(result.is_err());
         let rows = sink.rows();
         let message = rows[1]
