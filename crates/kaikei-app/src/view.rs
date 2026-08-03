@@ -1,4 +1,5 @@
-//! read model 専用の DTO（[`BalanceRowView`] / [`TrialBalanceView`]）。
+//! read model 専用の DTO（[`BalanceRowView`] / [`TrialBalanceView`] /
+//! [`EntrySummaryView`] / [`LedgerPageView`]）。
 //!
 //! `kaikei_core::GroupKey` には `impl` ブロックが1つも無く、公開コンストラクタも
 //! アクセサも存在しない（実測確認済み）。したがって `kaikei_core::BalanceRow` /
@@ -10,8 +11,25 @@
 //! D-013「JSON では金額を文字列で扱う」は presentation 層（HTTP/MCP 応答）が
 //! 外部にシリアライズする形式についての決定であり、この DTO は
 //! `kaikei-app` の呼び出し元にプロセス内でそのまま渡す中間表現なので対象外。
+//!
+//! # 取り消された仕訳は「消えない」（`DECISIONS.md` D-088）
+//!
+//! 帳簿は追記のみなので、赤伝で訂正された仕訳も、その赤伝も、どちらも
+//! 検索結果・元帳に残り続ける。**読み手がそれを「取り消し済み」と判別
+//! できなければ、AI は同じ仕訳をもう一度訂正しようとする。**
+//! そこで [`EntrySummaryView`] / [`LedgerRowView`] は次の2方向を必ず持つ:
+//!
+//! | 欄 | 意味 |
+//! |---|---|
+//! | `reverses` | この仕訳が**赤伝**であり、訂正対象がどれか |
+//! | `reversed_by` | この仕訳が**赤伝で取り消されている**こと（[`ReversalRef`]） |
+//!
+//! どちらも `Option` であり、`None` は「そうではない」を意味する。
 
-use kaikei_core::{AccountCode, AccountType, CoreError, Currency, Money};
+use kaikei_core::{
+    AccountCode, AccountType, AccountingDate, CoreError, Currency, EntryId, EntryNumber,
+    JournalLine, Money, Side, TagSet,
+};
 use std::collections::BTreeMap;
 
 /// `group_by` のグループキー。指定したタグキー文字列と値文字列の組。
@@ -118,6 +136,163 @@ impl TrialBalanceView {
         let (debit, credit) = self.totals()?;
         Ok(debit == credit)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 仕訳検索 / 総勘定元帳（Phase 3 PR-H。`DECISIONS.md` D-088 / D-089）
+// ---------------------------------------------------------------------------
+
+/// この仕訳を取り消している赤伝への参照。
+///
+/// 「取り消された」ことが読み手に分かる形にするための欄
+/// （モジュール doc「取り消された仕訳は『消えない』」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReversalRef {
+    /// 赤伝の仕訳ID。
+    pub entry_id: EntryId,
+    /// 赤伝の仕訳番号。
+    pub entry_no: EntryNumber,
+    /// 赤伝の取引日。
+    pub entry_date: AccountingDate,
+}
+
+/// 検索結果の仕訳1件（明細を含む）。
+///
+/// 明細を含めるのは、含めないと呼び出し元が件数分の追加問い合わせを
+/// することになるためである（1件ずつ引き直す形にすると、AI は検索1回に
+/// 対して `get_entry` を件数分呼ぶ）。含める代わりに1ページの上限を
+/// 小さく取る（[`crate::usecase::search_entries::MAX_LIMIT`]）。
+///
+/// `PartialEq` を導出していないのは `kaikei_core::JournalLine` が実装して
+/// いないためである（`kaikei-core` は凍結層であり、この DTO の都合で
+/// derive を足さない。`CLAUDE.md` §1）。
+#[derive(Debug, Clone)]
+pub struct EntrySummaryView {
+    /// 仕訳ID。
+    pub entry_id: EntryId,
+    /// 仕訳番号（会計年度内の連番）。
+    pub entry_no: EntryNumber,
+    /// 会計年度。
+    pub fiscal_year: i32,
+    /// 取引日（記帳日ではない。`CLAUDE.md` §7）。
+    pub entry_date: AccountingDate,
+    /// 摘要。
+    pub description: String,
+    /// 明細（`line_no` の昇順）。
+    pub lines: Vec<JournalLine>,
+    /// この仕訳が赤伝なら、訂正対象の仕訳ID。
+    pub reverses: Option<EntryId>,
+    /// この仕訳が赤伝なら、訂正理由（記帳時の入力のまま）。
+    pub reverse_reason: Option<String>,
+    /// この仕訳を取り消している赤伝（あれば）。
+    pub reversed_by: Option<ReversalRef>,
+}
+
+/// 仕訳検索の続きを指す位置（keyset ページング。`DECISIONS.md` D-089）。
+///
+/// **オフセットではない。** 取引日は過去日でも記帳できるため、ページを
+/// またぐ間に**前のページより前へ挿入される**仕訳がありうる。オフセットで
+/// 送ると、その瞬間に行が1つずれて**黙って読み飛ばされる**。
+/// この位置は `(entry_date, entry_no, entry_id)` の全順序で、次のページは
+/// 「この位置より厳密に後ろ」から始まる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryCursor {
+    /// 直前のページの最後の仕訳の取引日。
+    pub entry_date: AccountingDate,
+    /// 同・仕訳番号。
+    pub entry_no: EntryNumber,
+    /// 同・仕訳ID（同一日・同一番号を割る最終手段）。
+    pub entry_id: EntryId,
+}
+
+/// 仕訳検索の1ページ分。
+#[derive(Debug, Clone)]
+pub struct EntrySearchPageView {
+    /// このページの仕訳（取引日 → 仕訳番号 → 仕訳ID の昇順）。
+    pub entries: Vec<EntrySummaryView>,
+    /// **条件に一致した総件数**（このページの件数ではない）。
+    ///
+    /// 上限で切ったことを呼び出し元が判別できるようにするために返す。
+    /// これが無いと「返ってきた件数＝全件」と読める（`PROGRESS.md`
+    /// 「無言の truncation は『全部見た』と読める」）。
+    pub total_matches: u64,
+    /// 続きがある場合の次の開始位置。`None` なら**このページで全部**である。
+    pub next_cursor: Option<EntryCursor>,
+}
+
+/// 総勘定元帳の続きを指す位置（keyset ページング）。
+///
+/// 元帳の行は明細単位なので、[`EntryCursor`] に `line_no` を足した
+/// `(entry_date, entry_no, entry_id, line_no)` の全順序になる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerCursor {
+    /// 仕訳側の位置。
+    pub entry: EntryCursor,
+    /// 直前のページの最後の明細の行番号（1 始まり）。
+    pub line_no: u16,
+}
+
+/// 総勘定元帳の1行（＝ 対象科目の明細1行）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerRowView {
+    /// 仕訳ID。
+    pub entry_id: EntryId,
+    /// 仕訳番号。
+    pub entry_no: EntryNumber,
+    /// 取引日。
+    pub entry_date: AccountingDate,
+    /// 明細の行番号（1 始まり）。
+    pub line_no: u16,
+    /// 仕訳の摘要。
+    pub description: String,
+    /// 借方・貸方。
+    pub side: Side,
+    /// 金額（常に正。向きは [`LedgerRowView::side`] が持つ）。
+    pub amount: Money,
+    /// 明細のタグ。
+    pub tags: TagSet,
+    /// 明細の備考。
+    pub memo: Option<String>,
+    /// 相手科目（同じ仕訳の反対側にある科目コード。重複を除いた昇順）。
+    pub counter_accounts: Vec<AccountCode>,
+    /// この行までの残高（期首残高を含む。科目種別に従った符号付き）。
+    pub running_balance: Money,
+    /// この仕訳が赤伝なら、訂正対象の仕訳ID。
+    pub reverses: Option<EntryId>,
+    /// この仕訳を取り消している赤伝（あれば）。
+    pub reversed_by: Option<ReversalRef>,
+}
+
+/// 総勘定元帳の1ページ分。
+///
+/// # 合計はページではなく**期間全体**のもの
+///
+/// `opening_balance` / `debit_total` / `credit_total` / `closing_balance` /
+/// `total_lines` は、ページングに関係なく指定期間の全明細から求める。
+/// ページ内の行を合計しても `debit_total` にならない（そういう読み方を
+/// させないために、行側には合計を置かない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerPageView {
+    /// 対象の勘定科目コード。
+    pub account: AccountCode,
+    /// 対象科目の名称（`accounts` テーブルの現在の値）。
+    pub account_name: String,
+    /// 対象科目の5要素分類。残高の符号を決める。
+    pub account_type: AccountType,
+    /// 期首残高（`from` **より前**の全明細から求めた符号付き残高）。
+    pub opening_balance: Money,
+    /// 期間中の借方合計。
+    pub debit_total: Money,
+    /// 期間中の貸方合計。
+    pub credit_total: Money,
+    /// 期末残高（`opening_balance` に期間中の増減を加えた符号付き残高）。
+    pub closing_balance: Money,
+    /// 期間中の明細行数（このページの行数ではない）。
+    pub total_lines: u64,
+    /// このページの行（取引日 → 仕訳番号 → 仕訳ID → 行番号の昇順）。
+    pub rows: Vec<LedgerRowView>,
+    /// 続きがある場合の次の開始位置。`None` なら**このページで全部**である。
+    pub next_cursor: Option<LedgerCursor>,
 }
 
 #[cfg(test)]

@@ -18,7 +18,8 @@
 //!   presentation 層（`kaikei-mcp` / 将来の `kaikei-api`）と
 //!   `audit_log` の3箇所で同じ表を手書きすると必ず綴りがずれるため、
 //!   ここに1箇所だけ持つ（`DECISIONS.md` D-072）
-//! - read model 用の DTO: [`view::BalanceRowView`] / [`view::TrialBalanceView`]
+//! - read model 用の DTO: [`view::BalanceRowView`] / [`view::TrialBalanceView`] /
+//!   [`view::EntrySummaryView`] / [`view::LedgerPageView`]（Phase 3 PR-H）
 //! - 監査ログ: [`ports::AuditSink`]（ポート）と [`audit`]（記録する値と、
 //!   fail-closed / fail-open の手順 [`audit::with_audit`]）。
 //!   **帳簿とは別のコネクションで2回書く**（`DECISIONS.md` D-070）
