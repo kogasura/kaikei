@@ -345,6 +345,16 @@ impl ServerConfig {
     }
 }
 
+/// [`ConfigError`] が誘導先として名指しする README の見出し。
+///
+/// ★**節の名前も誘導先である**★（PR-I）。README の見出しを改名すると、
+/// 起動失敗のメッセージは「そんな節は無い」場所を案内し続ける——
+/// `.env.example` が欠けたときと同じ「実装は緑のまま誘導先だけが嘘になる」
+/// である。定数にしてテスト
+/// （`the_readme_section_named_by_the_failure_message_exists`）から
+/// README の見出しと突き合わせる。
+const README_SECTION: &str = "事業者設定";
+
 /// 未設定・空文字・値が不正な設定項目をまとめて表す。
 ///
 /// **1件ずつではなく全部返す**。起動失敗の stderr を1回見れば、何を
@@ -374,7 +384,7 @@ impl fmt::Display for ConfigError {
         writeln!(f)?;
         writeln!(
             f,
-            "設定項目の一覧と例は .env.example と README「MCP サーバーを起動する」を\
+            "設定項目の一覧と例は .env.example と README「{README_SECTION}」を\
              参照してください。"
         )?;
         writeln!(
@@ -660,6 +670,33 @@ mod tests {
         assert!(text.contains("README"), "{text}");
         assert!(!ENV_EXAMPLE.is_empty());
         assert!(!README.is_empty());
+    }
+
+    // ★節の名前も誘導先である★（PR-I）
+    //
+    // 上のテストは「README という文字列が本文に出ること」と「ファイルが
+    // 空でないこと」しか見ておらず、**その節が README に在るか**は見て
+    // いなかった。実際 PR-I で README を書き直したとき、メッセージが
+    // 名指ししていた節（「MCP サーバーを起動する」）は消えていた。
+    // 項目を足したのに `.env.example` へ足し忘れるのと同じ形の嘘である。
+    #[test]
+    fn the_readme_section_named_by_the_failure_message_exists() {
+        let heading = README
+            .lines()
+            .any(|line| line.starts_with('#') && line.contains(README_SECTION));
+        assert!(
+            heading,
+            "起動失敗のメッセージが案内する README の節「{README_SECTION}」が\
+             見出しとして存在しません。README の見出しを変えたなら、\
+             同じ PR で config.rs の README_SECTION も直すこと"
+        );
+        assert!(
+            ServerConfig::from_lookup(&|_| None)
+                .unwrap_err()
+                .to_string()
+                .contains(README_SECTION),
+            "メッセージが README_SECTION を経由していません"
+        );
     }
 
     // 空文字は「設定した」ことにしない（未設定と同じく起動を止める）。
