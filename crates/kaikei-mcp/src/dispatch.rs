@@ -283,23 +283,51 @@ impl<'a> ToolContext<'a> {
 
 /// ツールが成功したときに返す値。
 ///
-/// `body` は**応答の `structuredContent` にも `audit_log.output` にも
-/// 同じものが載る**（`docs/07-mcp-server.md` §9）。2箇所で別の JSON を
-/// 組み立てられる形にしない。
+/// `body` は応答の `structuredContent` になり、**既定では
+/// `audit_log.output` にも同じものが載る**（`docs/07-mcp-server.md` §9）。
+/// 書き込み系はこの既定を使う——**結果そのものが変更の記録**であり、
+/// 記帳した仕訳の姿を後から縮めて記録する理由が無い。
+///
+/// # 読み取り系だけが要約に差し替える（`DECISIONS.md` D-089 の決定6）
+///
+/// 読み取り系は応答本文が帳簿の抜粋そのものなので、上限まで返すと
+/// 1回の呼び出しで数十〜百数十 KB が `audit_log.output` に入る。しかも
+/// **読み取りは AI が最も多く呼ぶ操作**である。
+///
+/// 監査ログにおける読み取りの目的は「**誰がいつ何を読んだか**」であり、
+/// 返した内容そのものは (問い合わせ条件 = `input` + その時点の帳簿) から
+/// 再現できる（帳簿は追記のみなので過去の状態を再構成できる）。
+/// そこで [`ToolSuccess::with_audit_summary`] で要約に差し替える。
+///
+/// **2箇所で別の JSON を「組み立てる」形にはしない。** 要約は各ツールが
+/// `body` から不要な配列を落として作る（`search_entries` / `get_ledger` の
+/// `audit_summary`）ので、応答と要約の値が食い違うことはない。
 #[derive(Debug, Clone)]
 pub struct ToolSuccess {
     body: Map<String, Value>,
+    audit_output: Option<Map<String, Value>>,
     entry_id: Option<EntryId>,
 }
 
 impl ToolSuccess {
-    /// 応答本体から作る。
+    /// 応答本体から作る。`audit_log.output` にも同じものが載る。
     #[must_use]
     pub fn new(body: Map<String, Value>) -> Self {
         ToolSuccess {
             body,
+            audit_output: None,
             entry_id: None,
         }
+    }
+
+    /// `audit_log.output` に**本文の代わりに**載せる要約。
+    ///
+    /// 読み取り系だけが使う（理由は型の doc）。要約は `body` から
+    /// 導いたものにすること（別に組み立てると値が食い違う）。
+    #[must_use]
+    pub fn with_audit_summary(mut self, summary: Map<String, Value>) -> Self {
+        self.audit_output = Some(summary);
+        self
     }
 
     /// 記帳した仕訳ID（`audit_log.entry_id` に入る）。書き込み系だけが付ける。
@@ -307,6 +335,12 @@ impl ToolSuccess {
     pub fn with_entry_id(mut self, entry_id: EntryId) -> Self {
         self.entry_id = Some(entry_id);
         self
+    }
+
+    /// `audit_log.output` に載せる JSON（要約があればそちら）。
+    fn audit_output_json(&self) -> String {
+        let object = self.audit_output.as_ref().unwrap_or(&self.body);
+        Value::Object(object.clone()).to_string()
     }
 }
 
@@ -335,7 +369,9 @@ impl AuditableError for ToolFailure {
 
     /// **AI に返した失敗応答の本文をそのまま記録する**（PR-F レビュー C-4）。
     ///
-    /// 成功時は応答 body 全体が `audit_log.output` に載るのに、失敗時が
+    /// 成功時は応答 body（読み取り系は
+    /// [`ToolSuccess::with_audit_summary`] の要約）が `audit_log.output` に
+    /// 載るのに、失敗時が
     /// `{"message": ...}` だけだと、`hint.suggested_lines` /
     /// `candidate_accounts` / `difference` / `policy_notes` / `line` が
     /// 記録に残らない。**`hint` は AI の次の記帳内容を直接決める提案**であり、
@@ -442,7 +478,7 @@ pub async fn call<T: McpTool>(
         },
         |success| AuditSuccess {
             entry_id: success.entry_id,
-            output_json: Some(Value::Object(success.body.clone()).to_string()),
+            output_json: Some(success.audit_output_json()),
         },
     )
     .await;

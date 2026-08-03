@@ -45,6 +45,23 @@
 //!
 //! 明細は2本目の SQL（`entry_id = ANY(...)`）でまとめて引く。1件ずつ
 //! 引き直す形にすると、1ページ分で N+1 回の往復になる。
+//!
+//! # 科目コードの打ち間違いを「0件」にしない（PR-H レビュー C-3）
+//!
+//! `account` を指定された場合は、絞り込みの前に
+//! **その科目が `accounts` に在るか**を確かめ、無ければ
+//! [`RepoError::NotFound`] を返す（`ledger.rs` の1本目の SQL と同じ判定・
+//! 同じ文言）。
+//!
+//! 打ち間違い（`"690"` と `"609"`）を**空の成功**として返すと、
+//! 呼び出し元には「その科目の取引が無い」と読める。両者は次の手が違う——
+//! 前者は `list_accounts` でコードを調べ直す、後者は期間や条件を広げる。
+//! `get_ledger` は最初からこの区別をしており、**同じ打ち間違いが
+//! 2つのツールで別の意味になる**状態を残さない。
+//!
+//! 「該当する仕訳が無い」ことは依然として**0件の成功**である
+//! （実在する科目に取引が無いだけ）。ここで弾くのは
+//! **科目マスタに存在しないコード**だけである。
 
 use async_trait::async_trait;
 use kaikei_app::error::RepoError;
@@ -94,6 +111,10 @@ impl SearchEntriesQuery for PgSearchEntriesQuery {
             .account
             .as_ref()
             .map(|code| code.as_str().to_string());
+        // 打ち間違いを「0件の成功」にしない（モジュール doc）。
+        if let Some(code) = account.as_deref() {
+            self.ensure_account_exists(code).await?;
+        }
 
         // 金額の範囲は「同じ1行が両方を満たす」で判定するので、通貨も
         // その行と突き合わせる（別通貨の 1000 と一致してしまうのを防ぐ）。
@@ -294,6 +315,30 @@ impl SearchEntriesQuery for PgSearchEntriesQuery {
 }
 
 impl PgSearchEntriesQuery {
+    /// 絞り込みに使う科目コードが勘定科目マスタに在ることを確かめる。
+    ///
+    /// # Errors
+    ///
+    /// 登録されていないコードなら [`RepoError::NotFound`]。文言は
+    /// `ledger.rs` と同じ（同じ打ち間違いに同じ次の手を返す）。
+    async fn ensure_account_exists(&self, code: &str) -> Result<(), RepoError> {
+        let found = sqlx::query_scalar!(r#"SELECT 1 FROM accounts WHERE code = $1"#, code)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(from_sqlx_error)?;
+
+        if found.is_none() {
+            return Err(RepoError::NotFound {
+                reason: format!(
+                    "勘定科目 {code} は勘定科目マスタにありません。\
+                     list_accounts で登録済みの科目コードを確認してください\
+                     （その科目に取引が無い場合は 0 件の成功として返します）"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// ページに載る仕訳の明細をまとめて引く（N+1 を避ける）。
     async fn load_lines(
         &self,

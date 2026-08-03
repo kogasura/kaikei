@@ -30,6 +30,17 @@
 //! 取り消し済みの仕訳には `reversed_by` が付き、赤伝そのものには
 //! `reverses` と `reverse_reason` が付く。**この2つが無いと、AI は
 //! 取り消し済みの仕訳をもう一度訂正しようとする。**
+//!
+//! # 0件と「見つからない」を区別する（`get_ledger` と同じ規律）
+//!
+//! 条件に一致する仕訳が無いのは**成功**（空の一覧）。
+//! `account` に勘定科目マスタに無いコードを指定した場合だけが
+//! `not_found` の**エラー**である（判定は read model。
+//! `crates/kaikei-store/src/query/search.rs`）。
+//!
+//! **打ち間違いを空の成功にしない。** `"690"` と `"609"` を取り違えたときに
+//! 0件が返ると、呼び出し元は「その科目の取引が無い」と読んで期間を広げに
+//! 行く。次の手が `get_ledger` と食い違う状態を残さない（PR-H レビュー C-3）。
 
 use kaikei_app::error::AppError;
 use kaikei_app::id::entry_id_to_uuid_string;
@@ -69,6 +80,8 @@ pub struct SearchEntriesInput {
     pub to: Option<String>,
 
     /// この勘定科目コードの明細を含む仕訳だけに絞ります。
+    /// 帳簿に登録されていない科目コードはエラーになります（その科目に
+    /// 取引が無いだけの場合は 0 件の成功として返します）。
     #[serde(default)]
     pub account: Option<String>,
 
@@ -115,6 +128,9 @@ impl McpTool for SearchEntries {
 日付は取引日（YYYY-MM-DD）で絞り込みます（記帳した日ではありません）。\
 金額は文字列で指定します（例: \"1000\"。JSON の number は受け付けません）。\
 条件に一致する仕訳が無い場合はエラーではなく空の一覧を返します。\
+ただし account に帳簿へ登録されていない科目コードを指定した場合はエラーになります。\
+科目コードの打ち間違いと「その科目に取引が無い」は次の手が違うためです\
+（前者は list_accounts でコードを調べ直し、後者は期間や条件を広げます）。\
 1回に返す件数には上限があり、応答の total_matches（一致した総件数）・returned（返した件数）・\
 has_more（続きの有無）で切れたかどうかが分かります。続きは next_cursor を cursor に渡して取得します。\
 帳簿は追記のみなので、赤伝（逆仕訳）で取り消された仕訳も検索結果に残ります。\
@@ -170,6 +186,7 @@ has_more（続きの有無）で切れたかどうかが分かります。続き
             })
             .transpose()?;
 
+        let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
         let params = SearchEntriesParams {
             from,
             to,
@@ -179,7 +196,7 @@ has_more（続きの有無）で切れたかどうかが分かります。続き
             max_amount,
             tags,
             cursor,
-            limit: input.limit.unwrap_or(DEFAULT_LIMIT),
+            limit,
         };
 
         let page = search_entries::execute(
@@ -190,7 +207,9 @@ has_more（続きの有無）で切れたかどうかが分かります。続き
         .await
         .map_err(|error: AppError| ToolError::from_app_error(&error))?;
 
-        Ok(ToolSuccess::new(success_body(&page)))
+        let body = success_body(&page, limit);
+        let summary = audit_summary(&body);
+        Ok(ToolSuccess::new(body).with_audit_summary(summary))
     }
 }
 
@@ -198,7 +217,15 @@ has_more（続きの有無）で切れたかどうかが分かります。続き
 ///
 /// **0件は成功**（空の一覧を返し、エラーにしない）。「条件に合う仕訳が
 /// 無い」ことは、検索が失敗したことではない。
-fn success_body(page: &EntrySearchPageView) -> Map<String, Value> {
+///
+/// `limit` は**呼び出し元に適用された値**（省略時は [`DEFAULT_LIMIT`]）。
+/// [`MAX_LIMIT`] ではなくこちらを持つのは、切れた理由が
+/// 「自分が指定した件数」なのか「サーバの上限」なのかで**次の手が違う**
+/// ためである（前者は `limit` を上げれば1回で取れる。後者は条件を絞るか
+/// カーソルで辿るしかない）。上限だけを述べると、`limit: 1` で呼んだ側は
+/// 「上限は 100 件です」と読んで自分の指定に思い至らない
+/// （PR-H レビュー D-4）。
+fn success_body(page: &EntrySearchPageView, limit: u32) -> Map<String, Value> {
     let mut body = Map::new();
     body.insert(
         "entries".to_string(),
@@ -216,17 +243,49 @@ fn success_body(page: &EntrySearchPageView) -> Map<String, Value> {
         body.insert(
             "truncation_note".to_string(),
             json!(format!(
-                "条件に一致した {total} 件のうち {returned} 件を返しました。\
-                 続きは cursor に next_cursor の値を渡して取得してください\
-                 （1回に返す上限は {MAX_LIMIT} 件です）。\
+                "条件に一致した {total} 件のうち {returned} 件を返しました\
+                 （{cause}）。\
+                 続きは cursor に next_cursor の値を渡して取得してください。\
                  件数を絞りたい場合は期間や科目の条件を追加してください",
                 total = page.total_matches,
                 returned = page.entries.len(),
+                cause = truncation_cause(limit),
             )),
         );
     }
 
     body
+}
+
+/// 何が件数を決めたのかを述べる（呼び出し元の `limit` かサーバの上限か）。
+fn truncation_cause(limit: u32) -> String {
+    if limit < MAX_LIMIT {
+        format!(
+            "この呼び出しで指定された limit={limit} で切りました。\
+             1回に返せる上限は {MAX_LIMIT} 件なので、limit を上げれば\
+             1回で受け取れる件数を増やせます"
+        )
+    } else {
+        format!("1回に返す上限の {MAX_LIMIT} 件で切りました")
+    }
+}
+
+/// `audit_log.output` に残す要約（`DECISIONS.md` D-089 の決定6）。
+///
+/// 応答本文から**明細（`entries`）と説明文（`truncation_note`）を落とした
+/// 残り**である。件数（`total_matches` / `returned` / `has_more`）と
+/// 読み終わった位置（`next_cursor`）は残るので、
+/// 「誰がいつ何を、どこまで読んだか」は監査ログだけで追える。
+///
+/// 返した内容そのものは (問い合わせ条件 = `audit_log.input` + その時点の帳簿)
+/// から再現できる（帳簿は追記のみなので過去の状態を再構成できる）。
+/// 書き込み系は**結果そのものが変更の記録**なので全体を残す。この非対称は
+/// 意図的である。
+fn audit_summary(body: &Map<String, Value>) -> Map<String, Value> {
+    let mut summary = body.clone();
+    summary.remove("entries");
+    summary.remove("truncation_note");
+    summary
 }
 
 /// 検索結果の仕訳1件。
@@ -354,11 +413,14 @@ mod tests {
     // 0件でも成功として空の一覧を返す（`has_more` は偽で、切れた旨は出さない）。
     #[test]
     fn an_empty_result_is_a_success_without_a_truncation_note() {
-        let body = success_body(&EntrySearchPageView {
-            entries: Vec::new(),
-            total_matches: 0,
-            next_cursor: None,
-        });
+        let body = success_body(
+            &EntrySearchPageView {
+                entries: Vec::new(),
+                total_matches: 0,
+                next_cursor: None,
+            },
+            DEFAULT_LIMIT,
+        );
 
         assert_eq!(body["entries"], json!([]));
         assert_eq!(body["total_matches"], json!(0));
@@ -371,15 +433,18 @@ mod tests {
     // ★上限で切ったことが応答から分かる★
     #[test]
     fn a_truncated_page_says_so_and_carries_the_cursor_for_the_rest() {
-        let body = success_body(&EntrySearchPageView {
-            entries: vec![entry(1, 1)],
-            total_matches: 47,
-            next_cursor: Some(EntryCursor {
-                entry_date: AccountingDate::new(2026, 4, 15).unwrap(),
-                entry_no: EntryNumber::new(1),
-                entry_id: EntryId::new(1),
-            }),
-        });
+        let body = success_body(
+            &EntrySearchPageView {
+                entries: vec![entry(1, 1)],
+                total_matches: 47,
+                next_cursor: Some(EntryCursor {
+                    entry_date: AccountingDate::new(2026, 4, 15).unwrap(),
+                    entry_no: EntryNumber::new(1),
+                    entry_id: EntryId::new(1),
+                }),
+            },
+            DEFAULT_LIMIT,
+        );
 
         assert_eq!(body["total_matches"], json!(47));
         assert_eq!(body["returned"], json!(1));
@@ -388,6 +453,73 @@ mod tests {
         let note = body["truncation_note"].as_str().expect("切れた旨の説明");
         assert!(note.contains("47"), "{note}");
         assert!(note.contains("next_cursor"), "{note}");
+    }
+
+    // ★切れた理由が「自分の limit」か「サーバの上限」か分かる★
+    // （PR-H レビュー D-4）
+    #[test]
+    fn the_truncation_note_says_whether_the_callers_limit_or_the_maximum_cut_it() {
+        let caller = truncation_cause(1);
+        assert!(caller.contains("limit=1"), "{caller}");
+        assert!(caller.contains(&MAX_LIMIT.to_string()), "{caller}");
+
+        let maximum = truncation_cause(MAX_LIMIT);
+        assert!(!maximum.contains("limit="), "{maximum}");
+        assert!(maximum.contains(&MAX_LIMIT.to_string()), "{maximum}");
+
+        let body = success_body(
+            &EntrySearchPageView {
+                entries: vec![entry(1, 1)],
+                total_matches: 47,
+                next_cursor: Some(EntryCursor {
+                    entry_date: AccountingDate::new(2026, 4, 15).unwrap(),
+                    entry_no: EntryNumber::new(1),
+                    entry_id: EntryId::new(1),
+                }),
+            },
+            1,
+        );
+        let note = body["truncation_note"].as_str().unwrap();
+        assert!(note.contains("limit=1"), "{note}");
+    }
+
+    // ★監査ログに残すのは要約★（D-089 の決定6。PR-H レビュー C-5）
+    //
+    // 明細（`entries`）と説明文は落とすが、件数と続きの位置は残る。
+    // 要約の大きさは**件数に依らない**。
+    #[test]
+    fn the_audit_summary_drops_the_entries_but_keeps_the_counts() {
+        let entries: Vec<EntrySummaryView> =
+            (1..=u128::from(MAX_LIMIT)).map(|i| entry(i, 1)).collect();
+        let body = success_body(
+            &EntrySearchPageView {
+                entries,
+                total_matches: 470,
+                next_cursor: Some(EntryCursor {
+                    entry_date: AccountingDate::new(2026, 4, 15).unwrap(),
+                    entry_no: EntryNumber::new(1),
+                    entry_id: EntryId::new(1),
+                }),
+            },
+            MAX_LIMIT,
+        );
+        let summary = audit_summary(&body);
+
+        assert!(summary.get("entries").is_none(), "明細が要約に残っている");
+        assert!(summary.get("truncation_note").is_none());
+        for key in ["total_matches", "returned", "has_more", "next_cursor"] {
+            assert!(summary.contains_key(key), "{key} が要約から落ちている");
+        }
+        // 値は応答本文と同じ（別に組み立てていない）。
+        assert_eq!(summary["total_matches"], body["total_matches"]);
+
+        let summary_len = Value::Object(summary).to_string().len();
+        let body_len = Value::Object(body).to_string().len();
+        assert!(summary_len < 1_024, "要約が {summary_len} バイト");
+        assert!(
+            body_len > summary_len * 10,
+            "本文 {body_len} / 要約 {summary_len}"
+        );
     }
 
     // 取り消された仕訳・赤伝はそれと分かる形で出る（D-088）。

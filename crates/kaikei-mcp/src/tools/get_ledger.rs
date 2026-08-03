@@ -87,7 +87,7 @@ debit_total / credit_total / closing_balance / total_lines は期間全体の値
 1回に返す行数には上限があり、has_more と next_cursor で続きの有無が分かります。\
 指定した期間に明細が無い場合は空の rows を返し、勘定科目マスタに無い科目コードはエラーになります。\
 帳簿は追記のみなので、赤伝（逆仕訳）で取り消された仕訳の明細も残高も元帳に残ります。\
-取り消された仕訳の行には reversed_by が付きます。";
+取り消された仕訳の行には reversed_by が付き、赤伝の行には reverses と reverse_reason が付きます。";
 
     async fn run(ctx: &ToolContext<'_>, input: Self::Input) -> Result<ToolSuccess, ToolFailure> {
         let account = AccountCode::parse(&input.account)
@@ -103,6 +103,7 @@ debit_total / credit_total / closing_balance / total_lines は期間全体の値
             .transpose()?;
 
         let settings = ctx.book_settings();
+        let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
         let page = ledger::execute(
             ctx.ledger_query(),
             &settings,
@@ -111,24 +112,27 @@ debit_total / credit_total / closing_balance / total_lines は期間全体の値
                 from,
                 to,
                 cursor,
-                limit: input.limit.unwrap_or(DEFAULT_LIMIT),
+                limit,
             },
         )
         .await
         .map_err(|error: AppError| ToolError::from_app_error(&error))?;
 
-        Ok(ToolSuccess::new(success_body(
-            &page,
-            &input.from,
-            &input.to,
-        )))
+        let body = success_body(&page, &input.from, &input.to, limit);
+        let summary = audit_summary(&body);
+        Ok(ToolSuccess::new(body).with_audit_summary(summary))
     }
 }
 
 /// 成功応答（`docs/07-mcp-server.md` §3）。
 ///
 /// 金額はすべて**区切り無しの文字列**（§5）。件数・仕訳番号は JSON number。
-fn success_body(page: &LedgerPageView, from: &str, to: &str) -> Map<String, Value> {
+///
+/// `limit` は**呼び出し元に適用された値**（省略時は [`DEFAULT_LIMIT`]）。
+/// 切れた理由が「自分が指定した行数」なのか「サーバの上限」なのかで
+/// 次の手が違うので、`truncation_note` はどちらで切れたかを述べる
+/// （PR-H レビュー D-4）。
+fn success_body(page: &LedgerPageView, from: &str, to: &str, limit: u32) -> Map<String, Value> {
     let mut body = Map::new();
     body.insert("account".to_string(), json!(page.account.as_str()));
     body.insert("account_name".to_string(), json!(page.account_name));
@@ -175,15 +179,16 @@ fn success_body(page: &LedgerPageView, from: &str, to: &str) -> Map<String, Valu
         body.insert(
             "truncation_note".to_string(),
             json!(format!(
-                "この期間の明細 {total} 行のうち {returned} 行を返しました。\
-                 続きは cursor に next_cursor の値を渡して取得してください\
-                 （1回に返す上限は {MAX_LIMIT} 行です）。\
+                "この期間の明細 {total} 行のうち {returned} 行を返しました\
+                 （{cause}）。\
+                 続きは cursor に next_cursor の値を渡して取得してください。\
                  期間を狭めて取り直すこともできます。\
                  なお opening_balance / debit_total / credit_total / \
                  closing_balance は期間全体の値であり、返した行だけの合計では\
                  ありません",
                 total = page.total_lines,
                 returned = page.rows.len(),
+                cause = truncation_cause(limit),
             )),
         );
     }
@@ -191,9 +196,39 @@ fn success_body(page: &LedgerPageView, from: &str, to: &str) -> Map<String, Valu
     body
 }
 
+/// 何が行数を決めたのかを述べる（呼び出し元の `limit` かサーバの上限か）。
+fn truncation_cause(limit: u32) -> String {
+    if limit < MAX_LIMIT {
+        format!(
+            "この呼び出しで指定された limit={limit} で切りました。\
+             1回に返せる上限は {MAX_LIMIT} 行なので、limit を上げれば\
+             1回で受け取れる行数を増やせます"
+        )
+    } else {
+        format!("1回に返す上限の {MAX_LIMIT} 行で切りました")
+    }
+}
+
+/// `audit_log.output` に残す要約（`DECISIONS.md` D-089 の決定6）。
+///
+/// 応答本文から**明細（`rows`）と説明文（`truncation_note`）を落とした
+/// 残り**である。問い合わせ条件（`account` / `from` / `to`）・期間全体の
+/// 合計・件数・読み終わった位置（`next_cursor`）は残るので、
+/// 「誰がいつ何を、どこまで読んだか」は監査ログだけで追える
+/// （理由は `search_entries` 側の同名関数と `DECISIONS.md` D-089 の決定6）。
+fn audit_summary(body: &Map<String, Value>) -> Map<String, Value> {
+    let mut summary = body.clone();
+    summary.remove("rows");
+    summary.remove("truncation_note");
+    summary
+}
+
 /// 元帳の1行。
 ///
-/// `reverses` / `reversed_by` は該当するときだけ出す（`null` を置かない）。
+/// `reverses` / `reverse_reason` / `reversed_by` は該当するときだけ出す
+/// （`null` を置かない）。`reverse_reason` を出すのは、赤伝の行を見た
+/// 読み手が「なぜ取り消されたか」を `search_entries` へ引き直さずに
+/// 読めるようにするためである（D-088 の表。PR-H レビュー D-2）。
 fn row_to_json(row: &LedgerRowView) -> Value {
     let mut object = Map::new();
     object.insert(
@@ -238,6 +273,9 @@ fn row_to_json(row: &LedgerRowView) -> Value {
             "reverses".to_string(),
             json!(entry_id_to_uuid_string(reverses)),
         );
+    }
+    if let Some(reason) = row.reverse_reason.as_ref() {
+        object.insert("reverse_reason".to_string(), json!(reason));
     }
     if let Some(reversal) = row.reversed_by.as_ref() {
         object.insert("reversed_by".to_string(), reversal_ref_to_json(reversal));
@@ -297,6 +335,7 @@ mod tests {
             counter_accounts: vec![AccountCode::parse("100").unwrap()],
             running_balance: Money::from_minor(running, Currency::JPY),
             reverses: None,
+            reverse_reason: None,
             reversed_by: None,
         }
     }
@@ -323,7 +362,7 @@ mod tests {
         empty.debit_total = Money::from_minor(0, Currency::JPY);
         empty.closing_balance = Money::from_minor(0, Currency::JPY);
 
-        let body = success_body(&empty, "2026-01-01", "2026-12-31");
+        let body = success_body(&empty, "2026-01-01", "2026-12-31", DEFAULT_LIMIT);
 
         assert_eq!(body["rows"], json!([]));
         assert_eq!(body["currency"], json!("JPY"));
@@ -347,7 +386,7 @@ mod tests {
             line_no: 1,
         });
 
-        let body = success_body(&truncated, "2026-01-01", "2026-12-31");
+        let body = success_body(&truncated, "2026-01-01", "2026-12-31", DEFAULT_LIMIT);
 
         assert_eq!(body["total_lines"], json!(132));
         assert_eq!(body["returned"], json!(1));
@@ -366,7 +405,7 @@ mod tests {
         let mut negative = page(vec![row(1, Side::Credit, 500, -500)], 1);
         negative.closing_balance = Money::from_minor(-500, Currency::JPY);
 
-        let body = success_body(&negative, "2026-01-01", "2026-12-31");
+        let body = success_body(&negative, "2026-01-01", "2026-12-31", DEFAULT_LIMIT);
 
         for key in [
             "opening_balance",
@@ -393,19 +432,129 @@ mod tests {
             entry_no: EntryNumber::new(2),
             entry_date: AccountingDate::new(2026, 5, 1).unwrap(),
         });
-        let body = success_body(&page(vec![reversed], 1), "2026-01-01", "2026-12-31");
+        let body = success_body(
+            &page(vec![reversed], 1),
+            "2026-01-01",
+            "2026-12-31",
+            DEFAULT_LIMIT,
+        );
 
         assert_eq!(body["rows"][0]["reversed_by"]["entry_no"], json!(2));
         assert!(body["rows"][0].get("reverses").is_none());
+        assert!(body["rows"][0].get("reverse_reason").is_none());
 
-        // 取り消されていない行にはどちらの欄も出ない。
+        // 取り消されていない行にはどれも出ない。
         let body = success_body(
             &page(vec![row(1, Side::Debit, 1_000, 1_000)], 1),
             "2026-01-01",
             "2026-12-31",
+            DEFAULT_LIMIT,
         );
         assert!(body["rows"][0].get("reversed_by").is_none());
         assert!(body["rows"][0].get("reverses").is_none());
+        assert!(body["rows"][0].get("reverse_reason").is_none());
+    }
+
+    // 赤伝の行だけを見て「なぜ取り消されたか」が読める
+    // （D-088 の表。PR-H レビュー D-2）。
+    #[test]
+    fn a_row_of_a_reversal_carries_the_reason_it_was_made() {
+        let mut red = row(1, Side::Credit, 1_000, 0);
+        red.reverses = Some(EntryId::new(1));
+        red.reverse_reason = Some("数量の誤り".to_string());
+
+        let body = success_body(
+            &page(vec![red], 1),
+            "2026-01-01",
+            "2026-12-31",
+            DEFAULT_LIMIT,
+        );
+
+        assert_eq!(
+            body["rows"][0]["reverses"],
+            json!(entry_id_to_uuid_string(EntryId::new(1)))
+        );
+        assert_eq!(body["rows"][0]["reverse_reason"], json!("数量の誤り"));
+        assert!(body["rows"][0].get("reversed_by").is_none());
+    }
+
+    // ★切れた理由が「自分の limit」か「サーバの上限」か分かる★
+    // （PR-H レビュー D-4）
+    #[test]
+    fn the_truncation_note_says_whether_the_callers_limit_or_the_maximum_cut_it() {
+        let caller = truncation_cause(1);
+        assert!(caller.contains("limit=1"), "{caller}");
+        assert!(caller.contains(&MAX_LIMIT.to_string()), "{caller}");
+
+        let maximum = truncation_cause(MAX_LIMIT);
+        assert!(!maximum.contains("limit="), "{maximum}");
+        assert!(maximum.contains(&MAX_LIMIT.to_string()), "{maximum}");
+
+        // 応答にもその文言が載る。
+        let mut truncated = page(vec![row(1, Side::Debit, 1_000, 1_000)], 132);
+        truncated.next_cursor = Some(LedgerCursor {
+            entry: EntryCursor {
+                entry_date: AccountingDate::new(2026, 4, 15).unwrap(),
+                entry_no: EntryNumber::new(1),
+                entry_id: EntryId::new(1),
+            },
+            line_no: 1,
+        });
+        let body = success_body(&truncated, "2026-01-01", "2026-12-31", 1);
+        let note = body["truncation_note"].as_str().unwrap();
+        assert!(note.contains("limit=1"), "{note}");
+    }
+
+    // ★監査ログに残すのは要約★（D-089 の決定6。PR-H レビュー C-5）
+    //
+    // 明細（`rows`）と説明文は落とすが、条件・合計・件数・続きの位置は残る。
+    // 要約の大きさは**行数に依らない**。
+    #[test]
+    fn the_audit_summary_drops_the_rows_but_keeps_the_conditions_and_totals() {
+        let rows: Vec<LedgerRowView> = (1..=MAX_LIMIT as u16)
+            .map(|line_no| row(line_no, Side::Debit, 1_000, i128::from(line_no) * 1_000))
+            .collect();
+        let mut full = page(rows, u64::from(MAX_LIMIT) * 3);
+        full.next_cursor = Some(LedgerCursor {
+            entry: EntryCursor {
+                entry_date: AccountingDate::new(2026, 4, 15).unwrap(),
+                entry_no: EntryNumber::new(1),
+                entry_id: EntryId::new(1),
+            },
+            line_no: 1,
+        });
+        let body = success_body(&full, "2026-01-01", "2026-12-31", MAX_LIMIT);
+        let summary = audit_summary(&body);
+
+        assert!(summary.get("rows").is_none(), "明細が要約に残っている");
+        assert!(summary.get("truncation_note").is_none());
+        // 「何を・どこまで読んだか」は残る。
+        for key in [
+            "account",
+            "from",
+            "to",
+            "opening_balance",
+            "debit_total",
+            "credit_total",
+            "closing_balance",
+            "total_lines",
+            "returned",
+            "has_more",
+            "next_cursor",
+        ] {
+            assert!(summary.contains_key(key), "{key} が要約から落ちている");
+        }
+        // 値は応答本文と同じ（別に組み立てていない）。
+        assert_eq!(summary["closing_balance"], body["closing_balance"]);
+
+        // 上限まで返しても要約は 1KB を超えない（本文は行数に比例して伸びる）。
+        let summary_len = Value::Object(summary).to_string().len();
+        let body_len = Value::Object(body).to_string().len();
+        assert!(summary_len < 1_024, "要約が {summary_len} バイト");
+        assert!(
+            body_len > summary_len * 10,
+            "本文 {body_len} / 要約 {summary_len}"
+        );
     }
 
     // 相手科目が入る（元帳としての可読性）。
@@ -415,6 +564,7 @@ mod tests {
             &page(vec![row(1, Side::Debit, 1_000, 1_000)], 1),
             "2026-01-01",
             "2026-12-31",
+            DEFAULT_LIMIT,
         );
         assert_eq!(body["rows"][0]["counter_accounts"], json!(["100"]));
     }

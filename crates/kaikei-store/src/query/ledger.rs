@@ -184,7 +184,8 @@ impl LedgerQuery for PgLedgerQuery {
                 WHERE l.account_code = $1 AND e.entry_date < $2
             ),
             ordered AS (
-                SELECT e.id AS entry_id, e.entry_no, e.entry_date, e.description, e.reverses,
+                SELECT e.id AS entry_id, e.entry_no, e.entry_date, e.description,
+                       e.reverses, e.reverse_reason,
                        l.line_no, l.side, l.amount_minor, l.currency, l.currency_minor_unit,
                        l.tags, l.memo,
                        ((SELECT o.signed FROM opening o)
@@ -214,6 +215,7 @@ impl LedgerQuery for PgLedgerQuery {
                    entry_date                  AS "entry_date!",
                    description                 AS "description!",
                    reverses                    AS "reverses?",
+                   reverse_reason              AS "reverse_reason?",
                    line_no                     AS "line_no!",
                    side                        AS "side!",
                    amount_minor                AS "amount_minor!",
@@ -283,6 +285,7 @@ impl LedgerQuery for PgLedgerQuery {
                 counter_accounts,
                 running_balance,
                 reverses: record.reverses.map(entry_id_from_uuid),
+                reverse_reason: record.reverse_reason,
                 reversed_by: match (
                     record.reversed_by_id,
                     record.reversed_by_no,

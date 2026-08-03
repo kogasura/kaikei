@@ -259,6 +259,14 @@ pub struct LedgerRowView {
     pub running_balance: Money,
     /// この仕訳が赤伝なら、訂正対象の仕訳ID。
     pub reverses: Option<EntryId>,
+    /// この仕訳が赤伝なら、訂正理由（記帳時の入力のまま）。
+    ///
+    /// [`EntrySummaryView::reverse_reason`] と同じもの。元帳の行にも持たせるのは、
+    /// **赤伝の行を見た読み手が「なぜ取り消されたか」を引き直さずに読める**
+    /// ようにするためである（`DECISIONS.md` D-088 の表は `reverses` と
+    /// `reverse_reason` を赤伝に付く欄として並べている。片方だけ落とすと、
+    /// 元帳から検索へ移らないと理由が読めない）。
+    pub reverse_reason: Option<String>,
     /// この仕訳を取り消している赤伝（あれば）。
     pub reversed_by: Option<ReversalRef>,
 }
