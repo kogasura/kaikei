@@ -135,7 +135,10 @@ pub fn round_mode_from_code(code: &str) -> Result<RoundMode, JpError> {
 }
 
 /// 「未知の機械可読名」に対する共通のエラー。
-fn invalid_setting_code(field: &str, input: &str, valid: &[&str]) -> JpError {
+///
+/// 同じ `tax` モジュール内の他の語彙（[`super::category::TaxDirection`]）も
+/// この1箇所を通す（同じ形のエラーを別々に組み立てない）。
+pub(super) fn invalid_setting_code(field: &str, input: &str, valid: &[&str]) -> JpError {
     JpError::InvalidSettingCode {
         field: field.to_string(),
         input: input.to_string(),
