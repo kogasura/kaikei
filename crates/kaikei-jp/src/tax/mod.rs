@@ -25,7 +25,10 @@
 //!
 //! - [`category`][]: 税区分1件（[`TaxCategory`] / [`TaxDirection`]）
 //! - [`settings`][]: `settings_defaults` に対応する既定値（[`TaxMode`] / [`RoundingUnit`] /
-//!   [`TaxSettingsDefaults`]）。事業者ごとの実設定は [`JpSettings`] が持つ
+//!   [`TaxSettingsDefaults`]）と、**税制設定の線上語彙**（文字列 ⇄ 値の
+//!   両方向。[`TaxMode::as_code`] / [`TaxMode::from_code`] /
+//!   [`round_mode_code`] / [`round_mode_from_code`] 等）。
+//!   事業者ごとの実設定は [`JpSettings`] が持つ
 //! - [`table`][]: 1つの適用期間ぶんのマスタ（[`TaxCategoryTable`]）
 //! - [`rule_sets`][]: 適用期間の異なる複数マスタの集合（[`TaxRuleSets`]）
 //! - [`policy`][]: `kaikei-policy::TaxPolicy` の実装（[`JpTaxPolicy`] /
@@ -45,5 +48,8 @@ mod table;
 pub use category::{TaxCategory, TaxDirection};
 pub use policy::{JpSettings, JpSettingsOverrides, JpTaxPolicy};
 pub use rule_sets::TaxRuleSets;
-pub use settings::{RoundingUnit, TaxMode, TaxSettingsDefaults};
+pub use settings::{
+    round_mode_code, round_mode_from_code, RoundingUnit, TaxMode, TaxSettingsDefaults,
+    ROUND_MODE_CODES,
+};
 pub use table::TaxCategoryTable;

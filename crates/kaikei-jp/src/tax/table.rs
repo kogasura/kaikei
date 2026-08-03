@@ -238,8 +238,14 @@ impl TaxCategoryTable {
         self_starts_before_other_ends && other_starts_before_self_ends
     }
 
-    /// 適用期間の表示用文字列（エラーメッセージ用）。
-    pub(super) fn range_display(&self) -> String {
+    /// 適用期間の表示用文字列（エラーメッセージ・応答用）。
+    ///
+    /// `"2026-01-01 〜 2026-12-31"`、無期限なら `"2026-01-01 〜 無期限"`。
+    /// [`super::TaxRuleSets::available_ranges_display`] がこれを並べるほか、
+    /// 上位（`docs/07-mcp-server.md` §2 の `list_tax_categories`）が
+    /// マスタ1件の有効期間を名乗るのにも使うため公開している
+    /// （表記を各所で再発明しない）。
+    pub fn range_display(&self) -> String {
         match self.applies_to {
             Some(to) => format!(
                 "{} 〜 {}",

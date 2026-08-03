@@ -3,7 +3,8 @@
 **このプロジェクトの差別化の本体。**
 AI エージェントが会計操作を安全に行うための標準インタフェース。
 
-> **この文書の版**: Phase 3 着手時点（`DECISIONS.md` D-071 まで）を反映している。
+> **この文書の版**: Phase 3 PR-B **2巡目**時点（`DECISIONS.md` D-074 まで、
+> D-072〜D-074 の訂正注記を含む）を反映している。
 > D-072 以降の決定でここに書かれた内容が覆った場合、**決定を入れた PR の中で
 > この文書も直すこと**。設計書は一度書いたら終わりではなく、直さないと
 > 「却下済みの設計を後続の実装者に指示する文書」に劣化する
@@ -95,11 +96,11 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 |---|---|---|
 | `list_accounts` | **Phase 3** | 勘定科目一覧。科目コード・名称・5要素分類（`account_type`）・親科目（`parent`）・**記帳可否（`postable`）** を返す。`postable: false` は見出し科目で、記帳に使うと `NotPostable` になるため必ず返す。表示順（`sort`）は保持していないので返さない（並びは科目コード昇順。D-061） |
 | `get_entry` | **Phase 3** | 仕訳 1 件の詳細（明細・タグ）。証憑リンクは Phase 4 |
-| `get_trial_balance` | **Phase 3** | 試算表。集計期間（`from`/`to`、取引日ベース・両端含む）は**必須**。`group_by` には `aggregatable: true` のタグキーのみ指定可（それ以外は `NotAggregatable`。`CLAUDE.md` §4）。`from > to` は空の試算表ではなく**エラー**（入力ミスを「0件の空の試算表」として静かに成功させない）。集計対象の通貨が単一であることを要求する（D-042） |
+| `get_trial_balance` | **Phase 3** | 試算表。集計期間（`from`/`to`、取引日ベース・両端含む）は**必須**。`group_by` には `aggregatable: true` のタグキーのみ指定可（それ以外は `NotAggregatable`。`CLAUDE.md` §4）。`from > to` は空の試算表ではなく**エラー**（入力ミスを「0件の空の試算表」として静かに成功させない）。集計対象の通貨が単一であることを要求する（D-042。帳簿通貨と異なる行があれば `currency_mismatch`）。**0行の期間でも `currency` を返す**（PR-B 2巡目）。入出力は §3 |
 | `search_entries` | **Phase 3** | 日付・金額・科目・取引先・摘要で仕訳検索。read model の新設が要る（下記） |
 | `get_ledger` | **Phase 3** | 総勘定元帳（科目別の明細）。read model の新設が要る（下記） |
-| `list_tax_categories` | **Phase 3** | 有効な税区分一覧（指定日時点）。該当する年度マスタが存在しない日付では**空配列ではなくエラー**を返し、有効期間を示す（例:「2026-01-01〜2026-12-31 のマスタのみ同梱されています。取引日を確認してください」）。`TaxRuleSets::for_date` は該当なしで `None` を返す（D-055）。**前工事が要る**: 有効期間を組み立てる公開 API が現状無い（`TaxRuleSets` の公開メソッドは `from_embedded` / `new` / `for_date` の3つのみで、保持する表を列挙できない。`TaxCategoryTable::range_display` は `pub(super)`）。`kaikei-jp` に列挙用の公開 API を足すこと。**空マスタと未収録は意味が違う**——空配列を返すと AI が「この日は税区分が1つも無い」と誤解して税区分なしで記帳しようとする |
-| `get_settings` | **Phase 3** | 経理方式（`tax_mode`）／端数処理方式（`rounding`）／端数処理単位（`rounding_unit`）／課税事業者か（`is_taxable_business`）／簡易課税か（`simplified_taxation`）と、会計年度の区切り規則・帳簿通貨を返す。**帳簿通貨を保持する場所は現状どこにも無い**（`BookSettings` は `fiscal_year_rule` のみ、`JpSettings` は通貨を持たない）。PR-B で追加する。**日付引数を取らない**（事業者設定は起動時に一度だけ合成され、取引日に応じて変わらない。D-057）。設定が未指定ならサーバは起動に失敗するので、このツールが既定値を返すことはない（§7） |
+| `list_tax_categories` | **Phase 3** | 有効な税区分一覧（指定日時点）。該当する年度マスタが存在しない日付では**空配列ではなくエラー**を返し、有効期間を示す（例:「2026-01-01〜2026-12-31 のマスタのみ同梱されています。取引日を確認してください」）。`TaxRuleSets::for_date` は該当なしで `None` を返す（D-055）。**前工事は PR-B 3巡目で完了**: `TaxRuleSets::iter` / `len` / `is_empty`（保持するマスタの列挙）、`TaxCategoryTable::range_display`（`pub` 化）、`TaxRuleSets::available_ranges_display`（適用開始日の昇順に並べた有効期間）、`TaxRuleSets::require_for_date`（`None` を `JpError::NoApplicableTaxRuleSet` にし、有効期間を文言に含める）。**このエラー文言を MCP 層で書き起こさない**（D-072 と同じ理由で、同じ文言が複数ツールに散る）。**空マスタと未収録は意味が違う**——空配列を返すと AI が「この日は税区分が1つも無い」と誤解して税区分なしで記帳しようとする |
+| `get_settings` | **Phase 3** | 経理方式（`tax_mode`）／端数処理方式（`rounding`）／端数処理単位（`rounding_unit`）／課税事業者か（`is_taxable_business`）／簡易課税か（`simplified_taxation`）と、会計年度の区切り規則・帳簿通貨を返す。**帳簿通貨は `kaikei_app::context::BookSettings::book_currency` が保持する**（PR-B で追加。`Option` ではない必須フィールドで、既定で JPY にフォールバックしない。D-074）。`JpSettings` 側には持たせていないので、この応答は `JpSettings` と `BookSettings` の2つから組み立てる。**日付引数を取らない**（事業者設定は起動時に一度だけ合成され、取引日に応じて変わらない。D-057）。設定が未指定ならサーバは起動に失敗するので、このツールが既定値を返すことはない（§7） |
 | `get_statements` | Phase 4 以降 | B/S・P/L。**延期理由: D-031。** `TrialBalance` / `BalanceRow` は `kaikei-core` の外から構築できず（`GroupKey` に公開コンストラクタが無い）、DTO 経由で組み立て直す設計が要る |
 | `list_pending_transactions` | Phase 4 以降 | 未仕訳の取込明細。**延期理由: `kaikei-import` 未着手**（crate もテーブルも存在しない） |
 | `search_documents` | Phase 4 以降 | 証憑検索（日付・金額・取引先）。**延期理由: `kaikei-blob` 未着手**（`documents` / `entry_documents` は Phase 4 で設計する。`docs/03-database.md` §1 の注記） |
@@ -114,7 +115,7 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 | ツール | Phase | 説明 | 備考 |
 |---|---|---|---|
 | `post_journal_entry` | **Phase 3** | 仕訳を起こす | 貸借不一致は必ずエラー（`JournalEntry::new` と DB の遅延制約トリガの二重で防ぐ）。成功時は確定後の明細に加えて **`PolicyNote` の一覧を返す**（非適格の経過措置など、税額に反映されず注記にしか出ない情報がある。D-059）。`PolicyNote` は audit_log の `output` にも残す（D-070） |
-| `reverse_journal_entry` | **Phase 3** | 赤伝を起こす | 理由（`reason`）が必須。**空文字・空白のみは MCP 層で拒否する**（core/app 側に非空検証は無い）。既に赤伝済みの仕訳を再訂正する場合は `allow_double_reversal: true` が必要（既定は拒否） |
+| `reverse_journal_entry` | **Phase 3** | 赤伝を起こす | 理由（`reason`）が必須。**空文字・空白のみは `kaikei-app` のユースケース層が拒否する**（PR-B。`reverse_entry::execute` が I/O より前に `AppError::EmptyReverseReason` を返す。D-074）。MCP 層はそれを写像するだけでよい。既に赤伝済みの仕訳を再訂正する場合は `allow_double_reversal: true` が必要（既定は拒否） |
 | `journalize_transaction` | Phase 4 以降 | 取込明細を仕訳化 | **延期理由: `kaikei-import` 未着手** |
 | `ignore_transaction` | Phase 4 以降 | 取込明細を無視 | **延期理由: `kaikei-import` 未着手** |
 | `attach_document` | Phase 4 以降 | 証憑を仕訳に紐付け | **延期理由: `kaikei-blob` 未着手。** 現状 `PgTx::insert_entry` は `document_refs` が非空なら `RepoError::Unsupported` を返す（D-041） |
@@ -169,13 +170,83 @@ DB 所有者権限での手動操作以外に手段は無い。
 **この節に載せるのは Phase 3 で実装するツールだけ。**
 `suggest_journal_entry` / `close_period` の入出力仕様案は付録 A に移してある。
 
-> **未確定事項がある。** 以下の3点は PR-B（`kaikei-mcp` の骨格）で確定させる。
-> 決まるまで、この節の例は「確定した契約」ではなく作業対象として読むこと。
+> **未確定事項の現況**（PR-B 時点）。
 >
-> 1. **タグ値の線上形式**（後述）
-> 2. **通貨の指定方法**（§5）
-> 3. **金額の出力文字列形式**（§5。実装が現在返せるのは3桁区切り付きの
->    `"110,000"` のみで、区切り無しの文字列化 API は `kaikei-core` に無い）
+> | # | 論点 | 状態 |
+> |---|---|---|
+> | 1 | **タグ値の線上形式**（後述） | **PR-B（3巡目）で確定。** 平文の文字列マップ（`{"tax_category": "SALES_10"}`）。`TagSet` への変換は `kaikei_jp::tags::TagCatalog::parse_tag_set`、逆向きは `kaikei_jp::tags::tag_value_to_string`。**`kaikei-core` は変更していない** |
+> | 2 | **通貨の指定方法**（§5） | **PR-B で確定。** 帳簿通貨は `kaikei_app::context::BookSettings::book_currency`（必須・既定値なし）。明細で `currency` を省略したらこれを使う（D-074） |
+> | 3 | **金額の出力文字列形式**（§5） | **PR-B（2巡目）で確定。** 区切り無し（`"110000"` / USD `"1234.56"`）。整形は `kaikei_app::amount::money_to_plain_string`。エラー本文の整形済み文字列用に `strip_thousands_separators` も同モジュールにある。**`kaikei-core` は変更していない** |
+> | 4 | **`hint`（修正案）**（§3 末尾） | **前工事は PR-B（2巡目）で完了。** dry-run ユースケースは `kaikei_app::usecase::post_entry::preview`。`hint` を応答に載せるのは `kaikei-mcp` を新設する PR |
+>
+> 1 は当初「`kaikei-mcp` crate が存在しないと書き場所が無い」としてスコープ外に
+> していたが、**書き場所は `kaikei-jp` だった**（`TagValueType` を知っているのは
+> タグスキーマを読むこの層であり、`kaikei-app` は `kaikei-jp` に依存できない）。
+> PR-B 3巡目で確定させた（D-074 訂正注記4）。
+
+### 応答を組み立てるのに使う `kaikei-app` の入口（PR-B 2巡目で確定）
+
+**MCP 層はこの表の外で線上表現を発明しない。** 同じ対応表を `kaikei-mcp` /
+`kaikei-api` / `audit_log` の3箇所に手書きすると必ず綴りがずれる（D-072）。
+
+| 線上に出るもの | 入口 |
+|---|---|
+| エラーの分類コード（`error`） | `AppError::code()` / `RepoError::code()` / `core_error_code` / `policy_error_code`（§6） |
+| エラーの本文（`message`） | **`AppError::public_message()`**（下記） |
+| 金額（`amount` / `debit_total` …） | `kaikei_app::amount::money_to_plain_string` |
+| エラー本文中の整形済み金額 | `kaikei_app::amount::strip_thousands_separators` |
+| `side` | `kaikei_app::wire::side_code` / `side_from_code` |
+| `account_type` | `kaikei_app::wire::account_type_code` / `account_type_from_code` |
+| `policy_notes[].severity` | `kaikei_app::wire::note_severity_code` |
+| `fiscal_year_rule` | `kaikei_app::wire::fiscal_year_rule_code` / `fiscal_year_rule_from_code` |
+| `entry_id`（出力） | `kaikei_app::id::entry_id_to_uuid_string` |
+| `entry_id` / `original_id`（入力） | **`kaikei_app::id::entry_id_from_uuid_string`**（`uuid::Uuid::parse_str` を直に書かない。`kaikei-app` は `uuid` を再エクスポートしていないため、直に書くと下流が自分で `uuid` に依存することになる。D-047 と同型の問題） |
+| `tax_mode` / `rounding` / `rounding_unit` | `kaikei_jp::tax::{TaxMode, RoundingUnit}::as_code` / `from_code`、`round_mode_code` / `round_mode_from_code`（`kaikei-app` は `kaikei-jp` に依存できないため、この4つだけ置き場が違う） |
+| `lines[].tags`（入力） | `kaikei_jp::tags::TagCatalog::parse_tag_set`（同上。キーごとの `TagValueType` を知るのはタグスキーマを読む層） |
+| `lines[].tags`（出力） | `kaikei_jp::tags::tag_value_to_string` |
+| 税区分マスタの有効期間 | `kaikei_jp::tax::TaxCategoryTable::range_display` / `TaxRuleSets::available_ranges_display`（§2 の `list_tax_categories`） |
+
+`currency` は `kaikei_app::currency::currency_from_code`（§5）。
+
+これらが**公開 API だけで使えること**は、外部 crate としてリンクされる統合
+テスト2本が検証している:
+`crates/kaikei-app/tests/contract_from_downstream.rs`（経路 (a)(b)）と
+`crates/kaikei-jp/tests/contract_from_downstream.rs`（経路 (c) と `tags` 変換）。
+
+**この2本が検査できないこと**（PR-B 3巡目の訂正）: 統合テストのターゲットには
+その crate の `[dependencies]` と `[dev-dependencies]` が両方リンクされるため、
+**「下流が `uuid` や `rust_decimal` を自分の `Cargo.toml` に足さずに済むこと」は
+検査できない**（プローブでは書けてしまう）。各プローブは自分のソースを読んで
+「余計な crate に手を伸ばしていない」ことだけを機械的に見張っている。
+本物の検査は PR-D（`kaikei-mcp` 新設）で行う（§4「Phase 3 で新設が必要なもの」）。
+
+### `message` に載せるのは `public_message()`（`Display` ではない）
+
+§9 は「接続文字列・認証情報を含みうる下位層のエラー本文をそのまま転記しない」と
+定めている。一方この節は当初「`message` は `Display` を写像したもの」と書いていた。
+**この2つは両立しない。** `kaikei-store` の `sqlstate::map_sqlstate` は
+`reason: format!("...: {message}")` として **DB が返した文字列をそのまま
+`RepoError` に埋めている**（`crates/kaikei-store/src/sqlstate.rs`）。
+
+→ PR-B（2巡目）で `kaikei-app` に**外向きの本文を返す入口**を足した。
+
+| 入口 | 宛先 | 内容 |
+|---|---|---|
+| `Display`（`to_string()`） | **サーバのログ**（stderr。§4 の「stdout は JSON-RPC 専用」に注意） | 下位層の生メッセージを含む |
+| **`AppError::public_message()`** | 応答の `message`、`audit_log.output` | 生メッセージを含まない |
+
+- ドメインのエラー（`Unbalanced` / `UnknownAccount` / `EmptyReverseReason` /
+  `AlreadyReversed` …）は `public_message()` も `Display` と同じ値を返す。
+  文言はこのリポジトリが書いており、**言い換えない**（`CLAUDE.md` §10）。
+- `RepoError::NotFound` / `Unsupported` も `Display` のまま
+  （`NotFound` の `reason` は app 層が組み立て、**仕訳IDの UUID 正準表記**を含む。
+  ここを潰すと MC-14 の要件が応答から消える）。
+- `RepoError::AppendOnlyViolation` / `Conflict` / `OutOfRange` / `Corrupt` /
+  `Backend` は**正規化**する（分類コード + 汎用の日本語メッセージ）。
+  正規化後も「次の手」は残す（append-only なら「訂正は逆仕訳で」、
+  `Backend` なら「入力の問題ではない」ことを明示して再試行・管理者連絡へ誘導）。
+
+`error_code` には引き続き `code()` の値だけを入れる（§9）。
 
 ### post_journal_entry
 
@@ -200,18 +271,41 @@ DB 所有者権限での手動操作以外に手段は無い。
 - **`document_ids` は無い。** 証憑の紐付けは Phase 4 の `attach_document` で行う。
   post 時には指定できず、`PgTx::insert_entry` が `document_refs` 非空を
   `RepoError::Unsupported` で拒否する（D-041）。
-- `tags` の**値の型付けは未確定**。`TagSet` の値は型付き（`TagValue::Code/Text/Decimal/Date`）
-  だが、平文文字列から `TagValue` を作るにはキーごとの `value_type` が要り、
-  `TagSchema` の `defs` は private で、公開 API は `new` / `empty` / `validate` /
-  `is_aggregatable` の4つ。**既存の `TagSchema` からキーの `value_type` を引き戻す
-  手段が無い**（`new` は組み立て用で、逆引きには使えない）。
-  PR-B で次のいずれかに決める:
-  (a) `kaikei-jp::tags::load_*` が `TagSchema` と併せて `Vec<(TagKey, TagDef)>` を返す
-  （`kaikei-core` を変更せずに済む最小案）、
-  (b) `kaikei-core` に `TagSchema::value_type(&TagKey) -> Option<TagValueType>` を追加する
-  （**core の変更は人間の承認が必要**。`CLAUDE.md` §1）、
-  (c) D-035 の `{"t":..,"v":..}` 形式を線上形式にも使う（AI には冗長）。
-  決めたうえで `business_ratio`（Decimal）や日付型タグの文字列表現もこの節に明記する。
+- `tags` の**値の型付けは PR-B 3巡目で確定**した。線上は上の例のとおり
+  **平文の文字列マップ**（キーも値も文字列）で、型はスキーマ側が持つ。
+  当初挙げた3案のうち **(a)** を採った——`kaikei-jp` のローダが `TagSchema` と
+  併せてキーごとの `TagDef` を保持する
+  （`kaikei_jp::tags::TagCatalog`。`kaikei-core` は無変更。**(b)** は core の
+  変更で人間の承認が要り、**(c)** の `{"t":..,"v":..}` は AI に冗長）。
+
+  | 入口 | 用途 |
+  |---|---|
+  | `TagCatalog::parse_tag_set(iter)` | 線上の `tags`（文字列 → 文字列）→ `kaikei_core::TagSet` |
+  | `TagCatalog::parse_value(key, text)` | 1件分（キーの妥当性検証を含む） |
+  | `tags::tag_value_to_string(&TagValue)` | 応答に載せる逆向き |
+  | `TagCatalog::schema()` | `kaikei-app` / `kaikei-core` に渡す `&TagSchema` |
+
+  合成ルートは `kaikei_jp::compose::compose` が返す `Composition::tag_catalog`
+  を保持する（§4。`TagSchema` は `tag_catalog.schema()` で取る）。
+
+  値の文字列表現は **D-035 の JSONB 表現の `"v"` と同じ規約**にしてある
+  （線上とDBで別の書き方を発明しない）:
+
+  | `value_type` | 線上の文字列 | 例 |
+  |---|---|---|
+  | `Code` | そのまま | `"tax_category": "SALES_10"` |
+  | `Text` | そのまま | `"invoice_reg_no": "T1234567890123"` |
+  | `Decimal` | 小数の文字列（number にしない。D-013） | `"business_ratio": "0.30"` |
+  | `Date` | ISO 8601（`YYYY-MM-DD`） | `"delivered_on": "2026-04-15"` |
+
+  **未登録キー・型不一致・空値・入力内の重複キーはエラー**にする
+  （`CLAUDE.md` §4「`TagSet` はゴミ箱ではない」。黙って落とさない）。
+  エラーは有効なキー一覧や期待する書式を含む（同 §11）:
+  `unregistered_tag_key` 相当（`JpError::UnregisteredTagKey`）/
+  `JpError::InvalidTagValue` / `JpError::DuplicateTagKeyInInput`。
+  経路 (c) と同じく `JpError` なので、MCP 層の対応表に分類コードを足すこと
+  （D-072 のトレードオフの項）。
+  `Decimal` は丸めずに解釈する（表現できない桁数は受け付けない）。
 
 `auto_tax_lines: true` なら `TaxPolicy::derive_tax_lines` を通す。
 上記の例で仮受消費税 10,000 が自動追加されて貸借が一致するのは
@@ -237,26 +331,31 @@ DB 所有者権限での手動操作以外に手段は無い。
 }
 ```
 
-- `entry_id` は **UUID の正準表記**（ハイフン付き36文字。生成は UUID v7）。
-
-  **未解決（PR-B で直す）**: `reverse_journal_entry` の NotFound だけはこの契約を破る。
-  `kaikei-app` が `format!("仕訳が見つかりません（仕訳ID: {}）", input.original_id.as_u128())`
-  と組み立てており（`crates/kaikei-app/src/usecase/reverse_entry.rs`）、AI が送った UUID 文字列と
-  突き合わせられない39桁の10進数が返る。**app 層のエラーをそのまま写像するだけでは
-  MC-14 を満たせない。**
-  `EntryId` の内部表現は `u128` だが、`as_u128()` の10進表記では返さない。
+- `entry_id` は **UUID の正準表記**（ハイフン付き36文字・小文字。生成は UUID v7）。
   `reverse_journal_entry` の `original_id` も同じ表記。
+
+  **PR-B で解決済み。** `reverse_journal_entry` の NotFound は
+  `input.original_id.as_u128()`（39桁になりうる10進数）を組み立てていたが、
+  `kaikei_app::id::entry_id_to_uuid_string` を経由する形に直した
+  （`kaikei-core` は変更していない。`kaikei-app` が既に `uuid` に依存しており、
+  `entry_id_to_uuid` で `Uuid` に変換できるため）。
+  仕訳IDを人間・AI に見せる箇所は**必ずこの関数を通す**こと
+  （表記を各所で再発明しない）。回帰テストは
+  `reverse_entry_not_found_reports_the_id_in_canonical_uuid_form`。
 - `entry_no` / `fiscal_year` は JSON number（金額ではないため文字列にしない。§5）。
 - `policy_notes` は `kaikei_policy::PolicyNote`（`severity`: `info` / `warning`、`message`）。
   非適格の経過措置や簡易課税のように**税額計算に反映されず注記にしか現れない情報**の
   唯一の伝達経路であり、落とすと AI も監査ログも「控除割合の制限があった」ことを
   知る手段が無くなる（D-059 / D-070）。文言は `kaikei-policy` が組み立てたものを
   そのまま素通しする（税務判断を断定する言い換えをしない。`CLAUDE.md` §10）。
-- **PR-B の契約拡張**: 現在の `post_entry::execute` は
-  `tax.derive_tax_lines(...)?.lines` として `notes` を捨てており、戻り値も
-  `JournalEntry` 単体なので `policy_notes` を返せない。
-  `PostEntryOutput { entry, notes }` のような戻り値への拡張が Phase 3 のスコープに入る
-  （Phase 2 の申し送り「`PolicyNote` が永続化されない」への回答）。
+- **PR-B で実装済み**: `post_entry::execute` の戻り値は
+  `PostEntryOutput { entry: JournalEntry, notes: Vec<PolicyNote> }` になった
+  （Phase 2 の申し送り「`PolicyNote` が永続化されない」への回答。D-073）。
+  MCP 層は `output.notes` をそのまま `policy_notes` に詰め、`audit_log.output`
+  にも同じものを載せる。
+  **`policy_notes` が空配列でも「注記が無い」とは限らない。**
+  `auto_tax_lines: false` のときは `derive_tax_lines` 自体を呼ばないため常に空になる
+  （`validate_tag` は注記を返さない）。リクエストの `auto_tax_lines` と併せて読むこと。
 
 **確定後の明細を必ず返す。** AI が「何が記録されたか」を確認できるようにする。
 
@@ -267,34 +366,58 @@ JSON-RPC のエラー応答は使わない。D-071）：
 {
   "error": "unbalanced",
   "message": "貸借不一致: 借方 110,000 / 貸方 100,000（差額 10,000）",
-  "debit_total": "110,000",
-  "credit_total": "100,000",
-  "difference": "10,000"
+  "debit_total": "110000",
+  "credit_total": "100000",
+  "difference": "10000",
+  "policy_notes": [
+    { "severity": "info", "message": "税込経理の設定のため税額行を生成していません" }
+  ]
 }
 ```
 
-- `error` はエラーコード（§6 の対応表）。`message` は `CoreError` / `AppError` の
-  `Display` を写像したもの。
+- `error` はエラーコード（§6 の対応表）。`message` は
+  **`AppError::public_message()`**（上記「`message` に載せるのは
+  `public_message()`」を参照。`Display` をそのまま載せない）。
 - **現在の実装が返せるのはここまで。** `CoreError::Unbalanced` が持つのは
   `debit` / `credit` / `diff` の3つの表示用文字列だけで、
   「`tax_category` が `SALES_10` の明細に対する税額行がありません」のような
   税区分に踏み込んだ文言を組み立てる経路は存在しない。
   生成経路の無い文言を確定仕様として書かないこと。
-- 金額欄が3桁区切り付き（`"110,000"`）なのは `Money::to_display_string()` の出力を
-  そのまま載せているため。区切り無しに揃えるかどうかは §5 の未確定事項。
+- 金額欄は**区切り無し**（`"110000"`）。`CoreError::Unbalanced` が持つのは
+  `Money::to_display_string()` 由来の区切り付き文字列（`"110,000"`）なので、
+  `kaikei_app::amount::strip_thousands_separators` を通す（§5）。
+  区切り付きの表記が残るのは `message` の**文中**だけである。
+- **`policy_notes` は失敗時にも出す（PR-B 2巡目）。**
+  `post_entry::execute` / `preview` の失敗値は
+  `PostEntryFailure { error, notes }` で、`notes` は失敗経路でも運ばれる。
+  注記が最も要るのは失敗したときである——上の例の
+  「税込経理の設定のため税額行を生成していません」が無いと、AI は
+  「貸借不一致」だけを見て**金額を書き換える**という誤った修正に進む
+  （§1③ が空文になる）。
+  成功時と同じく、`auto_tax_lines: false` なら常に空になるので、
+  空配列は「注記が無い」を意味しない。
 
-`hint`（修正案）は **PR-B で足す**。AI の自己修正を一段速くする効果は大きいが、
+`hint`（修正案）を応答に載せるのは **`kaikei-mcp` を新設する PR**
+（`hint` はツール応答のフィールドであり、組み立て先の crate が要る）。
+**前工事（dry-run ユースケース）は PR-B 2巡目で完了している。**
+
+AI の自己修正を一段速くする効果は大きいが、
 「税区分 → 税額科目」の対応を知るのは `kaikei-jp` の `TaxCategoryTable` だけで、
 `TaxPolicy` trait には引く API が無く（`validate_tag` / `derive_tax_lines` /
 `round_mode` / `apply_ratio` の4つのみ）、MCP 層でこの推論を書くのは
 「MCP はユースケースを呼ぶ薄い層」（§4）と `CLAUDE.md` §1 に反する。
-実現可能な形は次のとおり:
+実現形は次のとおり:
 
-- `auto_tax_lines: false` で貸借不一致になった場合に限り、`kaikei-app` に新設する
-  **dry-run ユースケース**（入力明細に `derive_tax_lines` を1回かけ、貸借が一致するなら
-  生成された行を返す。既存の policy API だけで書ける）の結果を
-  `hint.suggested_lines` に載せる。
-- それ以外の場合は `hint` を返さない。
+- `auto_tax_lines: false` で貸借不一致になった場合に限り、同じ明細を
+  `auto_tax_lines: true` にして
+  **`kaikei_app::usecase::post_entry::preview`**（dry-run）を呼ぶ。
+  `Ok` なら `PreviewEntryOutput::lines` を `hint.suggested_lines` に載せる。
+  `Err` なら `hint` を返さない（税額行を足しても解決しないため）。
+  `preview` は **`insert_entry` も採番も行わない**が、`execute` と
+  **同じ関数**（`prepare` / `build_entry`）を通るので検証の順序が乖離しない。
+  **MCP 層で `with_tx` を開いて `load_posting_context` を呼び `TaxContext` を
+  自前で組み立てるコードを書かないこと**（§4 違反。1巡目の消費側が
+  実際にそう書けてしまい、コンパイルもテストも通った）。
 - 存在しない科目コードに対する `hint`（候補の科目）は MCP 層が `ChartOfAccounts` から
   組み立てる。`CoreError::UnknownAccount` のメッセージは
   「勘定科目が見つかりません: {code}」だけであり、**core に候補一覧を持たせない**
@@ -312,15 +435,25 @@ JSON-RPC のエラー応答は使わない。D-071）：
 }
 ```
 
-- `reason` は必須。**空文字・空白のみは MCP 層で拒否する。**
-  下位層はいずれも空文字を通す:
+- `reason` は必須。**空文字・空白のみは `kaikei-app` のユースケース層が拒否する**
+  （PR-B。`reverse_entry::execute` が I/O より前に `AppError::EmptyReverseReason` を返す。
+  エラーコードは `empty_reverse_reason`）。**MCP 層に検証を重ねて書かない。**
+  MCP 以外の呼び出し元（将来の CLI / `kaikei-api`）にも同じ規律が効く位置に置いた
+  （D-074）。
+  ユースケース層より下は依然として空文字を通す:
   `JournalEntry::reverse` は `reverse_reason = Some(reason)` と代入するだけ、
-  `ReverseEntryInput.reason` は素の `String` でユースケースも検証しない、
   DB の `CHECK ((reverses IS NULL) = (reverse_reason IS NULL))` は NULL の一致しか見ない
   （摘要には `CHECK (btrim(description) <> '')` があるのに `reverse_reason` には無い、
   という非対称が実在する）。
+  判定は `str::trim` の結果で行うため、全角スペース（U+3000）のみの理由も拒否される。
+  **受理した理由は加工せず、入力のまま保存する**（前後の空白をトリムして保存しない。
+  帳簿に残る文言を断りなく書き換えない）。
 - `allow_double_reversal` の既定は `false`。既に赤伝済みの仕訳を再訂正しようとすると
-  `AppError::AlreadyReversed { entry_no, reversal_no }` になる。
+  `AppError::AlreadyReversed { entry_no, reversal_no, reversal_id }` になる。
+  **`reversal_id`（既存赤伝の仕訳ID）を PR-B 2巡目で追加した。**
+  呼び出し元が仕訳を指すのは UUID であって通し番号ではなく、番号だけ返しても
+  AI はその赤伝を `get_entry` で開けない（`JournalRepo` に番号から引く経路が無い）。
+  応答では `entry_id_to_uuid_string` を通した UUID 正準表記で返すこと。
 - **会計年度は `reverse_date` で決まる**（元仕訳が別年度でも、逆仕訳は
   `reverse_date` の年度で採番される）。
 - 摘要は `「【訂正】{元の摘要}」` に固定され、`document_refs` は複製されない。
@@ -338,14 +471,102 @@ JSON-RPC のエラー応答は使わない。D-071）：
 }
 ```
 
+- **`policy_notes` は返さない（キーごと出さない）。** `reverse_entry::execute` は
+  `TaxPolicy` を引数に取らず（明細は貸借を反転して複製するだけで、税額行を
+  再導出すると二重計上になる）、注記の発生経路が存在しない。
+  戻り値の型も `ReverseEntryOutput { entry }` で `notes` を持たない（D-073）。
+  ここに `"policy_notes": []` を置くと「policy を通したが注記が無かった」と
+  区別できず、AI を誤った方向へ導く（`PROGRESS.md` Phase 1 の教訓3）。
+
 失敗時（二重訂正。ツール結果エラー）：
 
 ```json
 {
   "error": "already_reversed",
-  "message": "仕訳 42 は既に取消（逆仕訳 43）済みです。二重取消を許可する場合は allow_double_reversal を指定してください"
+  "message": "仕訳 42 は既に取消（逆仕訳 43、仕訳ID 0192b1c4-xxxx-7xxx-xxxx-xxxxxxxxxxxx）済みです。その赤伝の内容は仕訳ID 0192b1c4-xxxx-7xxx-xxxx-xxxxxxxxxxxx で確認できます。それでも二重取消が必要な場合は allow_double_reversal を指定してください",
+  "reversal_id": "0192b1c4-xxxx-7xxx-xxxx-xxxxxxxxxxxx",
+  "reversal_no": 43
 }
 ```
+
+### get_trial_balance
+
+```json
+{
+  "from": "2026-01-01",
+  "to": "2026-12-31",
+  "group_by": ["counterparty"]
+}
+```
+
+- `from` / `to` は **取引日**（`AccountingDate`）で**両端を含む**。どちらも必須。
+  `from > to` は空の試算表ではなく**エラー**（`error` は `rejected`）。
+  「0件の空の試算表」として静かに成功させない（§2 / MC-15）。
+- `group_by` は省略可（既定は空 ＝ 科目のみで集計）。
+  `aggregatable: true` のタグキーだけを受け付ける。それ以外・未登録のキーは
+  `not_aggregatable`（**SQL に到達する前に** `kaikei-app` が弾く。`CLAUDE.md` §4）。
+  重複したキーは `kaikei-app` が出現順を保ったまま除去する。
+
+成功時：
+
+```json
+{
+  "from": "2026-01-01",
+  "to": "2026-12-31",
+  "currency": "JPY",
+  "debit_total": "1100",
+  "credit_total": "1100",
+  "rows": [
+    {
+      "account": "100",
+      "account_type": "asset",
+      "group": { "counterparty": "CP0001" },
+      "debit_total": "1100",
+      "credit_total": "0",
+      "balance": "1100"
+    },
+    {
+      "account": "500",
+      "account_type": "revenue",
+      "group": { "counterparty": "CP0001" },
+      "debit_total": "0",
+      "credit_total": "1000",
+      "balance": "1000"
+    },
+    {
+      "account": "330",
+      "account_type": "liability",
+      "group": { "counterparty": "CP0001" },
+      "debit_total": "0",
+      "credit_total": "100",
+      "balance": "100"
+    }
+  ]
+}
+```
+
+写像元は `kaikei_app::view::TrialBalanceView`（`usecase::report::execute` の戻り値）。
+
+- `rows[]` は `BalanceRowView`。`account` は `AccountCode`、`account_type` は
+  **`kaikei_app::wire::account_type_code`**（`asset` / `liability` / `equity` /
+  `revenue` / `expense`）。`label_ja()` の「資産」等は**分岐に使わせない**ので
+  ここには出さない（人間向けに併記したければ別フィールドにする）。
+- `group` は `group_by` を指定したときだけ中身が入る（指定しなければ `{}`）。
+  キーはタグキー、値はタグ値の文字列。
+- 金額はすべて**区切り無しの文字列**（`money_to_plain_string`）。
+  `balance` は `account_type.is_debit_normal()` に従った符号付き残高で、
+  **負にもなりうる**（`"-1100"`）。
+- `debit_total` / `credit_total`（トップレベル）は `TrialBalanceView::totals()`。
+  `kaikei-app` が検算済みで、一致しない場合は成功応答ではなく
+  `inconsistent` のエラーになる（データ破損・実装バグの兆候）。
+- **`currency` は 0 行でも必ず入る（PR-B 2巡目）。** `TrialBalanceView` は
+  帳簿通貨（`BookSettings::book_currency`）を明示的に保持しており、
+  `TrialBalanceView::currency()` から取れる。行から推論していないので、
+  仕訳が1件も無い期間でも通貨を名乗れ、`debit_total` / `credit_total` は
+  `"0"` になる（`totals()` は `Option` を返さない）。
+  行の通貨が帳簿通貨と食い違えば `currency_mismatch` のエラーになる（D-042）。
+- **0件は成功。** 該当する仕訳が無い期間は `rows: []` を返し、エラーにしない
+  （エラーにするのは `from > to` の入力ミスだけ）。
 
 ---
 
@@ -400,9 +621,9 @@ JSON-RPC のエラー応答は使わない。D-071）：
 
 | 経路 | 対象ツール | 呼び方 |
 |---|---|---|
-| (a) 書き込み | `post_journal_entry` / `reverse_journal_entry` | `usecase::post_entry::execute` / `reverse_entry::execute` を `tx::with_tx` で包んで呼ぶ |
-| (b) 読み取り（read model 直行） | `get_trial_balance` / `search_entries` / `get_ledger` / `get_entry` | `Tx` を通さず read model クエリを呼ぶ（`usecase::report::execute` は `ports::TrialBalanceQuery` を受け取る。`CLAUDE.md` §6「Repository を通さず SQL から DTO へ直行」） |
-| (c) 税制の問い合わせ | `list_tax_categories` / `get_settings` / `suggest_tax_category` / `validate_invoice_number` | `kaikei-app` を経由せず、合成ルートが保持する `kaikei-jp` の値（`TaxRuleSets::for_date` / `JpSettings` / `InvoiceRegistrationNo::parse`）から直接組み立てる |
+| (a) 書き込み | `post_journal_entry` / `reverse_journal_entry` | `usecase::post_entry::execute` / `reverse_entry::execute` を `tx::with_tx` で包んで呼ぶ。**`post_entry::execute` / `preview` は失敗値が `PostEntryFailure`（`error` + `notes`）なので `tx::with_tx_err` を使う**（`with_tx` は `AppError` 固定。両者は同じ実装を通る） |
+| (b) 読み取り（read model 直行） | `get_trial_balance` / `search_entries` / `get_ledger` / `get_entry` | `Tx` を通さず read model クエリを呼ぶ（`usecase::report::execute` は `ports::TrialBalanceQuery` と `context::BookSettings` を受け取る。`CLAUDE.md` §6「Repository を通さず SQL から DTO へ直行」） |
+| (c) 税制の問い合わせ | `list_tax_categories` / `get_settings` / `suggest_tax_category` / `validate_invoice_number` | `kaikei-app` を経由せず、合成ルートが保持する `kaikei-jp` の値（`TaxRuleSets::require_for_date`（該当なしをエラーにする入口。`for_date` は `Option` のまま） / `JpSettings` / `InvoiceRegistrationNo::parse`）から直接組み立てる |
 
 `list_accounts` は DB の `accounts`（`ChartRepo::load_chart`）を読む。
 
@@ -414,8 +635,38 @@ JSON-RPC のエラー応答は使わない。D-071）：
   `.sqlx` オフラインキャッシュの再生成が要る
   （`.github/workflows/database.yml` の `cargo sqlx prepare --workspace --check`）。
 - `kaikei-app` の**勘定科目マスタ投入ユースケース**（D-070）。
-- **audit_log 書き込みポート**（§9）。
-- `post_entry::execute` の戻り値拡張（`PolicyNote` を返す。§3）。
+- **audit_log 書き込みポート**（§9）。分類コード（`audit_log_unavailable`）だけは
+  PR-B 2巡目で語彙に入れてある。
+- ~~`post_entry::execute` の戻り値拡張（`PolicyNote` を返す。§3）~~
+  → **PR-B で完了**（`PostEntryOutput { entry, notes }` /
+  `ReverseEntryOutput { entry }`）。失敗経路の `PolicyNote`
+  （`PostEntryFailure { error, notes }`）は **PR-B 2巡目で完了**。
+- ~~`hint` 用の dry-run ユースケース（§3）~~
+  → **PR-B 2巡目で完了**（`usecase::post_entry::preview`）。
+- ~~線上表現（金額の文字列・列挙型の機械可読名・仕訳IDの入力側）~~
+  → **PR-B 2巡目で完了**（`kaikei_app::{amount, wire, id}` と
+  `kaikei_jp::tax` の `as_code` / `from_code`。§3 の表）。
+- ~~線上の `tags` → `TagSet` の変換、税区分マスタの列挙~~
+  → **PR-B 3巡目で完了**（`kaikei_jp::tags::TagCatalog` と
+  `kaikei_jp::tax::TaxRuleSets::{iter, available_ranges_display, require_for_date}`）。
+- **【PR-D への申し送り】`kaikei-mcp` の依存が最小限であることを CI で検査する。**
+  §3 の表と2本のプローブ（`crates/{kaikei-app,kaikei-jp}/tests/contract_from_downstream.rs`）は
+  「線上表現を MCP 層で再発明しない」ことを狙っているが、**プローブでは
+  下流の依存が増えないことを検査できない**（統合テストにはその crate の
+  dev-dependencies までリンクされるため、`uuid` / `rust_decimal` を直接
+  使っても通ってしまう。実測済み）。`kaikei-mcp` が実在してはじめて、
+  その `Cargo.toml`（`kaikei-app` / `kaikei-jp` / `kaikei-core` / MCP SDK /
+  非同期ランタイム / シリアライズ以外を足していないこと）を
+  `.github/workflows/architecture.yml` の依存方向チェックと同型の
+  ステップで機械的に検査できる。**新しいジョブを足したら必須チェックへの
+  登録も同じ PR で行うこと**（`CLAUDE.md` §13）。
+
+**`kaikei-mcp` が新しく書かなくてよいもの**（§3 の表を再掲）: エラーコードの
+対応表、金額の文字列化、`side` / `account_type` / `severity` /
+`fiscal_year_rule` / `tax_mode` / `rounding` / `rounding_unit` の文字列、
+仕訳IDのパースと表示、貸借の検算、dry-run の手順、
+線上の `tags` と `TagSet` の相互変換、税区分マスタの有効期間の文言。
+これらを MCP 層に書いたら、それは「薄い層」ではない。
 
 ### ディレクトリ構成
 
@@ -518,38 +769,57 @@ Phase 3 で却下した。D-013 の訂正注記を参照）。
 
 `Money::parse(s, currency)` は `Currency` を**必須の引数**として要求し、
 `Currency::new(code, minor_unit)` は小数桁数まで必須である。
-つまり `{"amount": "110000"}` だけでは `Money` を構築できない。推奨形:
+つまり `{"amount": "110000"}` だけでは `Money` を構築できない。確定した形:
 
-1. **帳簿通貨（コード＋小数桁）を事業者設定の必須項目にする**（§7 と同じ扱い。
-   既定で JPY にフォールバックしない）。
+1. **帳簿通貨（コード＋小数桁）は `kaikei_app::context::BookSettings::book_currency`
+   が保持する。** `Option` ではない必須フィールドで、`Default` も実装しない
+   （既定で JPY にフォールバックしない。§7 と同じ扱い。D-074）。
+   `JpSettings` 側には持たせない（帳簿通貨は日本の税制固有の設定ではなく、
+   `kaikei-jp` を差し替えても必要になる帳簿全体の設定であるため）。
 2. 明細で `currency` を省略した場合は帳簿通貨を使う。
 3. 明示された場合は `kaikei_app::currency::currency_from_code` で解決する。
    **未知のコードは桁数を推測せずエラー**（推測すると金額が100倍ズレて記帳される。
-   `CLAUDE.md` §8）。
+   `CLAUDE.md` §8）。現在このホワイトリストにあるのは `JPY` / `USD` の2つだけで、
+   それ以外の通貨で帳簿を付けるには先にこの関数へ追加する必要がある。
+   **`Currency::new(code, 0)` を書いて迂回しないこと。**
 4. 1仕訳内で通貨が混在すると `JournalEntry::new` が `CurrencyMismatch` を返す。
    この制約をツールの説明文に書く。
 5. 小数桁は通貨ごとに検証される（JPY に `"1000.5"` を渡すとエラー、USD は2桁まで）。
 
-現状「帳簿通貨」を保持する場所はどこにも無い（`BookSettings` は `fiscal_year_rule`
-のみ、`JpSettings` にも通貨フィールドは無い）。この追加も PR-B の作業項目。
+`book_currency` は**既定の通貨**であって「唯一許される通貨」ではない
+（外貨建ての明細を将来受け付ける余地を型で塞がない）。
 
-### 出力の文字列形式（PR-B で確定）
+### 出力の文字列形式（PR-B 2巡目で確定）
 
 `kaikei-core` が持つ唯一の文字列化は `Money::to_display_string()` で、
 これは**3桁区切りカンマ付き**（`"110,000"`、USD なら `"1,234.56"`）を返す。
 区切り無しの文字列化 API は core に無い（`minor()` は最小通貨単位の整数であり、
 `minor_unit > 0` の通貨では金額そのものではない）。
 
-推奨は次の分離:
+**確定した分離:**
 
-- 機械可読フィールド（`amount` / `debit_total` 等）は**区切り無し**
-  （`"110000"` / USD は `"1234.56"`）に固定する。
-- 区切り付きの表記は `message` の文中でのみ使う（`Money::to_display_string()`）。
+- 機械可読フィールド（`amount` / `debit_total` / `balance` 等）は**区切り無し**
+  （`"110000"` / USD は `"1234.56"`）。
+- 区切り付きの表記は `message` の**文中**でのみ使う（`Money::to_display_string()`）。
 
-区切り無しを採る場合、整形手段が要る。`kaikei-core` に `to_plain_string()` を足す
-（**core の変更は人間の承認が必要**）か、`kaikei-mcp/src/amount.rs` の DTO 変換に
-閉じるかを PR-B で決める。`amount.rs` には `Money::parse` とのラウンドトリップテストを
-置くこと（`Money::parse` は正しい3桁区切り付きも受理するので、入力側の互換は保たれる）。
+整形手段は **`kaikei_app::amount`** に置いた。**`kaikei-core` は変更していない**
+（`Money::minor()` と `Currency::minor_unit()` はどちらも公開されており、
+この2つから組み立てられる）。
+
+| 関数 | 用途 |
+|---|---|
+| `money_to_plain_string(&Money) -> String` | `Money` → 区切り無し（`"110000"` / `"1234.56"` / `"-0.05"`） |
+| `strip_thousands_separators(&str) -> String` | 整形済み文字列から区切りだけを除く（`"110,000"` → `"110000"`） |
+
+後者が要るのは、`CoreError::Unbalanced` / `AppError::Inconsistent` が持つのが
+`Money` ではなく**整形済みの `String`** だからである。区切りは `,`、小数点は `.` と
+決まっているので、通貨の小数桁数を知る必要はない。
+
+`kaikei-mcp` 側に `amount.rs` を作らないこと（同じ整形が2箇所に育つ。
+`kaikei-api` も同じ形式を返す必要があり、presentation 層ごとに持つと必ずずれる）。
+`Money::parse` とのラウンドトリップは `crates/kaikei-app/src/amount.rs` の
+テストが JPY / USD の正負・ゼロ・`i64` 境界で検証済み
+（`Money::parse` は正しい3桁区切り付きも受理するので、入力側の互換は保たれる）。
 
 ### 桁の上限
 
@@ -575,27 +845,159 @@ JSON-RPC のプロトコルエラー（rmcp では `Err(ErrorData)`）は使わ�
 
 ### コードの写像
 
-`AppError` → `error` コードの対応表を1箇所に持つ。写像元は次の3つ:
+**対応表は PR-B で確定し、`crates/kaikei-app/src/error.rs` に1箇所だけ持つ**
+（`codes` モジュールの定数と、それを引く4つの入口。D-072）。
+**MCP 層はこの表を再実装しない。** `err.code()` を呼ぶだけにする。
 
-- `AppError`（`Repo` / `Policy` / `Core` / `AlreadyReversed` / `Inconsistent` / `Rejected`）
-- `CoreError`（15 バリアント）
-- `PolicyError`（8 バリアント）
-
-`AppError` は `#[non_exhaustive]` なので、**網羅 `match` ではなく `_ =>` の受け皿を
-必ず持つ**。受け皿の既定コードを決めておかないと、実装者が場当たりのコードを発明する。
-
-| 例 | コード |
+| 写像元 | 入口 |
 |---|---|
-| `CoreError::Unbalanced` | `unbalanced` |
-| `CoreError::UnknownAccount` | `unknown_account` |
-| `CoreError::NotPostable` | `not_postable` |
-| `CoreError::NotAggregatable` | `not_aggregatable` |
-| `AppError::AlreadyReversed` | `already_reversed` |
-| `RepoError::AppendOnlyViolation` | `append_only_violation` |
-| 上記以外・未知バリアント | `internal` |
+| `AppError` | `AppError::code()` |
+| `RepoError` | `RepoError::code()` |
+| `CoreError`（15 バリアント） | `kaikei_app::error::core_error_code()` |
+| `PolicyError`（8 バリアント） | `kaikei_app::error::policy_error_code()` |
 
-**対応表の確定は PR-B。** 上の表は書き方の例であり、全バリアントを埋めた版を
-PR-B でこの節に置く。
+`CoreError` / `PolicyError` が自由関数なのは、定義元の crate が凍結層で
+`impl` を生やせないため（`CLAUDE.md` §1）。
+
+#### 規約
+
+- コードは **snake_case の安定した識別子**であり、**メッセージ（日本語の
+  `Display`）とは別物**。文言を改善してもコードは変わらない。逆にコードの
+  変更は、応答・`audit_log.error_code`・それを読む AI の分岐を同時に壊す
+  破壊的変更である。意味が変わったらコードを付け替えず**新しいコードを足す**。
+- 層ごとの接頭辞は付けない（`RepoError::AppendOnlyViolation` は
+  `append_only_violation`）。例外は**異なる層に同名のバリアントが実在する場合**
+  だけで、現状は `Unsupported` の1件のみ。
+- `AppError::Repo` / `Policy` / `Core` は**中身へ委譲**する
+  （`AppError::Core(CoreError::Unbalanced)` は `unbalanced`）。
+  AI が知りたいのは「何が起きたか」であって「どの層を経由したか」ではない。
+
+#### `#[non_exhaustive]` の実測結果と受け皿
+
+| 型 | `#[non_exhaustive]` | `kaikei-app` 内の `match` | 下流の `match` |
+|---|---|---|---|
+| `AppError` | **付いている** | 網羅（受け皿を置かない） | `_` の腕が**必須**。既定は `"internal"` |
+| `RepoError` | 付いていない | 網羅 | 網羅できる |
+| `CoreError` | 付いていない | 網羅 | 網羅できる |
+| `PolicyError` | 付いていない（意図的。`kaikei-policy/src/error.rs` の doc） | 網羅 | 網羅できる |
+
+**`AppError::code()` にワイルドカードの腕を置かない（PR-B 2巡目で変更）。**
+1巡目は `_ => "internal"` + `#[allow(unreachable_patterns)]` を置いていたが、
+その腕があるとバリアント追加時に `code()` のコンパイルが壊れず、
+新しいバリアントが黙って `"internal"` になる。それを別のテスト関数
+（重複した網羅 `match`）で見張るのは、**同じ一覧を2つ手で維持する**ことであり
+`PROGRESS.md` Phase 1 の教訓6「手で維持する一覧は必ず腐る。構造で閉じる」に反する。
+
+受け皿を消すと `#[allow(unreachable_patterns)]` も不要になる
+（この lint は受け皿の腕自身が作り出していた問題だった。
+`cargo clippy -p kaikei-app --all-targets -- -D warnings` が警告0で通ることを実測済み）。
+
+`#[non_exhaustive]` は crate の**外**にしか効かないので、この変更は下流の
+網羅性要件を何も変えない。下流の `match` には引き続き `_` の腕が必須で、
+そこで使う既定値が `codes::INTERNAL` である
+（`crates/kaikei-app/tests/contract_from_downstream.rs` が
+外部 crate として実際に踏んでいる）。
+
+#### 対応表（全バリアント）
+
+**`CoreError`（15）**
+
+| バリアント | コード |
+|---|---|
+| `Unbalanced` | `unbalanced` |
+| `TooFewLines` | `too_few_lines` |
+| `UnknownAccount` | `unknown_account` |
+| `NotPostable` | `not_postable` |
+| `CurrencyMismatch` | `currency_mismatch` |
+| `InvalidAmount` | `invalid_amount` |
+| `UnknownTagKey` | `unknown_tag_key` |
+| `TagTypeMismatch` | `tag_type_mismatch` |
+| `MissingRequiredTag` | `missing_required_tag` |
+| `DateOutOfFiscalYear` | `date_out_of_fiscal_year` |
+| `PeriodClosed` | `period_closed` |
+| `EmptyDescription` | `empty_description` |
+| `InvalidChart` | `invalid_chart` |
+| `NotAggregatable` | `not_aggregatable` |
+| `InvalidValue` | `invalid_value` |
+
+**`PolicyError`（8）**
+
+| バリアント | コード |
+|---|---|
+| `Core(CoreError)` | 中身の `CoreError` へ委譲 |
+| `NoApplicableRuleSet` | `no_applicable_rule_set` |
+| `UnknownTaxCategory` | `unknown_tax_category` |
+| `TaxCategoryNotApplicable` | `tax_category_not_applicable` |
+| `UnknownCounterparty` | `unknown_counterparty` |
+| `QualifiedInvoiceUnverified` | `qualified_invoice_unverified` |
+| `InvalidPolicyData` | `invalid_policy_data` |
+| `Unsupported` | `policy_unsupported` |
+
+**`RepoError`（7）**
+
+| バリアント | コード |
+|---|---|
+| `NotFound` | `not_found` |
+| `AppendOnlyViolation` | `append_only_violation` |
+| `Conflict` | `conflict` |
+| `Corrupt` | `corrupt` |
+| `OutOfRange` | `out_of_range` |
+| `Unsupported` | `repo_unsupported` |
+| `Backend` | `backend` |
+
+**`AppError`（8）**
+
+| バリアント | コード |
+|---|---|
+| `Repo(RepoError)` | 中身の `RepoError` へ委譲 |
+| `Policy(PolicyError)` | 中身の `PolicyError` へ委譲 |
+| `Core(CoreError)` | 中身の `CoreError` へ委譲 |
+| `AlreadyReversed` | `already_reversed` |
+| `EmptyReverseReason` | `empty_reverse_reason` |
+| `InvalidEntryId` | `invalid_entry_id` |
+| `Inconsistent` | `inconsistent` |
+| `Rejected` | `rejected` |
+
+`EmptyReverseReason` は PR-B で追加したバリアント（§3 の
+`reverse_journal_entry` の `reason` 検証。D-074）。
+
+`InvalidEntryId` は PR-B 2巡目で追加（`kaikei_app::id::entry_id_from_uuid_string`
+が返す）。**`not_found` と混同しないこと**——「その UUID の仕訳が無い」
+（IDを調べ直す）と「送られた文字列が UUID ですらない」（表記を直す）は
+AI が取るべき次の手が違う。
+
+**`AppError` のバリアントを持たないコード**
+
+| コード | 使う場所 |
+|---|---|
+| `internal` | **下流**の `match` の `_` の腕の既定値（`kaikei-app` からは返らない） |
+| `audit_log_unavailable` | §9 の **fail-closed**（開始レコードが書けずツールを実行しなかった） |
+
+`audit_log_unavailable` は PR-B 2巡目で語彙に追加した（`AuditSink` ポート自体は
+後続 PR）。**`rejected` を借りてはならない**——`rejected` は
+「集計期間の開始日が終了日より後です」のような**入力を直せば通る**拒否に
+使っており、同じコードにすると AI が「入力を直せばよいのか」
+「サーバ都合で今は実行できないのか」を区別できず、無意味な作り直しを繰り返す。
+
+#### まだ埋まっていない写像元: `JpError`
+
+**上の表は `kaikei-app` から見えるエラーだけを覆う。**
+§4 の呼び出し経路 (c)（`list_tax_categories` / `get_settings` /
+`suggest_tax_category` / `validate_invoice_number`）は `kaikei-app` を経由せず
+`kaikei-jp` を直接呼ぶため、`kaikei_jp::JpError` が返る。
+**書き込み系（経路 (a)）も、線上の `tags` を `TagSet` にする段
+（§3。`TagCatalog::parse_tag_set`）だけは `JpError` が返る**——
+`UnregisteredTagKey` / `InvalidTagValue` / `DuplicateTagKeyInInput` /
+`NoApplicableTaxRuleSet` は PR-B 3巡目で追加したもので、いずれも
+「入力を直せば通る」拒否である（`internal` に潰さないこと）。
+`kaikei-app` は `kaikei-jp` に依存できない（`CLAUDE.md` §1・CI が検査）ので、
+**`JpError` → コードの対応表は `kaikei-app` には置けない。**
+
+→ `kaikei-mcp` 側（`error.rs`）に `JpError` 用の対応表を置く。
+`kaikei-app` の `codes` モジュールの定数を再利用し、**同じ意味には同じコードを
+使う**こと（例: `JpError::InvoiceRegNo*` 系には `invoice_*` の新しいコードを
+起こしてよいが、`unknown_tax_category` のように既に語彙がある概念に別名を
+作らない）。この作業は `kaikei-mcp` を新設する PR の担当。
 
 ---
 
@@ -616,7 +1018,8 @@ PR-B でこの節に置く。
 | `simplified_taxation` | 簡易課税か（**必須**） |
 | 決算3科目 | 元入金・事業主貸・事業主借（`ClosingAccounts`。構築時に実在検証される。D-066） |
 | `closing_tax_category` | 決算振替のゼロ化明細に付ける税区分コード |
-| 帳簿通貨 | コード＋小数桁（§5。既定で JPY にフォールバックしない） |
+| 帳簿通貨 | コード＋小数桁。`kaikei_app::context::BookSettings::book_currency` に詰める（§5。**必須**。既定で JPY にフォールバックしない。D-074） |
+| 会計年度の区切り規則 | `BookSettings::fiscal_year_rule`（現状 `CalendarYear` のみ） |
 | `APP_DATABASE_URL` | `kaikei_app` ロールの接続文字列（§8） |
 
 - 検証は `config.rs` に閉じ、`main.rs` は「読めなければ起動しない」だけにする。
@@ -702,6 +1105,9 @@ with_tx(...) で操作を実行
   `isError: true` のツール結果で
   「監査ログに記録できなかったため操作を実行していません。**帳簿は変更されていません**」と、
   帳簿が無変更であることまで含めて返す（`CLAUDE.md` §11）。
+  `error` には **`kaikei_app::error::codes::AUDIT_LOG_UNAVAILABLE`
+  （`"audit_log_unavailable"`）** を使う（PR-B 2巡目で語彙に追加）。
+  `rejected` を借りない理由は §6 を参照。
 - **結果レコードが書けなかった場合は操作を成功として返す（fail-open）。**
   結果に警告を添える（「記帳は完了しましたが監査ログの結果記録に失敗しました。
   request_id=... の行を確認してください」）。**再実行を促す文言にしない**
@@ -760,11 +1166,17 @@ CREATE INDEX ON audit_log (occurred_at);
 - **`entry_id` に外部キーを張らない。** 別トランザクションで書くため、
   rollback された操作の `entry_id` は存在しえない。
   そして「存在しないことを記録できること」自体に価値がある。
-- **`error_code` には分類コードだけを入れる**（§6 の対応表の値）。
+- **`error_code` には分類コードだけを入れる**（§6 の対応表の値。`AppError::code()`）。
   AI に返した本文は `output` に入れる。
-  接続文字列・認証情報を含みうる下位層のエラー本文をそのまま転記しない
-  （`RepoError::Backend { reason }` には DB が返した文字列がそのまま入るため、
-  分類コードと汎用メッセージに正規化する）。
+- **`output` に入れる本文は `AppError::public_message()`**（PR-B 2巡目）。
+  `Display`（`to_string()`）を転記しないこと。`RepoError::Backend { reason }` /
+  `Corrupt` 等には **DB が返した文字列がそのまま入っており**
+  （`crates/kaikei-store/src/sqlstate.rs` の `format!("...: {message}")`）、
+  接続文字列・ロール名・制約定義が混じりうる。
+  `public_message()` が該当バリアントを分類コードと汎用メッセージに
+  正規化する（対応表は §3「`message` に載せるのは `public_message()`」）。
+  **失われた詳細は `Display` 側に残っている**ので、サーバのログ（stderr）には
+  そちらを出す。この使い分けは §3 の `message` と同じ規律である。
 
 ### append-only の強制
 
@@ -818,11 +1230,11 @@ CREATE INDEX ON audit_log (occurred_at);
 | # | ケース | 期待 |
 |---|---|---|
 | MC-01 | 貸借一致の仕訳を post | 成功。確定後明細が返る |
-| MC-02 | 貸借不一致の仕訳を post | エラー。差額が含まれる（`hint` は PR-B で追加。§3） |
+| MC-02 | 貸借不一致の仕訳を post | エラー。`error` は `unbalanced`、`message` に差額が含まれる。金額フィールドは**区切り無し**（§5）。`auto_tax_lines: true` で `derive_tax_lines` が注記を返していた場合、**失敗応答にも `policy_notes` が入る**（PR-B 2巡目。app 層の回帰テストは `post_entry_carries_policy_notes_on_the_failure_path`）。`hint` の組み立て（`preview` を呼ぶ）はこの PR で追加する（§3） |
 | MC-03 | `auto_tax_lines: true` で税行が自動追加（**税抜経理・課税事業者の設定**） | 貸借一致する。税込経理・免税事業者の設定では税行が生成されず貸借不一致になることも併せて確認する |
 | MC-04 | 存在しない科目コード | エラー。`hint` には全件ではなく候補を絞って返す（コードの前方一致・名称の部分一致など。件数の上限を決める）。`hint` を組み立てるのは MCP 層（`ChartRepo::load_chart` の結果から作る）で、core のエラーは候補を持たない |
 | MC-05 | 締め済み期間への post | エラー。fixture は `period_snapshots` に**直接 INSERT** して締め状態を作る（Phase 3 に `close_period` は無い。`kaikei_app` は `period_snapshots` に INSERT 権限を持つ） |
-| MC-12 | `reverse_journal_entry` の理由が省略・空文字・空白のみ | 3ケースともエラー。**MCP 層で検証する**（core も app も DB も空文字を通す。§3） |
+| MC-12 | `reverse_journal_entry` の理由が省略・空文字・空白のみ | 3ケースともエラー（`error` は `empty_reverse_reason`）。**検証は `kaikei-app` のユースケース層にある**（PR-B で実装。`AppError::EmptyReverseReason`）。MCP 層は写像するだけで、同じ検証を重ねて書かない。「省略」だけは DTO のデシリアライズで弾かれる（`reason` は `Option` にしない）。app 層側の回帰テストは `crates/kaikei-app/src/usecase/reverse_entry.rs` の `reverse_entry_rejects_blank_reason`（全角スペース U+3000 を含む7ケース） |
 
 ### 提案系・検証系
 
@@ -836,7 +1248,7 @@ CREATE INDEX ON audit_log (occurred_at);
 | # | ケース | 期待 |
 |---|---|---|
 | MC-13 | `list_accounts` | 科目種別（`account_type`）と**記帳可否（`postable`）**を含めて返す |
-| MC-14 | `get_entry` | 存在する仕訳の明細・タグを返す。存在しない ID では次の手が分かる NotFound を返す |
+| MC-14 | `get_entry` | 存在する仕訳の明細・タグを返す。存在しない ID では次の手が分かる NotFound を返し、**仕訳IDは UUID の正準表記**で示す（10進表記にしない。§3。`reverse_journal_entry` 側は PR-B で解決済み） |
 | MC-15 | `get_trial_balance` | 期間で絞り込める。`group_by` 指定が効く。借方合計＝貸方合計。`from > to` はエラー（空結果にしない） |
 | MC-16 | `search_entries` | 日付・金額・科目・摘要で絞り込める。**0件でも成功として空配列を返す**（エラーにしない） |
 | MC-17 | `get_ledger` | 科目別に借方・貸方・残高を返す。期間指定が効く |
@@ -852,6 +1264,8 @@ CREATE INDEX ON audit_log (occurred_at);
 | MC-26 | ドメインエラー（貸借不一致等） | JSON-RPC のプロトコルエラーではなく `isError: true` のツール結果として返る（D-071） |
 | MC-27 | 出力の金額 | 全て JSON 文字列である（入力だけでなく出力側も number にしない。§5） |
 | MC-24 | 事業者設定（`is_taxable_business` / `simplified_taxation` 等）を与えずに起動 | 既定値にフォールバックせず**起動が失敗**し、不足項目を名指しするメッセージが出る（§7。D-057） |
+| MC-29 | 未登録のタグキー（例: `tax_cat`）で post | **エラー**（黙って落とさない）。メッセージに**有効なタグキー一覧**が含まれる（§3。`CLAUDE.md` §4・§11）。型に合わない値（`business_ratio: "3割"`）も同様に、期待する書式を示すエラー |
+| MC-30 | `kaikei-mcp` の依存 | `Cargo.toml` が `kaikei-app` / `kaikei-jp` / `kaikei-core` / MCP SDK / 非同期ランタイム / シリアライズ以外に依存していない（`uuid` / `rust_decimal` を自前で足していない）。**CI のジョブとして機械的に検査する**（§4 の申し送り。プローブでは検査できない） |
 
 ### 監査ログ
 
@@ -862,7 +1276,7 @@ CREATE INDEX ON audit_log (occurred_at);
 | MC-21 | 結果レコードの書き込みだけが失敗 | 記帳は成功として返り、警告が添えられる。開始レコードだけが残り「結果不明」として識別できる（fail-open） |
 | MC-22 | 記帳が失敗（貸借不一致等）してトランザクションが rollback される | **開始レコードは audit_log に残る。** D-070 の存在理由そのもの（同一トランザクションで書く実装に退行したら、このテストだけが落ちる） |
 | MC-23 | `kaikei_app` の audit_log への権限 | `SELECT` / `INSERT` はでき、`UPDATE` / `DELETE` / `TRUNCATE` はできない（`crates/kaikei-store/tests/privileges.rs` の `assert_privilege` と同じ形で追加） |
-| MC-25 | 経過措置対象の税区分（`PURCHASE_10_NON_QUALIFIED`）で記帳 | `PolicyNote` が post の戻り値に含まれ、かつ audit_log の `output` にも残る（D-059 / D-070） |
+| MC-25 | 経過措置対象の税区分（`PURCHASE_10_NON_QUALIFIED`）で記帳 | `PolicyNote` が post の戻り値に含まれ、かつ audit_log の `output` にも残る（D-059 / D-070）。app 層まで運ばれることは PR-B で担保済み（`crates/kaikei-e2e/tests/e2e_jp.rs` の `condition_3_*` が `PostEntryOutput.notes` を検証する）。MCP 層に残るのは「応答と audit_log に載せる」部分 |
 
 ### Phase 4 以降に延期したケース（行を消さない）
 

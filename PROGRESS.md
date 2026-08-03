@@ -382,6 +382,12 @@ D-049〜D-069。とくに後続 Phase に影響するもの:
   （監査ログ、または仕訳への付帯情報として）設計が必要。**未着手**であり、
   Phase 2 時点ではテスト内で`derive_tax_lines`を直接呼んで確認するに留めた
   （`crates/kaikei-e2e/tests/e2e_jp.rs`の`condition_3_*`を参照）。
+  → **Phase 3 PR-B で半分消化**。`post_entry::execute`の戻り値を
+  `PostEntryOutput { entry, notes }`に拡張し、`notes`が呼び出し元まで
+  届くようにした（`DECISIONS.md` D-073）。`condition_3_*`は同じpolicyへ
+  直接問い合わせ直すのではなく、**post_entryの戻り値**を検証する形に
+  書き換えてある。**残りは永続化**（`audit_log.output`への保存。D-070の
+  決定4）で、audit_log用ポート・テーブルごと`kaikei-mcp`のPRの担当。
 - **`opening_entries`（期首の振替）は未実装のまま**（D-065）。事業主貸・
   事業主借の期首リセット方式が税理士確認事項として未解決のため。
 - **簡易課税のみなし仕入率による計算は未実装**（設定を保持するのみ）。

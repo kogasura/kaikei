@@ -57,6 +57,64 @@ impl TaxRuleSets {
     pub fn for_date(&self, date: AccountingDate) -> Option<&TaxCategoryTable> {
         self.tables.iter().find(|table| table.contains(date))
     }
+
+    /// 保持しているマスタを巡回する（構築時に渡された順。
+    /// [`TaxRuleSets::from_embedded`] なら `kaikei_jp_data::TAX_CATEGORY_SOURCES`
+    /// の並び）。
+    ///
+    /// 「同梱されているマスタは何か」を答える経路（`docs/07-mcp-server.md` §2
+    /// の `list_tax_categories`）が要る。適用期間だけを文字列で欲しい場合は
+    /// [`TaxRuleSets::available_ranges_display`] を使う。
+    pub fn iter(&self) -> impl Iterator<Item = &TaxCategoryTable> {
+        self.tables.iter()
+    }
+
+    /// 保持しているマスタの数。
+    pub fn len(&self) -> usize {
+        self.tables.len()
+    }
+
+    /// マスタを1つも保持していないか。
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+
+    /// 保持しているマスタの適用期間を、適用開始日の昇順に並べた表示用文字列。
+    ///
+    /// [`TaxRuleSets::for_date`] が `None` を返したときに「どの期間なら
+    /// 有効か」を示すために使う（`CLAUDE.md` §11）。ラベル（YAMLのファイル名）
+    /// は含めない——線上に出るのは**期間**であり、読み手（AI・利用者）が
+    /// 次に直すのは取引日だからである。ラベルまで要る診断は
+    /// [`TaxRuleSets::iter`] と [`TaxCategoryTable::label`] で組み立てる。
+    pub fn available_ranges_display(&self) -> String {
+        if self.tables.is_empty() {
+            return "（マスタが1つも読み込まれていません）".to_string();
+        }
+        let mut tables: Vec<&TaxCategoryTable> = self.tables.iter().collect();
+        tables.sort_by_key(|table| table.applies_from());
+        tables
+            .iter()
+            .map(|table| table.range_display())
+            .collect::<Vec<_>>()
+            .join("、")
+    }
+
+    /// 取引日に適用されるマスタを引き、無ければ有効期間を示すエラーを返す。
+    ///
+    /// [`TaxRuleSets::for_date`] の `None` は**正常な戻り値**であり
+    /// （`DECISIONS.md` D-055）、`JpTaxPolicy` はそれを
+    /// `kaikei_policy::PolicyError::NoApplicableRuleSet` に写像する。
+    /// 一方、税制を問い合わせるだけの経路（`docs/07-mcp-server.md` §4 の
+    /// 経路 (c)。`list_tax_categories`）は `kaikei-app` を通らないため、
+    /// **空配列ではなくエラーを返す**という要件（同 §2）をここで満たす。
+    /// 文言を各ツールで書き起こさないための入口である。
+    pub fn require_for_date(&self, date: AccountingDate) -> Result<&TaxCategoryTable, JpError> {
+        self.for_date(date)
+            .ok_or_else(|| JpError::NoApplicableTaxRuleSet {
+                date: date.to_iso_string(),
+                available: self.available_ranges_display(),
+            })
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +258,88 @@ mod tests {
             TaxRuleSets::new(vec![a, b]).is_err(),
             "無期限のマスタが2つあれば必ず重なるので拒否すべき"
         );
+    }
+
+    // ---- 保持している表の列挙（Phase 3 PR-B。docs/07-mcp-server.md §2） ----
+
+    /// ★消費側が「保持する表を列挙できない」と指摘した点★
+    #[test]
+    fn iter_enumerates_every_table_that_was_loaded() {
+        let rule_sets = TaxRuleSets::new(vec![
+            table("2025", date(2025, 1, 1), Some(date(2025, 12, 31))),
+            table("2026-", date(2026, 1, 1), None),
+        ])
+        .unwrap();
+
+        let labels: Vec<&str> = rule_sets.iter().map(|t| t.label()).collect();
+        assert_eq!(labels, vec!["2025", "2026-"]);
+        assert_eq!(rule_sets.len(), 2);
+        assert!(!rule_sets.is_empty());
+    }
+
+    #[test]
+    fn from_embedded_can_be_enumerated() {
+        let rule_sets = TaxRuleSets::from_embedded().unwrap();
+        assert_eq!(rule_sets.len(), rule_sets.iter().count());
+        assert!(!rule_sets.is_empty());
+        for table in rule_sets.iter() {
+            assert!(table.range_display().contains('〜'));
+        }
+    }
+
+    /// 有効期間の一覧は適用開始日の昇順で、無期限も表現できる。
+    #[test]
+    fn available_ranges_display_is_sorted_by_applies_from() {
+        let rule_sets = TaxRuleSets::new(vec![
+            table("2026-", date(2026, 1, 1), None),
+            table("2025", date(2025, 1, 1), Some(date(2025, 12, 31))),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            rule_sets.available_ranges_display(),
+            "2025-01-01 〜 2025-12-31、2026-01-01 〜 無期限"
+        );
+    }
+
+    #[test]
+    fn available_ranges_display_says_so_when_nothing_is_loaded() {
+        let rule_sets = TaxRuleSets::new(vec![]).unwrap();
+        assert!(rule_sets.is_empty());
+        assert!(rule_sets
+            .available_ranges_display()
+            .contains("読み込まれていません"));
+    }
+
+    /// `for_date` の `None` を受けた上位が「どの期間なら有効か」を
+    /// 答えられること（`docs/07-mcp-server.md` §2 の
+    /// 「空配列ではなくエラーを返し、有効期間を示す」）。
+    #[test]
+    fn require_for_date_reports_the_valid_ranges_when_no_table_applies() {
+        let rule_sets = TaxRuleSets::new(vec![table(
+            "2026",
+            date(2026, 1, 1),
+            Some(date(2026, 12, 31)),
+        )])
+        .unwrap();
+
+        let table = rule_sets.require_for_date(date(2026, 4, 1)).unwrap();
+        assert_eq!(table.label(), "2026");
+
+        let err = rule_sets.require_for_date(date(2025, 12, 31)).unwrap_err();
+        match err {
+            JpError::NoApplicableTaxRuleSet { date, available } => {
+                assert_eq!(date, "2025-12-31");
+                assert_eq!(available, "2026-01-01 〜 2026-12-31");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let message = rule_sets
+            .require_for_date(date(2025, 12, 31))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("2026-01-01"), "message = {message}");
+        assert!(message.contains("取引日"), "message = {message}");
     }
 
     #[test]

@@ -17,7 +17,9 @@
 //! - [`chart`][]: 勘定科目テンプレート（`kaikei-jp-data/chart/*.yaml`）→
 //!   `kaikei_core::ChartOfAccounts`（`docs/04-jp-tax.md` §5。PR-5）
 //! - [`tags`][]: タグスキーマ（`kaikei-jp-data/tags.yaml`）→
-//!   `kaikei_core::TagSchema`（`docs/04-jp-tax.md` §4。PR-5）
+//!   `kaikei_core::TagSchema`（`docs/04-jp-tax.md` §4。PR-5）、および
+//!   線上（JSON）の文字列 → `kaikei_core::TagSet` の変換
+//!   （[`tags::TagCatalog`]。Phase 3 PR-B）
 //! - [`household_split`][]: 家事按分ヘルパー（[`household_split::household_split`]）。
 //!   `kaikei-policy::TaxPolicy` の実装ではなく単独の関数（`docs/04-jp-tax.md`
 //!   §8。PR-6）

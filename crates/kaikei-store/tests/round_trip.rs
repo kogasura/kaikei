@@ -200,6 +200,7 @@ async fn save_then_find_round_trips_all_fields(
         1_700_000_000_123_000, // マイクロ秒境界
     );
 
+    // `with_tx` のエラー型 `E` は総称なので明示する（PR-B 2巡目）。
     let found: Option<JournalEntry> = with_tx(&store, |tx| {
         let entry = entry.clone();
         Box::pin(async move {

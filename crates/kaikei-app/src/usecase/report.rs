@@ -12,6 +12,7 @@
 //! テストID（`RPT-1` 等）はこのファイル内でのみ一意な連番であり、
 //! `docs/02-test-cases.md` のID体系とは独立している。
 
+use crate::context::BookSettings;
 use crate::error::AppError;
 use crate::ports::TrialBalanceQuery;
 use crate::view::TrialBalanceView;
@@ -33,6 +34,12 @@ pub struct ReportInput {
 ///
 /// `query` は `Tx` を経由しない read model 専用のクエリ（[`TrialBalanceQuery`]）。
 ///
+/// `settings` から使うのは [`BookSettings::book_currency`] だけだが、
+/// 引数の型は書き込み系ユースケース（`post_entry` / `reverse_entry`）と
+/// 揃えて `&BookSettings` にしている。呼び出し側が保持しているのは
+/// この構造体であり、フィールドを1つ取り出して渡す形にすると
+/// 「どの設定を使うユースケースか」が呼び出し側の書き方に依存してしまう。
+///
 /// # Errors
 ///
 /// - `input.from > input.to`（集計期間の開始日が終了日より後）の場合は
@@ -42,11 +49,12 @@ pub struct ReportInput {
 ///   [`AppError::Core`]（[`CoreError::NotAggregatable`]）
 /// - `query.trial_balance` が失敗した場合は [`AppError::Repo`]
 /// - 借方合計と貸方合計が一致しない場合は [`AppError::Inconsistent`]
-/// - 行同士の通貨不一致・合算のオーバーフロー等、[`TrialBalanceView::totals`]
-///   が失敗した場合は [`AppError::Core`]
+/// - 行の通貨が帳簿通貨と食い違う場合・合算のオーバーフロー等、
+///   [`TrialBalanceView::totals`] が失敗した場合は [`AppError::Core`]
 pub async fn execute(
     query: &dyn TrialBalanceQuery,
     tag_schema: &TagSchema,
+    settings: &BookSettings,
     input: ReportInput,
 ) -> Result<TrialBalanceView, AppError> {
     // 1. from/to の妥当性検証。入力ミスを「0件の空の試算表」として
@@ -83,16 +91,18 @@ pub async fn execute(
     }
 
     let rows = query.trial_balance(input.from, input.to, &group_by).await?;
-    let view = TrialBalanceView::new(rows);
+    // 通貨は行から推論せず帳簿通貨を明示する。0行の期間でも応答で通貨を
+    // 名乗れるようにするため（`view.rs` の doc）。
+    let view = TrialBalanceView::new(rows, settings.book_currency);
 
     // 3. 検算。借方合計と貸方合計が食い違えばデータ破損・実装バグの兆候。
-    if let Some((debit, credit)) = view.totals()? {
-        if debit != credit {
-            return Err(AppError::Inconsistent {
-                debit: debit.to_display_string(),
-                credit: credit.to_display_string(),
-            });
-        }
+    //    行が0件なら両方ゼロなので自明に一致する。
+    let (debit, credit) = view.totals()?;
+    if debit != credit {
+        return Err(AppError::Inconsistent {
+            debit: debit.to_display_string(),
+            credit: credit.to_display_string(),
+        });
     }
 
     Ok(view)
@@ -102,6 +112,7 @@ pub async fn execute(
 mod tests {
     use super::*;
     use crate::error::RepoError;
+    use crate::test_support::settings;
     use crate::view::BalanceRowView;
     use async_trait::async_trait;
     use kaikei_core::{AccountCode, AccountType, Currency, Money, TagDef, TagValueType};
@@ -203,7 +214,7 @@ mod tests {
         ]);
         let schema = TagSchema::empty();
 
-        let result = execute(&query, &schema, sample_input()).await;
+        let result = execute(&query, &schema, &settings(), sample_input()).await;
 
         let view = result.unwrap();
         assert_eq!(view.rows().len(), 2);
@@ -225,7 +236,7 @@ mod tests {
         let mut input = sample_input();
         input.group_by = vec![kaikei_core::TagKey::parse("business_ratio").unwrap()];
 
-        let result = execute(&query, &schema, input).await;
+        let result = execute(&query, &schema, &settings(), input).await;
 
         assert!(matches!(
             result,
@@ -248,7 +259,7 @@ mod tests {
         let mut input = sample_input();
         input.group_by = vec![kaikei_core::TagKey::parse("unregistered").unwrap()];
 
-        let result = execute(&query, &schema, input).await;
+        let result = execute(&query, &schema, &settings(), input).await;
 
         assert!(matches!(
             result,
@@ -266,7 +277,7 @@ mod tests {
         ]);
         let schema = TagSchema::empty();
 
-        let result = execute(&query, &schema, sample_input()).await;
+        let result = execute(&query, &schema, &settings(), sample_input()).await;
 
         assert!(matches!(result, Err(AppError::Inconsistent { .. })));
     }
@@ -277,9 +288,50 @@ mod tests {
         let query = FakeTrialBalanceQuery::with_rows(Vec::new());
         let schema = TagSchema::empty();
 
-        let result = execute(&query, &schema, sample_input()).await;
+        let result = execute(&query, &schema, &settings(), sample_input()).await;
 
         assert!(result.unwrap().rows().is_empty());
+    }
+
+    // RPT-9（PR-B 2巡目）: 0行の期間でも試算表は**帳簿通貨を名乗り**、
+    // 合計をゼロとして返せる（応答で通貨を出せない状態を解消した。`view.rs` の doc）。
+    #[tokio::test]
+    async fn report_with_no_rows_still_names_the_book_currency() {
+        let query = FakeTrialBalanceQuery::with_rows(Vec::new());
+        let schema = TagSchema::empty();
+
+        let view = execute(&query, &schema, &settings(), sample_input())
+            .await
+            .unwrap();
+
+        assert_eq!(view.currency(), Currency::JPY);
+        let (debit, credit) = view.totals().unwrap();
+        assert_eq!(debit.minor(), 0);
+        assert_eq!(credit.minor(), 0);
+        assert_eq!(debit.currency(), Currency::JPY);
+    }
+
+    // RPT-10（PR-B 2巡目 / `DECISIONS.md` D-042）: read model が帳簿通貨と
+    // 異なる通貨の行を返したら、空の成功ではなくエラーになる。
+    #[tokio::test]
+    async fn report_rejects_rows_in_a_currency_other_than_the_book_currency() {
+        let usd_row = BalanceRowView {
+            account: AccountCode::parse("100").unwrap(),
+            account_type: AccountType::Asset,
+            group: Default::default(),
+            debit_total: Money::from_minor(1_000, Currency::USD),
+            credit_total: Money::zero(Currency::USD),
+            balance: Money::from_minor(1_000, Currency::USD),
+        };
+        let query = FakeTrialBalanceQuery::with_rows(vec![usd_row]);
+        let schema = TagSchema::empty();
+
+        let result = execute(&query, &schema, &settings(), sample_input()).await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Core(CoreError::CurrencyMismatch { .. }))
+        ));
     }
 
     // RPT-6（修正1）: from > to は「0件の空の試算表」として静かに成功させず、
@@ -293,7 +345,7 @@ mod tests {
         input.from = AccountingDate::new(2026, 12, 31).unwrap();
         input.to = AccountingDate::new(2026, 1, 1).unwrap();
 
-        let result = execute(&query, &schema, input).await;
+        let result = execute(&query, &schema, &settings(), input).await;
 
         match result {
             Err(AppError::Rejected { reason }) => {
@@ -340,7 +392,7 @@ mod tests {
             kaikei_core::TagKey::parse("counterparty").unwrap(),
         ];
 
-        execute(&query, &schema, input).await.unwrap();
+        execute(&query, &schema, &settings(), input).await.unwrap();
 
         let received = query
             .received_group_by
@@ -362,7 +414,7 @@ mod tests {
         let query = FailingTrialBalanceQuery;
         let schema = TagSchema::empty();
 
-        let result = execute(&query, &schema, sample_input()).await;
+        let result = execute(&query, &schema, &settings(), sample_input()).await;
 
         assert!(matches!(
             result,

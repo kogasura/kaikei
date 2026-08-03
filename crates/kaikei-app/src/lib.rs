@@ -11,6 +11,13 @@
 //! - DB 等の infra 依存を必要としない具象実装: [`clock::SystemClock`] /
 //!   [`period_guard::ClosedPeriodGuard`] / [`id`] の関数群 / [`currency`] の
 //!   関数群
+//! - **線上（応答 JSON）に出る表現**の唯一の置き場:
+//!   [`error::codes`]（エラーの分類コード）/ [`wire`]（列挙型の機械可読名）/
+//!   [`amount`]（金額の区切り無し文字列）/ [`id::entry_id_to_uuid_string`] と
+//!   [`id::entry_id_from_uuid_string`]（仕訳IDの UUID 表記）。
+//!   presentation 層（`kaikei-mcp` / 将来の `kaikei-api`）と
+//!   `audit_log` の3箇所で同じ表を手書きすると必ず綴りがずれるため、
+//!   ここに1箇所だけ持つ（`DECISIONS.md` D-072）
 //! - read model 用の DTO: [`view::BalanceRowView`] / [`view::TrialBalanceView`]
 //! - テスト用のインメモリ fake: [`testing`]（`#[cfg(any(test, feature =
 //!   "testing"))]`）
@@ -61,6 +68,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod amount;
 pub mod clock;
 pub mod context;
 pub mod currency;
@@ -75,6 +83,7 @@ pub mod testing;
 pub mod tx;
 pub mod usecase;
 pub mod view;
+pub mod wire;
 
 pub use kaikei_policy::{
     Counterparty, CounterpartyIndex, NoteSeverity, PolicyError, PolicyNote, TaxContext,
