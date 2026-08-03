@@ -27,7 +27,7 @@
 //! - ツールレジストリ（[`server`]）と、**監査ログで挟む唯一の呼び出し経路**
 //!   （[`dispatch`]）。
 //!
-//! # 監査ログを通らないツールは書けない
+//! # 監査ログを通らないツールを書けなくする
 //!
 //! `ROADMAP.md` Phase 3 の完了条件は「全操作が audit_log に記録される」で
 //! ある。それを11ツールの手作業（各ツールが `with_audit` を呼ぶ）に委ねると、
@@ -37,8 +37,13 @@
 //! そこで [`dispatch`] が「呼び忘れる形が存在しない」ようにしてある。
 //! ツールが実装する [`dispatch::McpTool`] は応答（`CallToolResult`）を
 //! 組み立てられず、受け取る [`dispatch::ToolContext`] は
-//! [`kaikei_app::ports::AuditSink`] を露出しない。詳細は [`dispatch`] の
-//! モジュール doc（`DECISIONS.md` D-084）。
+//! [`kaikei_app::ports::AuditSink`] を露出しない。
+//!
+//! **ただし「書けない」を型だけで達成してはいない。** MCP のツールを
+//! 登録・実行する能力は `rmcp` の API から来るので、`rmcp` を名指しできる
+//! ファイルを **`dispatch.rs` と `error.rs` の2つに限る許可リスト**を
+//! `tests/audit_is_structural.rs` が機械的に検査している。
+//! 詳細は [`dispatch`] のモジュール doc（`DECISIONS.md` D-084）。
 //!
 //! # このPR（Phase 3 PR-F）の範囲
 //!

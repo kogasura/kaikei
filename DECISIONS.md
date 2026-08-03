@@ -2770,7 +2770,7 @@ docs/07 §3 が挙げた3案のうち (a)）。
 | (c) 線上でも D-035 の `{"t":..,"v":..}` 形式を使う | 型を送り手（AI）に書かせることになる。型はスキーマが持っており、送り手が書いた `"t"` とスキーマが食い違ったらどちらを信じるかという論点が新たに増える。冗長でもある |
 | 変換を `kaikei-mcp` の DTO 層に置く（初版 docs/07） | 上記のとおり `kaikei-api` が同じ変換を再実装する。`JpError` を返す点でも経路 (c) と同型で、置き場を分ける理由が無い |
 | 未登録キーを黙って捨てる／`Text` として通す | `CLAUDE.md` §4「`TagSet` はゴミ箱ではない」。`tax_cat` のような綴り違いが**無言で消える**と、AI は「税区分を付けた」と思ったまま `tax_category` 無しの明細を作る（`required_for` の検証は通ってしまう組み合わせがある） |
-| 入力に同じキーが2回来たら後勝ちにする | `tags.yaml` の重複キーを拒否している（D-062）のと同じ理由。送り手が意図した値と保存される値が食い違う |
+| 入力に同じキーが2回来たら後勝ちにする | `tags.yaml` の重複キーを拒否している（D-062）のと同じ理由。送り手が意図した値と保存される値が食い違う。**ただし MCP 経由では現にこの後勝ちが起きている**（D-085 の訂正注記。重複は `rmcp` の stdio トランスポートが JSON をパースする時点で畳み込まれ、`TagCatalog::parse_tag_set` に届く時点で既に1件になっている）。この却下は「MCP 層で後勝ちを**実装しない**」という意味であって、「重複が拒否される」という保証ではない |
 | 小数を `Decimal::from_str`（`kaikei-core` の `parse_decimal` と同じ）で読む | 表現できない桁数を**黙って丸める**。`business_ratio` は税務調査時の根拠として記録するもの（`tags.yaml`）で、入口で丸めた値が保存されるのは事故。`from_str_exact` で拒否し、`CLAUDE.md` §11 に従って書式を示す |
 
 **値の文字列表現は D-035 の JSONB の `"v"` と同じ規約にする**（`Decimal` は
@@ -3535,7 +3535,7 @@ pub trait McpTool: Send + Sync + 'static {
         -> impl Future<Output = Result<ToolSuccess, ToolFailure>> + Send;
 }
 
-// ルータそのものを dispatch 層に閉じ込める（レビュー反映。下記の訂正注記1）
+// rmcp の ToolRouter を private フィールドとして包む（レビュー反映。下記の訂正注記1）
 pub struct ToolRegistry { /* rmcp の ToolRouter を包んで隠す */ }
 impl ToolRegistry {
     pub fn new() -> Self;
@@ -3553,7 +3553,8 @@ pub async fn call<T: McpTool>(runtime: &Runtime, arguments: Option<Map<String, V
 | 1 | ツールが応答を組み立てる | `McpTool::run` の戻り値は `Result<ToolSuccess, ToolFailure>`。`CallToolResult`（`isError` を含む）を作れるのは `dispatch::call` と `ToolError` だけ |
 | 2 | ツールが監査ログを書く／書き忘れる | `run` が受け取る `ToolContext` は `AuditSink` を**露出しない**（`Runtime` 自体が渡らない）。監査ログを書く能力がツールに無い |
 | 3 | `ToolContext` を自作する | フィールドも `new` も private。作れるのは `dispatch` モジュールだけ |
-| 4 | 別経路でルータに載せる | **`rmcp` の `ToolRouter` が `dispatch` の外に出ない。** `server.rs` が持つのは `ToolRegistry` で、載せる口は `with::<T: McpTool>` だけ（訂正注記1） |
+| 4 | `ToolRegistry` に `McpTool` 以外を載せる | 載せる口は `with::<T: McpTool>` だけで、内側の `ToolRouter` は private フィールド（訂正注記1） |
+| 4b | **別のルータ・別の `ServerHandler` を書き足す** | **型では閉じない。** `rmcp` を名指しできるファイルを `dispatch.rs` / `error.rs` の2つに限る**許可リスト**（訂正注記3） |
 | 5 | fail-open の警告を捨てる | `call` は `AuditedCall::into_result_noting_outcome(&mut notes)`（既定経路）しか使わず、積まれた警告を必ず応答の `warnings` に載せる。`into_parts_unchecked`（逃げ道。D-076）はこの crate に1箇所も無い |
 | 6 | クライアント由来のツール名が `audit_log.tool` に載る | `AuditCall` を組み立てるのは `dispatch.rs` の1箇所だけ（**走査で担保**）で、そこは `ToolName::resolve`（`server::is_registered_tool` ＝`tools/list` と同じレジストリを引く）を通す。**型で閉じているのは「登録済み以外から `ToolName` を作れない」ことである**（訂正注記2） |
 
@@ -3607,13 +3608,17 @@ presentation 層でも「呼ぶ場所」を1つに閉じる必要がある。
 理由に却下していたが、**却下しただけでは使えないままにならない**
 （読み取り系・成功前提のツールなら普通に書ける）。
 
-そこで **`ToolRouter` 自体を `dispatch.rs` に閉じ込め**、外には
-`dispatch::ToolRegistry`（ツールを載せる口が `with::<T: McpTool>` しか無い型）
-だけを見せる形に変えた。`server.rs` は `McpTool` の型を並べるだけになり、
-`McpTool` を実装していない型をルータに載せる方法が**型として存在しない**。
+そこで **`ToolRouter` を `dispatch.rs` の private フィールドに閉じ込め**、
+外には `dispatch::ToolRegistry`（ツールを載せる口が `with::<T: McpTool>` しか
+無い型）だけを見せる形に変えた。`server.rs` は `McpTool` の型を並べるだけに
+なり、**`ToolRegistry` を経由して** `McpTool` 以外を載せる方法は無くなった。
 `route` は private にした。走査（second line）にも `ToolRouter` /
 `with_async_tool` / `with_sync_tool` / `AsyncTool` / `SyncTool` / `ToolBase` /
 `IntoToolRoute` / `CallToolHandler` を追加した。
+
+**この注記の「型として存在しない」という当初の書き方は誤りだった**
+（訂正注記3）。閉じたのは「`ToolRegistry` 経由の登録」であって、
+「別のルータを新しく作ること」ではない。
 
 **訂正注記2（レビュー C-6。提供していない保証を書いていた）**:
 初版の表 6 は「`AuditCall.tool` に渡せる型を `dispatch::ToolName` に限定した」と
@@ -3624,6 +3629,73 @@ presentation 層でも「呼ぶ場所」を1つに閉じる必要がある。
 走査＋その1ファイル内で `ToolName::resolve` を通す慣行」であり、
 **型で閉じているのは `ToolName::resolve` が登録済み以外を弾くこと**である。
 表と `docs/07-mcp-server.md` §9 の記述を実態に合わせた。
+
+**訂正注記3（レビュー3巡目 B / C-1 / D-4。禁止リストを許可リストへ反転する）**:
+
+訂正注記1 で塞いだつもりの登録経路が、**同じ走査でもう一度破られた**。
+`rmcp-macros` 3.1.0 の `#[tool_handler]` は
+`if !has_method("call_tool", &item_impl)` で条件付き生成する。つまり
+**同じ impl ブロックに `call_tool` を手書きすると、マクロが生成する
+dispatch 経路が黙って置き換わる**。実測では `tools/list` は正規の2件のまま
+（見た目は正常）、`tools/call` を1回送っただけで `journal_entries` に1件・
+`audit_log` に0行で、`cargo build` / `clippy -D warnings` /
+`cargo test -p kaikei-mcp` は全緑だった。使う識別子
+（`call_tool` / `CallToolRequestParams` / `CallToolResponse` /
+`ToolCallContext` / `into_call_tool_result`）は `CONFINED` 15件のどれにも
+入っておらず、`tool_handler` 自体は `server.rs` で許可されていた。
+しかもその impl は既に `get_info` を手書きしており、「メソッドを自分で書けば
+マクロが引き下がる」形が**見本として目の前に置かれていた**。
+レビュアーはさらに `ToolRouter::add_route` / `merge`、`IntoToolRoute` の
+`WithToolAttr` / `ToolAttrGenerateFunctionAdapter`、`CallToolHandlerExt`
+（`mentions` の識別子境界判定により既存の `CallToolHandler` 規則に
+**一致しない**）が未了であることも挙げた。
+
+**識別子の禁止リストは原理的に不完全である。** `rmcp` が API を1つ増やす
+たび、レビュアーが1つ見落とすたびに穴が開く。2巡続けて破られた時点で、
+足りないのは識別子ではなく**方式**だと判断した。
+
+そこで向きを反転し、**`crates/kaikei-mcp/src/` のうち `rmcp` という識別子を
+書いてよいファイルを許可リストで限定する**ことにした。
+
+| ファイル | なぜ必要か |
+|---|---|
+| `dispatch.rs` | ルータ、`ServerHandler` の実装（`call_tool` / `list_tools` / `get_tool` / `get_info`）、stdio トランスポートの起動（`serve_stdio`） |
+| `error.rs` | `ToolError::into_call_tool_result`（ツール結果エラーの組み立て。D-071） |
+
+MCP のツールを登録・実行する能力はすべて `rmcp` の API から来るので、
+**どの API を使う迂回であっても `rmcp` の名前が必要**であり、迂回は必ず
+許可された2ファイルのどちらかに現れる。「`rmcp` が将来 API を増やす」
+「レビュアーが見落とす」に対して強い。MC-30（`kaikei-mcp` の依存の許可
+リスト）や `tests/forbidden_tools.rs` の
+`every_registered_tool_is_one_of_the_eleven_phase_3_tools`（禁止4件だけで
+なく許可11件の側からも閉じる）と**同じ形**であり、このプロジェクトが既に
+採っている方式である。
+
+あわせて **`#[tool_handler]` を外し、`ServerHandler` の4メソッドを
+`dispatch.rs` で手書き**した。生成物と手書きが入れ替わるという事象そのものが
+起きなくなり、「`call_tool` を手書きする」形自体が許可リストの内側に入る。
+`serve_stdio` も `server.rs` から `dispatch.rs` へ移した（stdio トランス
+ポートを名指しするには `rmcp` を書く必要があるため）。
+`server.rs` に残るのは「どのツールを登録するか」と「AI に何と名乗るか」だけで、
+`rmcp` の型は `dispatch` が再輸出する `ServerInfo` / `Tool` /
+`Implementation` / `ServerCapabilities` を借りる（**登録経路に関わる型は
+再輸出しない**。そこが許可リストの唯一の穴であり、識別子の閉じ込め
+`CONFINED` を second line として残してある）。
+
+**「型で閉じた」という記述をすべて撤回する**（3巡目 C-1）。`rmcp` は
+`kaikei-mcp` の直接依存で `ToolRouter` は `pub` であり、**同一 crate の他
+モジュールから import を妨げる仕組みは Rust に無い**（レビュアーが実際に
+コンパイルを通している）。`dispatch.rs` の「`ToolRouter` を名指しできない
+以上、`with_async_tool` を呼ぶ相手が無い」、`server.rs` の「`ToolRouter` は
+このモジュールから見えない」、この決定の「型として存在しない」、
+`docs/07-mcp-server.md` の「『監査ログを通らないツール』は書けない」は
+**いずれも成立していなかった**。止めているのは検査であって型ではない。
+訂正注記2（`AuditCall` / `ToolName`）と同じ扱いで、実態どおりに書き直した。
+
+**`every_known_rmcp_registration_path_is_confined` の「1つ残らず」も撤回した**
+（3巡目 D-4）。網羅を担うのは許可リストであり、識別子の一覧は再輸出という
+穴に対する second line である。テスト名も
+`the_second_line_rules_for_rmcp_identifiers_are_still_present` に改めた。
 
 ---
 

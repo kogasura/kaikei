@@ -1,4 +1,15 @@
-//! ツールレジストリと `rmcp` の [`ServerHandler`] 実装。
+//! ツールレジストリ（何を登録するか）とサーバー情報の文面。
+//!
+//! # このモジュールは `rmcp` を名指しできない
+//!
+//! `kaikei-mcp` の `src/` で `rmcp` という識別子を書いてよいのは
+//! `dispatch.rs` と `error.rs` だけである（`crate::dispatch` のモジュール doc、
+//! `tests/audit_is_structural.rs` の許可リスト）。
+//! したがって MCP プロトコルの入口——`ServerHandler` の実装
+//! （`call_tool` / `list_tools` / `get_tool` / `get_info`）と stdio
+//! トランスポートの起動（[`crate::dispatch::serve_stdio`]）——は
+//! [`crate::dispatch`] に置いてある。ここに残るのは
+//! **「どのツールを登録するか」と「AI に何と名乗るか」**だけである。
 //!
 //! # 「存在させないツール」はここに現れない
 //!
@@ -15,14 +26,20 @@
 //! 一覧だけが腐るということが起きない
 //! （`PROGRESS.md` Phase 1 の教訓6「手で維持する一覧は必ず腐る。構造で閉じる」）。
 //!
-//! # このモジュールは `rmcp` の `ToolRouter` を持たない
+//! # このモジュールはルータを直接持たない
 //!
-//! 保持するのは [`crate::dispatch::ToolRegistry`]（`ToolRouter` を包んで
-//! 隠す型）である。`ToolRouter` をここに置くと
-//! `with_async_tool::<T>()` / `with_sync_tool::<T>()` で
-//! **[`crate::dispatch::call`] を通らないツールを登録できてしまう**
+//! 保持するのは [`crate::dispatch::ToolRegistry`]（`rmcp` の `ToolRouter` を
+//! private フィールドとして包む型）である。`ToolRouter` をここに持たせて
+//! いたときは、`with_async_tool::<T>()` / `with_sync_tool::<T>()` で
+//! **[`crate::dispatch::call`] を通らないツールを登録できてしまった**
 //! （`DECISIONS.md` D-084 の訂正注記）。`ToolRegistry` にツールを載せる口は
-//! `with::<T: McpTool>` だけなので、その形は型として存在しない。
+//! `with::<T: McpTool>` だけなので、**その型を経由して** `McpTool` 以外を
+//! 載せる方法は無い。
+//!
+//! **「別のルータを新しく作る」ことは型では止まらない**（`rmcp` は直接依存で
+//! `ToolRouter` は `pub`。同一 crate 内の import を妨げる仕組みは Rust に
+//! 無い）。そちらを止めているのは冒頭のファイル許可リストであって、型では
+//! ない（3巡目 C-1。ここに「型として存在しない」と書かないこと）。
 //!
 //! # レジストリの検査に [`KaikeiServer`] を組み立てない
 //!
@@ -30,22 +47,20 @@
 //! （[`Runtime`]）を必須で持つためである。レジストリに何が載っているかは
 //! DB にも設定にも依存しない性質なので、それを見るために DB 接続を要求する
 //! のは筋が悪い。3つとも [`tool_registry`]（サーバー本体が使うのと**同じ
-//! 構築関数**）から導出しており、`#[tool_handler]` が生成する
+//! 構築関数**）から導出しており、[`crate::dispatch`] が手書きしている
 //! `list_tools` / `call_tool` / `get_tool` が引くのと同じ集合を見る:
 //!
-//! | 生成されるメソッド | 実体 | 対応する自由関数 |
+//! | ハンドラのメソッド | 実体 | 対応する自由関数 |
 //! |---|---|---|
-//! | `list_tools` | `tool_registry.list_all()` | [`registered_tool_names`] |
-//! | `call_tool` | `tool_registry.call(...)`（未登録名は `has_route` が偽） | [`is_registered_tool`] |
-//! | `get_tool` | `tool_registry.get(name).cloned()` | [`tool_definition`] |
+//! | `list_tools` | `tools().list_all()` | [`registered_tool_names`] |
+//! | `call_tool` | `tools().call(...)`（未登録名は `has_route` が偽） | [`is_registered_tool`] |
+//! | `get_tool` | `tools().get(name).cloned()` | [`tool_definition`] |
 //!
 //! 両者が実際に一致することは、`Runtime` を組み立てられる側
 //! （`tests/startup_pg.rs`）が本物の [`KaikeiServer`] に対して確かめる。
 
-use crate::dispatch::ToolRegistry;
+use crate::dispatch::{Implementation, ServerCapabilities, ServerInfo, Tool, ToolRegistry};
 use crate::startup::Runtime;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo, Tool};
-use rmcp::{tool_handler, ServerHandler};
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
@@ -91,13 +106,25 @@ impl KaikeiServer {
     pub fn runtime(&self) -> &Arc<Runtime> {
         &self.runtime
     }
+
+    /// このサーバーが引くレジストリ。
+    ///
+    /// **crate 内限定。** `ServerHandler` の実装は [`crate::dispatch`] に
+    /// あり（`rmcp` を名指しできるファイルがそこだけであるため）、
+    /// `tools/list` / `tools/call` の実体をそこから引くために貸す。
+    /// [`crate::dispatch::ToolRegistry`] の公開メソッドは
+    /// `with::<T: McpTool>` / `list_all` / `get` / `has_route` だけなので、
+    /// これを渡してもツールを勝手に載せることはできない。
+    pub(crate) fn tools(&self) -> &ToolRegistry {
+        &self.tools
+    }
 }
 
 /// 登録済みツール名の一覧（`tools/list` に出るのと同じ集合）。
 ///
-/// `#[tool_handler]` が生成する `list_tools` は `tool_registry.list_all()` を
-/// そのまま返すので、この関数が見ている集合と `tools/list` の応答は同一で
-/// ある。
+/// [`crate::dispatch`] が手書きしている `list_tools` は
+/// `tools().list_all()` をそのまま返すので、この関数が見ている集合と
+/// `tools/list` の応答は同一である。
 pub fn registered_tool_names() -> Vec<String> {
     registered_name_set().iter().cloned().collect()
 }
@@ -110,7 +137,7 @@ pub fn registered_tool_names() -> Vec<String> {
 /// 1呼び出しあたり11回走る。
 ///
 /// **導出元は変えていない。** ここで見るのも `tool_registry().list_all()` で
-/// あり、`#[tool_handler]` が生成する `list_tools` と同じ集合である
+/// あり、[`crate::dispatch`] の `list_tools` と同じ集合である
 /// （ツールの登録は起動前に確定し、実行中に増減しない）。
 fn registered_name_set() -> &'static BTreeSet<String> {
     static NAMES: OnceLock<BTreeSet<String>> = OnceLock::new();
@@ -125,7 +152,7 @@ fn registered_name_set() -> &'static BTreeSet<String> {
 
 /// そのツール名が登録されているか。
 ///
-/// 登録されていない名前で `tools/call` された場合、`rmcp` は
+/// 登録されていない名前で `tools/call` された場合、ルータは
 /// ツール結果エラーではなく**プロトコルエラー**
 /// （`invalid_params: tool not found`）を返す。これは
 /// `docs/07-mcp-server.md` §6 が認めている唯一の例外
@@ -138,16 +165,17 @@ pub fn is_registered_tool(name: &str) -> bool {
 
 /// ツール定義（`tools/list` の1要素）を名前で引く。
 ///
-/// `#[tool_handler]` が生成する `get_tool` は
-/// `tool_registry.get(name).cloned()` であり、この関数と同じものを返す。
+/// [`crate::dispatch`] が手書きしている `get_tool` は
+/// `tools().get(name).cloned()` であり、この関数と同じものを返す。
 pub fn tool_definition(name: &str) -> Option<Tool> {
     tool_registry().get(name).cloned()
 }
 
 /// クライアント（＝AI）が最初に受け取るサーバー情報。
 ///
-/// [`ServerHandler::get_info`] の実体。実行時依存に依らない値なので
-/// 自由関数として切り出してある（文言の検査にサーバーを組み立てさせない）。
+/// [`crate::dispatch`] が手書きしている `get_info` の実体。実行時依存に
+/// 依らない値なので自由関数として切り出してある（文言の検査にサーバーを
+/// 組み立てさせない）。
 pub fn server_info() -> ServerInfo {
     ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
         .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
@@ -170,13 +198,17 @@ pub fn server_info() -> ServerInfo {
 ///
 /// # ★ここは `McpTool` の型を並べる場所である★
 ///
-/// [`ToolRegistry::with`]（境界は `T: McpTool`）が**唯一の登録経路**であり、
-/// そこを通ったハンドラは必ず [`crate::dispatch::call`]（＝監査ログで挟む
-/// 経路）に入る。`rmcp` の `ToolRouter` はこのモジュールから**見えない**ので、
-/// `with_route` / `with_async_tool` / `with_sync_tool` で別のルートを足すことは
-/// できない（`DECISIONS.md` D-084 の訂正注記。それが可能だった間は
-/// **監査ログを通らないツールを書けた**）。`tests/audit_is_structural.rs` が
-/// second line として同じ識別子をソース走査でも見張っている。
+/// [`ToolRegistry::with`]（境界は `T: McpTool`）が**このレジストリの唯一の
+/// 登録経路**であり、そこを通ったハンドラは必ず [`crate::dispatch::call`]
+/// （＝監査ログで挟む経路）に入る。`with_route` / `with_async_tool` /
+/// `with_sync_tool` は `ToolRegistry` には無い（`DECISIONS.md` D-084 の
+/// 訂正注記。`ToolRouter` を直接持たせていた間は**監査ログを通らないツールを
+/// 書けた**）。
+///
+/// **「別のルータを作って別の `ServerHandler` を書く」ことまでは型で止まらない。**
+/// それを止めているのは冒頭の**ファイル許可リスト**（`rmcp` を名指しできる
+/// のは `dispatch.rs` と `error.rs` だけ。`tests/audit_is_structural.rs`）で
+/// ある。
 ///
 /// **このPR（Phase 3 PR-F）では2件**（書き込み系）。読み取り系・提案系は
 /// PR-G / PR-H。追加してよいのは `docs/07-mcp-server.md` §2 の表で
@@ -189,37 +221,6 @@ pub fn tool_registry() -> ToolRegistry {
     ToolRegistry::new()
         .with::<PostJournalEntry>()
         .with::<ReverseJournalEntry>()
-}
-
-#[tool_handler(router = self.tools)]
-impl ServerHandler for KaikeiServer {
-    fn get_info(&self) -> ServerInfo {
-        server_info()
-    }
-}
-
-/// stdio トランスポートでサーバーを起動し、切断されるまで待つ。
-///
-/// # stdout は JSON-RPC 専用チャネル
-///
-/// `println!` や stdout に出る `tracing` が1行でも混ざるとプロトコルが壊れ、
-/// 接続ごと落ちる。ログ・診断出力は必ず **stderr** に出すこと
-/// （`docs/07-mcp-server.md` §4）。
-///
-/// 設定の読み込みと合成は [`crate::config`] / [`crate::startup`] /
-/// `src/main.rs`（PR-E）。
-///
-/// # Errors
-///
-/// 初期化（`initialize` の折衝）に失敗した場合、または待機中に
-/// トランスポートが異常終了した場合。
-pub async fn serve_stdio(server: KaikeiServer) -> Result<(), Box<dyn std::error::Error>> {
-    use rmcp::transport::stdio;
-    use rmcp::ServiceExt;
-
-    let running = server.serve(stdio()).await?;
-    running.waiting().await?;
-    Ok(())
 }
 
 #[cfg(test)]

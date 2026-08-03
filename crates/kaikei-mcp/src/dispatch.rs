@@ -15,29 +15,62 @@
 //! | ツールは `CallToolResult` を組み立てられない | [`McpTool::run`] の戻り値は `Result<`[`ToolSuccess`]`, `[`ToolFailure`]`>` であり、応答（`isError` を含む）を組み立てるのは [`call`] だけ |
 //! | ツールは監査ログの記録先に触れない | [`McpTool::run`] が受け取るのは [`ToolContext`] で、[`kaikei_app::ports::AuditSink`] を**露出しない**。[`crate::startup::Runtime`] 自体が渡らない |
 //! | [`ToolContext`] を自分で作れない | フィールドも `new` も private。作れるのはこのモジュールだけ |
-//! | ルータに載せる経路が1つしかない | [`ToolRegistry`] が `rmcp` の `ToolRouter` を**包んで隠す**（下記）。ツールを載せる口は [`ToolRegistry::with`]`::<T: `[`McpTool`]`>` だけで、その中身は必ず [`call`] である |
+//! | ツールが応答を組み立てる形にならない | [`ToolRegistry`] にツールを載せる口は [`ToolRegistry::with`]`::<T: `[`McpTool`]`>` だけで、その中身は必ず [`call`] である |
 //! | fail-open の警告を捨てられない | [`call`] は [`kaikei_app::audit::AuditedCall::into_result_noting_outcome`]（既定経路）しか使わず、積まれた警告を必ず応答の `warnings` に載せる。`into_parts_unchecked`（逃げ道）はこの crate に1箇所も無い |
 //!
-//! # ルータそのものを閉じ込める（PR-F レビュー B-1）
+//! # ★このファイルは `rmcp` を名指しできる2ファイルのうちの1つである★
 //!
-//! **`route` を1本にするだけでは足りなかった。** `rmcp` の `ToolRouter` は
-//! `with_route` のほかに `with_async_tool::<T>()` / `with_sync_tool::<T>()` を
-//! 持ち、`ToolBase` + `AsyncTool` を実装した型はそこから**ハンドラ本体ごと**
-//! ルータに載る。その経路は `ToolRoute` も `CallToolResult` も `with_audit` も
-//! 書かずに済むため、ソース走査を全て素通りする——`rmcp` 3.1 の module doc は
-//! 「1ツール1ファイルならこちら」とその形を勧めてすらいる。
+//! **`kaikei-mcp` の `src/` で `rmcp` という識別子を書いてよいのは
+//! `dispatch.rs` と `error.rs` だけ**であり、`tests/audit_is_structural.rs`
+//! の `rmcp_is_named_only_in_the_files_allowed_to_name_it`（許可リスト）が
+//! 機械的に検査する。だから `rmcp` に触るコード——`ServerHandler` の実装
+//! （`call_tool` / `list_tools` / `get_tool` / `get_info`）も、stdio
+//! トランスポートの起動（[`serve_stdio`]）も、このファイルに集めてある。
 //!
-//! そこで **`ToolRouter` を持てるのはこのモジュールだけ**にした。
-//! [`crate::server`] が触るのは [`ToolRegistry`] で、そこには
-//! `with::<T: McpTool>` / `list_all` / `get` / `has_route` / `call` しか無い。
-//! **`McpTool` を実装していない型をルータに載せる方法が型として存在しない**
-//! （`ToolRouter` を名指しできない以上、`with_async_tool` を呼ぶ相手が無い）。
+//! ## なぜ禁止リストではなく許可リストなのか（PR-F レビュー3巡目 B）
 //!
-//! 型で閉じられない残り（同一 crate 内から `with_audit` を呼ぶ、
-//! `dispatch.rs` の中で `ToolRouter` に別のツールを足す）は
-//! `tests/audit_is_structural.rs` がソースを走査して見張る。
-//! **「型で閉じる → 残りをソース走査で見張る」の順番**であって、
-//! ソース走査が主ではない。
+//! **識別子の禁止リストは2巡続けて破られた。**
+//!
+//! | 巡 | 破り方 | 禁止リストに無かったもの |
+//! |---|---|---|
+//! | 1 | `ToolRouter::with_async_tool::<T>()` / `with_sync_tool` / `(Tool, handler)` タプル | `with_async_tool` / `AsyncTool` / `ToolBase` / `IntoToolRoute` |
+//! | 2 | `#[tool_handler]` の impl に `call_tool` を**手書き**する | `call_tool` / `CallToolRequestParams` / `ToolCallContext` / `into_call_tool_result` |
+//!
+//! 2 は特に静かだった。`rmcp-macros` 3.1.0 の `#[tool_handler]` は
+//! `if !has_method("call_tool", &item_impl)` で条件付き生成するので、
+//! 同じ impl ブロックに `call_tool` を手書きすると**マクロが生成する
+//! dispatch 経路が黙って置き換わる**。`tools/list` は正規の2件のまま、
+//! `tools/call` を1回送ると `journal_entries` に1件・`audit_log` に0行。
+//! `cargo build` も `clippy -D warnings` も `cargo test` も全緑だった。
+//!
+//! 禁止する識別子を足し続ける限り、`rmcp` が API を1つ増やすたび・
+//! レビュアーが1つ見落とすたびに同じことが起きる（**原理的に不完全**）。
+//! そこで向きを反転し、**`rmcp` を名指しできるファイルの側を許可リストで
+//! 限定した**。どの API を使う迂回であっても `rmcp` の名前は必要なので、
+//! 迂回は必ず許可された2ファイルのどちらかに現れる。
+//! `docs/07-mcp-server.md` §10 MC-30（依存の許可リスト）や
+//! `tests/forbidden_tools.rs` の許可リスト側検査と同じ形である。
+//!
+//! ## 何が型で閉じていて、何が閉じていないか（PR-F レビュー3巡目 C-1）
+//!
+//! **`rmcp` を「型として見えなくする」ことはできない。** `rmcp` は
+//! `kaikei-mcp` の直接依存であり `ToolRouter` は `pub` なので、
+//! 同一 crate の他モジュールから `use rmcp::...` を妨げる仕組みは Rust に
+//! 無い。以前この doc / `server.rs` / `docs/07` / `DECISIONS.md` D-084 が
+//! 書いていた「`ToolRouter` は見えない」「型として存在しない」は
+//! **成立していなかった**（レビュアーが実際にコンパイルを通している）。
+//!
+//! 実際の内訳はこうである。
+//!
+//! | 担保 | 手段 |
+//! |---|---|
+//! | [`ToolRegistry`] に `McpTool` 以外を載せられない | **型**（`with` の境界が `T: `[`McpTool`]、内側の `ToolRouter` は private フィールド） |
+//! | [`ToolContext`] を自作できない／[`kaikei_app::ports::AuditSink`] に触れない | **型**（private フィールド・private な `new`・`Runtime` を渡さない） |
+//! | 別のルータ・別の `ServerHandler`・別のハンドラを**書き足す** | **ファイル許可リスト**（`rmcp` を名指しできるのは2ファイル） |
+//! | 同一 crate から `kaikei_app::audit::with_audit` を直接呼ぶ | **識別子の閉じ込め**（`tests/audit_is_structural.rs` の `CONFINED`） |
+//!
+//! 3行目は型ではなく**検査**である。ここを型で閉じたと書かないこと
+//! （提供していない保証を書かない、は本 PR が繰り返し適用してきた規律）。
 //!
 //! # `AuditCall::tool` にはレジストリの名前しか載らない
 //!
@@ -83,7 +116,12 @@ use kaikei_jp::compose::Composition;
 use kaikei_store::pool::PgStore;
 use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
 use rmcp::handler::server::tool::{schema_for_input, ToolCallContext};
-use rmcp::model::{CallToolResponse, CallToolResult, Tool};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
+    PaginatedRequestParams, ResultType,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
@@ -91,6 +129,20 @@ use serde_json::{Map, Value};
 use crate::error::ToolError;
 use crate::server::KaikeiServer;
 use crate::startup::Runtime;
+
+/// `rmcp` の型のうち、**`rmcp` を名指しできない他モジュールにも要るもの**の
+/// 再輸出。
+///
+/// `src/server.rs` は `tools/list` の定義（[`Tool`]）とサーバー情報
+/// （[`ServerInfo`]）を組み立てるが、モジュール doc の許可リストにより
+/// `rmcp` を名指しできない。そこでここから貸す。
+///
+/// **登録経路に関わる型（`ToolRouter` / `ToolRoute` / `ToolCallContext` /
+/// `CallToolResult` …）は再輸出しないこと。** 再輸出すると
+/// 「`rmcp` を名指しせずに登録経路へ届く」抜け道ができ、許可リストの意味が
+/// 消える。`tests/audit_is_structural.rs` の `CONFINED`（識別子の閉じ込め）が
+/// その漏れに対する second line として残してある。
+pub use rmcp::model::{Implementation, ServerCapabilities, ServerInfo, Tool};
 
 /// 応答に fail-open の警告を載せるキー。
 ///
@@ -576,25 +628,30 @@ fn deserialize_input<T: McpTool>(
 // レジストリへの登録（唯一の経路）
 // ---------------------------------------------------------------------------
 
-/// `tools/list` と `tools/call` が引くレジストリ。**`rmcp` の `ToolRouter` を
-/// 包んで隠す唯一の型。**
+/// `tools/list` と `tools/call` が引くレジストリ。`rmcp` の `ToolRouter` を
+/// **private フィールドとして包む**型。
 ///
-/// # なぜ包むのか（PR-F レビュー B-1）
+/// # 何が閉じているか（PR-F レビュー B-1 / 3巡目 B）
 ///
 /// `ToolRouter` を [`crate::server`] に持たせていたときは、そこで
 /// `with_async_tool::<T>()` / `with_sync_tool::<T>()`（`rmcp` が `ToolBase` +
 /// `AsyncTool` の実装型に対して用意している登録口）を呼べば、
 /// **[`call`] を通らないツールをルータに載せられた**。その形は `ToolRoute` も
-/// `CallToolResult` も `with_audit` も書かないので、ソース走査では捕まらない。
+/// `CallToolResult` も `with_audit` も書かないので、識別子の走査では捕まらない。
 ///
 /// この型はツールを載せる口を [`ToolRegistry::with`]（境界が
 /// `T: `[`McpTool`]）だけにし、内側の `ToolRouter` を外に出さない。
-/// **`McpTool` を実装していない型を載せる方法が型として存在しない。**
+/// **この型を経由して `McpTool` 以外を載せる方法は型として無い。**
 ///
-/// 残りの3メソッド（[`ToolRegistry::call`] / [`ToolRegistry::list_all`] /
-/// [`ToolRegistry::get`]）は `rmcp` の `#[tool_handler]` が生成する
-/// `call_tool` / `list_tools` / `get_tool` が呼ぶ委譲である
-/// （マクロは `router = <式>` の式に対してこの3つを呼ぶ）。
+/// **ただし「別のルータを新しく作る」ことは型では止まらない。**
+/// `rmcp` は直接依存であり `ToolRouter` は `pub` なので、同一 crate の
+/// 他モジュールが `use rmcp::...` するのを妨げる仕組みは Rust に無い。
+/// そちらを止めているのはモジュール doc の**ファイル許可リスト**
+/// （`rmcp` を名指しできるのは `dispatch.rs` と `error.rs` だけ）である。
+///
+/// [`ToolRegistry::list_all`] / [`ToolRegistry::get`] と private な
+/// [`ToolRegistry::call`] は、このファイルが手書きしている
+/// [`ServerHandler`] の `list_tools` / `get_tool` / `call_tool` の実体である。
 #[derive(Clone)]
 pub struct ToolRegistry {
     router: ToolRouter<KaikeiServer>,
@@ -624,22 +681,22 @@ impl ToolRegistry {
         self
     }
 
-    /// `tools/call`（`#[tool_handler]` が生成する `call_tool` の実体）。
+    /// `tools/call`（下の [`ServerHandler`] 実装の `call_tool` の実体）。
     ///
     /// 未登録の名前には `invalid_params: tool not found`
     /// （`docs/07-mcp-server.md` §6 が認める唯一のプロトコルエラー）を返す。
     ///
-    /// # Errors
-    ///
-    /// `rmcp` が返すプロトコルエラー（未登録のツール名など）。
-    pub async fn call(
+    /// **private。** `ToolCallContext` を引数に持つメソッドを公開すると、
+    /// 他モジュールが `rmcp` を名指しせずに `tools/call` の入口へ届いて
+    /// しまう（ファイル許可リストの抜け道になる）。
+    async fn call(
         &self,
         context: ToolCallContext<'_, KaikeiServer>,
-    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         self.router.call(context).await
     }
 
-    /// `tools/list`（`#[tool_handler]` が生成する `list_tools` の実体）。
+    /// `tools/list`（`list_tools` の実体）。
     #[must_use]
     pub fn list_all(&self) -> Vec<Tool> {
         self.router.list_all()
@@ -689,6 +746,93 @@ fn tool_attr<T: McpTool>() -> Tool {
         panic!("ツール {} の入力スキーマを生成できません: {error}", T::NAME)
     });
     Tool::new(T::NAME, T::DESCRIPTION, schema)
+}
+
+// ---------------------------------------------------------------------------
+// MCP のサーバーハンドラ（`tools/list` と `tools/call` の入口）
+// ---------------------------------------------------------------------------
+
+/// `rmcp` が JSON-RPC の要求を配る先。
+///
+/// # `#[tool_handler]` を使わず手書きする（PR-F レビュー3巡目 B）
+///
+/// `rmcp-macros` 3.1.0 の `#[tool_handler]` は
+/// `if !has_method("call_tool", &item_impl)` で条件付き生成する。つまり
+/// **同じ impl ブロックに `call_tool` を手書きすると、マクロが生成する
+/// dispatch 経路が黙って置き換わる**。実測では `tools/list` は正規の2件の
+/// まま、`tools/call` を1回送ると `journal_entries` に1件・`audit_log` に
+/// 0行で、`cargo build` / `clippy -D warnings` / `cargo test` は全緑だった。
+/// しかも当時この impl は既に `get_info` を手書きしており、
+/// 「メソッドを自分で書けばマクロが引き下がる」形が見本として置かれていた。
+///
+/// マクロを外して4つとも手書きにすれば、生成物と手書きが入れ替わるという
+/// 事象そのものが起きない。中身はマクロが生成していたものと同じで、
+/// `call_tool` は [`ToolRegistry::call`]（＝[`route`] が載せたハンドラ＝
+/// [`call`]）へ委譲する。
+///
+/// この impl がこのファイルに在るのは、モジュール doc の許可リスト
+/// （`rmcp` を名指しできるのは `dispatch.rs` と `error.rs` だけ）による。
+/// **「`call_tool` を手書きする」形自体が許可リストの内側に入っている**ので、
+/// これを別のファイルで書き直す迂回は検査で落ちる。
+impl ServerHandler for KaikeiServer {
+    fn get_info(&self) -> ServerInfo {
+        crate::server::server_info()
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let call_context = ToolCallContext::new(self, request, context);
+        self.tools().call(call_context).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools: self.tools().list_all(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tools().get(name).cloned()
+    }
+}
+
+/// stdio トランスポートでサーバーを起動し、切断されるまで待つ。
+///
+/// # stdout は JSON-RPC 専用チャネル
+///
+/// `println!` や stdout に出る `tracing` が1行でも混ざるとプロトコルが壊れ、
+/// 接続ごと落ちる。ログ・診断出力は必ず **stderr** に出すこと
+/// （`docs/07-mcp-server.md` §4）。
+///
+/// 設定の読み込みと合成は [`crate::config`] / [`crate::startup`] /
+/// `src/main.rs`（PR-E）。
+///
+/// この関数が `server.rs` ではなくここに在るのは、`rmcp` のトランスポートを
+/// 名指しするためである（モジュール doc の許可リスト）。
+///
+/// # Errors
+///
+/// 初期化（`initialize` の折衝）に失敗した場合、または待機中に
+/// トランスポートが異常終了した場合。
+pub async fn serve_stdio(server: KaikeiServer) -> Result<(), Box<dyn std::error::Error>> {
+    use rmcp::transport::stdio;
+    use rmcp::ServiceExt;
+
+    let running = server.serve(stdio()).await?;
+    running.waiting().await?;
+    Ok(())
 }
 
 #[cfg(test)]

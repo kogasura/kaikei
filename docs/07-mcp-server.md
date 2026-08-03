@@ -693,7 +693,7 @@ pub trait McpTool: Send + Sync + 'static {
         -> impl Future<Output = Result<ToolSuccess, ToolFailure>> + Send;
 }
 
-// ルータそのものを dispatch 層に閉じ込める。ツールを載せる口はこれだけ。
+// rmcp の ToolRouter を private フィールドとして包む。ツールを載せる口はこれだけ。
 pub struct ToolRegistry { /* rmcp の ToolRouter を包んで隠す */ }
 impl ToolRegistry {
     pub fn new() -> Self;
@@ -704,39 +704,80 @@ pub async fn call<T: McpTool>(runtime: &Runtime, arguments: Option<Map<String, V
     -> CallToolResult;                                  // 唯一の実行経路
 ```
 
-| 塞ぐもの | 実体 |
-|---|---|
-| ツールが応答を組み立てる | `run` の戻り値は `Result<ToolSuccess, ToolFailure>`。`CallToolResult`（`isError` を含む）を作れるのは `dispatch::call` と `ToolError` だけ |
-| ツールが監査ログを書く／書き忘れる | `run` が受け取る `ToolContext` は `AuditSink` を**露出しない**（`Runtime` 自体が渡らない） |
-| `ToolContext` を自作する | フィールドも `new` も private |
-| 別経路でルータに載せる | **`rmcp` の `ToolRouter` が `dispatch` の外に出ない。** `server.rs` が持つのは `ToolRegistry` で、ツールを載せる口は `with::<T: McpTool>` だけである |
-| fail-open の警告を捨てる | `call` は `AuditedCall::into_result_noting_outcome(&mut notes)`（既定経路）しか使わず、警告を必ず応答の `warnings` に載せる。`into_parts_unchecked` はこの crate に1箇所も無い |
-| クライアント由来の名前が `audit_log.tool` に載る | `AuditCall` を組み立てるのは `dispatch.rs` の1箇所だけ（走査で担保）で、そこは `ToolName::resolve`（レジストリを引く。**登録済み以外を弾くことは型で閉じている**）を通す（§9） |
+| 塞ぐもの | 実体 | 手段 |
+|---|---|---|
+| ツールが応答を組み立てる | `run` の戻り値は `Result<ToolSuccess, ToolFailure>`。`CallToolResult`（`isError` を含む）を作れるのは `dispatch::call` と `ToolError` だけ | 型 |
+| ツールが監査ログを書く／書き忘れる | `run` が受け取る `ToolContext` は `AuditSink` を**露出しない**（`Runtime` 自体が渡らない） | 型 |
+| `ToolContext` を自作する | フィールドも `new` も private | 型 |
+| `ToolRegistry` に `McpTool` 以外を載せる | ツールを載せる口は `with::<T: McpTool>` だけで、内側の `ToolRouter` は private フィールド | 型 |
+| **別のルータ・別の `ServerHandler` を書き足す** | **`rmcp` を名指しできるファイルを `dispatch.rs` / `error.rs` の2つに限る許可リスト** | 検査 |
+| fail-open の警告を捨てる | `call` は `AuditedCall::into_result_noting_outcome(&mut notes)`（既定経路）しか使わず、警告を必ず応答の `warnings` に載せる。`into_parts_unchecked` はこの crate に1箇所も無い | 型＋走査 |
+| クライアント由来の名前が `audit_log.tool` に載る | `AuditCall` を組み立てるのは `dispatch.rs` の1箇所だけ（走査で担保）で、そこは `ToolName::resolve`（レジストリを引く。**登録済み以外を弾くことは型で閉じている**）を通す（§9） | 走査＋型 |
 
-> **★ルータを外に出すと走査では捕まらない抜け道ができる★**（PR-F レビュー B-1）
+> **★識別子の禁止リストは2巡続けて破られた。許可リストに反転した★**
+> （PR-F レビュー B-1 / 3巡目 B）
 >
-> 初版は `dispatch::route` を「唯一の登録経路」とし、`server.rs` に
-> `ToolRouter` を持たせていた。しかし `rmcp` の `ToolRouter` は
-> `with_route` のほかに **`with_async_tool::<T>()` / `with_sync_tool::<T>()`** を
-> 持ち、`ToolBase` + `AsyncTool` を実装した型は**ハンドラ本体ごと**そこから
-> 載る。その経路は `ToolRoute` も `CallToolResult` も `with_audit` も
-> `#[tool(` も書かずに済むため、`tests/audit_is_structural.rs` の走査を
-> **全て素通り**する（レビュー2名が独立に再現し、`get_settings` を名乗る
-> probe が `tools/list` に載り、`audit_log` に1行も残さずに実 DB へ記帳できた）。
-> しかも `rmcp` 3.1 の module doc は「1ツール1ファイルならこの形」と
-> 勧めており、**最も踏みやすい経路**だった。
+> | 巡 | 破り方 | 当時の禁止リストに無かった識別子 |
+> |---|---|---|
+> | 1 | `ToolRouter::with_async_tool::<T>()` / `with_sync_tool` / `(Tool, handler)` タプル | `with_async_tool` / `AsyncTool` / `ToolBase` / `IntoToolRoute` |
+> | 2 | `#[tool_handler]` の impl に `call_tool` を**手書き**する | `call_tool` / `CallToolRequestParams` / `ToolCallContext` / `into_call_tool_result` |
 >
-> そこで `ToolRouter` を `dispatch.rs` に閉じ込め、外には `ToolRegistry`
-> （`with::<T: McpTool>` しか無い型）だけを見せる形に変えた。
-> `McpTool` を実装していない型をルータに載せる方法が**型として存在しない**。
+> 1 は `ToolBase` + `AsyncTool` を実装した型が**ハンドラ本体ごと**ルータに
+> 載る形で、`ToolRoute` も `CallToolResult` も `with_audit` も `#[tool(` も
+> 書かない。`rmcp` 3.1 の module doc が「1ツール1ファイルならこの形」と
+> 勧めてすらいた（レビュー2名が独立に再現し、`get_settings` を名乗る probe が
+> `tools/list` に載り、`audit_log` に1行も残さずに実 DB へ記帳できた）。
+>
+> 2 はさらに静かだった。`rmcp-macros` 3.1.0 の `#[tool_handler]` は
+> `if !has_method("call_tool", &item_impl)` で条件付き生成するので、**同じ
+> impl ブロックに `call_tool` を手書きするとマクロが生成する dispatch 経路が
+> 黙って置き換わる**。`tools/list` は正規の2件のまま、`tools/call` を1回
+> 送っただけで `journal_entries` に1件・`audit_log` に0行。
+> `cargo build` / `clippy -D warnings` / `cargo test -p kaikei-mcp` は全緑。
+> しかもその impl は既に `get_info` を手書きしており、「メソッドを自分で
+> 書けばマクロが引き下がる」形が**見本として目の前に置かれていた**。
+>
+> レビューはこの時点でまだ塞がっていない口として `ToolRouter::add_route` /
+> `merge`、`IntoToolRoute` の `WithToolAttr` /
+> `ToolAttrGenerateFunctionAdapter`、`CallToolHandlerExt`（`mentions` の
+> 識別子境界判定により `CallToolHandler` 規則には**一致しない**）も挙げていた。
+> **識別子を足し続ける限りこれは終わらない**（禁止リストは原理的に不完全で
+> あり、`rmcp` が API を1つ増やすたびに穴が開く）。
+>
+> そこで向きを反転し、**`kaikei-mcp/src/` のうち `rmcp` という識別子を
+> 書いてよいファイルを許可リストで限定した**。
+>
+> | ファイル | なぜ必要か |
+> |---|---|
+> | `dispatch.rs` | ルータ、`ServerHandler` の実装（`call_tool` / `list_tools` / `get_tool` / `get_info`）、stdio トランスポートの起動 |
+> | `error.rs` | `ToolError::into_call_tool_result`（D-071） |
+>
+> どの API を使う迂回であっても `rmcp` の名前は必要なので、迂回は必ず
+> 許可された2ファイルのどちらかに現れる。`#[tool_handler]` は使わず
+> **`ServerHandler` の4メソッドを `dispatch.rs` で手書き**してあるので、
+> 「`call_tool` を手書きする」形自体が許可リストの内側にある。
+> MC-30（依存の許可リスト）や `tests/forbidden_tools.rs` の
+> `every_registered_tool_is_one_of_the_eleven_phase_3_tools`（禁止4件だけで
+> なく許可11件の側からも閉じる）と同じ形である。
+
+> **★「型で閉じた」と書かないこと★**（PR-F レビュー3巡目 C-1）
+>
+> `rmcp` は `kaikei-mcp` の直接依存であり `ToolRouter` は `pub` である。
+> **同一 crate の他モジュールから import を妨げる仕組みは Rust に無い**
+> （レビュアーが実際にコンパイルを通している）。以前ここと
+> `crates/kaikei-mcp/src/dispatch.rs` / `src/server.rs` / `DECISIONS.md` D-084 に
+> あった「`ToolRouter` は見えない」「型として存在しない」「監査ログを通らない
+> ツールは書けない」は**いずれも成立していなかった**。止めているのは検査で
+> あって型ではない。提供していない保証を書かない。
 
 型で閉じられない残り（同一 crate 内から `with_audit` を呼ぶ、`dispatch.rs` の
-中で `ToolRouter` に別のツールを足す）は
-`crates/kaikei-mcp/tests/audit_is_structural.rs` がソースを走査して見張る。
-**「型で閉じる → 残りを走査で見張る」の順**であって、走査が主ではない。
-走査の対象には `ToolRouter` / `with_async_tool` / `with_sync_tool` /
-`AsyncTool` / `SyncTool` / `ToolBase` / `IntoToolRoute` / `CallToolHandler` も
-入れてある（型の側が崩れたときに気づける second line）。
+中で `ToolRouter` に別のツールを足す、`dispatch.rs` が `rmcp` の型を再輸出する）は
+`crates/kaikei-mcp/tests/audit_is_structural.rs` が見張る。
+一次の担保はファイル許可リスト
+（`rmcp_is_named_only_in_the_files_allowed_to_name_it`）であり、識別子の
+閉じ込め（`ToolRouter` / `with_async_tool` / `AsyncTool` / `IntoToolRoute` /
+`CallToolHandler` …）は**再輸出という唯一の穴に対する second line** として
+残してある。**識別子の一覧が網羅であるとは主張しない。**
 
 **`rmcp` のツールマクロ（`#[tool]` / `#[tool_router]`）は使わない。**
 マクロで書くとハンドラ本体をその場に書くことになり、`dispatch::call` を
@@ -884,10 +925,10 @@ kaikei-mcp/src/
 ├── main.rs               起動（設定ロード → 合成 → stdio サーバ）        ← PR-E で新設
 ├── startup.rs            合成ルート。kaikei_jp::compose::compose + PgStore の結線 ← PR-E で新設
 ├── config.rs             事業者設定の読み込みと必須検証（欠けていたら起動失敗。§7） ← PR-E で新設
-├── dispatch.rs           ★監査ログを通す唯一の経路★ McpTool / ToolContext / route / call ← PR-F で新設
+├── dispatch.rs           ★監査ログを通す唯一の経路★ McpTool / ToolContext / call / ToolRegistry / ServerHandler の実装 / serve_stdio ← PR-F で新設。**rmcp を名指しできる2ファイルのうちの1つ**
 ├── wire.rs               線上の DTO（AmountStr 等）。★整形は書かない★ ← PR-D で新設
-├── server.rs             tool_router の合成、rmcp の ServerHandler 実装     ← PR-D で新設
-├── error.rs              JpError → 分類コード、ToolError → CallToolResult::structured_error（§6） ← PR-D で新設
+├── server.rs             レジストリに何を載せるか（tool_registry）とサーバー情報の文面 ← PR-D で新設
+├── error.rs              JpError → 分類コード、ToolError → CallToolResult::structured_error（§6） ← PR-D で新設。**rmcp を名指しできる2ファイルのうちの1つ**
 └── tools/
     ├── list_accounts.rs
     ├── get_entry.rs
@@ -1928,7 +1969,7 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 
 | # | ケース | 期待 |
 |---|---|---|
-| MC-11 | 全ツール呼び出しが audit_log に記録される | 1回のツール呼び出しにつき**同一 `request_id` で2行**（`status='started'` と `status='ok'\|'error'`）が残る。`tool` 列が呼び出したツール名と一致する。書き込み系は結果レコードの `entry_id` が返した仕訳IDと一致する。**Phase 3 の全11ツールに対して総当たりで確認する**（1ツールだけのサンプル検査にしない）。**PR-F で書き込み系2件を実装**（`crates/kaikei-e2e/tests/mcp_write_tools.rs`）。残り9件は PR-G / PR-H。なお**「総当たり」の性質そのものは PR-F で構造に移した**——ツールをレジストリに載せる経路が `ToolRegistry::with::<T: McpTool>` の1本しか無く、その中身が必ず `dispatch::call`（監査ログで挟む）なので、「監査ログを通らないツール」は書けない（D-084。`crates/kaikei-mcp/tests/audit_is_structural.rs`）。総当たりのテストは、その構造が守られていることを実 DB で追認するものになった |
+| MC-11 | 全ツール呼び出しが audit_log に記録される | 1回のツール呼び出しにつき**同一 `request_id` で2行**（`status='started'` と `status='ok'\|'error'`）が残る。`tool` 列が呼び出したツール名と一致する。書き込み系は結果レコードの `entry_id` が返した仕訳IDと一致する。**Phase 3 の全11ツールに対して総当たりで確認する**（1ツールだけのサンプル検査にしない）。**PR-F で書き込み系2件を実装**（`crates/kaikei-e2e/tests/mcp_write_tools.rs`）。残り9件は PR-G / PR-H。なお**「総当たり」の性質そのものは PR-F で大部分が構造に移った**——ツールをレジストリに載せる経路が `ToolRegistry::with::<T: McpTool>` の1本しか無く、その中身が必ず `dispatch::call`（監査ログで挟む）である。ただし「監査ログを通らないツールを書けない」を成立させているのは**型だけではない**（`rmcp` を直接名指しすれば別のルータを作れる）。そこを閉じているのは `rmcp` を名指しできるファイルの許可リスト（`crates/kaikei-mcp/tests/audit_is_structural.rs` の `rmcp_is_named_only_in_the_files_allowed_to_name_it`。D-084 の訂正注記3）である。総当たりのテストは、その構造が守られていることを実 DB で追認するものになった |
 | MC-20 | 開始レコードの書き込みが失敗する状況（audit 用接続を落とす、または `REVOKE INSERT ON audit_log FROM kaikei_app`）で post | ツールは `isError: true` を返し、**帳簿には1件も入っていない**（fail-closed） |
 | MC-21 | 結果レコードの書き込みだけが失敗 | 記帳は成功として返り、警告が添えられる。開始レコードだけが残り「結果不明」として識別できる（fail-open） |
 | MC-22 | 記帳が失敗（貸借不一致等）してトランザクションが rollback される | **開始レコードは audit_log に残る。** D-070 の存在理由そのもの（同一トランザクションで書く実装に退行したら、このテストだけが落ちる） |

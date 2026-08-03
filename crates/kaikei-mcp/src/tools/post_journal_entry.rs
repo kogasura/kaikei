@@ -95,7 +95,17 @@ pub struct PostJournalEntryInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PostJournalEntryLine {
-    /// 勘定科目コード。list_accounts で取得できるコードを指定します。
+    // ★実装済みのツールにしか誘導しない★（PR-F レビュー3巡目 D-1）
+    //
+    // 初版は「list_accounts で取得できるコードを指定します」と書いていたが、
+    // `list_accounts` は PR-G であり、`tools/list` に出ていない。指示どおり
+    // 呼ぶと `-32602 tool not found` が返り、AI からは「サーバが壊れている」
+    // ようにしか見えない（D-038 の誤診クラス）。**この面に書いてよいのは、
+    // その時点で実際に呼べるツールだけである。**
+    // PR-G で `list_accounts` を登録したら、この文言に戻してよい。
+    /// 勘定科目コード。帳簿に登録されている科目コードを指定します
+    /// （例: "135"）。登録されていないコードを指定した場合はエラーになり、
+    /// コードが近い記帳可能な科目が候補として返ります。
     pub account: String,
 
     /// 借方なら debit、貸方なら credit を指定します。

@@ -68,7 +68,7 @@ READMEおよびドキュメントでの表現は
 | Phase 0 | `kaikei-core`（貸借不一致の仕訳がプログラム上に存在できない簿記エンジン） | ✅ 完了 |
 | Phase 1 | `kaikei-policy`（trait）/ `kaikei-store`（PostgreSQL）/ `kaikei-app`（ユースケース3本） | ✅ 完了 |
 | Phase 2 | `kaikei-jp`（消費税の税額計算・勘定科目テンプレート・家事按分・決算振替） | ✅ 完了 |
-| Phase 3 | `kaikei-mcp`（rmcp / stdio。読み取り系7 + 書き込み系2 + 提案系・検証系2 + audit_log） | 実装中（合成ルートまで完了。ツールは未実装） |
+| Phase 3 | `kaikei-mcp`（rmcp / stdio。読み取り系7 + 書き込み系2 + 提案系・検証系2 + audit_log） | 実装中（`audit_log` と書き込み系2件まで完了。残り9件は未実装） |
 | Phase 4〜5 | CSV 取込・証憑 / 帳票・決算 | 未着手 |
 
 各 Phase の実績・設計変更・申し送りは `PROGRESS.md`、設計判断の記録は
@@ -226,7 +226,7 @@ cargo run -p kaikei-mcp
 
 | ツール | できること |
 |---|---|
-| `post_journal_entry` | 仕訳を1件起こす。金額は**文字列**で渡します（例: `"110000"`）。貸借が一致しない仕訳は記帳されず、差額と修正案（`hint`）が返ります |
+| `post_journal_entry` | 仕訳を1件起こす。金額は**文字列**で渡します（例: `"110000"`）。貸借が一致しない仕訳は記帳されません。応答には差額（`difference`）が入り、税抜経理の課税事業者で `auto_tax_lines` を使っていない場合は消費税額の行を足す修正案（`hint`）も付きます（税込経理・免税事業者・`auto_tax_lines: true` では `hint` は付かず、理由が `policy_notes` に入ります） |
 | `reverse_journal_entry` | 逆仕訳（赤伝）で訂正する。元の仕訳は書き換わりません |
 
 照会系・提案系（`get_trial_balance` / `search_entries` / `list_accounts` など
@@ -235,7 +235,16 @@ cargo run -p kaikei-mcp
 **削除・更新のツールは存在しません**（`delete_journal_entry` /
 `update_journal_entry` / `execute_sql` / `reopen_period` は登録されておらず、
 DB のロール権限とトリガでも塞いであります）。
-すべてのツール呼び出しは `audit_log` に**開始・結果の2行**として記録されます。
+
+ツールの呼び出しは `audit_log` に**開始レコードと結果レコードの2行**として
+記録します。ただし2行が揃わない場合があり、それぞれ意味が違います。
+
+| 状況 | 残る行 | 応答 |
+|---|---|---|
+| 通常 | 開始 + 結果の2行 | 通常の成功／失敗 |
+| 開始レコードが書けない | 0行 | **操作を実行しません**（fail-closed）。帳簿は変更されません |
+| 結果レコードだけが書けない | 開始の1行 | 操作は実行され、応答に `warnings` が付きます（fail-open）。その呼び出しは「結果不明」として識別できます |
+| 登録されていないツール名 | 0行 | ツール呼び出しに到達しないため、プロトコルエラー（`tool not found`）になります |
 
 ## 仕訳番号と欠番
 
