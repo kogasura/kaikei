@@ -53,6 +53,7 @@ use kaikei_jp::tax::TaxRuleSets;
 use kaikei_store::audit::PgAuditSink;
 use kaikei_store::convert::{naive_date_to_accounting_date, timestamp_to_datetime};
 use kaikei_store::pool::{connect_app_with, inspect_journal_privileges, PgStore};
+use kaikei_store::query::{PgLedgerQuery, PgSearchEntriesQuery};
 use std::fmt;
 use std::sync::Arc;
 
@@ -95,6 +96,16 @@ pub struct Runtime {
 
     /// 記帳時刻の取得。`Utc::now()` を直に呼ばずこれを通す（`CLAUDE.md` §7）。
     pub clock: SystemClock,
+
+    /// 仕訳検索の read model（Phase 3 PR-H）。
+    ///
+    /// **`store` とは別の入口である。** 読み取りは Repository を通さず
+    /// SQL から DTO へ直行する（`CLAUDE.md` §6）。同じ `PgPool` を共有する
+    /// が、`PgTx` の経路には入らない。
+    pub search_query: Arc<PgSearchEntriesQuery>,
+
+    /// 総勘定元帳の read model（同上）。
+    pub ledger_query: Arc<PgLedgerQuery>,
 }
 
 /// [`assemble`] の結果。
@@ -186,7 +197,11 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
     }
 
     let store = Arc::new(PgStore::new(pool.clone()));
-    let audit_sink = Arc::new(PgAuditSink::new(pool));
+    let audit_sink = Arc::new(PgAuditSink::new(pool.clone()));
+    // read model は書き込み側（`PgStore`/`PgTx`）を経由しない（`CLAUDE.md` §6）。
+    // プールは共有するが、経路は別である。
+    let search_query = Arc::new(PgSearchEntriesQuery::new(pool.clone()));
+    let ledger_query = Arc::new(PgLedgerQuery::new(pool));
 
     // 4. 勘定科目マスタの投入（追加のみ・冪等。`DECISIONS.md` D-081）。
     let imported = with_tx(store.as_ref(), |tx| {
@@ -225,6 +240,8 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
             book_settings: config.book_settings,
             id_gen: UuidV7IdGenerator,
             clock,
+            search_query,
+            ledger_query,
         }),
         diagnostics,
     })

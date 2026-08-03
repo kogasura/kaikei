@@ -147,6 +147,7 @@ use kaikei_app::clock::SystemClock;
 use kaikei_app::context::BookSettings;
 use kaikei_app::error::codes;
 use kaikei_app::id::UuidV7IdGenerator;
+use kaikei_app::ports::{LedgerQuery, SearchEntriesQuery};
 use kaikei_core::EntryId;
 use kaikei_jp::compose::Composition;
 use kaikei_store::pool::PgStore;
@@ -267,6 +268,16 @@ impl<'a> ToolContext<'a> {
     /// 記帳時刻の取得（`CLAUDE.md` §7）。
     pub fn clock(&self) -> SystemClock {
         self.runtime.clock
+    }
+
+    /// 仕訳検索の read model（`CLAUDE.md` §6。`Tx` を通さない）。
+    pub fn search_entries_query(&self) -> &'a dyn SearchEntriesQuery {
+        self.runtime.search_query.as_ref()
+    }
+
+    /// 総勘定元帳の read model（同上）。
+    pub fn ledger_query(&self) -> &'a dyn LedgerQuery {
+        self.runtime.ledger_query.as_ref()
     }
 }
 

@@ -210,30 +210,43 @@ pub fn server_info() -> ServerInfo {
 /// のは `dispatch.rs` と `error.rs` だけ。`tests/audit_is_structural.rs`）で
 /// ある。
 ///
-/// **このPR（Phase 3 PR-F）では2件**（書き込み系）。読み取り系・提案系は
-/// PR-G / PR-H。追加してよいのは `docs/07-mcp-server.md` §2 の表で
+/// **PR-F で書き込み系2件、PR-H で読み取り系のうち `search_entries` /
+/// `get_ledger` の2件**を登録した。残りの読み取り系・提案系は PR-G。
+/// 追加してよいのは `docs/07-mcp-server.md` §2 の表で
 /// **Phase 3** と書かれた11件だけで、「存在させないツール」の4件を
 /// ここに足してはならない。
 pub fn tool_registry() -> ToolRegistry {
+    use crate::tools::get_ledger::GetLedger;
     use crate::tools::post_journal_entry::PostJournalEntry;
     use crate::tools::reverse_journal_entry::ReverseJournalEntry;
+    use crate::tools::search_entries::SearchEntries;
 
     ToolRegistry::new()
         .with::<PostJournalEntry>()
         .with::<ReverseJournalEntry>()
+        .with::<SearchEntries>()
+        .with::<GetLedger>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // PR-F の時点で登録されているのは書き込み系の2件（読み取り系・提案系は
-    // PR-G / PR-H）。件数そのものではなく「その2件が居ること」を見る
-    // （件数のリテラルは PR-G で必ず古くなる）。
+    // 件数そのものではなく「その名前が居ること」を見る
+    // （件数のリテラルは並行して進む PR で必ず古くなる）。
     #[test]
     fn the_write_tools_are_registered() {
         let names = registered_tool_names();
         for expected in ["post_journal_entry", "reverse_journal_entry"] {
+            assert!(names.iter().any(|name| name == expected), "{expected}");
+        }
+    }
+
+    // PR-H で足した読み取り系2件（`search_entries` / `get_ledger`）。
+    #[test]
+    fn the_search_and_ledger_tools_are_registered() {
+        let names = registered_tool_names();
+        for expected in ["search_entries", "get_ledger"] {
             assert!(names.iter().any(|name| name == expected), "{expected}");
         }
     }

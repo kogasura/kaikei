@@ -209,6 +209,25 @@ pub fn lines_to_json(lines: &[JournalLine]) -> Value {
     Value::Array(lines.iter().map(line_to_json).collect())
 }
 
+/// 「この仕訳を取り消している赤伝」を線上の JSON にする。
+///
+/// # なぜこの欄が要るのか（`DECISIONS.md` D-088）
+///
+/// 帳簿は追記のみなので、赤伝で訂正された仕訳も検索結果・元帳に残り続ける。
+/// **取り消し済みであることが読み取れないと、AI は同じ仕訳をもう一度
+/// 訂正しようとする**（`reverse_journal_entry` は `allow_double_reversal`
+/// を明示すれば二重訂正を通してしまう）。
+///
+/// 仕訳IDは UUID の正準表記に揃える（10進表記にしない。
+/// [`kaikei_app::id::entry_id_to_uuid_string`]）。
+pub fn reversal_ref_to_json(reversal: &kaikei_app::view::ReversalRef) -> Value {
+    json!({
+        "entry_id": kaikei_app::id::entry_id_to_uuid_string(reversal.entry_id),
+        "entry_no": reversal.entry_no.as_u32(),
+        "entry_date": reversal.entry_date.to_iso_string(),
+    })
+}
+
 /// `PolicyNote` の一覧を線上の JSON 配列にする。
 ///
 /// **文言は `kaikei-policy` の実装が組み立てたものをそのまま素通しする**

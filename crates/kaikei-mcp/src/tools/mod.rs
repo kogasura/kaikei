@@ -18,11 +18,15 @@
 //! - **業務判断**。税額行を足すかどうか、締まっているかどうかの判定は
 //!   `kaikei-app` のユースケースと `kaikei-jp` の policy が行う。
 
+pub mod get_ledger;
 pub mod post_journal_entry;
 pub mod reverse_journal_entry;
+pub mod search_entries;
 
 use kaikei_app::error::AppError;
-use kaikei_core::{AccountingDate, CoreError};
+use kaikei_core::{AccountingDate, CoreError, TagKey};
+use kaikei_jp::compose::Composition;
+use std::collections::BTreeMap;
 
 use crate::error::ToolError;
 
@@ -48,4 +52,35 @@ pub(crate) fn in_field(field: &str, error: ToolError) -> ToolError {
 /// **取引日**であって記帳日ではない（`CLAUDE.md` §7）。
 pub(crate) fn parse_date(field: &str, text: &str) -> Result<AccountingDate, ToolError> {
     AccountingDate::parse(text).map_err(|error| in_field(field, core_error(error)))
+}
+
+/// 線上の `tags`（文字列マップ）を**絞り込み条件**に変換する。
+///
+/// 記帳側（`post_journal_entry`）が `TagCatalog::parse_tag_set` で
+/// `TagSet` を作るのと同じ入口（`TagCatalog::parse_value`）を通し、
+/// 正準化済みの値文字列に揃える。**値の書き方を MCP 層で決めない**
+/// （`0.30` と `0.3` のどちらで保存されているかを知っているのは
+/// タグスキーマを読む層である。`DECISIONS.md` D-072）。
+///
+/// 検索条件では `TagSet` にせず `(TagKey, String)` の並びにする。
+/// `TagSet` はキーごとに1つの値しか持てない袋であり、将来「同じキーの
+/// 複数値」を条件にしたくなったときに形が合わなくなるためである。
+///
+/// # Errors
+///
+/// 未登録のキー・型に合わない値は `kaikei-jp` の文言のまま返す
+/// （有効なキー一覧や期待する書式を含む。`CLAUDE.md` §11）。
+pub(crate) fn parse_tag_filters(
+    composition: &Composition,
+    tags: &BTreeMap<String, String>,
+) -> Result<Vec<(TagKey, String)>, ToolError> {
+    tags.iter()
+        .map(|(key, value)| {
+            let (key, parsed) = composition
+                .tag_catalog
+                .parse_value(key, value)
+                .map_err(|error| ToolError::from_jp_error(&error))?;
+            Ok((key, kaikei_jp::tags::tag_value_to_string(&parsed)))
+        })
+        .collect()
 }
