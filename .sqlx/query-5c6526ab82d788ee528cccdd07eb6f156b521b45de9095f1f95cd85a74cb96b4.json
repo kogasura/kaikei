@@ -1,0 +1,96 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH matched AS (\n                SELECT e.id, e.fiscal_year, e.entry_no, e.entry_date, e.description,\n                       e.reverses, e.reverse_reason\n                FROM journal_entries e\n                WHERE ($1::date IS NULL OR e.entry_date >= $1)\n                  AND ($2::date IS NULL OR e.entry_date <= $2)\n                  AND ($3::text IS NULL OR e.description ILIKE $3 ESCAPE '\\')\n                  AND ($4::text IS NULL OR EXISTS (\n                        SELECT 1 FROM journal_lines l\n                         WHERE l.entry_id = e.id AND l.account_code = $4))\n                  AND (($5::bigint IS NULL AND $6::bigint IS NULL) OR EXISTS (\n                        SELECT 1 FROM journal_lines l\n                         WHERE l.entry_id = e.id\n                           AND l.currency = $7::text\n                           AND l.currency_minor_unit = $8::smallint\n                           AND ($5::bigint IS NULL OR l.amount_minor >= $5)\n                           AND ($6::bigint IS NULL OR l.amount_minor <= $6)))\n                  AND NOT EXISTS (\n                        SELECT 1 FROM unnest($9::text[], $10::text[]) AS f(k, v)\n                         WHERE NOT EXISTS (\n                            SELECT 1 FROM journal_lines l\n                             WHERE l.entry_id = e.id AND l.tags -> f.k ->> 'v' = f.v))\n            ),\n            total AS (SELECT count(*) AS n FROM matched),\n            page AS (\n                SELECT m.id, m.fiscal_year, m.entry_no, m.entry_date, m.description,\n                       m.reverses, m.reverse_reason,\n                       rev.id         AS reversed_by_id,\n                       rev.entry_no   AS reversed_by_no,\n                       rev.entry_date AS reversed_by_date\n                FROM matched m\n                LEFT JOIN LATERAL (\n                    SELECT r.id, r.entry_no, r.entry_date\n                      FROM journal_entries r\n                     WHERE r.reverses = m.id\n                     ORDER BY r.entry_date, r.entry_no, r.id\n                     LIMIT 1\n                ) rev ON TRUE\n                WHERE NOT $11::boolean\n                   OR (m.entry_date, m.entry_no, m.id)\n                      > ($12::date, $13::integer, $14::uuid)\n                ORDER BY m.entry_date, m.entry_no, m.id\n                LIMIT $15\n            )\n            SELECT t.n                AS \"total_matches!\",\n                   p.id               AS \"id?\",\n                   p.fiscal_year      AS \"fiscal_year?\",\n                   p.entry_no         AS \"entry_no?\",\n                   p.entry_date       AS \"entry_date?\",\n                   p.description      AS \"description?\",\n                   p.reverses         AS \"reverses?\",\n                   p.reverse_reason   AS \"reverse_reason?\",\n                   p.reversed_by_id   AS \"reversed_by_id?\",\n                   p.reversed_by_no   AS \"reversed_by_no?\",\n                   p.reversed_by_date AS \"reversed_by_date?\"\n            FROM total t\n            LEFT JOIN page p ON TRUE\n            ORDER BY p.entry_date, p.entry_no, p.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total_matches!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "fiscal_year?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "entry_no?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "entry_date?",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 5,
+        "name": "description?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "reverses?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "reverse_reason?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "reversed_by_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "reversed_by_no?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "reversed_by_date?",
+        "type_info": "Date"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Date",
+        "Date",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Text",
+        "Int2",
+        "TextArray",
+        "TextArray",
+        "Bool",
+        "Date",
+        "Int4",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5c6526ab82d788ee528cccdd07eb6f156b521b45de9095f1f95cd85a74cb96b4"
+}
