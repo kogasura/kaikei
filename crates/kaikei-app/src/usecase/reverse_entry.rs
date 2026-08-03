@@ -137,11 +137,17 @@ where
     })?;
 
     // 2. I/O: 二重訂正の検出。既定では拒否する。
+    //
+    //    `find_reversal_of` が返す `EntryId` を**捨てない**（PR-B 2巡目）。
+    //    呼び出し元が仕訳を指すのは UUID であって通し番号ではないため、
+    //    番号だけ返すと AI は「既にある赤伝を見る」ことができない
+    //    （`JournalRepo` には番号から引く経路が無い）。
     if !input.allow_double_reversal {
-        if let Some((_, reversal_no)) = tx.find_reversal_of(input.original_id).await? {
+        if let Some((reversal_id, reversal_no)) = tx.find_reversal_of(input.original_id).await? {
             return Err(AppError::AlreadyReversed {
                 entry_no: original.entry_no(),
                 reversal_no,
+                reversal_id,
             });
         }
     }
@@ -310,12 +316,58 @@ mod tests {
             Err(AppError::AlreadyReversed {
                 entry_no,
                 reversal_no,
+                reversal_id,
             }) => {
                 assert_eq!(entry_no.as_u32(), 1);
                 assert_eq!(reversal_no, first_reversal.entry_no());
+                // PR-B 2巡目: 既存赤伝の **仕訳ID** も返る（番号だけでは
+                // AI がその赤伝を引き直せない）。
+                assert_eq!(reversal_id, first_reversal.id());
             }
             other => panic!("AlreadyReversed を期待したが: {other:?}"),
         }
+    }
+
+    // RE-12（PR-B 2巡目）: 二重訂正のメッセージに、既存赤伝の仕訳IDが
+    // **UUID の正準表記**で含まれる（`docs/07-mcp-server.md` §3）。
+    #[tokio::test]
+    async fn reverse_entry_double_reversal_message_carries_the_existing_reversal_uuid() {
+        let store = InMemoryStore::with_chart(sample_chart());
+        let original_date = AccountingDate::new(2026, 4, 1).unwrap();
+        seed_entry(&store, 1, original_date).await;
+
+        let first_input = ReverseEntryInput {
+            original_id: EntryId::new(1),
+            reverse_date: AccountingDate::new(2026, 4, 5).unwrap(),
+            reason: "1回目".to_string(),
+            allow_double_reversal: false,
+        };
+        let first_reversal = run_reverse_entry(&store, 100, first_input)
+            .await
+            .unwrap()
+            .entry;
+
+        let second_input = ReverseEntryInput {
+            original_id: EntryId::new(1),
+            reverse_date: AccountingDate::new(2026, 4, 10).unwrap(),
+            reason: "2回目".to_string(),
+            allow_double_reversal: false,
+        };
+        let err = run_reverse_entry(&store, 200, second_input)
+            .await
+            .unwrap_err();
+
+        let expected = entry_id_to_uuid_string(first_reversal.id());
+        let message = err.to_string();
+        assert!(
+            message.contains(&expected),
+            "既存赤伝の UUID が含まれていない: {message}"
+        );
+        // 10進表記は混ざらない。
+        assert!(
+            !message.contains(&first_reversal.id().as_u128().to_string()),
+            "10進表記が混ざっている: {message}"
+        );
     }
 
     // RE-3: allow_double_reversal: true を指定すれば二重訂正が許可される。

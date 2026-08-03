@@ -27,8 +27,28 @@
 //! `CoreError` / `PolicyError` が**メソッドではなく自由関数**なのは、
 //! 定義元の crate（`kaikei-core` / `kaikei-policy`）が凍結層であり
 //! （`CLAUDE.md` §1）、他 crate から `impl` を生やせないため。
+//!
+//! # 本文には2つの入口がある（`Display` と `public_message`）
+//!
+//! | 入口 | 宛先 | 内容 |
+//! |---|---|---|
+//! | `Display`（`to_string()`） | **内部ログ・診断** | 下位層が返した生の文字列を含みうる |
+//! | [`AppError::public_message`] / [`RepoError::public_message`] | **外部への応答**（MCP / HTTP の `message`、`audit_log.output`） | 生の文字列を含まないことを型の側で保証する |
+//!
+//! この2つを分けるのは、`docs/07-mcp-server.md` §3（「`message` は
+//! `Display` を写像したもの」）と §9（「接続文字列を含みうる下位層のエラー
+//! 本文をそのまま転記しない」）が**そのままでは両立しない**ため。
+//! 実際 `kaikei-store` の `sqlstate::map_sqlstate` は
+//! `reason: format!("...: {message}")` として **DB が返した文字列を
+//! そのまま埋めている**（接続文字列・ロール名・テーブル定義が混じりうる）。
+//!
+//! ドメインのエラー（`Unbalanced` / `UnknownAccount` / `EmptyReverseReason` 等）は
+//! 文言をこのリポジトリ自身が書いているので `public_message` も `Display` と
+//! 同じ値を返す。正規化するのは**下位層の生メッセージを含みうるバリアント
+//! だけ**である（[`RepoError::public_message`] の表を参照）。
 
-use kaikei_core::{CoreError, EntryNumber};
+use crate::id::entry_id_to_uuid_string;
+use kaikei_core::{CoreError, EntryId, EntryNumber};
 use kaikei_policy::PolicyError;
 
 /// エラーコードの語彙。
@@ -130,19 +150,53 @@ pub mod codes {
     pub const ALREADY_REVERSED: &str = "already_reversed";
     /// `AppError::EmptyReverseReason`（訂正理由が空文字・空白のみ）。
     pub const EMPTY_REVERSE_REASON: &str = "empty_reverse_reason";
+    /// `AppError::InvalidEntryId`（仕訳IDが UUID の正準表記として解釈できない）。
+    ///
+    /// **`not_found` とは別のコードにする。** 「その UUID の仕訳が無い」
+    /// （＝IDを調べ直す）と「送られた文字列が UUID ですらない」
+    /// （＝表記を直す）は AI が取るべき次の手が違う
+    /// （`kaikei_app::id::entry_id_from_uuid_string` が返す）。
+    pub const INVALID_ENTRY_ID: &str = "invalid_entry_id";
     /// `AppError::Inconsistent`（試算表の検算失敗）。
     pub const INCONSISTENT: &str = "inconsistent";
     /// `AppError::Rejected`（上記に分類できない業務ルール違反）。
     pub const REJECTED: &str = "rejected";
 
+    // ---- presentation 層が直接使うコード（`AppError` のバリアントを持たない） ----
+
+    /// 監査ログの**開始レコードが書けなかった**ため、ツールを実行しなかった
+    /// （`docs/07-mcp-server.md` §9 の fail-closed）。
+    ///
+    /// このコードに対応する [`super::AppError`] のバリアントは**無い**。
+    /// fail-closed の判定は `with_tx` の外側（`AuditSink` を呼ぶ presentation
+    /// 層。ポート自体は後続 PR）で起き、ユースケースには到達しないため。
+    /// 語彙だけを先にここに置くのは、実装者が場当たりの綴りを発明したり
+    /// [`REJECTED`] を借りたりするのを防ぐため。
+    ///
+    /// **[`REJECTED`] を借りてはならない。** `Rejected` は
+    /// 「集計期間の開始日が終了日より後です」のような**入力を直せば通る**
+    /// 拒否に使っている。同じコードにすると、AI が
+    /// 「入力を直せば通るのか」「サーバ都合で今は実行できないのか」を
+    /// 区別できず、無意味な入力の作り直しを繰り返す。
+    ///
+    /// 添えるメッセージは「**帳簿は変更されていません**」まで含めること
+    /// （`docs/07-mcp-server.md` §9・`CLAUDE.md` §11）。
+    pub const AUDIT_LOG_UNAVAILABLE: &str = "audit_log_unavailable";
+
     // ---- 受け皿 ----
 
-    /// 未知のバリアントに対する既定コード。
+    /// **下流**が知らないバリアントに出会ったときの既定コード。
     ///
-    /// [`super::AppError`] は `#[non_exhaustive]` なので、将来この crate に
-    /// 追加されたバリアントが対応表の更新より先に下流へ届くことがありうる。
-    /// そのとき実装者が場当たりのコードを発明しないよう、既定を1つに決めておく
+    /// [`super::AppError`] は `#[non_exhaustive]` なので、`kaikei-app` の
+    /// 外（`kaikei-mcp` / `kaikei-api`）の `match` にはワイルドカードの腕が
+    /// 必須であり、将来追加されたバリアントはそこに落ちる。そのとき実装者が
+    /// 場当たりのコードを発明しないよう、既定を1つに決めておく
     /// （`docs/07-mcp-server.md` §6）。
+    ///
+    /// **`kaikei-app` の中では使わない。** [`super::AppError::code`] は
+    /// ワイルドカードを持たない網羅 `match` であり、バリアントを足すと
+    /// コンパイルが壊れて割り当て漏れが露見する（`DECISIONS.md` D-072 の
+    /// 訂正注記）。
     pub const INTERNAL: &str = "internal";
 }
 
@@ -199,6 +253,14 @@ pub fn policy_error_code(err: &PolicyError) -> &'static str {
 /// 受け取ったユースケースは「訂正は逆仕訳（`reverse`）で行ってください」と
 /// 案内できるが、単一の `Backend` バリアントに潰れているとその案内を
 /// 組み立てられない。
+///
+/// # `reason` をそのまま外部に出さない
+///
+/// 各バリアントの `reason` は**診断のための文字列**であり、実装
+/// （`kaikei-store` の `sqlstate::map_sqlstate`）は
+/// `format!("...: {message}")` として **DB が返したメッセージをそのまま
+/// 埋めている**（接続文字列・ロール名・制約定義が混じりうる）。
+/// 外部への応答には `Display` ではなく [`RepoError::public_message`] を使う。
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {
     /// 指定した対象が永続化層に存在しない。
@@ -276,6 +338,58 @@ impl RepoError {
             RepoError::Backend { .. } => codes::BACKEND,
         }
     }
+
+    /// **外部（MCP / HTTP の応答、`audit_log.output`）に出してよい本文**を返す。
+    ///
+    /// `Display`（`to_string()`）は `reason` をそのまま含むため、
+    /// **下位層が返した生のメッセージが外に漏れうる**
+    /// （`kaikei-store` の `sqlstate::map_sqlstate` は DB のメッセージを
+    /// `reason` に埋め込む）。`docs/07-mcp-server.md` §9 が
+    /// 「接続文字列・認証情報を含みうる下位層のエラー本文をそのまま転記しない」
+    /// と定めているのはこの経路のこと。
+    ///
+    /// | バリアント | 扱い |
+    /// |---|---|
+    /// | `NotFound` | `Display` をそのまま（`reason` は app 層が組み立てる。仕訳IDの UUID 正準表記を含む） |
+    /// | `Unsupported` | `Display` をそのまま（未実装の説明であり DB 由来ではない） |
+    /// | `AppendOnlyViolation` / `Conflict` / `OutOfRange` / `Corrupt` / `Backend` | **正規化**（`reason` を出さず、分類ごとの汎用文言 + 次の手） |
+    ///
+    /// 正規化した側でも「次の手が分かる文言」は保つ（`CLAUDE.md` §11）。
+    /// 消えた詳細は `Display` 側に残っているので、**サーバのログには
+    /// `Display` を、応答にはこちらを**出すこと。
+    pub fn public_message(&self) -> String {
+        match self {
+            // `reason` を app 層自身が組み立てるバリアント。
+            // `NotFound` の `reason` は `reverse_entry::execute` が
+            // 仕訳IDの UUID 正準表記を入れて作る（`docs/07-mcp-server.md` §3）。
+            // ここで潰すと AI が「どのIDが無かったのか」を失う。
+            RepoError::NotFound { .. } | RepoError::Unsupported { .. } => self.to_string(),
+
+            RepoError::AppendOnlyViolation { .. } => {
+                "この操作は許可されていません。帳簿（仕訳）は追記のみで、\
+                 更新・削除はできません。訂正は逆仕訳（reverse_journal_entry）で\
+                 行ってください"
+                    .to_string()
+            }
+            RepoError::Conflict { .. } => "既に存在するデータと重複するため保存できませんでした。\
+                 同じ仕訳を二重に登録しようとしていないか確認してください"
+                .to_string(),
+            RepoError::OutOfRange { .. } => {
+                "値が保存可能な範囲を超えています。金額の桁数を確認してください".to_string()
+            }
+            RepoError::Corrupt { .. } => {
+                "保存データの整合性検証に失敗しました。この操作は完了していません。\
+                 入力を変えても解消しません。サーバのログを添えて管理者に連絡してください"
+                    .to_string()
+            }
+            RepoError::Backend { .. } => {
+                "永続化層でエラーが発生しました。この操作は完了していません。\
+                 入力の問題ではないため、時間をおいて再試行するか、\
+                 サーバのログを添えて管理者に連絡してください"
+                    .to_string()
+            }
+        }
+    }
 }
 
 /// ユースケースが失敗したときに返すエラー。
@@ -292,6 +406,12 @@ impl RepoError {
 /// 壊れるより、`_ => {}` の一手で追従できる方が実用上安全と判断した
 /// （後から `#[non_exhaustive]` を付けるのは破壊的変更になるため、最初から
 /// 付けておく）。
+///
+/// **`#[non_exhaustive]` は crate の外にしか効かない。** したがって
+/// `kaikei-app` 自身の [`AppError::code`] / [`AppError::public_message`] は
+/// ワイルドカードを持たない網羅 `match` であり、バリアントを足すと
+/// **この crate のビルドが壊れて**割り当て漏れが露見する。
+/// 下流の追従しやすさと、定義元での取りこぼしの検出は両立する。
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AppError {
@@ -310,20 +430,57 @@ pub enum AppError {
     /// 既に赤伝（逆仕訳）済みの仕訳を再度取り消そうとした。
     ///
     /// 二重取消は既定で拒否する（誤操作・AI の暴走が帳簿の残高を静かに
-    /// 壊すことを防ぐ多層防御の一つ）。許可する運用（`allow_double_reversal`
-    /// をユースケース入力に明示した場合のみ許可）は、その入力型を持つ
-    /// ユースケース本体（後続の PR）が実装する。
+    /// 壊すことを防ぐ多層防御の一つ）。許可する運用は
+    /// `ReverseEntryInput::allow_double_reversal` を明示した場合のみ。
+    ///
+    /// # なぜ `reversal_id` を持つのか
+    ///
+    /// 呼び出し元（MCP / API）が仕訳を指すのに使うのは **UUID**（`original_id`）
+    /// であって通し番号ではない。既存の赤伝を番号だけで返すと、AI は
+    /// 「その赤伝を見る」ために `entry_no` から `EntryId` を引く手段を持たない
+    /// （`JournalRepo` は `find_entry(EntryId)` しか無く、番号からの検索は
+    /// 存在しない）。[`crate::ports::JournalRepo::find_reversal_of`] は
+    /// 元々 `(EntryId, EntryNumber)` を返しており、`EntryId` を捨てていたのは
+    /// このバリアントが受け皿を持たなかったからでしかない。
+    ///
+    /// 番号（`entry_no` / `reversal_no`）は人間が帳簿を目で追うための表示で、
+    /// **両方を持つ**（どちらか一方に寄せない）。
     #[error(
-        "仕訳 {} は既に取消（逆仕訳 {}）済みです。\
-         二重取消を許可する場合は allow_double_reversal を指定してください",
+        "仕訳 {} は既に取消（逆仕訳 {}、仕訳ID {}）済みです。\
+         その赤伝の内容は仕訳ID {} で確認できます。\
+         それでも二重取消が必要な場合は allow_double_reversal を指定してください",
         entry_no.as_u32(),
-        reversal_no.as_u32()
+        reversal_no.as_u32(),
+        entry_id_to_uuid_string(*reversal_id),
+        entry_id_to_uuid_string(*reversal_id)
     )]
     AlreadyReversed {
         /// 取り消そうとした仕訳の番号。
         entry_no: EntryNumber,
-        /// 既存の逆仕訳の番号。
+        /// 既存の逆仕訳の番号（人間向けの表示）。
         reversal_no: EntryNumber,
+        /// 既存の逆仕訳の仕訳ID。応答には **UUID の正準表記**で載せること
+        /// （[`crate::id::entry_id_to_uuid_string`]）。
+        reversal_id: EntryId,
+    },
+
+    /// 仕訳IDとして渡された文字列が **UUID の正準表記として解釈できない**。
+    ///
+    /// 「その仕訳が存在しない」（`RepoError::NotFound`）とは**別のエラー**
+    /// である。AI が取るべき次の手が違う（前者はIDを調べ直す、後者は
+    /// 表記そのものを直す）ため、コードも分けている
+    /// （[`codes::INVALID_ENTRY_ID`] / [`codes::NOT_FOUND`]）。
+    ///
+    /// 生成元は [`crate::id::entry_id_from_uuid_string`]。
+    #[error(
+        "仕訳IDの形式が不正です: \"{input}\"。\
+         仕訳IDは UUID の正準表記（ハイフン付き36文字。\
+         例: 0192a7b3-1234-7abc-8def-0123456789ab）で指定してください"
+    )]
+    InvalidEntryId {
+        /// 受け取った文字列（長すぎる場合は先頭のみ。
+        /// [`crate::id::entry_id_from_uuid_string`] が切り詰める）。
+        input: String,
     },
 
     /// 訂正理由（`reverse_entry` の `reason`）が空文字、または空白のみだった。
@@ -375,6 +532,24 @@ impl AppError {
     /// 中身のエラーへ委譲する（`AppError::Core(CoreError::Unbalanced)` は
     /// `"app_core"` ではなく `"unbalanced"` になる。AI が知りたいのは
     /// 「何が起きたか」であって「どの層を経由したか」ではない）。
+    ///
+    /// # ★ワイルドカードの腕を置かない★
+    ///
+    /// この `match` には `_ => codes::INTERNAL` の受け皿を**置かない**
+    /// （1巡目では置いていた。`DECISIONS.md` D-072 の訂正注記）。
+    ///
+    /// - 受け皿があると、`AppError` にバリアントを足してもこの関数の
+    ///   コンパイルは壊れず、そのバリアントは黙って `"internal"` になる。
+    ///   「手で維持する一覧は必ず腐る」（`PROGRESS.md` Phase 1 の教訓6）の
+    ///   典型であり、それを別のテスト関数（重複した網羅 `match`）で
+    ///   見張るのは**同じ一覧を2つ手で維持する**ことにほかならない。
+    /// - 受け皿を消すと `#[allow(unreachable_patterns)]` も不要になる
+    ///   （lint は受け皿の腕自身が作り出していた問題だった）。
+    /// - `#[non_exhaustive]` は crate の**外**にしか効かないので、
+    ///   この判断は下流の網羅性要件を何も変えない。下流の `match` には
+    ///   引き続きワイルドカードが必須で、そこで使う既定値が
+    ///   [`codes::INTERNAL`] である。実際にそうなることは
+    ///   `tests/contract_from_downstream.rs` が外部 crate として検証する。
     pub fn code(&self) -> &'static str {
         match self {
             AppError::Repo(inner) => inner.code(),
@@ -382,26 +557,36 @@ impl AppError {
             AppError::Core(inner) => core_error_code(inner),
             AppError::AlreadyReversed { .. } => codes::ALREADY_REVERSED,
             AppError::EmptyReverseReason => codes::EMPTY_REVERSE_REASON,
+            AppError::InvalidEntryId { .. } => codes::INVALID_ENTRY_ID,
             AppError::Inconsistent { .. } => codes::INCONSISTENT,
             AppError::Rejected { .. } => codes::REJECTED,
-            // `#[non_exhaustive]` の受け皿。
-            //
-            // 定義元 crate（ここ）から見ると `AppError` は網羅済みなので、
-            // この腕は**現時点では到達しない**。それでも置くのは、下流
-            // （`kaikei-mcp` / `kaikei-api`）がバリアント追加のたびに
-            // 場当たりのコードを発明することを防ぐため
-            // （`docs/07-mcp-server.md` §6）。
-            //
-            // `#[allow(unreachable_patterns)]` は必須。付けないと
-            // `cargo clippy -- -D warnings`（CI の `quality` ジョブ）が
-            // 「unreachable pattern」で落ちる（実測確認済み）。
-            //
-            // この腕があるためバリアント追加時にこの関数のコンパイルは
-            // 壊れない。割り当て漏れを機械的に検出するのは、下部
-            // `tests::exhaustive_app_error_code`（ワイルドカードを持たない
-            // 網羅 `match`）の役目である。
-            #[allow(unreachable_patterns)]
-            _ => codes::INTERNAL,
+        }
+    }
+
+    /// **外部（MCP / HTTP の応答、`audit_log.output`）に出してよい本文**を返す。
+    ///
+    /// `docs/07-mcp-server.md` §3 の `message` フィールドに載せるのはこの値
+    /// （`Display` ではない）。両者の使い分けは本モジュール doc の
+    /// 「本文には2つの入口がある」を参照。
+    ///
+    /// - [`AppError::Repo`] は [`RepoError::public_message`] に委譲する
+    ///   （下位層の生メッセージを含みうるバリアントだけが正規化される）。
+    /// - [`AppError::Policy`] / [`AppError::Core`] と `AppError` 自身の
+    ///   バリアントは、文言をこのリポジトリが書いているので `Display` を
+    ///   そのまま返す。**言い換えない**（`CLAUDE.md` §10。policy が組み立てた
+    ///   文言を上位層で税務判断に踏み込んだ表現へ書き換えないため）。
+    ///
+    /// この `match` にもワイルドカードを置かない（[`AppError::code`] と同じ理由）。
+    pub fn public_message(&self) -> String {
+        match self {
+            AppError::Repo(inner) => inner.public_message(),
+            AppError::Policy(_)
+            | AppError::Core(_)
+            | AppError::AlreadyReversed { .. }
+            | AppError::EmptyReverseReason
+            | AppError::InvalidEntryId { .. }
+            | AppError::Inconsistent { .. }
+            | AppError::Rejected { .. } => self.to_string(),
         }
     }
 }
@@ -411,25 +596,10 @@ mod tests {
     use super::*;
     use kaikei_core::{AccountType, TagValueType};
 
-    /// **ワイルドカードを持たない**網羅 `match`。
-    ///
-    /// `AppError` にバリアントを追加すると、[`AppError::code`] 側は受け皿の
-    /// `_ =>` があるためコンパイルが通ってしまう（そのバリアントは黙って
-    /// `"internal"` になる）。この関数が非網羅としてコンパイルエラーになる
-    /// ことで、**同じ PR の中でコードを割り当てる**ことを強制する。
-    /// `PROGRESS.md` Phase 1 の教訓6「手で維持する一覧は必ず腐る。構造か CI で
-    /// 機械的に閉じられないか先に考える」への対応。
-    fn exhaustive_app_error_code(err: &AppError) -> &'static str {
-        match err {
-            AppError::Repo(inner) => inner.code(),
-            AppError::Policy(inner) => policy_error_code(inner),
-            AppError::Core(inner) => core_error_code(inner),
-            AppError::AlreadyReversed { .. } => codes::ALREADY_REVERSED,
-            AppError::EmptyReverseReason => codes::EMPTY_REVERSE_REASON,
-            AppError::Inconsistent { .. } => codes::INCONSISTENT,
-            AppError::Rejected { .. } => codes::REJECTED,
-        }
-    }
+    // 1巡目にあった `exhaustive_app_error_code`（ワイルドカードを持たない
+    // 網羅 `match` のコピー）は削除した。[`AppError::code`] 自身が
+    // ワイルドカードを持たなくなり、バリアント追加は `cargo build` を壊す。
+    // 同じ一覧を2つ手で維持する方が腐りやすい（`DECISIONS.md` D-072 の訂正注記）。
 
     fn all_core_errors() -> Vec<CoreError> {
         vec![
@@ -549,8 +719,14 @@ mod tests {
             AppError::AlreadyReversed {
                 entry_no: EntryNumber::new(42),
                 reversal_no: EntryNumber::new(43),
+                reversal_id: crate::id::entry_id_from_uuid(
+                    uuid::Uuid::parse_str("0192b1c4-1234-7abc-8def-0123456789ab").unwrap(),
+                ),
             },
             AppError::EmptyReverseReason,
+            AppError::InvalidEntryId {
+                input: "42".to_string(),
+            },
             AppError::Inconsistent {
                 debit: "110,000".to_string(),
                 credit: "100,000".to_string(),
@@ -628,32 +804,37 @@ mod tests {
         }
     }
 
-    // EC-6: 受け皿（`_ => internal`）の既定値が `"internal"` であること。
+    // EC-6: **下流用**の既定コードの値が固定されていること。
     //
-    // 定義元 crate から未知のバリアントを構築することは原理的にできないため、
-    // 「受け皿に落ちたときに何が返るか」を実行時に踏むテストは書けない。
-    // 代わりに (1) 既定コードの値が固定されていること、(2) 現存する全バリアントが
-    // 受け皿に落ちていないこと（EC-1〜EC-4）、(3) バリアント追加時に
-    // `exhaustive_app_error_code` がコンパイルエラーになること、の3点で守る。
+    // `AppError::code` はワイルドカードの腕を持たないため、この値が
+    // `kaikei-app` の中から返ることは無い（EC-4 が「受け皿に落ちていない」
+    // ではなく「全バリアントが固有のコードを持つ」を検査するのはそのため）。
+    // この定数が要るのは下流（`kaikei-mcp` / `kaikei-api`）の `match` であり、
+    // 実際にそこで使われることは `tests/contract_from_downstream.rs` が
+    // 外部 crate として検証する。
     #[test]
-    fn the_fallback_code_is_internal() {
+    fn the_downstream_fallback_code_is_internal() {
         assert_eq!(codes::INTERNAL, "internal");
     }
 
-    // EC-7: 受け皿を持つ `AppError::code` と、ワイルドカードを持たない
-    // 網羅 `match` の結果が一致する（＝現時点で受け皿は一度も使われていない）。
+    // EC-7: 監査ログの fail-closed 用コードが `rejected` と衝突しない。
+    //
+    // 「入力を直せば通る」（`Rejected`。例: 集計期間の開始日が終了日より後）と
+    // 「サーバ都合で今は実行できない」（監査ログに記録できなかった）は
+    // AI が取るべき次の手が違うため、同じコードに潰さない
+    // （`docs/07-mcp-server.md` §9）。
     #[test]
-    fn code_agrees_with_the_wildcard_free_exhaustive_match() {
+    fn the_audit_fail_closed_code_is_distinct_from_rejected() {
+        assert_eq!(codes::AUDIT_LOG_UNAVAILABLE, "audit_log_unavailable");
+        assert_ne!(codes::AUDIT_LOG_UNAVAILABLE, codes::REJECTED);
+        // `AppError` のどのバリアントもこのコードを返さない
+        // （fail-closed の判定はユースケースに到達しない位置で起きる）。
         let mut errors = own_app_errors();
         errors.extend(all_core_errors().into_iter().map(AppError::Core));
         errors.extend(all_policy_errors().into_iter().map(AppError::Policy));
         errors.extend(all_repo_errors().into_iter().map(AppError::Repo));
         for err in errors {
-            assert_eq!(
-                err.code(),
-                exhaustive_app_error_code(&err),
-                "受け皿が使われています（コードの割り当て漏れ）: {err:?}"
-            );
+            assert_ne!(err.code(), codes::AUDIT_LOG_UNAVAILABLE);
         }
     }
 
@@ -699,5 +880,159 @@ mod tests {
             reason: "証憑の紐付けは未実装です".to_string(),
         });
         assert_ne!(policy.code(), repo.code());
+    }
+
+    // EC-11（PR-B 2巡目）: `AlreadyReversed` は既存赤伝の仕訳IDを
+    // **UUID の正準表記**でメッセージに含める。番号だけだと、AI は
+    // その赤伝を `find_entry(EntryId)` で引き直せない。
+    #[test]
+    fn already_reversed_reports_the_existing_reversal_id_as_a_canonical_uuid() {
+        let reversal_id = crate::id::entry_id_from_uuid(
+            uuid::Uuid::parse_str("0192b1c4-1234-7abc-8def-0123456789ab").unwrap(),
+        );
+        let err = AppError::AlreadyReversed {
+            entry_no: EntryNumber::new(42),
+            reversal_no: EntryNumber::new(43),
+            reversal_id,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("0192b1c4-1234-7abc-8def-0123456789ab"),
+            "{message}"
+        );
+        // 10進表記は混ざらない。
+        assert!(
+            !message.contains(&reversal_id.as_u128().to_string()),
+            "{message}"
+        );
+        // 人間向けの番号も残っている。
+        assert!(
+            message.contains("42") && message.contains("43"),
+            "{message}"
+        );
+        assert_eq!(err.code(), codes::ALREADY_REVERSED);
+    }
+
+    // EC-12（PR-B 2巡目）: `InvalidEntryId` は `NotFound` と別コードになる。
+    #[test]
+    fn invalid_entry_id_is_not_confused_with_not_found() {
+        let malformed = AppError::InvalidEntryId {
+            input: "42".to_string(),
+        };
+        let missing = AppError::Repo(RepoError::NotFound {
+            reason: "仕訳が見つかりません".to_string(),
+        });
+        assert_eq!(malformed.code(), codes::INVALID_ENTRY_ID);
+        assert_eq!(missing.code(), codes::NOT_FOUND);
+        assert_ne!(malformed.code(), missing.code());
+        // 次の手（正しい表記の例）が含まれる（`CLAUDE.md` §11）。
+        assert!(malformed.to_string().contains("36"), "{malformed}");
+    }
+
+    // EC-13（PR-B 2巡目）: 下位層の生メッセージを含みうるバリアントの
+    // `public_message` は、その生メッセージを含まない。
+    //
+    // `kaikei-store::sqlstate::map_sqlstate` が実際に組み立てる形
+    // （`format!("...: {message}")`）を模した `reason` を与えて確認する。
+    #[test]
+    fn public_message_does_not_leak_the_backend_reason() {
+        const SECRET: &str = "postgres://kaikei_app:s3cret@db.internal:5432/kaikei";
+        let leaky = [
+            RepoError::Backend {
+                reason: format!("未分類のデータベースエラーです（SQLSTATE 08006）: {SECRET}"),
+            },
+            RepoError::Corrupt {
+                reason: format!("保存しようとしたデータが制約に違反しています: {SECRET}"),
+            },
+            RepoError::AppendOnlyViolation {
+                reason: format!("権限エラーです（SQLSTATE 42501）: {SECRET}"),
+            },
+            RepoError::Conflict {
+                reason: format!("一意制約違反です（SQLSTATE 23505）: {SECRET}"),
+            },
+            RepoError::OutOfRange {
+                reason: format!("数値が範囲を超えました（SQLSTATE 22003）: {SECRET}"),
+            },
+        ];
+        for err in leaky {
+            // 診断用の `Display` には残っている（サーバのログ向け）。
+            assert!(err.to_string().contains(SECRET), "{err:?}");
+            // 外部に出す本文には残らない。
+            assert!(
+                !err.public_message().contains(SECRET),
+                "生メッセージが漏れています: {}",
+                err.public_message()
+            );
+            assert!(
+                !AppError::Repo(err).public_message().contains(SECRET),
+                "AppError 経由で漏れています"
+            );
+        }
+    }
+
+    // EC-14（PR-B 2巡目）: 正規化した本文も「次の手が分かる」文言を保つ。
+    #[test]
+    fn normalized_public_messages_still_tell_the_caller_what_to_do() {
+        let append_only = RepoError::AppendOnlyViolation {
+            reason: "permission denied for table journal_entries".to_string(),
+        };
+        assert!(
+            append_only.public_message().contains("逆仕訳"),
+            "{}",
+            append_only.public_message()
+        );
+
+        let backend = RepoError::Backend {
+            reason: "connection refused".to_string(),
+        };
+        // 「入力を直せば通る」と誤解させないこと（再試行・管理者連絡へ誘導する）。
+        assert!(
+            backend.public_message().contains("入力"),
+            "{}",
+            backend.public_message()
+        );
+    }
+
+    // EC-15（PR-B 2巡目）: ドメインのエラーは `public_message` でも
+    // `Display` と同じ本文を返す（言い換えない。`CLAUDE.md` §10）。
+    //
+    // 特に `NotFound` は app 層が組み立てる `reason`（仕訳IDの UUID 正準表記を
+    // 含む）を落とさないこと。ここを潰すと `docs/07-mcp-server.md` §3 の
+    // 「仕訳IDは UUID の正準表記で示す」が応答から消える。
+    #[test]
+    fn domain_errors_keep_their_display_text_in_the_public_message() {
+        let not_found = RepoError::NotFound {
+            reason: "仕訳が見つかりません（仕訳ID: 0192a7b3-1234-7abc-8def-0123456789ab）"
+                .to_string(),
+        };
+        assert_eq!(not_found.public_message(), not_found.to_string());
+        assert!(not_found
+            .public_message()
+            .contains("0192a7b3-1234-7abc-8def-0123456789ab"));
+
+        let unsupported = RepoError::Unsupported {
+            reason: "証憑の紐付けは未実装です".to_string(),
+        };
+        assert_eq!(unsupported.public_message(), unsupported.to_string());
+
+        let mut domain = own_app_errors();
+        domain.extend(all_core_errors().into_iter().map(AppError::Core));
+        domain.extend(all_policy_errors().into_iter().map(AppError::Policy));
+        for err in domain {
+            assert_eq!(err.public_message(), err.to_string(), "{err:?}");
+        }
+    }
+
+    // EC-16（PR-B 2巡目）: `public_message` は空文字を返さない
+    // （空の本文は AI にとって「エラーの理由が無い」と同じ）。
+    #[test]
+    fn public_message_is_never_empty() {
+        let mut errors = own_app_errors();
+        errors.extend(all_core_errors().into_iter().map(AppError::Core));
+        errors.extend(all_policy_errors().into_iter().map(AppError::Policy));
+        errors.extend(all_repo_errors().into_iter().map(AppError::Repo));
+        for err in errors {
+            assert!(!err.public_message().trim().is_empty(), "{err:?}");
+        }
     }
 }
