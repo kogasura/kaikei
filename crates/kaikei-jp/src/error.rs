@@ -189,6 +189,26 @@ pub enum JpError {
     #[error(transparent)]
     Core(#[from] kaikei_core::CoreError),
 
+    /// 設定値の**機械可読名**が不正（[`crate::tax::TaxMode::from_code`] 等）。
+    ///
+    /// `settings_defaults` の YAML を読むときと、presentation 層
+    /// （`kaikei-mcp` の `get_settings` / 設定ファイルの読み込み）が
+    /// 文字列から値を復元するときの**両方**が使う。同じ語彙を2箇所で
+    /// 手書きしないための共通の入口である（`docs/07-mcp-server.md` §7）。
+    ///
+    /// `field` は YAML / JSON 上のフィールド名（`tax_mode` 等）で、
+    /// メッセージの先頭に出る。`valid` には有効な値を必ず列挙する
+    /// （`CLAUDE.md` §11「次の手が分かる文言」）。
+    #[error("{field} の値が不正です: \"{input}\"（有効な値: {valid}）")]
+    InvalidSettingCode {
+        /// 対象のフィールド名（`tax_mode` / `rounding` / `rounding_unit`）。
+        field: String,
+        /// 受け取った値（そのまま）。
+        input: String,
+        /// 有効な値の一覧（`", "` 区切りに整形済み）。
+        valid: String,
+    },
+
     /// 決算処理（[`crate::closing::JpSoleProprietorClosingPolicy`]）に必要な科目
     /// （元入金・事業主貸・事業主借のいずれか）が、構築時に渡された
     /// `ChartOfAccounts` に存在しない。
