@@ -11,32 +11,61 @@ mod common;
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-/// `migrations/` にある `.sql` ファイルが**全て**適用されていること。
+/// 適用されたマイグレーションの**一覧**（バージョンと description）が
+/// 期待どおりであること。
 ///
-/// 期待値をリテラル（かつては `8`）で書くと、マイグレーションを追加する
-/// たびに数字を手で直すことになり、直し忘れれば「適用されていない」のか
-/// 「数え間違い」なのか区別できない緑/赤になる（`PROGRESS.md` Phase 1 の
-/// 教訓6「手で維持する一覧は必ず腐る。構造で閉じる」）。
-/// ディレクトリを数えれば、ファイルを足すだけで期待値が追随する。
+/// # なぜ「件数を数える」形にしないのか
+///
+/// `#[sqlx::test]` は実行前に `migrations/` の `.sql` を全件適用する。
+/// したがって「`migrations/` の `.sql` の数」と「`_sqlx_migrations` の
+/// 行数」を突き合わせる形は**原理的に常に一致し、赤になる経路が無い**
+/// （ファイルを足せば期待値も一緒に増える）。旧版のリテラル `8` が持って
+/// いた「マイグレーションが増減したことに人間が気づく」検出力すら失う。
+/// 加えて `0010_x.down.sql` を置くと、sqlx は up/down を1件と数えるのに
+/// ディレクトリを数える側は2件と数え、**誤検出で赤になる**。
+///
+/// ここではバージョン番号と description をリテラルの一覧として持つ。
+/// description は sqlx がファイル名から作る（`0002_accounts.sql` →
+/// version 2 / description `"accounts"`。`_` は空白に置換される）。
+/// この一覧は「手で維持する一覧」だが、**維持を忘れると赤になる**点が
+/// 前の形と決定的に違う（`PROGRESS.md` Phase 1 の教訓6が禁じているのは
+/// 「腐っても誰も気づかない一覧」である）。
+///
+/// マイグレーションを足したら、この一覧に1行足すこと。
 #[sqlx::test]
-async fn every_migration_file_is_recorded(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+async fn applied_migrations_match_the_expected_list(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
     let roles = common::roles(pool_opts, conn_opts).await;
 
-    let expected = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .expect("migrations/ を読めること")
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sql"))
-        .count() as i64;
-    assert!(expected > 0, "migrations/ に .sql が1つも無い");
+    let applied: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT version, description FROM _sqlx_migrations WHERE success ORDER BY version",
+    )
+    .fetch_all(&roles.migrator)
+    .await
+    .unwrap();
 
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
-        .fetch_one(&roles.migrator)
-        .await
-        .unwrap();
+    let expected: Vec<(i64, String)> = [
+        (1, "baseline privileges"),
+        (2, "accounts"),
+        (3, "journal"),
+        (4, "append only triggers"),
+        (5, "counterparties"),
+        (6, "entry counters"),
+        (7, "period snapshots"),
+        (8, "distinct error codes"),
+        // Phase 3 PR-C: 監査ログ（docs/07-mcp-server.md §9・D-075）。
+        (9, "audit log"),
+    ]
+    .into_iter()
+    .map(|(version, description)| (version, description.to_string()))
+    .collect();
 
     assert_eq!(
-        count, expected,
-        "migrations/ の .sql ファイルが全て適用されていること"
+        applied, expected,
+        "適用されたマイグレーションの一覧が期待と違う。\
+         migrations/ にファイルを追加・改名したなら、この一覧にも反映すること"
     );
 }
 
