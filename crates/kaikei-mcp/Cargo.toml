@@ -28,7 +28,10 @@ kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
 kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
 kaikei-jp = { path = "../kaikei-jp", version = "0.0.1" }
 rmcp = { workspace = true }
-tokio = { workspace = true }
+# tokio はここには無い。この crate の src/ から参照が0件のため。
+# 実際に要るのは合成ルート（`#[tokio::main]`）を置く PR-E であり、使う PR で足す。
+# MC-30 の許可リストには残してある（許可リストは「足してよい上限」であって
+# 「足さねばならない一覧」ではない）。
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
