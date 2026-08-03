@@ -226,7 +226,7 @@ cargo run -p kaikei-mcp
 
 | ツール | できること |
 |---|---|
-| `post_journal_entry` | 仕訳を1件起こす。金額は**文字列**で渡します（例: `"110000"`）。貸借が一致しない仕訳は記帳されません。応答には差額（`difference`）が入り、税抜経理の課税事業者で `auto_tax_lines` を使っていない場合は消費税額の行を足す修正案（`hint`）も付きます（税込経理・免税事業者・`auto_tax_lines: true` では `hint` は付かず、理由が `policy_notes` に入ります） |
+| `post_journal_entry` | 仕訳を1件起こす。金額は**文字列**で渡します（例: `"110000"`）。貸借が一致しない仕訳は記帳されず、差額（`difference`）が返ります。修正案（`hint`）が付くのは `auto_tax_lines` を指定していない呼び出しだけで、内容は帳簿の設定で変わります——税抜経理の課税事業者では消費税額の行を足した `suggested_lines`、税込経理や免税事業者では「なぜ税額行が作れないか」の `policy_notes` だけ（それも無ければ `hint` は付きません） |
 | `reverse_journal_entry` | 逆仕訳（赤伝）で訂正する。元の仕訳は書き換わりません |
 
 照会系・提案系（`get_trial_balance` / `search_entries` / `list_accounts` など

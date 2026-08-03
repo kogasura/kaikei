@@ -3526,6 +3526,11 @@ stdout には一切書かない。
 各ツールは `dispatch::McpTool` を実装するだけで、監査ログの手順も
 `isError` の扱いも一切書かない。
 
+**これは型だけで達成していない**（訂正注記3）。型で閉じているのは
+`ToolRegistry` / `ToolContext` / `McpTool::run` の戻り値までで、
+「別のルータを新しく作る」ことは `rmcp` を名指しできるファイルの
+**許可リスト**（`dispatch.rs` / `error.rs`）が止めている。
+
 ```rust
 pub trait McpTool: Send + Sync + 'static {
     type Input: DeserializeOwned + JsonSchema + Send + 'static;
@@ -3696,6 +3701,23 @@ MCP のツールを登録・実行する能力はすべて `rmcp` の API から
 （3巡目 D-4）。網羅を担うのは許可リストであり、識別子の一覧は再輸出という
 穴に対する second line である。テスト名も
 `the_second_line_rules_for_rmcp_identifiers_are_still_present` に改めた。
+
+**実測**（4種類の迂回を実際に書いて確かめた。確認後は復元済み）:
+
+| 迂回 | 結果 |
+|---|---|
+| `#[tool_handler]` の impl に `call_tool` を手書きし、`runtime.store` + `with_tx_err` + `post_entry::execute` で実 DB に記帳する | `cargo build` は通るが `rmcp_is_named_only_in_the_files_allowed_to_name_it` が `server.rs` の3行を挙げて落ちる |
+| `ToolRouter::add_route` / `merge` | 同上（`server.rs` の `use rmcp::...` と本文） |
+| `CallToolHandlerExt` | 同上。**識別子の閉じ込めはこれを捕まえない**（`CallToolHandlerExt` は `CallToolHandler` 規則に一致しない）。許可リストだけが捕まえた |
+| `with_async_tool` / `with_sync_tool` / `(Tool, handler)` タプル（1巡目に塞いだ形の退行） | 同上（`tools/probe_regression.rs`） |
+
+**正規経路が壊れていないことも実 DB で確かめた**（使い捨て DB を作って
+`tools/call` を1回送り、確認後に DROP）。`#[tool_handler]` を外して手書きに
+した `call_tool` は `dispatch::call` に届いており、`journal_entries` に1件・
+`audit_log` に `started` / `ok` の2行（`tool='post_journal_entry'`,
+`actor='mcp'`）が残った。2巡目の迂回が示した「1件・0行」と対照になる。
+未登録のツール名は `-32602 tool not found`（§6 が認める唯一のプロトコル
+エラー）のままである。
 
 ---
 
