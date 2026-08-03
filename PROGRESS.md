@@ -472,7 +472,35 @@ Phase 2 で実際に起きたことを、脚色せずに記録する。
 
 ## Phase 3 — kaikei-mcp
 
-未着手。
+実装中（PR-E まで完了）。完了時に他 Phase と同じ節構成で記録する。
+
+### 実装中の申し送り
+
+- **`accounts.active` / `accounts.sort_order` は現在どこからも読まれていない。**
+  `kaikei-store` の `load_chart`（`crates/kaikei-store/src/chart.rs`）が
+  `SELECT` するのは `code / name / account_type / parent_code / postable` の
+  5列だけで、`active` は問い合わせてすらいない。したがって
+  **`active = false` にしても何も起きない**——その科目に対する記帳は成功し、
+  自動生成される税額行も `active = false` の科目に付く（レビューで実測）。
+  `sort_order` も同様に読まれていない（テンプレートの `sort` は
+  `kaikei_core::AccountDef` に対応するフィールドが無く、ロード時に破棄
+  される。`DECISIONS.md` D-061）。
+
+  **科目の無効化は Phase 4 以降。** 列は `0002_accounts.sql` に存在するが、
+  「無効化された科目には記帳できない」という振る舞いは1行も実装されて
+  いない。実装する場合の置き場は `kaikei-core`（`ChartOfAccounts` が
+  `postable` と同じ扱いで判定する）か `kaikei-app`（読み込み時に除外する）
+  かの選択から始まる論点であり、PR-E の範囲では決めていない。
+
+  この申し送りが要るのは、PR-E の README が
+  「テンプレート側を採用したい場合は勘定科目マスタを直接編集してください」と
+  **DB の直接編集を正規の手段として案内し始めた**ためである。
+  `active = false` にして科目を引退させたつもりになる経路が新しくできた。
+  README にも同じ注意を書いてある。
+
+- **勘定科目マスタとテンプレートの食い違い（`ImportChartOutput::kept_existing`）の
+  出口が起動時の stderr しか無い。** `docs/07-mcp-server.md` §7 の
+  「PR-G への申し送り」を参照（`get_settings` に載せる）。
 
 ---
 
