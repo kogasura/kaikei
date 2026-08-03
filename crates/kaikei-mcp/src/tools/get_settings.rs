@@ -28,6 +28,19 @@
 //! このツールが `chart_differences` として返す。AI は `list_accounts` が返す
 //! 名称がテンプレートと違う理由を、応答だけで説明できるようになる
 //! （`DECISIONS.md` D-086）。
+//!
+//! # ★`chart_differences` は起動時点のスナップショットである★（PR-G レビュー C-3）
+//!
+//! `list_accounts` は**毎回 DB の `accounts` を読む**のに対し、
+//! `chart_differences` が返すのは [`crate::startup::assemble`] が起動時に
+//! 採取した `Vec` である。稼働中に `accounts` が編集されると**両者は食い違う**
+//! （`accounts` は帳簿本体と違い append-only ではない。`ports.rs` の
+//! [`kaikei_app::ports::ChartWriteRepo`] の doc）。
+//!
+//! したがって値だけを裸で返さず、`{"as_of": "startup", "items": [...]}` の形で
+//! **いつ時点の観測か**を応答に残す。この crate の他の箇所——0行の試算表でも
+//! 通貨を名乗る（D-074）、`suggest_tax_category` が `filtered_by` を必ず返す——
+//! と同じ規律（**その値がどういう条件で得られたかを応答に残す**）である。
 
 use kaikei_app::usecase::import_chart::ChartDifference;
 use kaikei_jp::tax::JpSettings;
@@ -62,8 +75,11 @@ inclusive は税込経理）・端数処理の方式と単位・課税事業者�
 （取引日で変わる消費税区分は list_tax_categories で取得します）。\
 auto_tax_lines を指定した記帳で消費税額の行が生成されるかどうかは、\
 ここで返る tax_mode と is_taxable_business で決まります。\
-勘定科目マスタの定義が同梱テンプレートと食い違っている場合は、\
-その内容を chart_differences に返します（帳簿は登録済みの定義で動いています）。";
+勘定科目マスタの定義が同梱テンプレートと食い違っていた場合は、\
+その内容を chart_differences.items に返します（帳簿は登録済みの定義で動いています）。\
+chart_differences は起動時に採取した結果であり（as_of は startup）、\
+サーバーの起動後に勘定科目が編集されても更新されません。\
+勘定科目の現在の状態は list_accounts で取得してください。";
 
     async fn run(ctx: &ToolContext<'_>, _input: Self::Input) -> Result<ToolSuccess, ToolFailure> {
         let composition = ctx.composition();
@@ -119,12 +135,21 @@ fn success_body(
             "minor_unit": book.book_currency.minor_unit(),
         }),
     );
+    // ★いつ時点の観測かを応答に残す★（PR-G レビュー C-3。モジュール doc）
+    // `as_of` は列挙値で、現在は `"startup"` の1つだけ。裸の配列に戻さないこと
+    // （戻すと「毎回 DB を見た結果」と区別が付かなくなる）。
     body.insert(
         "chart_differences".to_string(),
-        Value::Array(differences.iter().map(difference_to_json).collect()),
+        json!({
+            "as_of": AS_OF_STARTUP,
+            "items": Value::Array(differences.iter().map(difference_to_json).collect()),
+        }),
     );
     body
 }
+
+/// `chart_differences.as_of` の値。**起動時に一度だけ採取した**ことを示す。
+const AS_OF_STARTUP: &str = "startup";
 
 /// テンプレートと食い違って**既存を残した**科目1件。
 ///
@@ -237,7 +262,7 @@ mod tests {
     fn accounts_kept_from_the_database_are_reported_in_the_response() {
         let body = Value::Object(success_body(settings(), &book(), &[difference()]));
 
-        let differences = body["chart_differences"].as_array().expect("配列");
+        let differences = body["chart_differences"]["items"].as_array().expect("配列");
         assert_eq!(differences.len(), 1, "{body}");
         let difference = &differences[0];
         assert_eq!(difference["account"], json!("500"));
@@ -257,7 +282,25 @@ mod tests {
     #[test]
     fn no_difference_is_an_empty_array_and_the_key_is_still_present() {
         let body = Value::Object(success_body(settings(), &book(), &[]));
-        assert_eq!(body["chart_differences"], json!([]));
+        assert_eq!(body["chart_differences"]["items"], json!([]));
+    }
+
+    // ★PR-G レビュー C-3★ **起動時点の観測であることが応答に残る。**
+    //
+    // `list_accounts` は毎回 DB を読むので、稼働中に `accounts` が編集されると
+    // 両者は食い違う。裸の配列で返すと、その食い違いを説明する手掛かりが
+    // 応答から消える。
+    #[test]
+    fn the_chart_differences_say_when_they_were_observed() {
+        for differences in [&[][..], &[difference()][..]] {
+            let body = Value::Object(success_body(settings(), &book(), differences));
+            let reported = &body["chart_differences"];
+            assert_eq!(reported["as_of"], json!("startup"), "{body}");
+            assert!(reported["items"].is_array(), "{body}");
+            // 裸の配列に戻していない（戻すと「毎回 DB を見た結果」と
+            // 区別が付かなくなる）。
+            assert!(!reported.is_array(), "{body}");
+        }
     }
 
     // 日付引数を取らない（設定は取引日で変わらない。D-057）。
@@ -278,5 +321,8 @@ mod tests {
         }
         assert!(description.contains("list_tax_categories"));
         assert!(description.contains("chart_differences"));
+        // 起動時点のスナップショットであることを説明文にも書く（C-3）。
+        assert!(description.contains("起動時"), "{description}");
+        assert!(description.contains("list_accounts"), "{description}");
     }
 }

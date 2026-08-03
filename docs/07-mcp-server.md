@@ -15,6 +15,15 @@ AI エージェントが会計操作を安全に行うための標準インタ�
 > | §7 | 「PR-G への申し送り: `kept_existing` の出口を stderr だけにしない」を**実装済み**にした（`get_settings` の `chart_differences`） | D-087 |
 > | §10 | MC-08 / MC-13 / MC-14 / MC-15 / MC-18 / MC-19 / MC-28 の実装箇所と、MC-11 の残り（PR-H の2件）を書いた | D-086 |
 >
+> **PR-G のレビュー指摘（B / C-1 / C-2 / C-3）で §3 が4箇所変わった:**
+>
+> | 節 | 変わった点 | 決定 |
+> |---|---|---|
+> | §3 `get_entry` | **その仕訳が既に訂正済みか**（`reversed_by` / `reversed_by_entry_no`）を返すようにした。初版は逆仕訳→原仕訳の向きしか返さず、訂正済みの仕訳の応答が未訂正のものと1バイトも違わなかった | D-086 |
+> | §3 `get_trial_balance` | `group_by` の**未登録キー**（`unknown_tag_key`）と**登録済みだが集計軸に使えないキー**（`not_aggregatable`）を別のエラーにし、どちらにも `aggregatable_group_by_keys` を添えた | D-086 |
+> | §3 `get_settings` | `chart_differences` を `{"as_of": "startup", "items": [...]}` にした（起動時点のスナップショットであることを応答に残す） | D-087 |
+> | §3 `suggest_tax_category` | `filtered_by` に帳簿の設定（`tax_mode` / `is_taxable_business` / `simplified_taxation`）を並べ、`disclaimer` に「帳簿の設定によっては税額行が生成されない」を足した | D-087 |
+>
 > PR-F（1つ前の版）で変わったのは次の6箇所である:
 >
 > | 節 | 変わった点 | 決定 |
@@ -117,7 +126,7 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 | ツール | Phase | 説明 |
 |---|---|---|
 | `list_accounts` | **Phase 3** | 勘定科目一覧。科目コード・名称・5要素分類（`account_type`）・親科目（`parent`）・**記帳可否（`postable`）** を返す。`postable: false` は見出し科目で、記帳に使うと `NotPostable` になるため必ず返す。表示順（`sort`）は保持していないので返さない（並びは科目コード昇順。D-061） |
-| `get_entry` | **Phase 3** | 仕訳 1 件の詳細（明細・タグ）。証憑リンクは Phase 4 |
+| `get_entry` | **Phase 3** | 仕訳 1 件の詳細（明細・タグ）。**訂正の関係は両方向**——その仕訳が訂正している原仕訳（`reverses`）と、その仕訳を訂正した赤伝（`reversed_by`）。後者は集約に入っていないので `JournalRepo::find_reversal_of` を同じトランザクションで引く（PR-G レビュー B。§3）。証憑リンクは Phase 4 |
 | `get_trial_balance` | **Phase 3** | 試算表。集計期間（`from`/`to`、取引日ベース・両端含む）は**必須**。`group_by` には `aggregatable: true` のタグキーのみ指定可（それ以外は `NotAggregatable`。`CLAUDE.md` §4）。`from > to` は空の試算表ではなく**エラー**（入力ミスを「0件の空の試算表」として静かに成功させない）。集計対象の通貨が単一であることを要求する（D-042。帳簿通貨と異なる行があれば `currency_mismatch`）。**0行の期間でも `currency` を返す**（PR-B 2巡目）。入出力は §3 |
 | `search_entries` | **Phase 3** | 日付・金額・科目・取引先・摘要で仕訳検索。read model の新設が要る（下記） |
 | `get_ledger` | **Phase 3** | 総勘定元帳（科目別の明細）。read model の新設が要る（下記） |
@@ -134,13 +143,22 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 
 > **`get_entry` の read model（`entry_detail.rs`）は作らない**（PR-G。D-086）。
 > 初版はこの3つを並べていたが、`get_entry` は**集計ではなく集約1件の取得**で
-> あり、`JournalRepo::find_entry` が既に `JournalEntry`（明細・タグ・訂正の
-> 関係を含む）を返す。D-031 が read model を要求したのは `TrialBalance` /
-> `BalanceRow` が core の外から構築できないためで、`JournalEntry` にその制約は
-> 無い（`rehydrate` があり `kaikei-store` が実際に使っている）。
-> 同じ「仕訳1件を読む」経路を2本持つと、`reverse_journal_entry` が読む姿と
-> `get_entry` が返す姿が別々に育つ。**PR-H が新設するのは `search.rs` /
-> `ledger.rs` の2本である。**
+> あり、`JournalRepo::find_entry` が既に `JournalEntry`（明細・タグ・**その
+> 仕訳が誰を訂正しているか**）を返す。D-031 が read model を要求したのは
+> `TrialBalance` / `BalanceRow` が core の外から構築できないためで、
+> `JournalEntry` にその制約は無い（`rehydrate` があり `kaikei-store` が実際に
+> 使っている）。同じ「仕訳1件を読む」経路を2本持つと、
+> `reverse_journal_entry` が読む姿と `get_entry` が返す姿が別々に育つ。
+> **PR-H が新設するのは `search.rs` / `ledger.rs` の2本である。**
+>
+> **★集約が持つのは後ろ向きのポインタだけである★**（PR-G レビュー B。
+> 以前ここは「訂正の関係を含む」と書いていたが、実態より1段強かった）。
+> `JournalEntry` にあるのは `reverses` / `reverse_reason`——
+> **逆仕訳 → 原仕訳**の向きだけで、**原仕訳 → 逆仕訳**の関係は集約に入って
+> いない。read model を作らないという判断は変わらないが、その分
+> `get_entry` は `JournalRepo::find_reversal_of`（`reverse_entry::execute` が
+> 二重訂正の検出に既に使っているポート）を**同じトランザクションの中で**
+> もう1回引いて `reversed_by` を返す。新規 SQL も `.sqlx` の更新も要らない。
 
 ### 書き込み系
 
@@ -617,9 +635,46 @@ AI の自己修正を一段速くする効果は大きいが、
   `from > to` は空の試算表ではなく**エラー**（`error` は `rejected`）。
   「0件の空の試算表」として静かに成功させない（§2 / MC-15）。
 - `group_by` は省略可（既定は空 ＝ 科目のみで集計）。
-  `aggregatable: true` のタグキーだけを受け付ける。それ以外・未登録のキーは
-  `not_aggregatable`（**SQL に到達する前に** `kaikei-app` が弾く。`CLAUDE.md` §4）。
+  `aggregatable: true` のタグキーだけを受け付ける（同梱スキーマでは
+  `counterparty` / `project` / `tax_category` の3つ）。
   重複したキーは `kaikei-app` が出現順を保ったまま除去する。
+- **拒否は2種類あり、別のコードで返す**（PR-G レビュー C-2）:
+
+  | 指定したキー | `error` | 出所 |
+  |---|---|---|
+  | 帳簿に**登録されていない**（`tags.yaml` に無い） | `unknown_tag_key` | MCP 層（`TagCatalog::def` が `None`） |
+  | 登録済みだが `aggregatable: false` | `not_aggregatable` | `kaikei-app`（**SQL に到達する前に**弾く。`CLAUDE.md` §4） |
+
+  どちらの応答にも **`aggregatable_group_by_keys`**（選べるキーの一覧）が付き、
+  `DESCRIPTION` にも同じキーが列挙してある。
+
+  > **★なぜ MCP 層で分けるのか★**
+  >
+  > `TagSchema::is_aggregatable` は**未登録のキーにも `false` を返す**ので、
+  > 素直に流すと未登録のキーに対して
+  > 「集計軸に使えないタグキーです: memo（**aggregatable = false**）」という
+  > **成立していない事実**（`aggregatable` の宣言自体が存在しない）が返る。
+  > しかも Phase 3 の11ツールには**有効なタグキーを一覧できるツールが無い**
+  > ので、AI はこのエラーを踏んだあと正しいキーに辿り着けない（§11 違反）。
+  >
+  > 発生源（`kaikei-core` の `CoreError::NotAggregatable`）は凍結層なので
+  > 触らない。MCP 層が見るのは**登録の有無だけ**であり、集計軸として妥当かは
+  > 従来どおり `report::execute` が決める（同じ検証を2箇所に持たない）。
+  > core 側のメッセージ改善（未登録キーと非集計キーを区別する）は別 Issue。
+
+  実サーバの応答（**どちらも実物**）:
+
+  ```json
+  { "error": "unknown_tag_key",
+    "message": "group_by: タグキー \"memo\" はこの帳簿に登録されていません（登録されているキー: business_ratio, counterparty, imported_tx_id, invoice_reg_no, project, tax_category）。集計軸に指定できるのは、そのうち集計軸として宣言されているキーだけです: counterparty, project, tax_category",
+    "aggregatable_group_by_keys": ["counterparty", "project", "tax_category"] }
+  ```
+
+  ```json
+  { "error": "not_aggregatable",
+    "message": "group_by: 集計軸に使えないタグキーです: business_ratio（aggregatable = false）",
+    "aggregatable_group_by_keys": ["counterparty", "project", "tax_category"] }
+  ```
 
 成功時：
 
@@ -754,16 +809,47 @@ AI の自己修正を一段速くする効果は大きいが、
 - `reverses` / `reverse_reason` は**逆仕訳のときだけ**現れる。`null` を置くと
   「逆仕訳ではない」と「訂正理由が空」の区別が応答から消える
   （`lines[].memo` と同じ扱い。`PROGRESS.md` Phase 1 の教訓3）。
+- **`reversed_by` / `reversed_by_entry_no` は、その仕訳が既に赤伝で訂正されて
+  いるときだけ現れる**（PR-G レビュー B）。上の実サーバの応答を訂正した後に
+  同じ `entry_id` で引くと、次の2キーが増える:
+
+  ```json
+  { "reversed_by": "019fc7c8-3a11-7600-8246-0a29b67d371d",
+    "reversed_by_entry_no": 2 }
+  ```
+
+  `reverses` とは**向きが逆**である（`reverses` は「この仕訳が誰を訂正して
+  いるか」、`reversed_by` は「この仕訳を誰が訂正したか」）。
+
+  > **★これが無いと訂正済みかどうかが応答から消える★**
+  >
+  > `JournalEntry`（集約）が持つのは `reverses` / `reverse_reason`——
+  > **逆仕訳 → 原仕訳**の向きだけである。初版はそれをそのまま返していたので、
+  > 訂正前と訂正後の `get_entry` は**全キーが完全に一致した**。
+  > `get_trial_balance` では残高が0になっているのに、`get_entry` では
+  > 生きているように見える。しかも同じ応答の説明文が
+  > 「訂正は `reverse_journal_entry` で」と誘導するため、AI は訂正済みの
+  > 仕訳をもう一度訂正しようとして `already_reversed` を踏む（§11 違反）。
+  > **訂正履歴は本プロジェクトの存在意義**（`CLAUDE.md` §2）である。
+  >
+  > 実装は read model の新設ではなく、
+  > `JournalRepo::find_reversal_of`（`reverse_entry::execute` が二重訂正の
+  > 検出に既に使っているポート）を**同じトランザクションの中で**もう1回
+  > 呼ぶだけである。新しい SQL も `.sqlx` の更新も要らず、
+  > `reverse_journal_entry` が二重訂正を拒否する判断と同じ述語を見る。
 - 存在しない仕訳IDは**空の成功にしない**（MC-14）。実サーバの応答:
 
   ```json
   { "error": "not_found",
-    "message": "見つかりません: 仕訳が見つかりません（仕訳ID: 0192a7b3-1234-7abc-8def-0123456789ab）。仕訳IDが正しいか確認してください" }
+    "message": "見つかりません: 指定された仕訳（仕訳ID: 0192a7b3-1234-7abc-8def-0123456789ab）。仕訳IDが正しいか確認してください" }
   ```
 
   文言は `reverse_journal_entry` が組み立てるものと同一（**仕訳IDは UUID の
   正準表記**）。「UUID ですらない文字列」は `invalid_entry_id` であり、
   `not_found` と区別する（§6。AI が取るべき次の手が違う）。
+  `RepoError::NotFound` の `Display` が既に `"見つかりません: {reason}"` なので、
+  **`reason` 側に「見つかりません」を書かない**（PR-G レビュー D-2。以前は
+  「見つかりません: 仕訳が見つかりません（…）」と同じことを2回言っていた）。
 - **`recorded_at`（記帳時刻）は返していない。** `Timestamp` を線上の表記に
   する入口が `kaikei-app` に無く、MCP 層で組み立てると `chrono` を名指しする
   ことになる（MC-30 の許可リストに無い）。必要になったら
@@ -824,7 +910,7 @@ AI の自己修正を一段速くする効果は大きいが、
   "simplified_taxation": false,
   "fiscal_year_rule": "calendar_year",
   "book_currency": { "code": "JPY", "minor_unit": 0 },
-  "chart_differences": []
+  "chart_differences": { "as_of": "startup", "items": [] }
 }
 ```
 
@@ -833,7 +919,7 @@ AI の自己修正を一段速くする効果は大きいが、
   金額が100倍ずれる。`CLAUDE.md` §8）。
 - **`chart_differences`**（PR-E からの申し送り。§7）: 起動時の科目投入で
   テンプレートと定義が食い違い、**既存を残した**科目
-  （`ImportChartOutput::kept_existing`。D-081）。要素の形は
+  （`ImportChartOutput::kept_existing`。D-081）。`items` の要素の形は
 
   ```json
   { "account": "500", "fields": ["name"],
@@ -844,7 +930,15 @@ AI の自己修正を一段速くする効果は大きいが、
 
   `message` は `ChartDifference::describe()` をそのまま使う（起動時に stderr へ
   出しているものと同一。言い換えると説明が2つに育つ）。
-  食い違いが無ければ空配列（**キーは必ず出す**）。
+  食い違いが無ければ `items` は空配列（**キーは必ず出す**）。
+- **`chart_differences.as_of` は `"startup"` 固定である**（PR-G レビュー C-3）。
+  `list_accounts` が**毎回 DB の `accounts` を読む**のに対し、これは
+  `startup::assemble` が**起動時に一度だけ**採取した `Vec` である。
+  稼働中に `accounts` が編集されると両者は食い違う（`accounts` は帳簿本体と
+  違い append-only ではない）。裸の配列で返すと「毎回 DB を見た結果」と
+  区別が付かないので、**いつ時点の観測かを応答に残す**。
+  0行の試算表でも `currency` を名乗る（D-074）／`suggest_tax_category` が
+  `filtered_by` を必ず返す、と同じ規律である。
 
 ### suggest_tax_category（PR-G）
 
@@ -859,7 +953,10 @@ AI の自己修正を一段速くする効果は大きいが、
   "date": "2026-04-15",
   "table": { "label": "kaikei-jp-data/tax/jp/2026.yaml",
              "applies_from": "2026-01-01", "range": "2026-01-01 〜 無期限" },
-  "filtered_by": { "direction": "sales", "description_used_for_filtering": false },
+  "filtered_by": { "direction": "sales", "description_used_for_filtering": false,
+                   "tax_mode": "exclusive", "is_taxable_business": true,
+                   "simplified_taxation": false,
+                   "book_settings_used_for_filtering": false },
   "description": "A社へのコンサル料",
   "count": 3,
   "candidates": [
@@ -867,7 +964,7 @@ AI の自己修正を一段速くする効果は大きいが、
       "rate": "0.10", "requires_qualified_invoice": false, "tax_account": "330",
       "reason": "2026-04-15 時点で有効なマスタ「kaikei-jp-data/tax/jp/2026.yaml」（2026-01-01 〜 無期限）に、売上側の区分「課税売上 10%」として登録されています。税率は 0.10 です" }
   ],
-  "disclaimer": "候補と根拠のみを返しています。どの区分を使うかの判断はこのサーバーでは行いません。候補は、指定された取引日の時点で有効な消費税区分マスタに登録されている区分です。取引内容の文面からの推論は行っていません。"
+  "disclaimer": "候補と根拠のみを返しています。どの区分を使うかの判断はこのサーバーでは行いません。候補は、指定された取引日の時点で有効な消費税区分マスタに登録されている区分です。取引内容の文面からの推論は行っていません。この帳簿の設定（filtered_by の tax_mode / is_taxable_business / simplified_taxation）でも候補を絞っていません。帳簿の設定によっては、候補の区分で記帳しても税額の行が生成されないことがあります。"
 }
 ```
 
@@ -888,6 +985,22 @@ AI の自己修正を一段速くする効果は大きいが、
   `kaikei-import`）、無い規則を MCP 層で発明しないためである。
   回帰検知は `the_description_is_echoed_but_never_used_to_filter`
   （摘要を付けても候補が変わらないことを見る）。
+- **`filtered_by` に帳簿の設定を並べる**（PR-G レビュー C-1）。
+  初版は免税事業者（`is_taxable_business: false`）や簡易課税の帳簿でも
+  「税率は 0.10 です」と述べ `tax_account` を返し、応答が課税事業者の帳簿と
+  **完全に同一**だった。その区分で実際に記帳しても**税額行は1行も生成
+  されない**のに、`disclaimer` が否定していたのは「文面からの推論」だけで、
+  「帳簿の設定は考慮していない」とはどこにも書いていなかった。
+  §10 の「断定しない」（1件に絞らない・順位を付けない・摘要から推論しない）は
+  満たしていたが、**根拠が不完全なまま税率だけが目立つ**状態だった。
+  そこで `tax_mode` / `is_taxable_business` / `simplified_taxation`
+  （`get_settings` が返すのと同じ値）を並べ、`disclaimer` に
+  「帳簿の設定によっては税額行が生成されないことがある」を足す。
+  **候補は絞らない**（どの区分を使うかの判断はこのサーバーが行わない）ので、
+  これは業務判断ではなく**事実の提示**である（D-072 に反しない）。
+  回帰検知は `the_book_settings_that_decide_whether_tax_lines_appear_are_reported_back`
+  （免税事業者の帳簿で `filtered_by` が変わり、`candidates` は変わらないことを
+  同時に見る）。
 - 帳簿は一切変更しない（MC-08 の (2)。`Tx` を開かず DB にも触らない）。
 
 ### validate_invoice_number（PR-G）
@@ -2249,7 +2362,7 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 
 | # | ケース | 期待 |
 |---|---|---|
-| MC-08 | `suggest_tax_category` | (1) 根拠が空でない、(2) 呼び出しの前後で**帳簿が一切変わらない**（試算表と仕訳件数が不変。§1 ② の機械的検証）。**PR-G で実装**: 候補ごとの `reason` は `crates/kaikei-mcp/src/tools/suggest_tax_category.rs` の `every_candidate_carries_a_non_empty_reason`、帳簿が動かないことは `crates/kaikei-e2e/tests/mcp_stdio_server.rs` の `the_read_tools_answer_through_the_real_binary_and_are_audited`（読み取り・提案を8回呼んで `journal_entries` が1件のまま）。**断定しないこと**は `the_response_does_not_single_out_one_category_or_rank_them`（順位・信頼度のキーが無い）と `the_description_is_echoed_but_never_used_to_filter`（摘要で候補が変わらない）が見る（D-087） |
+| MC-08 | `suggest_tax_category` | (1) 根拠が空でない、(2) 呼び出しの前後で**帳簿が一切変わらない**（試算表と仕訳件数が不変。§1 ② の機械的検証）。**PR-G で実装**: 候補ごとの `reason` は `crates/kaikei-mcp/src/tools/suggest_tax_category.rs` の `every_candidate_carries_a_non_empty_reason`、帳簿が動かないことは `crates/kaikei-e2e/tests/mcp_stdio_server.rs` の `the_read_tools_answer_through_the_real_binary_and_are_audited`（読み取り・提案を8回呼んで `journal_entries` が1件のまま）。**断定しないこと**は `the_response_does_not_single_out_one_category_or_rank_them`（順位・信頼度のキーが無い）と `the_description_is_echoed_but_never_used_to_filter`（摘要で候補が変わらない）が見る（D-087）。**根拠が帳簿の設定を落としていないこと**は `the_book_settings_that_decide_whether_tax_lines_appear_are_reported_back`（免税事業者の帳簿で `filtered_by` が変わり、`candidates` は変わらない。PR-G レビュー C-1） |
 | MC-28 | `validate_invoice_number` の出力 | 形式検証の結果のみを述べ、「実在する／実在しない」と断定しない（`CLAUDE.md` §10）。**PR-G で実装**: `crates/kaikei-mcp/src/tools/validate_invoice_number.rs` の `a_well_formed_number_reports_the_format_only_without_claiming_it_exists`（`not_checked` が空でないこと・断定に読める語が無いこと・キー名が `valid` でないこと）と `each_failed_check_has_its_own_error_code`（D-053 の4観点） |
 
 ### 読み取り系
@@ -2257,12 +2370,12 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 | # | ケース | 期待 |
 |---|---|---|
 | MC-13 | `list_accounts` | 科目種別（`account_type`）と**記帳可否（`postable`）**を含めて返す。**PR-G で実装**: `crates/kaikei-mcp/src/tools/list_accounts.rs` の `every_account_carries_its_type_and_whether_it_can_be_posted_to`（並びが科目コード昇順であることも見る）と `postable_only_hides_the_headings_and_says_so_in_the_response`。実バイナリ経由は `crates/kaikei-e2e/tests/mcp_stdio_server.rs`。**同梱テンプレートの科目は現時点で全て記帳可能**なので、見出し科目を含む絞り込みの検査は単体側にある |
-| MC-14 | `get_entry` | 存在する仕訳の明細・タグを返す。存在しない ID では次の手が分かる NotFound を返し、**仕訳IDは UUID の正準表記**で示す（10進表記にしない。§3。`reverse_journal_entry` 側は PR-B で解決済み）。**PR-G で実装**: `crates/kaikei-mcp/src/tools/get_entry.rs` の `a_missing_entry_is_reported_as_not_found_with_the_canonical_uuid`（10進表記が漏れていないことも見る）／`a_reversal_entry_points_at_the_original_and_carries_the_reason`。read model は新設していない（`JournalRepo::find_entry`。D-086） |
-| MC-15 | `get_trial_balance` | 期間で絞り込める。`group_by` 指定が効く。借方合計＝貸方合計。`from > to` はエラー（空結果にしない）。**PR-G で実装**: 実 DB は `crates/kaikei-e2e/tests/mcp_stdio_server.rs` の `the_read_tools_answer_through_the_real_binary_and_are_audited`（`group_by: ["tax_category"]` が効くこと）と `the_read_tools_tell_an_empty_result_apart_from_a_bad_request`（0行の期間は成功・`from > to` は `rejected`）。応答の詰め替えは `crates/kaikei-mcp/src/tools/get_trial_balance.rs` の単体検査 |
+| MC-14 | `get_entry` | 存在する仕訳の明細・タグを返す。存在しない ID では次の手が分かる NotFound を返し、**仕訳IDは UUID の正準表記**で示す（10進表記にしない。§3。`reverse_journal_entry` 側は PR-B で解決済み）。**PR-G で実装**: `crates/kaikei-mcp/src/tools/get_entry.rs` の `a_missing_entry_is_reported_as_not_found_with_the_canonical_uuid`（10進表記が漏れていないことと、`Display` の「見つかりません」が二重にならないことを見る）／`a_reversal_entry_points_at_the_original_and_carries_the_reason`。read model は新設していない（`JournalRepo::find_entry`。D-086）。**訂正済みの仕訳が未訂正のものと区別できること**は `an_entry_that_has_already_been_reversed_says_so_with_the_reversal_id`（単体）と `crates/kaikei-e2e/tests/mcp_stdio_server.rs` の `reversing_through_the_real_binary_goes_through_the_same_audited_path`（実バイナリで訂正前後の応答を突き合わせる。PR-G レビュー B） |
+| MC-15 | `get_trial_balance` | 期間で絞り込める。`group_by` 指定が効く。借方合計＝貸方合計。`from > to` はエラー（空結果にしない）。**PR-G で実装**: 実 DB は `crates/kaikei-e2e/tests/mcp_stdio_server.rs` の `the_read_tools_answer_through_the_real_binary_and_are_audited`（`group_by: ["tax_category"]` が効くこと）と `the_read_tools_tell_an_empty_result_apart_from_a_bad_request`（0行の期間は成功・`from > to` は `rejected`・未登録のタグキーは `unknown_tag_key`・登録済みだが非集計のキーは `not_aggregatable`）。応答の詰め替えと2種類の拒否の区別は `crates/kaikei-mcp/src/tools/get_trial_balance.rs` の単体検査（`an_unregistered_key_is_not_reported_as_a_non_aggregatable_one` / `the_description_lists_exactly_the_aggregatable_keys`。PR-G レビュー C-2） |
 | MC-16 | `search_entries` | 日付・金額・科目・摘要で絞り込める。**0件でも成功として空配列を返す**（エラーにしない） |
 | MC-17 | `get_ledger` | 科目別に借方・貸方・残高を返す。期間指定が効く |
 | MC-18 | `list_tax_categories` | 指定日時点で有効な区分のみを返す。取引日で切り替わる（D-050 / D-055）。該当マスタが無い日付では**エラー**で、メッセージに有効期間が含まれる。**PR-G で実装**: `crates/kaikei-mcp/src/tools/list_tax_categories.rs` の `the_categories_valid_on_the_given_date_are_returned_with_their_source_table` / `a_date_outside_the_embedded_masters_is_an_error_that_shows_the_available_range`。**収録外になるのは開始日より前**である（同梱マスタの `applies_to` は未指定＝未来側は開いている） |
-| MC-19 | `get_settings` | 起動時に合成した `JpSettings`（税抜/税込・端数処理・端数処理単位・課税事業者区分・簡易課税）をそのまま返す。日付引数を取らない。**PR-G で実装**: `crates/kaikei-mcp/src/tools/get_settings.rs` の `the_composed_settings_are_returned_with_their_machine_readable_codes` / `the_input_takes_no_arguments` / `accounts_kept_from_the_database_are_reported_in_the_response`（§7 の申し送り。D-087） |
+| MC-19 | `get_settings` | 起動時に合成した `JpSettings`（税抜/税込・端数処理・端数処理単位・課税事業者区分・簡易課税）をそのまま返す。日付引数を取らない。**PR-G で実装**: `crates/kaikei-mcp/src/tools/get_settings.rs` の `the_composed_settings_are_returned_with_their_machine_readable_codes` / `the_input_takes_no_arguments` / `accounts_kept_from_the_database_are_reported_in_the_response`（§7 の申し送り。D-087）／`the_chart_differences_say_when_they_were_observed`（`as_of: startup`。PR-G レビュー C-3） |
 
 ### プロトコル・契約
 

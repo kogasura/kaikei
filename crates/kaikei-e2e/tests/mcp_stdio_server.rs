@@ -588,6 +588,13 @@ async fn reversing_through_the_real_binary_goes_through_the_same_audited_path(
         .expect("entry_id")
         .to_string();
 
+    // ★訂正前★ この時点では誰も訂正していない（キーごと出ない）。
+    let before = server
+        .call_tool("get_entry", json!({ "entry_id": original_id }))
+        .await;
+    assert!(!is_error(&before), "{before}");
+    assert!(body(&before).get("reversed_by").is_none(), "{before}");
+
     let reversed = server
         .call_tool(
             "reverse_journal_entry",
@@ -619,22 +626,56 @@ async fn reversing_through_the_real_binary_goes_through_the_same_audited_path(
     assert!(is_error(&refused), "{refused}");
     assert_eq!(body(&refused)["error"], json!("empty_reverse_reason"));
 
+    // ★訂正後★（PR-G レビュー B）
+    //
+    // 帳簿は追記のみなので原仕訳そのものは1バイトも変わらない。それでも
+    // **「既に訂正済みである」ことは応答から読めなければならない**
+    // （`CLAUDE.md` §2 の訂正履歴。`get_trial_balance` では残高が0になって
+    // いるのに `get_entry` では生きているように見える、という状態にしない）。
+    let after = server
+        .call_tool("get_entry", json!({ "entry_id": original_id }))
+        .await;
+    assert!(!is_error(&after), "{after}");
+    assert_ne!(
+        body(&before),
+        body(&after),
+        "訂正済みの仕訳が未訂正のときと同じ応答です: {after}"
+    );
+    assert_eq!(body(&after)["reversed_by"], json!(reversal_id), "{after}");
+    assert_eq!(body(&after)["reversed_by_entry_no"], json!(2), "{after}");
+    // 向きを取り違えていない（原仕訳は誰も訂正していない）。
+    assert!(body(&after).get("reverses").is_none(), "{after}");
+
+    // 逆仕訳の側は逆向きの関係（`reverses`）を持ち、誰にも訂正されていない。
+    let reversal_entry = server
+        .call_tool("get_entry", json!({ "entry_id": reversal_id }))
+        .await;
+    assert!(!is_error(&reversal_entry), "{reversal_entry}");
+    assert_eq!(body(&reversal_entry)["reverses"], json!(original_id));
+    assert!(
+        body(&reversal_entry).get("reversed_by").is_none(),
+        "{reversal_entry}"
+    );
+
     server.shutdown().await;
 
     // 元仕訳・逆仕訳の2件が残る（元仕訳は書き換わらない。`CLAUDE.md` §2）。
     assert_eq!(journal_entry_count(&app).await, 2);
 
-    // 3回の tools/call でそれぞれ2行、計6行。
+    // 6回の tools/call でそれぞれ2行、計12行。
     let rows = audit_rows(&app).await;
-    assert_eq!(rows.len(), 6, "{rows:?}");
+    assert_eq!(rows.len(), 12, "{rows:?}");
     assert_audited_pair(&rows[0..2], "post_journal_entry", "ok");
-    assert_audited_pair(&rows[2..4], "reverse_journal_entry", "ok");
-    assert_audited_pair(&rows[4..6], "reverse_journal_entry", "error");
+    assert_audited_pair(&rows[2..4], "get_entry", "ok");
+    assert_audited_pair(&rows[4..6], "reverse_journal_entry", "ok");
+    assert_audited_pair(&rows[6..8], "reverse_journal_entry", "error");
+    assert_audited_pair(&rows[8..10], "get_entry", "ok");
+    assert_audited_pair(&rows[10..12], "get_entry", "ok");
     assert_eq!(
-        rows[3].entry_id.map(|id| id.to_string()).as_deref(),
+        rows[5].entry_id.map(|id| id.to_string()).as_deref(),
         Some(reversal_id.as_str())
     );
-    assert_eq!(rows[5].error_code.as_deref(), Some("empty_reverse_reason"));
+    assert_eq!(rows[7].error_code.as_deref(), Some("empty_reverse_reason"));
 }
 
 // ---------------------------------------------------------------------------
@@ -819,7 +860,13 @@ async fn the_read_tools_answer_through_the_real_binary_and_are_audited(
     assert_eq!(s["fiscal_year_rule"], json!("calendar_year"));
     assert_eq!(s["book_currency"]["code"], json!("JPY"));
     // テンプレートどおりに投入した直後なので食い違いは無い（キーは必ず出る）。
-    assert_eq!(s["chart_differences"], json!([]), "{settings}");
+    // **起動時点の観測であることが応答に残る**（PR-G レビュー C-3）。
+    assert_eq!(s["chart_differences"]["items"], json!([]), "{settings}");
+    assert_eq!(
+        s["chart_differences"]["as_of"],
+        json!("startup"),
+        "{settings}"
+    );
 
     // ---- suggest_tax_category ----
     let suggested = server
@@ -829,6 +876,25 @@ async fn the_read_tools_answer_through_the_real_binary_and_are_audited(
         )
         .await;
     assert!(!is_error(&suggested), "{suggested}");
+    // 帳簿の設定が根拠として並ぶ（PR-G レビュー C-1）。起動時に環境変数で
+    // 渡した値がそのまま出る（`get_settings` と同じ値）。
+    let filtered_by = &body(&suggested)["filtered_by"];
+    assert_eq!(filtered_by["tax_mode"], json!("exclusive"), "{suggested}");
+    assert_eq!(
+        filtered_by["is_taxable_business"],
+        json!(true),
+        "{suggested}"
+    );
+    assert_eq!(
+        filtered_by["simplified_taxation"],
+        json!(false),
+        "{suggested}"
+    );
+    assert_eq!(
+        filtered_by["book_settings_used_for_filtering"],
+        json!(false),
+        "{suggested}"
+    );
     let candidates = body(&suggested)["candidates"].as_array().expect("配列");
     assert!(
         candidates.len() > 1,
@@ -898,6 +964,8 @@ async fn the_read_tools_answer_through_the_real_binary_and_are_audited(
 /// |---|---|
 /// | 仕訳が1件も無い期間の試算表 | **成功**（`rows: []`。通貨と合計 `"0"` は返る） |
 /// | 開始日が終了日より後 | **エラー**（`rejected`） |
+/// | 未登録のタグキーで `group_by` | **エラー**（`unknown_tag_key`。「aggregatable = false」とは言わない） |
+/// | 登録済みだが集計軸に使えないタグキーで `group_by` | **エラー**（`not_aggregatable`。上と別コード） |
 /// | 存在しない仕訳ID | **エラー**（`not_found`。UUID の正準表記を含む） |
 /// | 仕訳IDが UUID ですらない | **エラー**（`invalid_entry_id`。`not_found` と区別する） |
 /// | 同梱していない日付の税区分 | **エラー**（有効期間を示す。空配列にしない） |
@@ -938,6 +1006,49 @@ async fn the_read_tools_tell_an_empty_result_apart_from_a_bad_request(
     assert_eq!(body(&reversed_period)["error"], json!("rejected"));
     let message = body(&reversed_period)["message"].as_str().unwrap();
     assert!(message.contains("2026-12-31"), "{message}");
+
+    // ★未登録のキーと「集計軸に使えないキー」を区別する★（PR-G レビュー C-2）
+    //
+    // `TagSchema::is_aggregatable` はどちらにも `false` を返すので、素直に
+    // 流すと未登録のキーにも「（aggregatable = false）」という成立していない
+    // 事実が返る。どちらの応答にも選べるキーの一覧が付く（§11）。
+    let unregistered = server
+        .call_tool(
+            "get_trial_balance",
+            json!({ "from": "2026-01-01", "to": "2026-12-31", "group_by": ["memo"] }),
+        )
+        .await;
+    assert!(is_error(&unregistered), "{unregistered}");
+    assert_eq!(body(&unregistered)["error"], json!("unknown_tag_key"));
+    let message = body(&unregistered)["message"].as_str().unwrap();
+    assert!(message.contains("登録されていません"), "{message}");
+    assert!(
+        !message.contains("aggregatable = false"),
+        "未登録のキーに成立していない事実を述べています: {message}"
+    );
+    assert_eq!(
+        body(&unregistered)["aggregatable_group_by_keys"],
+        json!(["counterparty", "project", "tax_category"]),
+        "{unregistered}"
+    );
+
+    let not_aggregatable = server
+        .call_tool(
+            "get_trial_balance",
+            json!({ "from": "2026-01-01", "to": "2026-12-31", "group_by": ["business_ratio"] }),
+        )
+        .await;
+    assert!(is_error(&not_aggregatable), "{not_aggregatable}");
+    assert_eq!(
+        body(&not_aggregatable)["error"],
+        json!("not_aggregatable"),
+        "登録済みのキーが未登録扱いになっています: {not_aggregatable}"
+    );
+    assert_eq!(
+        body(&not_aggregatable)["aggregatable_group_by_keys"],
+        json!(["counterparty", "project", "tax_category"]),
+        "{not_aggregatable}"
+    );
 
     // 存在しない仕訳IDは**見つからない**（空の成功にしない）。
     let missing = server
@@ -1017,6 +1128,8 @@ async fn the_read_tools_tell_an_empty_result_apart_from_a_bad_request(
         calls,
         vec![
             ("get_trial_balance".to_string(), "ok".to_string()),
+            ("get_trial_balance".to_string(), "error".to_string()),
+            ("get_trial_balance".to_string(), "error".to_string()),
             ("get_trial_balance".to_string(), "error".to_string()),
             ("get_entry".to_string(), "error".to_string()),
             ("get_entry".to_string(), "error".to_string()),

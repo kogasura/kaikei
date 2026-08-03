@@ -8,8 +8,8 @@
 //!
 //! 1. `CLAUDE.md` §6 が read model を分離する対象は「**SQL 集計**」であり、
 //!    `get_entry` は集計ではなく**集約1件の取得**である
-//! 2. `find_entry` は既に `JournalEntry`（明細・タグ・逆仕訳の関係を含む
-//!    集約そのもの）を返す。`D-031` が read model を要求したのは
+//! 2. `find_entry` は既に `JournalEntry`（明細・タグ・**その仕訳が誰を
+//!    訂正しているか**）を返す。`D-031` が read model を要求したのは
 //!    `TrialBalance` / `BalanceRow` が **core の外から構築できない**ためで、
 //!    `JournalEntry` にその制約は無い（`rehydrate` があり、`kaikei-store` が
 //!    実際にそれを使って組み立てている）
@@ -17,6 +17,28 @@
 //!    が読む姿とこのツールが返す姿が**別々に育つ**。訂正の可否
 //!    （`reverses` / `reverse_reason`）が2つの実装で食い違うと、AI は
 //!    どちらが帳簿の事実か判断できない
+//!
+//! # ★集約が持つのは後ろ向きのポインタだけである★（PR-G レビュー B）
+//!
+//! `JournalEntry` が保持しているのは `reverses` / `reverse_reason`——
+//! **逆仕訳 → 原仕訳**の向きだけである。**原仕訳 → 逆仕訳**の関係は集約に
+//! 入っておらず、`find_entry` だけでは「この仕訳が既に訂正済みか」を
+//! 応答に載せられない。実際、初版の応答は訂正前と訂正後で**1バイトも
+//! 変わらなかった**（`get_trial_balance` では残高が0になっているのに、
+//! `get_entry` では生きているように見える）。
+//!
+//! しかも同じ応答の説明文が「訂正は `reverse_journal_entry` で行います」と
+//! 誘導するので、AI は訂正済みの仕訳をもう一度訂正しようとして
+//! `already_reversed` を踏む（`CLAUDE.md` §11 が塞ぐべき形）。
+//! **訂正履歴は本プロジェクトの存在意義**（同 §2）であり、読み取り系の
+//! 主力ツールがそれを落としてよい理由は無い。
+//!
+//! そこで [`kaikei_app::ports::JournalRepo::find_reversal_of`]
+//! （`reverse_entry::execute` が二重訂正の検出に既に使っているポート）を
+//! **同じトランザクションの中で**もう1回呼び、訂正済みのときだけ
+//! `reversed_by` / `reversed_by_entry_no` を足す。
+//! read model も新しい SQL も要らず、`reverse_journal_entry` が二重訂正を
+//! 拒否する判断と**同じ述語**を見ることになる（2つの実装が別々に育たない）。
 //!
 //! # 「空の結果」と「見つからない」を区別する
 //!
@@ -30,7 +52,7 @@ use kaikei_app::error::{AppError, RepoError};
 use kaikei_app::id::{entry_id_from_uuid_string, entry_id_to_uuid_string};
 use kaikei_app::ports::JournalRepo;
 use kaikei_app::tx::with_tx;
-use kaikei_core::{EntryId, JournalEntry};
+use kaikei_core::{EntryId, EntryNumber, JournalEntry};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -64,9 +86,14 @@ impl McpTool for GetEntry {
 金額はすべて文字列で返します（例: \"110000\"）。\
 その仕訳が逆仕訳（赤伝）である場合は、訂正対象の仕訳ID（reverses）と\
 訂正理由（reverse_reason）も返します。\
+その仕訳が既に逆仕訳で訂正されている場合は、訂正した逆仕訳の仕訳ID（reversed_by）と\
+仕訳番号（reversed_by_entry_no）を返します。\
+reversed_by が応答に無い仕訳は、まだ訂正されていません。\
 指定した仕訳IDの仕訳が存在しない場合はエラーになります（空の結果は返しません）。\
 帳簿は追記のみで、このツールで取得した仕訳を書き換えることはできません。\
-訂正は reverse_journal_entry（逆仕訳）で行います。";
+まだ訂正されていない仕訳の訂正は reverse_journal_entry（逆仕訳）で行います。\
+reversed_by が付いている仕訳をもう一度訂正する場合は、\
+reverse_journal_entry の allow_double_reversal に true を指定する必要があります。";
 
     async fn run(ctx: &ToolContext<'_>, input: Self::Input) -> Result<ToolSuccess, ToolFailure> {
         // UUID のパースは `kaikei-app` の入口を通す（`uuid` を自前で持たない。
@@ -74,17 +101,24 @@ impl McpTool for GetEntry {
         let entry_id = entry_id_from_uuid_string(&input.entry_id)
             .map_err(|error| in_field("entry_id", ToolError::from_app_error(&error)))?;
 
-        let entry = with_tx(ctx.store(), move |tx| {
+        // 「その仕訳が既に訂正済みか」は集約に入っていないので、**同じ
+        // トランザクションの中で** `find_reversal_of` をもう1回引く
+        // （モジュール doc「集約が持つのは後ろ向きのポインタだけである」）。
+        // 別の `with_tx` に分けると、2回の読み取りの間に赤伝が入りうる。
+        let (entry, reversal) = with_tx(ctx.store(), move |tx| {
             Box::pin(async move {
-                tx.find_entry(entry_id)
+                let entry = tx
+                    .find_entry(entry_id)
                     .await?
-                    .ok_or_else(|| not_found(entry_id))
+                    .ok_or_else(|| not_found(entry_id))?;
+                let reversal = tx.find_reversal_of(entry_id).await?;
+                Ok((entry, reversal))
             })
         })
         .await
         .map_err(|error| ToolError::from_app_error(&error))?;
 
-        Ok(ToolSuccess::new(success_body(&entry)))
+        Ok(ToolSuccess::new(success_body(&entry, reversal)))
     }
 }
 
@@ -95,10 +129,18 @@ impl McpTool for GetEntry {
 /// 送った文字列と突き合わせられない。`docs/07-mcp-server.md` §3 / MC-14）。
 /// 文言は `reverse_journal_entry` の同じ状況（`reverse_entry::execute` が
 /// 組み立てる `RepoError::NotFound`）と揃える。
+///
+/// # `reason` に「見つかりません」を書かない（PR-G レビュー D-2）
+///
+/// [`RepoError::NotFound`] の `Display` は `"見つかりません: {reason}"` で
+/// ある。`reason` 側にも同じことを書くと、応答が
+/// 「見つかりません: 仕訳が見つかりません（…）」と**同じことを2回**言う。
+/// `reason` が担うのは「**何が**見つからなかったか」と「次の手」だけにする
+/// （`reverse_entry::execute` 側も同時に直してある。文言は引き続き同一）。
 fn not_found(entry_id: EntryId) -> AppError {
     AppError::Repo(RepoError::NotFound {
         reason: format!(
-            "仕訳が見つかりません（仕訳ID: {}）。\
+            "指定された仕訳（仕訳ID: {}）。\
              仕訳IDが正しいか確認してください",
             entry_id_to_uuid_string(entry_id)
         ),
@@ -112,7 +154,16 @@ fn not_found(entry_id: EntryId) -> AppError {
 /// `reverses` / `reverse_reason` は逆仕訳のときだけ現れる——`null` を置くと
 /// 「逆仕訳ではない」と「訂正理由が空」の区別が応答から消える
 /// （`PROGRESS.md` Phase 1 の教訓3。`lines[].memo` と同じ扱い）。
-fn success_body(entry: &JournalEntry) -> Map<String, Value> {
+///
+/// `reversal`（[`kaikei_app::ports::JournalRepo::find_reversal_of`] の結果）は
+/// **この仕訳を訂正している赤伝**である。`reverses` とは向きが逆で、
+/// 訂正済みのときだけ `reversed_by` / `reversed_by_entry_no` として現れる。
+/// こちらも `null` を置かない（「訂正されていない」と「赤伝のIDが分からない」を
+/// 混ぜないため）。
+fn success_body(
+    entry: &JournalEntry,
+    reversal: Option<(EntryId, EntryNumber)>,
+) -> Map<String, Value> {
     let mut body = Map::new();
     body.insert(
         "entry_id".to_string(),
@@ -143,6 +194,20 @@ fn success_body(entry: &JournalEntry) -> Map<String, Value> {
     }
     if let Some(reason) = entry.reverse_reason() {
         body.insert("reverse_reason".to_string(), json!(reason));
+    }
+    // ★訂正済みであることを応答に残す★（PR-G レビュー B）
+    // 仕訳番号だけでなく**仕訳ID**を返す。呼び出し元が仕訳を指すのは UUID で
+    // あって通し番号ではなく、番号だけ返しても AI はその赤伝を `get_entry` で
+    // 開けない（`reverse_journal_entry` の `already_reversed` と同じ形）。
+    if let Some((reversal_id, reversal_no)) = reversal {
+        body.insert(
+            "reversed_by".to_string(),
+            json!(entry_id_to_uuid_string(reversal_id)),
+        );
+        body.insert(
+            "reversed_by_entry_no".to_string(),
+            json!(reversal_no.as_u32()),
+        );
     }
     body
 }
@@ -221,7 +286,7 @@ mod tests {
     // MC-14: 明細とタグを含む詳細が返り、金額は文字列。
     #[test]
     fn an_existing_entry_is_returned_with_its_lines_and_totals() {
-        let body = Value::Object(success_body(&entry()));
+        let body = Value::Object(success_body(&entry(), None));
 
         assert_eq!(
             body["entry_id"],
@@ -244,16 +309,14 @@ mod tests {
     // （`null` を置くと「訂正理由が空」と区別できない）。
     #[test]
     fn a_plain_entry_omits_the_reversal_keys() {
-        let body = Value::Object(success_body(&entry()));
+        let body = Value::Object(success_body(&entry(), None));
         assert!(body.get("reverses").is_none(), "{body}");
         assert!(body.get("reverse_reason").is_none(), "{body}");
     }
 
-    // 逆仕訳は訂正対象の仕訳IDと理由を返す（UUID の正準表記）。
-    #[test]
-    fn a_reversal_entry_points_at_the_original_and_carries_the_reason() {
-        let original = entry();
-        let reversal = original
+    /// 原仕訳を訂正する赤伝（`reverse` が課す不変条件を通したもの）。
+    fn reversal_of(original: &JournalEntry) -> JournalEntry {
+        original
             .reverse(
                 EntryId::new(0x0192_b1c4_1234_7abc_8def_0123_4567_89ab),
                 EntryNumber::new(43),
@@ -265,9 +328,16 @@ mod tests {
                 &ClosedPeriodGuard::all_open(),
                 &FixedClock,
             )
-            .unwrap();
+            .unwrap()
+    }
 
-        let body = Value::Object(success_body(&reversal));
+    // 逆仕訳は訂正対象の仕訳IDと理由を返す（UUID の正準表記）。
+    #[test]
+    fn a_reversal_entry_points_at_the_original_and_carries_the_reason() {
+        let original = entry();
+        let reversal = reversal_of(&original);
+
+        let body = Value::Object(success_body(&reversal, None));
         assert_eq!(
             body["reverses"],
             json!("0192a7b3-1234-7abc-8def-0123456789ab")
@@ -280,6 +350,48 @@ mod tests {
         assert!(!body
             .to_string()
             .contains(&original.id().as_u128().to_string()));
+    }
+
+    // ★PR-G レビュー B★ **訂正済みの仕訳は未訂正の仕訳と応答が違う。**
+    //
+    // 初版はここが同一で、訂正前と訂正後の `get_entry` が1バイトも変わらな
+    // かった（`get_trial_balance` では残高0なのに生きているように見える）。
+    #[test]
+    fn an_entry_that_has_already_been_reversed_says_so_with_the_reversal_id() {
+        let original = entry();
+        let reversal = reversal_of(&original);
+
+        let before = Value::Object(success_body(&original, None));
+        let after = Value::Object(success_body(
+            &original,
+            Some((reversal.id(), reversal.entry_no())),
+        ));
+
+        assert_ne!(
+            before, after,
+            "訂正済みの仕訳が未訂正の仕訳と区別できません（CLAUDE.md §2）"
+        );
+        assert_eq!(
+            after["reversed_by"],
+            json!("0192b1c4-1234-7abc-8def-0123456789ab")
+        );
+        assert_eq!(after["reversed_by_entry_no"], json!(43));
+        // 向きを取り違えないこと（原仕訳は誰も訂正していない）。
+        assert!(after.get("reverses").is_none(), "{after}");
+        // 10進表記（最大39桁）で漏れていないこと。
+        assert!(!after
+            .to_string()
+            .contains(&reversal.id().as_u128().to_string()));
+    }
+
+    // 訂正されていない仕訳は `reversed_by` をキーごと出さない
+    // （`null` を置くと「訂正されていない」と「赤伝のIDが分からない」が
+    // 混ざる）。
+    #[test]
+    fn an_entry_that_has_not_been_reversed_omits_the_reversed_by_keys() {
+        let body = Value::Object(success_body(&entry(), None));
+        assert!(body.get("reversed_by").is_none(), "{body}");
+        assert!(body.get("reversed_by_entry_no").is_none(), "{body}");
     }
 
     // MC-14: 存在しない ID は**空の成功にしない**。仕訳IDは UUID の正準表記。
@@ -300,6 +412,9 @@ mod tests {
         );
         // 次の手が分かる文言（`CLAUDE.md` §11）。
         assert!(message.contains("確認してください"), "{message}");
+        // ★同じことを2回言わない★（PR-G レビュー D-2）。`Display` の
+        // 「見つかりません: 」に `reason` 側の「見つかりません」が重ならない。
+        assert_eq!(message.matches("見つかりません").count(), 1, "{message}");
     }
 
     // 説明文が `CLAUDE.md` §10 の禁止表現を含まず、§11 の「次の手」を含む。
@@ -311,5 +426,13 @@ mod tests {
         }
         assert!(description.contains("文字列"));
         assert!(description.contains("reverse_journal_entry"));
+        // 訂正済みかどうかが応答から読めることを説明文でも述べる
+        // （訂正済みの仕訳に対して無条件に「訂正は逆仕訳で」と誘導しない。
+        // `CLAUDE.md` §11）。
+        assert!(description.contains("reversed_by"), "{description}");
+        assert!(
+            description.contains("allow_double_reversal"),
+            "{description}"
+        );
     }
 }

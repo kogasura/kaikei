@@ -105,7 +105,7 @@ pub struct PostJournalEntryLine {
     //
     // PR-G で `list_accounts` を登録したので、誘導を戻した（PR-F からの
     // 申し送り）。この文言が指すツールが登録されていることは、
-    // `server.rs` の `every_input_schema_description_mentioning_a_tool_names_a_registered_one`
+    // `server.rs` の `no_description_points_the_caller_at_a_tool_that_is_not_registered`
     // が機械的に検査する（同じ事故を「戻し忘れ」の側からも塞ぐ）。
     /// 勘定科目コード。帳簿に登録されている科目コードを指定します
     /// （例: "135"）。使えるコードは list_accounts で取得できます。

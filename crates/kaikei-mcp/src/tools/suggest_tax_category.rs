@@ -27,12 +27,29 @@
 //! 使っていないこと**を明示する。使っていないものを黙って受け取ると、
 //! 呼び出し元は「摘要を書けば絞り込まれる」と誤解する。
 //!
+//! # 根拠に**帳簿の設定**も並べる（PR-G レビュー C-1）
+//!
+//! 初版の `reason` は「税率は 0.10 です」と述べ、候補には `tax_account`
+//! （仮受消費税等の科目）も載っていた。ところが免税事業者
+//! （`is_taxable_business: false`）や簡易課税の帳簿では、**その区分で実際に
+//! 記帳しても税額行は1行も生成されない**。にもかかわらず応答は課税事業者の
+//! 帳簿と完全に同一だった。`disclaimer` が否定していたのは「文面からの推論」
+//! だけで、「帳簿の設定は考慮していない」とはどこにも書いていない。
+//!
+//! そこで [`kaikei_jp::tax::JpSettings`] の `tax_mode` /
+//! `is_taxable_business` / `simplified_taxation` を `filtered_by` に並べ、
+//! `disclaimer` に「帳簿の設定によっては税額行が生成されないことがある」を
+//! 足す。**業務判断は書かない**（どの設定でどの区分が使えるかを決めるのは
+//! `kaikei-jp` の policy であって MCP 層ではない。`DECISIONS.md` D-072）。
+//! 並べているのは `get_settings` が返すのと同じ値であり、**事実の提示で
+//! あって判断ではない**。
+//!
 //! # 帳簿を一切変更しない
 //!
 //! `Tx` を開かず、DB にも触れない（同 §4 の経路 (c)）。合成ルートが保持する
 //! [`kaikei_jp::tax::TaxRuleSets`] を引くだけである。
 
-use kaikei_jp::tax::{TaxCategoryTable, TaxDirection};
+use kaikei_jp::tax::{JpSettings, TaxCategoryTable, TaxDirection};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -79,6 +96,9 @@ impl McpTool for SuggestTaxCategory {
 direction を指定した場合はその向き（売上・仕入・対象外）に絞ります。\
 各候補の根拠は、マスタに書かれている事実（適用期間・向き・税率・\
 適格請求書の保存が必要かどうか・注記）です。\
+候補はこの帳簿の設定（経理方式・課税事業者かどうか・簡易課税かどうか）では絞っていません。\
+その設定は filtered_by に返すので、税額行が生成されるかどうかの判断に使ってください\
+（設定によっては、候補の区分で記帳しても税額の行は生成されません）。\
 摘要から区分を推論することはしません（description を渡しても絞り込みには使いません）。\
 帳簿は一切変更しません。記帳するには、選んだ区分コードを post_journal_entry の\
 明細の tags の tax_category に指定して別途呼び出します。";
@@ -107,6 +127,7 @@ direction を指定した場合はその向き（売上・仕入・対象外）�
             direction,
             input.description.as_deref(),
             table,
+            composition.tax_policy.settings(),
         )))
     }
 }
@@ -115,10 +136,16 @@ direction を指定した場合はその向き（売上・仕入・対象外）�
 ///
 /// **確定は人間（呼び出し元）に残す**（`CLAUDE.md` §10）。ここで
 /// 「この取引は SALES_10 です」に相当する文を書かないこと。
+/// **帳簿の設定を考慮していないことも明示する**（PR-G レビュー C-1）。
+/// 「文面からの推論をしていない」だけを書くと、「帳簿の設定は見たうえで
+/// 候補を出した」と読めてしまう。実際には見ていない。
 const DISCLAIMER: &str = "\
 候補と根拠のみを返しています。どの区分を使うかの判断はこのサーバーでは行いません。\
 候補は、指定された取引日の時点で有効な消費税区分マスタに登録されている区分です。\
-取引内容の文面からの推論は行っていません。";
+取引内容の文面からの推論は行っていません。\
+この帳簿の設定（filtered_by の tax_mode / is_taxable_business / simplified_taxation）でも\
+候補を絞っていません。帳簿の設定によっては、候補の区分で記帳しても\
+税額の行が生成されないことがあります。";
 
 /// 候補1件の根拠（**マスタに書かれている事実だけ**を述べる）。
 ///
@@ -164,11 +191,17 @@ fn direction_label(direction: TaxDirection) -> &'static str {
 }
 
 /// 成功応答の本文。
+///
+/// `settings` は**この帳簿の設定**（[`crate::tools::get_settings`] が返すのと
+/// 同じ値）。候補の絞り込みには使わず、`filtered_by` に事実として並べる
+/// （モジュール doc「根拠に帳簿の設定も並べる」）。綴りは `kaikei-jp` の
+/// 入口（`TaxMode::as_code`）を通し、この層で表を作らない（D-072）。
 fn success_body(
     date: &str,
     direction: Option<TaxDirection>,
     description: Option<&str>,
     table: &TaxCategoryTable,
+    settings: JpSettings,
 ) -> Map<String, Value> {
     let candidates: Vec<Value> = table
         .categories()
@@ -191,11 +224,19 @@ fn success_body(
     body.insert("table".to_string(), tax_table_to_json(table));
     // 何で絞ったかを必ず返す（0件だったときに「その日に区分が無い」のか
     // 「その向きの区分が無い」のかを応答だけで判断できるようにする）。
+    //
+    // 帳簿の設定は**絞り込みに使っていない**が、税額行が生成されるかどうかを
+    // 決めるのはこの3つである。値を出さずに「税率は 0.10 です」だけを述べると、
+    // 免税事業者の帳簿でも課税事業者と同一の応答になる（PR-G レビュー C-1）。
     body.insert(
         "filtered_by".to_string(),
         json!({
             "direction": direction.map(|d| d.as_code()),
             "description_used_for_filtering": false,
+            "tax_mode": settings.tax_mode.as_code(),
+            "is_taxable_business": settings.is_taxable_business,
+            "simplified_taxation": settings.simplified_taxation,
+            "book_settings_used_for_filtering": false,
         }),
     );
     if let Some(description) = description {
@@ -210,10 +251,33 @@ fn success_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaikei_core::AccountingDate;
-    use kaikei_jp::tax::TaxRuleSets;
+    use kaikei_core::{AccountingDate, RoundMode};
+    use kaikei_jp::tax::{RoundingUnit, TaxMode, TaxRuleSets};
 
-    fn body_for(direction: Option<TaxDirection>, description: Option<&str>) -> Value {
+    /// 課税事業者・税抜経理の帳簿（`get_settings` の既定の検証と同じ値）。
+    fn taxable_settings() -> JpSettings {
+        JpSettings {
+            tax_mode: TaxMode::Exclusive,
+            rounding: RoundMode::Floor,
+            rounding_unit: RoundingUnit::Line,
+            is_taxable_business: true,
+            simplified_taxation: false,
+        }
+    }
+
+    /// 免税事業者の帳簿（この設定では税額行が1行も生成されない）。
+    fn tax_exempt_settings() -> JpSettings {
+        JpSettings {
+            is_taxable_business: false,
+            ..taxable_settings()
+        }
+    }
+
+    fn body_with(
+        direction: Option<TaxDirection>,
+        description: Option<&str>,
+        settings: JpSettings,
+    ) -> Value {
         let rule_sets = TaxRuleSets::from_embedded().expect("同梱マスタは読める");
         let date = AccountingDate::new(2026, 4, 15).unwrap();
         let table = rule_sets
@@ -224,7 +288,12 @@ mod tests {
             direction,
             description,
             table,
+            settings,
         ))
+    }
+
+    fn body_for(direction: Option<TaxDirection>, description: Option<&str>) -> Value {
+        body_with(direction, description, taxable_settings())
     }
 
     fn candidates(body: &Value) -> &Vec<Value> {
@@ -338,6 +407,61 @@ mod tests {
         assert!(message.contains("sales"), "{message}");
     }
 
+    // ★PR-G レビュー C-1★ 帳簿の設定が応答に出る。
+    //
+    // 免税事業者の帳簿では、候補の区分で記帳しても税額行は1行も生成されない。
+    // その事実を応答から読めるようにする（候補そのものは絞らない——どの区分を
+    // 使うかの判断はこのサーバーが行わないため）。
+    #[test]
+    fn the_book_settings_that_decide_whether_tax_lines_appear_are_reported_back() {
+        let taxable = body_for(None, None);
+        let exempt = body_with(None, None, tax_exempt_settings());
+
+        assert_eq!(taxable["filtered_by"]["tax_mode"], json!("exclusive"));
+        assert_eq!(taxable["filtered_by"]["is_taxable_business"], json!(true));
+        assert_eq!(taxable["filtered_by"]["simplified_taxation"], json!(false));
+
+        // ★免税事業者の帳簿の応答が課税事業者と同一にならない★
+        assert_ne!(
+            taxable["filtered_by"], exempt["filtered_by"],
+            "帳簿の設定が応答に出ていません: {exempt}"
+        );
+        assert_eq!(exempt["filtered_by"]["is_taxable_business"], json!(false));
+
+        // ただし**候補は絞らない**（1件に絞らない・順位を付けないのと同じ理由）。
+        assert_eq!(
+            taxable["candidates"], exempt["candidates"],
+            "帳簿の設定で候補を絞っています（業務判断を MCP 層に書いています）"
+        );
+        assert_eq!(
+            exempt["filtered_by"]["book_settings_used_for_filtering"],
+            json!(false)
+        );
+
+        // 「設定は見ていない」ことが `disclaimer` にも書いてある
+        // （否定しているのが「文面からの推論」だけ、という状態にしない）。
+        let disclaimer = exempt["disclaimer"].as_str().unwrap();
+        assert!(disclaimer.contains("is_taxable_business"), "{disclaimer}");
+        assert!(
+            disclaimer.contains("税額の行が生成されないことがあります"),
+            "{disclaimer}"
+        );
+    }
+
+    // 綴りは `kaikei-jp` の入口と一致する（この層で表を作っていない）。
+    #[test]
+    fn the_tax_mode_code_comes_from_the_frozen_vocabulary() {
+        let inclusive = JpSettings {
+            tax_mode: TaxMode::Inclusive,
+            ..taxable_settings()
+        };
+        let body = body_with(None, None, inclusive);
+        assert_eq!(
+            body["filtered_by"]["tax_mode"],
+            json!(TaxMode::Inclusive.as_code())
+        );
+    }
+
     // 説明文が `CLAUDE.md` §10 の禁止表現を含まず、断定もしない。
     #[test]
     fn the_description_avoids_forbidden_claims_and_leaves_the_decision_to_the_caller() {
@@ -348,5 +472,8 @@ mod tests {
         assert!(description.contains("候補と根拠"));
         assert!(description.contains("決めません"));
         assert!(description.contains("帳簿は一切変更しません"));
+        // 帳簿の設定で絞っていないことを説明文でも述べる（C-1）。
+        assert!(description.contains("filtered_by"), "{description}");
+        assert!(description.contains("簡易課税"), "{description}");
     }
 }

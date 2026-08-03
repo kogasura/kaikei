@@ -19,11 +19,36 @@
 //!
 //! MCP 層がするのは日付とタグキーのパース、および `TrialBalanceView` の
 //! 詰め替えだけである。
+//!
+//! # ★「未登録のキー」と「集計軸に使えないキー」を区別する★（PR-G レビュー C-2）
+//!
+//! `TagSchema::is_aggregatable` は**未登録のキーにも `false` を返す**。
+//! したがって `report::execute` が返す `CoreError::NotAggregatable` の文言
+//! 「集計軸に使えないタグキーです: {key}（aggregatable = false）」は、
+//! 未登録のキーに対しては**成立していない事実**を述べる（`aggregatable` の
+//! 宣言そのものが存在しない）。しかも Phase 3 の11ツールには有効なタグキーを
+//! 一覧できるツールが無いので、AI はこのエラーを踏んだあと正しいキーに
+//! 辿り着く手段が無い（`CLAUDE.md` §11）。
+//!
+//! 発生源（`kaikei-core` の `CoreError`）は凍結層なので触らない。代わりに
+//! この層で次の3つを行う。
+//!
+//! 1. **登録されているかどうか**を先に見る（[`parse_group_by`]）。未登録なら
+//!    `unknown_tag_key` として拒否する。**`aggregatable` の判定ではない**ので
+//!    `report::execute` の検証と重複しない（登録済みのキーはそのまま素通しし、
+//!    集計軸として妥当かは従来どおり `report::execute` が決める）
+//! 2. どちらの拒否にも **`aggregatable: true` のキーの一覧**を添える
+//!    （[`aggregatable_keys`]）
+//! 3. [`GetTrialBalance::DESCRIPTION`] にそのキーを列挙する
+//!    （`the_description_lists_exactly_the_aggregatable_keys` が同梱スキーマと
+//!    突き合わせるので、`tags.yaml` を変えると落ちる）
 
 use kaikei_app::amount::money_to_plain_string;
+use kaikei_app::error::codes;
 use kaikei_app::usecase::report::{self, ReportInput};
 use kaikei_app::view::TrialBalanceView;
 use kaikei_core::TagKey;
+use kaikei_jp::tags::TagCatalog;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -51,8 +76,8 @@ pub struct GetTrialBalanceInput {
     pub to: String,
 
     /// 科目に加えて集計軸にするタグキー（例: ["counterparty"]）。
-    /// 省略すると科目のみで集計します。集計軸に使えるタグキーだけを
-    /// 指定できます。
+    /// 省略すると科目のみで集計します。指定できるのは集計軸として宣言されて
+    /// いるタグキーだけで、その一覧はこのツールの説明文にあります。
     #[serde(default)]
     pub group_by: Vec<String>,
 }
@@ -69,16 +94,20 @@ from と to は取引日で、両端を含みます。どちらも必須です�
 金額はすべて文字列で返します（例: \"110000\"。桁区切りは入りません）。\
 balance は科目の借方・貸方のどちらが正常かに従った符号付きの残高で、\
 負の値になることもあります。\
-group_by には集計軸に使えるタグキーだけを指定できます。\
+group_by に指定できるタグキーは counterparty, project, tax_category の3つです。\
+仕訳に付けられるタグキーはこれ以外にもありますが、集計軸としては宣言されていません。\
+帳簿に登録されていないタグキーを指定した場合と、登録されているが集計軸として\
+宣言されていないタグキーを指定した場合とでは、返るエラーが異なります。\
+どちらの場合も、指定できるタグキーの一覧が aggregatable_group_by_keys に返ります。\
 該当する仕訳が1件も無い期間は、エラーではなく空の rows を返します。";
 
     async fn run(ctx: &ToolContext<'_>, input: Self::Input) -> Result<ToolSuccess, ToolFailure> {
         let from = parse_date("from", &input.from)?;
         let to = parse_date("to", &input.to)?;
-        let group_by = parse_group_by(&input.group_by)?;
 
         let composition = ctx.composition();
         let settings = ctx.book_settings();
+        let group_by = parse_group_by(&composition.tag_catalog, &input.group_by)?;
 
         // read model に直行する（`Tx` を開かない。`CLAUDE.md` §6）。
         let view = report::execute(
@@ -88,7 +117,7 @@ group_by には集計軸に使えるタグキーだけを指定できます。\
             ReportInput { from, to, group_by },
         )
         .await
-        .map_err(|error| ToolError::from_app_error(&error))?;
+        .map_err(|error| describe_failure(&composition.tag_catalog, &error))?;
 
         Ok(ToolSuccess::new(success_body(
             &input.from,
@@ -98,15 +127,95 @@ group_by には集計軸に使えるタグキーだけを指定できます。\
     }
 }
 
-/// 線上のタグキーを [`TagKey`] にする。
+/// `aggregatable: true` が宣言されているタグキー（昇順）。
+///
+/// 一覧をこの層に**書き写さない**。同梱スキーマ（`tags.yaml` を読んだ
+/// [`TagCatalog`]）から毎回導出する（`PROGRESS.md` Phase 1 の教訓6
+/// 「手で維持する一覧は必ず腐る」）。
+fn aggregatable_keys(catalog: &TagCatalog) -> Vec<&str> {
+    let mut keys: Vec<&str> = catalog
+        .defs()
+        .iter()
+        .filter(|(_, def)| def.aggregatable)
+        .map(|(key, _)| key.as_str())
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// 線上のタグキーを [`TagKey`] にし、**帳簿に登録されているか**を確かめる。
+///
+/// # ここで見るのは「登録されているか」だけである
 ///
 /// **集計軸として妥当かどうか（`aggregatable`）はここで見ない**
 /// （`report::execute` が SQL 到達前に弾く。同じ検証を2箇所に置かない）。
-/// ここが返すのは「そもそもタグキーとして解釈できない文字列」だけである。
-fn parse_group_by(keys: &[String]) -> Result<Vec<TagKey>, ToolError> {
+/// 登録済みのキーはこの関数を素通りし、集計軸として使えるかは従来どおり
+/// `report::execute` が決める。
+///
+/// 登録の有無を見るのは、`TagSchema::is_aggregatable` が両者を1つの `false` に
+/// 潰してしまい、未登録のキーに対して「（aggregatable = false）」という
+/// **成立していない事実**が返るためである（モジュール doc）。
+/// この判定に使えるのは `TagCatalog`（`kaikei-jp`）だけで、`TagSchema` の
+/// 公開 API では「登録されているか」を引き戻せない。
+///
+/// # Errors
+///
+/// - タグキーとして解釈できない文字列（`CoreError` をそのまま写す）
+/// - 帳簿に登録されていないキー → [`codes::UNKNOWN_TAG_KEY`]
+fn parse_group_by(catalog: &TagCatalog, keys: &[String]) -> Result<Vec<TagKey>, ToolError> {
     keys.iter()
-        .map(|key| TagKey::parse(key).map_err(|error| in_field("group_by", core_error(error))))
+        .map(|key| {
+            let parsed =
+                TagKey::parse(key).map_err(|error| in_field("group_by", core_error(error)))?;
+            if catalog.def(&parsed).is_none() {
+                return Err(unregistered_key(catalog, parsed.as_str()));
+            }
+            Ok(parsed)
+        })
         .collect()
+}
+
+/// 帳簿に登録されていないタグキーを指定された（`aggregatable` 以前の話）。
+///
+/// **「集計軸に使えない」とは言わない。** そのキーには `aggregatable` の宣言
+/// そのものが無く、次の手も違う（前者は綴りを直すか `tags.yaml` に登録する、
+/// 後者は別の集計軸を選ぶ）。
+fn unregistered_key(catalog: &TagCatalog, key: &str) -> ToolError {
+    in_field(
+        "group_by",
+        ToolError::new(
+            codes::UNKNOWN_TAG_KEY,
+            format!(
+                "タグキー \"{key}\" はこの帳簿に登録されていません\
+                 （登録されているキー: {registered}）。\
+                 集計軸に指定できるのは、そのうち集計軸として宣言されている\
+                 キーだけです: {aggregatable}",
+                registered = catalog.registered_keys_display(),
+                aggregatable = aggregatable_keys(catalog).join(", "),
+            ),
+        ),
+    )
+    .with_detail(
+        "aggregatable_group_by_keys",
+        json!(aggregatable_keys(catalog)),
+    )
+}
+
+/// `report::execute` が返した失敗を応答にする。
+///
+/// 集計軸として使えないキーだった場合（`CoreError::NotAggregatable`）は、
+/// **文言を言い換えずに**選べるキーの一覧を添える。Phase 3 の11ツールには
+/// 有効なタグキーを一覧できるツールが無いので、これが無いと AI は次の手を
+/// 持てない（`CLAUDE.md` §11）。
+fn describe_failure(catalog: &TagCatalog, error: &kaikei_app::error::AppError) -> ToolError {
+    let tool_error = ToolError::from_app_error(error);
+    if tool_error.code() == codes::NOT_AGGREGATABLE {
+        return in_field("group_by", tool_error).with_detail(
+            "aggregatable_group_by_keys",
+            json!(aggregatable_keys(catalog)),
+        );
+    }
+    tool_error
 }
 
 /// 成功応答の本文（`docs/07-mcp-server.md` §3）。
@@ -274,10 +383,17 @@ mod tests {
         assert_eq!(body_of(&view)["rows"][0]["group"], json!({}));
     }
 
+    /// 同梱スキーマ（`kaikei-jp-data/tags.yaml`）。合成ルートが
+    /// `Composition::tag_catalog` に載せるのと同じ値である
+    /// （この層は `kaikei-jp-data` を直接依存に持てないので `bundled` を通す）。
+    fn catalog() -> TagCatalog {
+        TagCatalog::bundled().expect("同梱スキーマは読める")
+    }
+
     // タグキーとして解釈できない文字列は、どの欄が悪いかを添えて拒否する。
     #[test]
     fn an_unparsable_group_by_key_names_the_field() {
-        let error = parse_group_by(&["".to_string()]).unwrap_err();
+        let error = parse_group_by(&catalog(), &["".to_string()]).unwrap_err();
         assert!(
             error.message().starts_with("group_by: "),
             "{}",
@@ -285,14 +401,107 @@ mod tests {
         );
     }
 
-    // 集計軸の妥当性検証をこの層に持たない（解釈できるキーは素通しする）。
+    // 集計軸の妥当性検証をこの層に持たない（**登録済みの**キーは素通しする）。
+    // `business_ratio` は登録済みだが `aggregatable: false` であり、
+    // ここでは弾かれず `report::execute` が弾く。
     #[test]
-    fn parsable_keys_pass_through_without_aggregatable_checks_here() {
-        let keys = parse_group_by(&["counterparty".to_string(), "project".to_string()]).unwrap();
+    fn registered_keys_pass_through_without_aggregatable_checks_here() {
+        let keys = parse_group_by(
+            &catalog(),
+            &[
+                "counterparty".to_string(),
+                "project".to_string(),
+                "business_ratio".to_string(),
+            ],
+        )
+        .unwrap();
         assert_eq!(
             keys.iter().map(TagKey::as_str).collect::<Vec<_>>(),
-            vec!["counterparty", "project"]
+            vec!["counterparty", "project", "business_ratio"]
         );
+    }
+
+    // ★PR-G レビュー C-2★ **未登録のキー**と
+    // **登録済みだが集計軸に使えないキー**が別のエラーになる。
+    //
+    // `TagSchema::is_aggregatable` はどちらにも `false` を返すので、
+    // 素直に `report::execute` へ流すと、未登録のキーに対して
+    // 「（aggregatable = false）」という成立していない事実を述べてしまう。
+    #[test]
+    fn an_unregistered_key_is_not_reported_as_a_non_aggregatable_one() {
+        let catalog = catalog();
+        let error = parse_group_by(&catalog, &["memo".to_string()]).unwrap_err();
+
+        assert_eq!(error.code(), kaikei_app::error::codes::UNKNOWN_TAG_KEY);
+        let message = error.message();
+        assert!(message.starts_with("group_by: "), "{message}");
+        assert!(message.contains("登録されていません"), "{message}");
+        // ★成立していない事実を述べない★
+        assert!(!message.contains("aggregatable = false"), "{message}");
+        // 次の手（`CLAUDE.md` §11）。有効なキーに辿り着ける。
+        assert!(message.contains("counterparty"), "{message}");
+        assert_eq!(
+            error.to_json()["aggregatable_group_by_keys"],
+            json!(["counterparty", "project", "tax_category"])
+        );
+    }
+
+    // 登録済みだが集計軸に使えないキーは、`kaikei-core` の文言のまま
+    // （言い換えない）返り、選べるキーの一覧が添う。
+    #[test]
+    fn a_registered_but_non_aggregatable_key_keeps_the_core_wording_and_gains_candidates() {
+        let catalog = catalog();
+        let error = describe_failure(
+            &catalog,
+            &kaikei_app::error::AppError::Core(kaikei_core::CoreError::NotAggregatable {
+                key: "business_ratio".to_string(),
+            }),
+        );
+
+        assert_eq!(error.code(), kaikei_app::error::codes::NOT_AGGREGATABLE);
+        let message = error.message();
+        assert!(message.starts_with("group_by: "), "{message}");
+        // 下位層の文言はそのまま（ここでは事実として成立している）。
+        assert!(message.contains("aggregatable = false"), "{message}");
+        assert_eq!(
+            error.to_json()["aggregatable_group_by_keys"],
+            json!(["counterparty", "project", "tax_category"])
+        );
+    }
+
+    // 集計軸に使えるキーの一覧を同梱スキーマから導出している
+    // （この層に書き写していない）。
+    #[test]
+    fn the_aggregatable_keys_are_derived_from_the_bundled_schema() {
+        let catalog = catalog();
+        let keys = aggregatable_keys(&catalog);
+        assert_eq!(keys, vec!["counterparty", "project", "tax_category"]);
+        for (key, def) in catalog.defs() {
+            assert_eq!(
+                keys.contains(&key.as_str()),
+                def.aggregatable,
+                "{}",
+                key.as_str()
+            );
+        }
+    }
+
+    // ★説明文に有効なキーを列挙する★（C-2 の (c)）
+    //
+    // Phase 3 の11ツールには有効なタグキーを一覧できるツールが無いので、
+    // AI が最初に読む面に書いておく。`tags.yaml` を変えるとここが落ちる。
+    #[test]
+    fn the_description_lists_exactly_the_aggregatable_keys() {
+        let catalog = catalog();
+        let description = GetTrialBalance::DESCRIPTION;
+        for (key, def) in catalog.defs() {
+            assert_eq!(
+                description.contains(key.as_str()),
+                def.aggregatable,
+                "説明文と tags.yaml が食い違っています（{}）: {description}",
+                key.as_str()
+            );
+        }
     }
 
     // 既定は「科目のみで集計」。
