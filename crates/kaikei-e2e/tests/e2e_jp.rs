@@ -34,10 +34,9 @@
 mod common;
 
 use kaikei_app::context::{BookSettings, FiscalYearRule};
-use kaikei_app::error::AppError;
 use kaikei_app::ports::{IdGenerator, JournalRepo};
-use kaikei_app::tx::with_tx;
-use kaikei_app::usecase::post_entry::{self, PostEntryInput, PostEntryOutput};
+use kaikei_app::tx::{with_tx, with_tx_err};
+use kaikei_app::usecase::post_entry::{self, PostEntryFailure, PostEntryInput, PostEntryOutput};
 use kaikei_app::usecase::report::{self, ReportInput};
 use kaikei_core::{
     AccountCode, AccountType, AccountingDate, ChartOfAccounts, Currency, EntryId, FiscalYear,
@@ -221,13 +220,16 @@ async fn run_post_entry<P>(
     schema: TagSchema,
     id_gen: Arc<SequentialIdGenerator>,
     input: PostEntryInput,
-) -> Result<PostEntryOutput, AppError>
+) -> Result<PostEntryOutput, PostEntryFailure>
 where
     P: TaxPolicy + 'static,
 {
     let clock = clock();
     let settings = settings();
-    with_tx(store, |tx| {
+    // PR-B 2巡目: `post_entry::execute` の失敗値は `PostEntryFailure`
+    // （失敗経路でも `PolicyNote` を運ぶ）。`with_tx` はエラー型について
+    // 総称なのでそのまま通る。
+    with_tx_err(store, |tx| {
         Box::pin(async move {
             post_entry::execute(tx, &tax, &schema, &*id_gen, &clock, &settings, input).await
         })
@@ -795,10 +797,11 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
         to: AccountingDate::new(2026, 12, 31).unwrap(),
         group_by: Vec::new(),
     };
-    let before_closing = report::execute(&query, &composition.tag_schema, period.clone())
-        .await
-        .unwrap();
-    let (debit_before, credit_before) = before_closing.totals().unwrap().unwrap();
+    let before_closing =
+        report::execute(&query, &composition.tag_schema, &settings(), period.clone())
+            .await
+            .unwrap();
+    let (debit_before, credit_before) = before_closing.totals().unwrap();
     assert_eq!(
         debit_before.minor(),
         credit_before.minor(),
@@ -870,7 +873,7 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     );
 
     // 7. 記帳後、report::execute（SQL集計）で収益・費用の残高が0になっていることを確認する。
-    let after_closing = report::execute(&query, &composition.tag_schema, period)
+    let after_closing = report::execute(&query, &composition.tag_schema, &settings(), period)
         .await
         .unwrap();
     for row in after_closing.rows() {
@@ -886,7 +889,7 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
             );
         }
     }
-    let (debit_after, credit_after) = after_closing.totals().unwrap().unwrap();
+    let (debit_after, credit_after) = after_closing.totals().unwrap();
     assert_eq!(debit_after.minor(), credit_after.minor());
 
     // 8. DBから全仕訳（決算仕訳を含む）を読み戻してBS/PLを組み立てる。

@@ -41,7 +41,7 @@ mod common;
 use kaikei_app::context::{BookSettings, FiscalYearRule};
 use kaikei_app::error::AppError;
 use kaikei_app::ports::{ChartRepo, IdGenerator, JournalRepo};
-use kaikei_app::tx::with_tx;
+use kaikei_app::tx::{with_tx, with_tx_err};
 use kaikei_app::usecase::post_entry::{self, PostEntryInput};
 use kaikei_app::usecase::report::{self, ReportInput};
 use kaikei_app::usecase::reverse_entry::{self, ReverseEntryInput};
@@ -295,13 +295,16 @@ where
     // このファイルの検証対象は永続化（DBに入るか・読み戻せるか）なので、
     // ここで `entry` だけを取り出す。`notes`（`PolicyNote`）が実際に
     // 運ばれることの検証は `kaikei-e2e` の `condition_3_*` にある。
-    with_tx(store, |tx| {
+    with_tx_err(store, |tx| {
         Box::pin(async move {
             post_entry::execute(tx, &tax, &schema, &*id_gen, &clock, &settings, input).await
         })
     })
     .await
+    // PR-B 2巡目: 失敗値は `PostEntryFailure`（`error` + `notes`）。
+    // このファイルは永続化の検証なので `AppError` に潰す。
     .map(|output| output.entry)
+    .map_err(AppError::from)
 }
 
 /// `store` に対して1回分の `reverse_entry::execute` を実行する。
@@ -406,12 +409,12 @@ async fn posted_entry_appears_in_trial_balance_with_matching_totals(
         to: AccountingDate::new(2026, 12, 31).unwrap(),
         group_by: Vec::new(),
     };
-    let view = report::execute(&query, &TagSchema::empty(), report_input)
+    let view = report::execute(&query, &TagSchema::empty(), &settings(), report_input)
         .await
         .unwrap();
 
     assert_eq!(view.rows().len(), 2);
-    let (debit, credit) = view.totals().unwrap().unwrap();
+    let (debit, credit) = view.totals().unwrap();
     assert_eq!(debit.minor(), credit.minor());
     assert_eq!(debit.minor(), 50_000);
 }
@@ -473,7 +476,7 @@ async fn reversed_entry_offsets_original_in_trial_balance_and_persists_reversal_
         to: AccountingDate::new(2026, 12, 31).unwrap(),
         group_by: Vec::new(),
     };
-    let view = report::execute(&query, &TagSchema::empty(), report_input)
+    let view = report::execute(&query, &TagSchema::empty(), &settings(), report_input)
         .await
         .unwrap();
 
@@ -487,7 +490,7 @@ async fn reversed_entry_offsets_original_in_trial_balance_and_persists_reversal_
         );
         assert_eq!(row.balance.minor(), 0, "account={:?}", row.account);
     }
-    let (debit, credit) = view.totals().unwrap().unwrap();
+    let (debit, credit) = view.totals().unwrap();
     assert_eq!(debit.minor(), credit.minor());
 }
 
@@ -882,7 +885,7 @@ async fn report_rejects_non_aggregatable_group_by_before_reaching_sql() {
         group_by: vec![TagKey::parse("business_ratio").unwrap()],
     };
 
-    let result = report::execute(&query, &schema, input).await;
+    let result = report::execute(&query, &schema, &settings(), input).await;
 
     assert!(
         matches!(

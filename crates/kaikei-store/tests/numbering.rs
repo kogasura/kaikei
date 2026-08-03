@@ -11,6 +11,7 @@
 
 mod common;
 
+use kaikei_app::error::AppError;
 use kaikei_app::ports::NumberingRepo;
 use kaikei_app::tx::with_tx;
 use kaikei_core::EntryNumber;
@@ -57,10 +58,10 @@ async fn next_entry_no_does_not_skip_numbers_after_rollback(
 
     // 1回目: 採番した直後に意図的に失敗させ、with_tx にロールバックさせる
     // （`sqlx::Transaction` の ROLLBACK が実際に発行される）。
-    let first_attempt: Result<(), kaikei_app::error::AppError> = with_tx(&store, |tx| {
+    let first_attempt: Result<(), AppError> = with_tx(&store, |tx| {
         Box::pin(async move {
             tx.next_entry_no(2026).await?;
-            Err(kaikei_app::error::AppError::Rejected {
+            Err(AppError::Rejected {
                 reason: "テスト用の意図的な失敗（rollbackを発生させる）".to_string(),
             })
         })
