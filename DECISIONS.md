@@ -2789,3 +2789,163 @@ docs/07 §3 が挙げた3案のうち (a)）。
 （`UnregisteredTagKey` / `InvalidTagValue` / `DuplicateTagKeyInInput` /
 `NoApplicableTaxRuleSet`）に対する分類コードは、`JpError` 用の対応表ごと
 `kaikei-mcp` 側に置く（D-072 トレードオフの項、`docs/07-mcp-server.md` §6）。
+
+---
+
+## D-075 audit_log は帳簿とは別のコネクションで2回書き、append-only を帳簿と同じ4点セットで守る
+
+**決定**: `audit_log` を `crates/kaikei-store/migrations/0009_audit_log.sql` で新設し、
+D-070 が定めた「開始レコード → 操作 → 結果レコード」の2回書きを、
+**帳簿のトランザクション（`PgTx`）を経由しない別コネクション**で行う。
+
+| 層 | 実体 |
+|---|---|
+| テーブル・トリガ・権限 | `migrations/0009_audit_log.sql` |
+| ポート（trait） | `kaikei_app::ports::AuditSink`（`&self`。`Store` / `TxScope` と無関係） |
+| 記録する値 | `kaikei_app::audit`（`RequestId` / `AuditCall` / `AuditStart` / `AuditResult` / `AuditOutcome`） |
+| PostgreSQL 実装 | `kaikei_store::audit::PgAuditSink`（`execute(&self.pool)`） |
+
+確定した細目:
+
+1. **主キーは `BIGINT GENERATED ALWAYS AS IDENTITY`。`BIGSERIAL` を使わない。**
+   `BIGSERIAL` はテーブル権限とは別にシーケンスの `USAGE` を要求し、付与漏れの
+   INSERT 失敗は SQLSTATE `42501` になる。`sqlstate.rs` はこれを
+   `AppendOnlyViolation` に写像するため、「監査ログが書けない」事象に対して
+   「訂正は逆仕訳で行ってください」という**完全に誤った案内**が出る。
+2. **append-only は4点セット**（`GRANT`/`REVOKE`・行トリガ・TRUNCATE の
+   STATEMENT トリガ・専用 ERRCODE）。トリガ関数は `reject_mutation()` を
+   **流用せず** `reject_audit_log_mutation()` を新設し、ERRCODE は
+   `P0010`/`P0011` の次の **`P0012`** を割り当てた。理由は 1 と同じで、
+   帳簿の文言（逆仕訳）が監査ログに対しては的外れだからである（D-038 の再演を防ぐ）。
+3. **`P0012` の写像先は `RepoError::Backend`。**`AppendOnlyViolation` に寄せない。
+   専用バリアントを `RepoError` に足すことも却下した（`RepoError` は
+   `#[non_exhaustive]` ではなく、バリアント追加は下流の網羅 `match` を壊す
+   破壊的変更。一方 `P0012` に到達するのは「アプリが `audit_log` を
+   UPDATE/DELETE しようとした」＝実装のバグの場合だけで、
+   `Backend`（「入力の問題ではない。ログを添えて管理者へ」）が意味的に最も近い）。
+4. **`status` と `error_code` の対応を型と CHECK の二重で守る。**
+   `AuditOutcome` は `Succeeded { output_json }` / `Failed { error_code,
+   public_message }` の2バリアントで、「成功なのに `error_code` がある」
+   「結果レコードに `'started'` を書く」を構築できない。DB 側にも
+   `CHECK ((status = 'error') = (error_code IS NOT NULL))` を置く。
+5. **`entry_id` に外部キーを張らない。** rollback された操作の仕訳IDは
+   `journal_entries` に存在しえない。**存在しないことを記録できること自体に
+   価値がある**（D-070 の目的そのもの）。
+6. **`occurred_at` に `DEFAULT now()` を付けない。** `Clock`（`AppClock`）から
+   取得した値を明示的に渡す（`CLAUDE.md` §7）。DEFAULT があるとテストで
+   時刻を固定できず、渡し忘れも検出できない。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `TxOps` に audit 用メソッドを生やす（`tx.record_audit(..)`） | **必ず帳簿と同一トランザクションになる。** `with_tx` は `Err` で必ず rollback するため、失敗した操作の記録が構造的に消える。最も知りたい記録だけが残らない（D-070） |
+| 監査ログ専用の `PgPool` をもう1本張る | 接続数が倍になるだけで、分離の実体は「別プール」ではなく「トランザクションを経由しないこと」。単一ユーザー・自己ホスト前提（D-015）の規模では利点が無い |
+| `P0012` を `AppendOnlyViolation` に写像する（写像表を増やさない） | 上記 2・3 と同じ。エラーメッセージが「訂正は逆仕訳で」になり、監査ログに対して誤った対処法を案内する |
+| `RepoError` に `AuditLogViolation` バリアントを足す | `#[non_exhaustive]` ではないため下流の網羅 `match` を壊す。得られるのは「実装のバグでしか到達しない経路」の分類精度だけで、割に合わない |
+| `input` / `output` を `TEXT` 列にする | JSONB で保持できる検索性（`->>` による絞り込み）を捨てることになる。壊れた JSON は `PgAuditSink` が INSERT 前に `serde_json` でパースして `RepoError::Corrupt` にする（`kaikei-app` は serde を持てないので、ポートは JSON テキストで渡し、パースは store 側で行う） |
+| `error_code` を CHECK で縛らず運用で守る | 「`status='error'` なのに分類コードが無い行」は、後から読む側に「失敗したが理由不明」としか見えない。型（`AuditOutcome`）で塞げるものを運用に落とさない |
+
+**理由**: 「append-only。」と書くだけでは守られない、という帳簿本体で得た教訓
+（D-006）が監査ログにもそのまま当てはまる。とくに ERRCODE を分けることは
+`docs/07-mcp-server.md` §9 が明示的に要求しており、これを怠ると D-038 で
+潰したはずの「誤診クラス」の欠陥を、監査ログという**事故調査に使う経路**で
+再生産することになる。
+
+**トレードオフ**: 1リクエストにつき DB 接続を2本（帳簿1・監査ログ1）短時間
+使う。`connect_app` の `max_connections` は 10 なので、同時実行が増えると
+プール枯渇が先に来る。単一ユーザー前提では問題にならないが、`kaikei-api`
+（Phase 4）で同時実行が現実になったら再評価が要る。
+
+---
+
+## D-076 fail-closed / fail-open の手順は `kaikei_app::audit::with_audit` に閉じる
+
+**決定**: 「開始レコードを書く → 操作 → 結果レコードを書く」という手順と、
+その失敗時の扱い（開始＝fail-closed、結果＝fail-open）を
+**`kaikei-app` の1つの関数 `with_audit` に閉じる**。
+`kaikei-mcp` の各ツールはこの関数を呼ぶだけで、順序も失敗時の分岐も書かない。
+
+```rust
+pub async fn with_audit<T, E, Op, Fut, D>(
+    sink: &dyn AuditSink,
+    clock: &dyn AppClock,
+    call: &AuditCall<'_>,
+    operation: Op,          // FnOnce() -> Fut。開始レコードが書けなければ呼ばれない
+    describe: D,            // FnOnce(&T) -> AuditSuccess。成功時の entry_id と出力JSON
+) -> Result<AuditedCall<T, E>, AuditLogUnavailable>
+```
+
+- 開始レコードが書けなければ `Err(AuditLogUnavailable)` を返し、
+  **`operation` を一度も呼ばない**（future すら構築されない）。
+  コードは `codes::AUDIT_LOG_UNAVAILABLE`、本文は
+  「帳簿は変更されていません」まで含める。
+- 結果レコードが書けなければ `AuditedCall::warning` に
+  `AuditResultNotRecorded` を載せ、操作の結果はそのまま返す。
+  警告文は**再実行を促さない**（二重計上を招く）。
+- `AuditLogUnavailable` は `AppError` のバリアントに**しない**。判定は
+  `with_tx` の外側で起き、ユースケースには到達しないため
+  （`docs/07-mcp-server.md` §6 の「`AppError` のバリアントを持たないコード」）。
+- 操作のエラー型は `AuditableError`（`audit_error_code` /
+  `audit_public_message`）で抽象化し、`AppError` と
+  `usecase::post_entry::PostEntryFailure` の両方を同じ手順で扱う。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 各ツール（Phase 3 で11個）が `sink.record_start` → `with_tx` → `sink.record_result` を手で書く | **同じ規律が11箇所に複製される。** とくに「開始レコードの失敗時に操作を実行しない」は、書き忘れても正常系のテストが全て緑のまま通る種類の規律であり、11箇所を目で守るのは `PROGRESS.md` Phase 1 の教訓6「手で維持する一覧は必ず腐る。構造で閉じる」に真っ向から反する |
+| 手順を `kaikei-mcp` 側のヘルパに置く | `kaikei-api`（Phase 4）が同じ手順を再実装することになる。D-072（線上表現を1箇所に持つ）と同型の問題で、presentation 層ごとに持つと必ずずれる。監査ログの手順は「どの入口から呼ばれても同じでなければ意味が無い」もの |
+| `operation` を `Future` で受け取る（クロージャにしない） | 呼び出し側が future を**先に構築**するため、「実行していない」ことがコード上で読み取りにくい。Rust の future は遅延なので実害は無いが、fail-closed は読んで分かる形にする価値がある |
+| 成功時の出力 JSON も `kaikei-app` が組み立てる | `kaikei-app` は serde を持てない（`CLAUDE.md` §1）。JSON の組み立ては presentation 層の責務であり、`describe` クロージャで受け取る |
+| 失敗時の本文も呼び出し側に組み立てさせる | `err.to_string()`（`Display`）を渡す事故が起きる。`Display` には DB が返した生メッセージ（接続文字列・ロール名）が入りうる。`with_audit` が `AuditableError::audit_public_message()` から自動で埋め、`AuditOutcome::Failed` が `public_message` しか運べない形にすることで、`Display` が `audit_log.output` に届く経路を**構造的に塞いだ** |
+
+**理由**: D-070 の決定は「2回書く」ことではなく「**失敗した操作の記録が残る**」
+ことであり、それを壊すのは順序の誤りと fail-closed の書き忘れである。
+規律を関数1つに閉じれば、退行はコンパイルエラーかテスト失敗になる。
+
+**トレードオフ**: `with_audit` のシグネチャが長い（型引数5つ・クロージャ2つ）。
+1ツールあたり1回だけ書く形なので許容した。`kaikei-mcp` の実装で
+書きにくさが目立つようなら、ツール共通のラッパを MCP 層に**1つだけ**
+置いて吸収する（手順そのものを再実装するのではなく）。
+
+---
+
+## D-077 「記帳が失敗しても監査ログが残る」ことを実 PostgreSQL の対照実験で実証する
+
+**決定**: D-070 / D-075 の設計が成立していることを、
+`crates/kaikei-store/tests/audit_log.rs`（`pg-tests`）で実 PostgreSQL に対して
+実証する。要となるのは次の3本で、**対照実験を含める**。
+
+| テスト | 何を示すか |
+|---|---|
+| `failed_posting_rolls_back_the_ledger_but_keeps_both_audit_rows` | 記帳が失敗して `with_tx` が rollback しても、開始レコードと結果レコード（`status='error'` + `error_code`）が残る。帳簿は0件 |
+| `audit_row_written_inside_a_rolled_back_transaction_still_survives` | `with_tx` の**内側**から `AuditSink` で書いた行が、そのトランザクションの rollback で消えない（＝別コネクションであることの直接の証明） |
+| `a_row_written_inside_the_same_transaction_does_disappear_on_rollback` | **対照実験。** 同一トランザクションへの素の INSERT は rollback で消える |
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| インメモリのフェイク（`RecordingAuditSink`）だけで検証する | フェイクにはトランザクションが無いので、**D-070 の要件を原理的に検証できない**。「別コネクション」は永続化層の性質であり、実 PostgreSQL でしか観測できない。フェイクで検証するのは fail-closed / fail-open の**手順**だけに留める |
+| 生き残るテスト（2本目）だけを置き、対照実験を書かない | 「消える条件が成立していないだけ」でも通ってしまう（空虚な真）。3本目が無いと、例えばテストDBが自動コミットになっていても緑になる |
+| 失敗した操作を「貸借不一致」で作る | `JournalEntry::new` が構築時に弾くため、そもそも `with_tx` に入らない。rollback を観測したいので、**帳簿に INSERT した後で**失敗する形（`AppError::Rejected` を返す）にした |
+| 新しい CI ジョブを追加して実行する | 不要。`database` ジョブの `cargo test -p kaikei-store --features pg-tests` は**テストターゲットを列挙しない**ので、`Cargo.toml` に `[[test]]` を足すだけで対象に入る。clippy も `--all-targets` で拾われる。ブランチ保護の必須チェック（`CLAUDE.md` §13）を触る必要が無い |
+
+あわせて、`tests/migrations.rs` の「マイグレーションが8件」というリテラルの
+期待値を、**`migrations/` の `.sql` を数える**形に置き換えた
+（`every_migration_file_is_recorded`）。マイグレーションを追加するたびに
+数字を手で直す一覧は必ず腐る（`PROGRESS.md` Phase 1 の教訓6）。
+`docs/03-database.md` §5 のファイル一覧も実態（0009 まで）に合わせ、
+「番号を先に予約しない」ことを明記した——旧版は `0008`/`0009` を
+documents / imported_transactions 用として予約していたが、その番号は
+既に別の用途で埋まっていた。
+
+**理由**: D-070 は「同一トランザクションで書くと最も重要な記録だけが
+残らない」という一点のためにある決定であり、その一点は正常系のテストでは
+一切観測できない。**この3本が落ちない限り退行に気づけない**ので、
+テストの側にも「なぜこの形なのか」を doc コメントで残した。
+
+**トレードオフ**: `pg-tests` の実行時間が約15秒増える（`#[sqlx::test]` は
+テストごとに使い捨てDBを作りマイグレーションを再適用する）。
+実 DB でしか検証できない性質なので受け入れる。

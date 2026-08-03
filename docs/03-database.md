@@ -28,9 +28,11 @@ REVOKE UPDATE, DELETE, TRUNCATE ON journal_entries, journal_lines FROM kaikei_ap
 GRANT SELECT, INSERT, UPDATE ON accounts, counterparties, entry_counters TO kaikei_app;
 GRANT SELECT, INSERT ON period_snapshots TO kaikei_app;
 
--- 監査ログ（Phase 3 で追加。docs/07-mcp-server.md §9）も帳簿本体と同じ扱いにする。
--- 専用のトリガ関数と専用 ERRCODE を割り当てること（reject_mutation() を流用すると
--- 「訂正は逆仕訳で行ってください」という的外れな案内になる。D-038 と同じ誤診クラス）。
+-- 監査ログ（Phase 3 PR-C で追加。migrations/0009_audit_log.sql、
+-- docs/07-mcp-server.md §9、DECISIONS.md D-075）も帳簿本体と同じ扱いにする。
+-- 専用のトリガ関数（reject_audit_log_mutation）と専用 ERRCODE（P0012）を
+-- 割り当ててある。reject_mutation() を流用すると「訂正は逆仕訳で行ってください」
+-- という的外れな案内になるため（D-038 と同じ誤診クラス）。
 GRANT SELECT, INSERT ON audit_log TO kaikei_app;
 REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM kaikei_app;
 ```
@@ -321,8 +323,20 @@ migrations/
 ├── 0004_append_only_triggers.sql
 ├── 0005_counterparties.sql
 ├── 0006_entry_counters.sql
-└── 0007_period_snapshots.sql
+├── 0007_period_snapshots.sql
+├── 0008_distinct_error_codes.sql  -- P0010/P0011 の分離（DECISIONS.md D-038）
+└── 0009_audit_log.sql             -- 監査ログ（Phase 3。§1 / docs/07 §9・D-075）
 ```
+
+**この一覧は実在するファイルと一致させること。** 適用済みマイグレーションは
+`_sqlx_migrations` の checksum 検証があるため後から編集できず、番号は必ず
+既存の続きになる。一覧が実態からずれると、次の実装者が既に使われている
+番号を選ぶ（実際、Phase 1 の版はここに 0007 までしか載せておらず、
+下の注記が `0008` / `0009` を documents / imported_transactions 用として
+予約したまま、その番号が別の用途で埋まっていた）。
+一覧の網羅性は `crates/kaikei-store/tests/migrations.rs` の
+`every_migration_file_is_recorded` が**ディレクトリを数えて**検証する
+（期待値をリテラルで持たない）。
 
 ロールの作成・パスワード設定は `docker/postgres/init/01-roles.sql` に集約する
 （マイグレーションには書かない）。ロールはクラスタ単位のオブジェクトであり、
@@ -330,9 +344,11 @@ migrations/
 再実行するため、ロール作成をマイグレーションに書くと2件目以降のテストが
 全て失敗する。
 
-`0008_documents.sql` / `0009_imported_transactions.sql`（`documents` /
-`entry_documents` / `imported_transactions`）は Phase 1 では作らない
-（人間承認済み・F-1。Phase 4 の `kaikei-blob` / `kaikei-import` と同時に設計する）。
+`documents` / `entry_documents` / `imported_transactions` は Phase 1 では
+作らない（人間承認済み・F-1。Phase 4 の `kaikei-blob` / `kaikei-import` と
+同時に設計する）。**番号を先に予約しない**——`0008` / `0009` は既に
+別の用途（D-038 のエラーコード分離、Phase 3 の監査ログ）で使われた。
+作るときに、その時点の続きの番号を取ること。
 
 ---
 

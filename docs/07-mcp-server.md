@@ -3,8 +3,8 @@
 **このプロジェクトの差別化の本体。**
 AI エージェントが会計操作を安全に行うための標準インタフェース。
 
-> **この文書の版**: Phase 3 PR-B **2巡目**時点（`DECISIONS.md` D-074 まで、
-> D-072〜D-074 の訂正注記を含む）を反映している。
+> **この文書の版**: Phase 3 **PR-C** 時点（`DECISIONS.md` D-077 まで）を
+> 反映している。§9（監査ログ）は PR-C で実装済みの内容に更新した。
 > D-072 以降の決定でここに書かれた内容が覆った場合、**決定を入れた PR の中で
 > この文書も直すこと**。設計書は一度書いたら終わりではなく、直さないと
 > 「却下済みの設計を後続の実装者に指示する文書」に劣化する
@@ -635,8 +635,11 @@ AI の自己修正を一段速くする効果は大きいが、
   `.sqlx` オフラインキャッシュの再生成が要る
   （`.github/workflows/database.yml` の `cargo sqlx prepare --workspace --check`）。
 - `kaikei-app` の**勘定科目マスタ投入ユースケース**（D-070）。
-- **audit_log 書き込みポート**（§9）。分類コード（`audit_log_unavailable`）だけは
-  PR-B 2巡目で語彙に入れてある。
+- ~~**audit_log 書き込みポート**（§9）~~
+  → **PR-C で完了**（`kaikei_app::ports::AuditSink` /
+  `kaikei_app::audit::with_audit` / `kaikei_store::audit::PgAuditSink` /
+  `crates/kaikei-store/migrations/0009_audit_log.sql`）。分類コード
+  （`audit_log_unavailable`）は PR-B 2巡目で語彙に入れてあったものを使う。
 - ~~`post_entry::execute` の戻り値拡張（`PolicyNote` を返す。§3）~~
   → **PR-B で完了**（`PostEntryOutput { entry, notes }` /
   `ReverseEntryOutput { entry }`）。失敗経路の `PolicyNote`
@@ -1084,6 +1087,23 @@ MCP クライアントの設定ファイル（例: Claude Code の MCP 設定）
 MCP 経由の操作は**読み取り系も含めて全て**記録する
 （`ROADMAP.md` Phase 3 の完了条件「全操作が audit_log に記録される」）。
 
+> **この節は PR-C で実装済み**（`DECISIONS.md` D-075〜D-077）。
+> 残っているのは `kaikei-mcp` 側の結線（各ツールが
+> `kaikei_app::audit::with_audit` を呼び、`input` / `output` の JSON を
+> 組み立てること）だけである。
+>
+> | 実装 | 置き場 |
+> |---|---|
+> | テーブル・トリガ・権限 | `crates/kaikei-store/migrations/0009_audit_log.sql` |
+> | ポート（trait） | `kaikei_app::ports::AuditSink` |
+> | 記録する値と手順 | `kaikei_app::audit`（`RequestId` / `AuditCall` / `AuditStart` / `AuditResult` / `AuditOutcome` / `with_audit`） |
+> | PostgreSQL 実装 | `kaikei_store::audit::PgAuditSink` |
+> | 実 PostgreSQL のテスト | `crates/kaikei-store/tests/audit_log.rs` |
+>
+> **fail-closed / fail-open をツールごとに手で書かないこと。**
+> 手順は `with_audit` に閉じてある（D-076）。MCP 層が書くのは
+> 「入力・出力の JSON」と「`actor` / `tool`」だけである。
+
 ### 1リクエスト＝2行
 
 **開始レコードと結果レコードを、操作用トランザクションとは別コネクションで
@@ -1122,30 +1142,46 @@ with_tx(...) で操作を実行
   commit/rollback を握っている。**`TxOps` に audit 用メソッドを生やすと必ず
   同一トランザクションになり、上の目的が消える。**
 - `kaikei-app/src/ports.rs` に `TxOps` とは独立した監査ログ用ポート
-  （例 `AuditSink`。`&self` で `PgPool` から別コネクションを acquire する）を新設し、
-  実装は `kaikei-store` に置く（§4「ビジネスロジックを MCP 層に書かない」と整合）。
+  **`AuditSink`**（`&self` で `PgPool` から別コネクションを acquire する）を新設し、
+  実装は `kaikei-store`（`kaikei_store::audit::PgAuditSink`）に置いた
+  （§4「ビジネスロジックを MCP 層に書かない」と整合）。
 - 呼ぶのは `with_tx` の**外側**（開始レコード → `with_tx(...)` → 結果レコード）。
+  この順序と fail-closed / fail-open は **`kaikei_app::audit::with_audit`** に
+  閉じてある。MCP 層で組み立て直さないこと（D-076）。
 - 接続プールの枯渇に注意（`connect_app` の `max_connections` は 10）。
+  1リクエストにつき帳簿1接続 + 監査ログ1接続を短時間だけ使う。
 
 ### スキーマ
+
+実装は `crates/kaikei-store/migrations/0009_audit_log.sql`。
 
 ```sql
 CREATE TABLE audit_log (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     request_id  UUID NOT NULL,        -- ツール呼び出しごとにサーバが採番
     occurred_at TIMESTAMPTZ NOT NULL, -- Clock から取得した値を明示的に渡す
-    actor       TEXT NOT NULL,        -- "mcp" / "cli" / "api"
-    tool        TEXT NOT NULL,
+    actor       TEXT NOT NULL CHECK (btrim(actor) <> ''),  -- "mcp" / "cli" / "api"
+    tool        TEXT NOT NULL CHECK (btrim(tool) <> ''),
     status      TEXT NOT NULL CHECK (status IN ('started', 'ok', 'error')),
     input       JSONB,                -- 開始レコードのみ
     output      JSONB,                -- 結果レコードのみ。確定後明細と PolicyNote
     error_code  TEXT,
-    entry_id    UUID                  -- 外部キーは張らない（下記）
+    entry_id    UUID,                 -- 外部キーは張らない（下記）
+    -- status と error_code の対応（kaikei_app::audit::AuditOutcome が型でも保証する）
+    CHECK ((status = 'error') = (error_code IS NOT NULL)),
+    CHECK (status <> 'started' OR output IS NULL)
 );
 
-CREATE INDEX ON audit_log (request_id);
-CREATE INDEX ON audit_log (occurred_at);
+CREATE INDEX idx_audit_log_request  ON audit_log (request_id);
+CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 ```
+
+- **`status` と `error_code` の対応は型と CHECK の二重で守る**（PR-C で追加）。
+  `kaikei_app::audit::AuditOutcome` は `Succeeded { output_json }` /
+  `Failed { error_code, public_message }` の2バリアントで、
+  「成功なのに `error_code` がある」「`'started'` を結果レコードに書く」を
+  **構築できない**。DB 側の CHECK は、ポートを経由しない直接 INSERT
+  （将来の移行スクリプト等）に対する最後の砦である。
 
 - **`BIGSERIAL` を使わない。** `BIGSERIAL` の既定値 `nextval` にはテーブル権限とは別に
   シーケンスの `USAGE` が必要で、付与し忘れると `kaikei_app` の INSERT が
@@ -1184,16 +1220,25 @@ CREATE INDEX ON audit_log (occurred_at);
 
 1. `GRANT SELECT, INSERT ON audit_log TO kaikei_app;`
    `REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM kaikei_app;`
-2. **`reject_mutation()` を流用しない。** audit_log 専用のトリガ関数を新設する。
-   流用すると例外メッセージが「append-only table: % は変更できません
-   （訂正は逆仕訳で行ってください）」になり、監査ログに対しては的外れな案内になる
-   （監査ログは逆仕訳で直すものではない）。これも D-038 と同じ誤診クラス。
-   メッセージ例:「監査ログは追記のみです。記録の訂正は新しい行の追加で行ってください」。
-3. **専用 ERRCODE を割り当てる**（`P0010` / `P0011` の次、例えば `P0012`）。
-   `kaikei-store/src/sqlstate.rs` の写像表に追加し、`AppendOnlyViolation` に寄せない。
-4. `crates/kaikei-store/tests/privileges.rs` に audit_log の行を追加する。
+2. **`reject_mutation()` を流用しない。** audit_log 専用のトリガ関数
+   `reject_audit_log_mutation()` を新設した（行トリガ + TRUNCATE の
+   STATEMENT トリガ）。流用すると例外メッセージが「append-only table: % は
+   変更できません（訂正は逆仕訳で行ってください）」になり、監査ログに
+   対しては的外れな案内になる（監査ログは逆仕訳で直すものではない）。
+   これも D-038 と同じ誤診クラス。
+   実際の文言:「監査ログ（%）は追記のみです。記録の訂正は新しい行の追加で
+   行ってください」。
+3. **専用 ERRCODE `P0012`**（`P0010` / `P0011` の次）。
+   `kaikei-store/src/sqlstate.rs` の写像表に追加済みで、
+   **`AppendOnlyViolation` には寄せていない**（写像先は `RepoError::Backend`。
+   `RepoError` は `#[non_exhaustive]` ではなくバリアント追加が破壊的変更に
+   なるため、専用バリアントは作らなかった。理由は D-075 と
+   `sqlstate.rs` の doc）。
+4. `crates/kaikei-store/tests/privileges.rs` に audit_log の権限マトリクスを、
+   `tests/append_only.rs` に実際に UPDATE / TRUNCATE を発行して
+   `42501` / `P0012` を確認するテストを追加済み（MC-23）。
 
-`docs/03-database.md` §1 の GRANT 例にも audit_log を追加すること。
+`docs/03-database.md` §1 の GRANT 例にも audit_log を追加済み。
 
 ### 個人情報
 
@@ -1277,6 +1322,15 @@ CREATE INDEX ON audit_log (occurred_at);
 | MC-22 | 記帳が失敗（貸借不一致等）してトランザクションが rollback される | **開始レコードは audit_log に残る。** D-070 の存在理由そのもの（同一トランザクションで書く実装に退行したら、このテストだけが落ちる） |
 | MC-23 | `kaikei_app` の audit_log への権限 | `SELECT` / `INSERT` はでき、`UPDATE` / `DELETE` / `TRUNCATE` はできない（`crates/kaikei-store/tests/privileges.rs` の `assert_privilege` と同じ形で追加） |
 | MC-25 | 経過措置対象の税区分（`PURCHASE_10_NON_QUALIFIED`）で記帳 | `PolicyNote` が post の戻り値に含まれ、かつ audit_log の `output` にも残る（D-059 / D-070）。app 層まで運ばれることは PR-B で担保済み（`crates/kaikei-e2e/tests/e2e_jp.rs` の `condition_3_*` が `PostEntryOutput.notes` を検証する）。MCP 層に残るのは「応答と audit_log に載せる」部分 |
+
+**MC-20 / MC-21 / MC-22 / MC-23 は PR-C で実装済み**
+（`crates/kaikei-store/tests/audit_log.rs` / `tests/privileges.rs` /
+`tests/append_only.rs`。`pg-tests` feature 配下で `database` ジョブが実行する）。
+`kaikei-mcp` 側で重ねて書く必要は無い。MC-11 のうち
+「**Phase 3 の全11ツールに対して総当たり**」の部分だけが
+`kaikei-mcp` を新設する PR の担当として残る（PR-C 時点ではツールが
+存在しないため、記帳操作を代表例として `request_id` で2行が対応することを
+検証している）。
 
 ### Phase 4 以降に延期したケース（行を消さない）
 
