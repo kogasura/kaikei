@@ -88,6 +88,83 @@ async fn kaikei_app_truncate_journal_tables_is_denied_with_42501(
     assert_eq!(sqlstate(&err).as_deref(), Some("42501"));
 }
 
+/// 監査ログ（audit_log）に対する kaikei_app の UPDATE も 42501 で拒否される。
+/// 帳簿本体と同じ4点セットで守る（`docs/07-mcp-server.md` §9・MC-23）。
+#[sqlx::test]
+async fn kaikei_app_update_audit_log_is_denied_with_42501(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+
+    let result = sqlx::query("UPDATE audit_log SET tool = tool WHERE false")
+        .execute(&roles.app)
+        .await;
+
+    let err = result.expect_err("kaikei_app による監査ログの UPDATE は成功してはいけません");
+    assert_eq!(sqlstate(&err).as_deref(), Some("42501"));
+}
+
+/// kaikei_migrator（所有者）は REVOKE をバイパスできるが、監査ログ**専用**の
+/// トリガ（reject_audit_log_mutation）が P0012 で拒否する。
+///
+/// **P0010（帳簿の reject_mutation）と別のコードであることが要点。**
+/// 同じコードに寄せると、監査ログの変更が拒否されたときに
+/// 「訂正は逆仕訳で行ってください」という的外れな案内が出る
+/// （`DECISIONS.md` D-038 と同じ誤診クラス。D-075）。
+#[sqlx::test]
+async fn kaikei_migrator_update_audit_log_is_rejected_by_a_dedicated_trigger(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    let request_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO audit_log (request_id, occurred_at, actor, tool, status) \
+         VALUES ($1, now(), 'mcp', 'post_journal_entry', 'started')",
+    )
+    .bind(request_id)
+    .execute(&roles.migrator)
+    .await
+    .expect("下準備の監査ログ INSERT に失敗しました");
+
+    let result = sqlx::query("UPDATE audit_log SET tool = 'x' WHERE request_id = $1")
+        .bind(request_id)
+        .execute(&roles.migrator)
+        .await;
+
+    let err =
+        result.expect_err("kaikei_migrator であっても監査ログの UPDATE は成功してはいけません");
+    assert_eq!(sqlstate(&err).as_deref(), Some("P0012"));
+    assert_ne!(
+        sqlstate(&err).as_deref(),
+        Some("P0010"),
+        "帳簿の append-only 違反と同じコードにしてはいけない（誤った案内になる）"
+    );
+
+    // 写像先も AppendOnlyViolation ではない（「逆仕訳で」と案内しない）。
+    let mapped = kaikei_store::error::from_sqlx_error(err);
+    assert!(!matches!(mapped, RepoError::AppendOnlyViolation { .. }));
+    assert!(!mapped.public_message().contains("逆仕訳"));
+}
+
+/// 監査ログの TRUNCATE も STATEMENT トリガで拒否される（行トリガは
+/// TRUNCATE を捕まえない）。
+#[sqlx::test]
+async fn kaikei_migrator_truncate_audit_log_is_rejected_by_a_dedicated_trigger(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+
+    let result = sqlx::query("TRUNCATE audit_log")
+        .execute(&roles.migrator)
+        .await;
+
+    let err = result.expect_err("kaikei_migrator であっても TRUNCATE は成功してはいけません");
+    assert_eq!(sqlstate(&err).as_deref(), Some("P0012"));
+}
+
 /// kaikei_migrator（所有者）による TRUNCATE も STATEMENT トリガが P0010 で拒否する
 /// （TRUNCATE は行トリガを起動しないため、STATEMENT トリガが無いと素通りしてしまう。
 /// phase1計画 R6。`no_truncate_*` トリガも `reject_mutation()` を使うため、
