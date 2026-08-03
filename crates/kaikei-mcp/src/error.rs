@@ -199,6 +199,26 @@ impl ToolError {
     /// `JpError` の文言は `kaikei-jp` が組み立てたもの（有効なキー一覧・
     /// 有効期間・期待する書式を含む）であり、**言い換えない**
     /// （`CLAUDE.md` §10 / §11）。
+    ///
+    /// # [`ToolError::from_app_error`] との非対称は意図したもの
+    ///
+    /// `from_app_error` は `Display` を**使わず** `public_message()` を使う。
+    /// `AppError` の `Display` は下位層（sqlx 等）が返した生の文字列を
+    /// `RepoError::Backend { reason }` にそのまま抱えており、接続文字列や
+    /// ロール名が混じりうるからである
+    /// （`tool_error_from_app_error_does_not_leak_the_backend_reason`）。
+    ///
+    /// 一方こちらは `Display` をそのまま線上に載せる。`JpError` の `Display` は
+    /// **`kaikei-jp` が AI 向けに自分で書いた文言**であり、外部クレートの
+    /// メッセージを抱え込む口を持たないためである。この性質は口を持つ
+    /// バリアント（`#[error(...)]` に `{source}` を書けるもの）を明示リストに
+    /// 固定することで保つ（`jp_error_display_is_self_authored`）。
+    ///
+    /// **サーバ側の情報が線上に出る唯一の例外が `JpError::Io`** で、これは
+    /// 読めなかったファイルのパス（`{path}`）を含む。運用者が直すための情報で
+    /// あり（`CLAUDE.md` §11）、かつマスタ・設定の不備は起動時に検出して
+    /// **起動を中止する**（`docs/07-mcp-server.md` §7）ため、通常ツール応答には
+    /// 現れない。この判断は `DECISIONS.md` D-080 に記録してある。
     pub fn from_jp_error(err: &JpError) -> Self {
         Self::new(jp_error_code(err), err.to_string())
     }
@@ -252,6 +272,69 @@ impl ToolError {
 mod tests {
     use super::*;
     use kaikei_app::error::RepoError;
+    use std::collections::BTreeSet;
+
+    /// `crates/kaikei-jp/src/error.rs` のソース。
+    ///
+    /// [`all_jp_errors`] は**手で維持する一覧**であり、そのままでは
+    /// 「新しいバリアントを足したのに一覧に載せ忘れる」を検出できない
+    /// （`jp_error_code` の網羅 `match` はコンパイルを壊すが、新バリアントに
+    /// `codes::INTERNAL` を割り当ててしまえばコンパイルは通り、
+    /// [`every_jp_error_variant_has_a_code`] は一覧に無いので発火しない）。
+    /// 「手で維持する一覧は必ず腐る」（`PROGRESS.md` Phase 1 の教訓6 /
+    /// `DECISIONS.md` D-047）。
+    ///
+    /// そこで `crates/kaikei-jp/tests/chart_drift.rs`（D-051）と同じ手法を使い、
+    /// **定義元のソースを読んで**バリアント名を抽出し、一覧と突き合わせる。
+    /// `include_str!` はコンパイル時に埋め込むので、定義元を変更すれば
+    /// このテストは必ず再ビルドされる。
+    const JP_ERROR_SOURCE: &str = include_str!("../../kaikei-jp/src/error.rs");
+
+    /// [`all_jp_errors`] に**意図的に含めない**バリアントと、その理由。
+    ///
+    /// 無言の除外にしない（除外は「検出できない領域」を作る操作なので、
+    /// 理由が読めない形で増やせてはいけない）。
+    const NOT_CONSTRUCTIBLE_FROM_TESTS: &[(&str, &str)] = &[(
+        "YamlParse",
+        "source が serde_norway::Error で、外部クレートがコンストラクタを\
+         公開していないためテストから値を作れない。jp_error_code では Io と\
+         同じ腕に並んでおり、腕から漏れないことは網羅 match が保証する",
+    )];
+
+    /// 抽出できるバリアント数の下限（番人）。
+    ///
+    /// 抽出パターンが `JpError` の書き方の変更に当たらなくなると、
+    /// 「0件を突き合わせて全件一致」という形で**検査が黙って機能停止する**。
+    /// 実数（現在23件）ではなく下限にするのは、バリアントが1つ増えただけで
+    /// このテストが落ちるのを避けるため。
+    const MIN_JP_ERROR_VARIANTS: usize = 20;
+
+    /// 自分の `Display` を**他の型に委ねてよい**バリアントと、その理由。
+    ///
+    /// `ToolError::from_jp_error` は `JpError` の `Display` をそのまま線上に
+    /// 載せる（`from_app_error` が `public_message()` を使うのと非対称。
+    /// `DECISIONS.md` D-080）。その前提は「`JpError` の文言は `kaikei-jp` が
+    /// AI 向けに自分で書いたものであり、下位層の生メッセージを抱えない」で
+    /// あり、`{source}` や `#[error(transparent)]` を持つバリアントが黙って
+    /// 増えるとこの前提が崩れる。
+    const MAY_DELEGATE_DISPLAY: &[(&str, &str)] = &[
+        (
+            "Io",
+            "{source} は std::io::Error。読めなかったパス（{path}）とあわせて、\
+             サーバ側の情報が線上に出る唯一の例外（D-080）",
+        ),
+        (
+            "YamlParse",
+            "{source} は serde_norway::Error。YAML の解析位置（行・列）が無いと\
+             どこを直せばよいか分からない（CLAUDE.md §11）",
+        ),
+        (
+            "Core",
+            "#[error(transparent)] で kaikei_core::CoreError に委ねる。\
+             CoreError は kaikei-core が AI 向けに書いた文言であり、\
+             外部クレートの生メッセージではない",
+        ),
+    ];
 
     fn all_jp_errors() -> Vec<JpError> {
         vec![
@@ -345,8 +428,244 @@ mod tests {
                 reason: "tax_category が必須です".to_string(),
             },
         ]
-        // `YamlParse` は `serde_norway::Error` を外から構築できないため
-        // ここには含めない（`Io` と同じ腕に落ちることは match が保証する）。
+        // 除外は [`NOT_CONSTRUCTIBLE_FROM_TESTS`] に理由付きで書く。
+        // 載せ忘れは [`all_jp_errors_covers_every_variant_declared_in_kaikei_jp`]
+        // がソースと突き合わせて検出する。
+    }
+
+    /// `enum <name> {` の本体から、バリアント名と `#[error(...)]` 属性を取り出す。
+    ///
+    /// 正規表現クレートは使わない（`kaikei-mcp` の依存は CI が許可リストで
+    /// 閉じており、テストのために増やす価値が無い。`DECISIONS.md` D-078）。
+    /// 対象は自リポジトリ内の既知の書式なので手書きで足りる
+    /// （`crates/kaikei-jp/tests/chart_drift.rs` と同じ方針）。
+    ///
+    /// バリアント名は「行頭（インデント除去後）が大文字で始まり、
+    /// `{` / `(` / `,` が続く」もの。構造体フィールドは必ず snake_case なので
+    /// 大文字始まりの条件だけで除外できる。
+    #[derive(Debug, PartialEq)]
+    struct ParsedVariant {
+        name: String,
+        /// 直前の `#[error(...)]` 属性の中身（属性が無ければ空文字列）。
+        error_attribute: String,
+    }
+
+    fn parse_enum_variants(source: &str, enum_header: &str) -> Vec<ParsedVariant> {
+        let Some(header_at) = source.find(enum_header) else {
+            return Vec::new();
+        };
+        let body = &source[header_at..];
+
+        let mut out: Vec<ParsedVariant> = Vec::new();
+        let mut pending_attribute = String::new();
+        let mut in_attribute = false;
+        let mut depth: i32 = 0;
+
+        for raw_line in body.lines().skip(1) {
+            let line = raw_line.trim();
+
+            if in_attribute || line.starts_with("#[error(") {
+                pending_attribute.push_str(line);
+                // 属性は `)]` で終わる。rustfmt は長い属性を複数行に折り返す。
+                in_attribute = !line.ends_with(")]");
+                continue;
+            }
+            // 空行・コメント・その他の属性は、直前の `#[error(...)]` を
+            // 破棄せずに読み飛ばす。
+            if line.is_empty() || line.starts_with("//") || line.starts_with("#[") {
+                continue;
+            }
+
+            match variant_name(line).filter(|_| depth == 0) {
+                Some(name) => out.push(ParsedVariant {
+                    name,
+                    error_attribute: std::mem::take(&mut pending_attribute),
+                }),
+                None => pending_attribute.clear(),
+            }
+
+            depth += line.matches('{').count() as i32;
+            depth -= line.matches('}').count() as i32;
+            if depth < 0 {
+                break; // enum の閉じ括弧
+            }
+        }
+
+        out
+    }
+
+    /// バリアント宣言の行なら、その名前を返す。
+    ///
+    /// 構造体フィールド（`label: String,`）は必ず snake_case なので、
+    /// 「大文字始まり」の条件だけで除外できる。
+    fn variant_name(line: &str) -> Option<String> {
+        if !line.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return None;
+        }
+        let ident_len = line
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(line.len());
+        // `YamlParse {` のように名前と `{` の間に空白が入る書き方に備える。
+        let rest = line[ident_len..].trim_start();
+        if rest.is_empty() || rest.starts_with(['{', '(', ',']) {
+            Some(line[..ident_len].to_string())
+        } else {
+            None
+        }
+    }
+
+    fn jp_error_variants() -> Vec<ParsedVariant> {
+        parse_enum_variants(JP_ERROR_SOURCE, "pub enum JpError {")
+    }
+
+    /// `Debug` の先頭トークンからバリアント名を取る。
+    ///
+    /// バリアント名を**値から導出する**ことで、[`all_jp_errors`] の要素と
+    /// 名前の対応を手で書かずに済ませる。
+    fn debug_variant_name(err: &JpError) -> String {
+        let rendered = format!("{err:?}");
+        let end = rendered
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rendered.len());
+        rendered[..end].to_string()
+    }
+
+    // `all_jp_errors()` が `JpError` の全バリアントを覆っていること。
+    //
+    // 手で維持する一覧の陳腐化を、定義元のソースと突き合わせて構造的に閉じる
+    // （`PROGRESS.md` Phase 1 教訓6 / D-051 と同じ手法）。
+    #[test]
+    fn all_jp_errors_covers_every_variant_declared_in_kaikei_jp() {
+        let declared: BTreeSet<String> = jp_error_variants().into_iter().map(|v| v.name).collect();
+
+        assert!(
+            declared.len() >= MIN_JP_ERROR_VARIANTS,
+            "crates/kaikei-jp/src/error.rs から抽出できたバリアントが {} 件しかありません\
+             （下限 {MIN_JP_ERROR_VARIANTS}）。JpError の書き方が変わって抽出ロジック\
+             （parse_enum_variants）が当たらなくなった可能性があります。\
+             このまま通すと「0件を突き合わせて全件一致」という形で検査が無言で\
+             機能停止します。抽出できたもの: {declared:?}",
+            declared.len()
+        );
+
+        let covered: BTreeSet<String> = all_jp_errors().iter().map(debug_variant_name).collect();
+        let excluded: BTreeSet<String> = NOT_CONSTRUCTIBLE_FROM_TESTS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|name| !covered.contains(*name) && !excluded.contains(*name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "JpError に増えたバリアントが all_jp_errors() に載っていません: {missing:?}\n\
+             every_jp_error_variant_has_a_code は一覧に載っているものしか見ないため、\
+             このままだと新しいバリアントに codes::INTERNAL を割り当てても検査が発火しません。\n\
+             値を作れない場合は NOT_CONSTRUCTIBLE_FROM_TESTS に理由付きで追加してください。"
+        );
+
+        let stale: Vec<&String> = covered
+            .union(&excluded)
+            .filter(|name| !declared.contains(*name))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "all_jp_errors() / NOT_CONSTRUCTIBLE_FROM_TESTS にあるのに \
+             crates/kaikei-jp/src/error.rs に見当たらないバリアントがあります: {stale:?}\n\
+             改名された（追随してください）か、抽出ロジックが一部を取りこぼしています。"
+        );
+    }
+
+    // `JpError` の `Display` は `kaikei-jp` が自分で書いた文言である。
+    //
+    // `ToolError::from_jp_error` はこれをそのまま線上に載せる（`from_app_error`
+    // が `public_message()` を使うのと非対称。`DECISIONS.md` D-080）。
+    // 前提が崩れる形——外部クレートの `Display` を `{source}` で埋め込む、
+    // あるいは `#[error(transparent)]` で丸ごと委ねる——が黙って増えないように、
+    // 委譲してよいバリアントを理由付きの明示リストに固定する。
+    #[test]
+    fn jp_error_display_is_self_authored() {
+        let delegating: BTreeSet<String> = jp_error_variants()
+            .into_iter()
+            .filter(|v| {
+                v.error_attribute.contains("{source}") || v.error_attribute.contains("transparent")
+            })
+            .map(|v| v.name)
+            .collect();
+
+        assert!(
+            !delegating.is_empty(),
+            "Display を委譲しているバリアントを1つも検出できませんでした。\
+             #[error(...)] 属性の抽出が働いていません（少なくとも Io は該当するはずです）"
+        );
+
+        let allowed: BTreeSet<String> = MAY_DELEGATE_DISPLAY
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+
+        assert_eq!(
+            delegating, allowed,
+            "JpError の Display を他の型に委ねているバリアントの集合が\
+             MAY_DELEGATE_DISPLAY と一致しません。\n\
+             ToolError::from_jp_error は JpError の Display をそのまま線上に載せます。\
+             外部クレートのメッセージを線上に出してよいかを判断し、\
+             よいなら MAY_DELEGATE_DISPLAY に理由付きで追加してください（D-080）。"
+        );
+    }
+
+    // 上2つが依存する抽出ロジックが、既知の入力で正しく動くこと。
+    //
+    // 「一部だけ黙って脱落する」が最も発見しにくい失敗モードなので、
+    // 折返し・行末コメント・構造体フィールドを含む形で確認する。
+    #[test]
+    fn enum_variant_extractor_reads_names_and_error_attributes() {
+        let source = r#"
+/// doc
+#[derive(Debug, thiserror::Error)]
+pub enum JpError {
+    /// doc comment
+    #[error("{label} のYAML解析に失敗しました: {source}")]
+    YamlParse {
+        label: String,
+        #[source]
+        source: serde_norway::Error,
+    },
+
+    #[error(
+        "折返した属性です: \"{input}\""
+    )]
+    WrappedAttribute {
+        input: String,
+    },
+
+    #[error(transparent)]
+    Core(#[from] kaikei_core::CoreError),
+}
+"#;
+        let parsed = parse_enum_variants(source, "pub enum JpError {");
+        let names: Vec<&str> = parsed.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["YamlParse", "WrappedAttribute", "Core"]);
+        assert!(parsed[0].error_attribute.contains("{source}"));
+        assert!(!parsed[1].error_attribute.contains("{source}"));
+        assert!(parsed[2].error_attribute.contains("transparent"));
+    }
+
+    // 定義元が見つからないとき、無言で「0件一致」にせず落ちること。
+    #[test]
+    #[should_panic(expected = "下限")]
+    fn all_jp_errors_check_fails_loudly_when_nothing_can_be_extracted() {
+        let declared: BTreeSet<String> = parse_enum_variants(JP_ERROR_SOURCE, "pub enum Renamed {")
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        assert!(
+            declared.len() >= MIN_JP_ERROR_VARIANTS,
+            "抽出できたバリアントが {} 件しかありません（下限 {MIN_JP_ERROR_VARIANTS}）",
+            declared.len()
+        );
     }
 
     // 全バリアントからコードが引け、受け皿（`internal`）に落ちない。
@@ -480,5 +799,86 @@ mod tests {
             .with_detail("error", json!("something_else"))
             .to_json();
         assert_eq!(body["error"], json!(codes::REJECTED));
+    }
+
+    /// テスト用の代表的なツール結果エラー（`docs/07-mcp-server.md` §3 の形）。
+    fn sample_tool_result() -> CallToolResult {
+        ToolError::new(
+            codes::UNBALANCED,
+            "貸借不一致: 借方 110,000 / 貸方 100,000（差額 10,000）。\
+             仮受消費税の計上漏れの可能性があります。",
+        )
+        .with_detail("debit_total", json!("110000"))
+        .with_detail("credit_total", json!("100000"))
+        .with_detail("difference", json!("10000"))
+        .into_call_tool_result()
+    }
+
+    // ドメインのエラーは **`isError: true`** のツール結果で返る（D-071 / D-080）。
+    //
+    // `rmcp` の同じ impl には `structured`（`is_error: Some(false)`）が隣接して
+    // おり、6文字違いで取り違えられる。取り違えると**全てのドメインエラーが
+    // 「成功」として AI に届く**——AI は次の手（`CLAUDE.md` §11）を読まずに
+    // 処理を続け、記帳できていないのに完了したと報告する。
+    // 本 PR の中心的な主張なので、値を直接検査する。
+    #[test]
+    fn tool_error_becomes_a_tool_result_error() {
+        let result = sample_tool_result();
+
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "isError が true ではありません。CallToolResult::structured（成功用）と\
+             structured_error（エラー用）を取り違えていないか確認してください（D-080）"
+        );
+    }
+
+    // 構造化コンテンツに応答本文がそのまま載る。
+    #[test]
+    fn tool_result_error_carries_the_body_as_structured_content() {
+        let result = sample_tool_result();
+
+        let structured = result.structured_content.as_ref().expect(
+            "structuredContent が空です。構造化コンテンツを読むクライアントが、\
+                 error / message を機械的に取り出せなくなります（D-080）",
+        );
+
+        assert_eq!(structured["error"], json!(codes::UNBALANCED));
+        assert!(structured["message"]
+            .as_str()
+            .expect("message が文字列ではありません")
+            .contains("貸借不一致"));
+        // ツール固有の欄も落ちない（金額は文字列。`docs/07-mcp-server.md` §5）。
+        assert_eq!(structured["difference"], json!("10000"));
+    }
+
+    // **`content` のテキストにも本文が載る。**
+    //
+    // 「`structured` ではなく `structured_error` を使う」の根拠の半分は
+    // `isError` だが、もう半分は「`structuredContent` をモデルに見せない
+    // クライアントでも本文が AI に届く」ことである（D-080 の却下表）。
+    // ここが崩れると `CallToolResult::error`（テキストのみ）や
+    // 構造化のみの応答との差が消え、主張が空文になる。
+    #[test]
+    fn tool_result_error_repeats_the_body_in_the_text_content() {
+        let wire = serde_json::to_value(sample_tool_result())
+            .expect("CallToolResult は JSON にできるはず");
+
+        // 線上の綴りも固定する（`isError` / `structuredContent` は camelCase）。
+        assert_eq!(wire["isError"], json!(true));
+        assert!(wire["structuredContent"].is_object());
+
+        let text = wire["content"][0]["text"]
+            .as_str()
+            .expect("content にテキストブロックがありません");
+
+        assert!(
+            text.contains("貸借不一致") && text.contains("仮受消費税"),
+            "content のテキストに本文が載っていません: {text}"
+        );
+        assert!(
+            text.contains(codes::UNBALANCED),
+            "content のテキストに分類コードが載っていません: {text}"
+        );
     }
 }
