@@ -6,6 +6,8 @@
 //! デシリアライズ専用の形であり、独立した「ドメイン概念」ではないため
 //! 別ファイルに分けない。
 
+use crate::error::JpError;
+use crate::tax::settings::invalid_setting_code;
 use kaikei_core::{AccountCode, Ratio};
 use serde::Deserialize;
 
@@ -24,16 +26,49 @@ pub enum TaxDirection {
 }
 
 impl TaxDirection {
-    /// YAML の `direction` フィールドの値を解釈する。
-    fn parse(s: &str) -> Result<Self, String> {
-        match s {
+    /// この列挙型が取りうる機械可読名の一覧（YAML / JSON 共通）。
+    pub const CODES: &'static [&'static str] = &["sales", "purchase", "none"];
+
+    /// 機械可読名を返す（YAML の `direction` と同じ語彙）。
+    ///
+    /// 線上（MCP / HTTP の応答）に `direction` を出すのはこの値である。
+    /// **presentation 層で同じ綴りの表を作らないこと**（`DECISIONS.md` D-072。
+    /// [`super::TaxMode::as_code`] / [`super::round_mode_code`] と同じ扱い）。
+    pub fn as_code(&self) -> &'static str {
+        match self {
+            TaxDirection::Sales => "sales",
+            TaxDirection::Purchase => "purchase",
+            TaxDirection::None => "none",
+        }
+    }
+
+    /// 機械可読名から値を復元する。
+    ///
+    /// # Errors
+    ///
+    /// 未知の値は [`JpError::InvalidSettingCode`]（有効な値を列挙する）。
+    pub fn from_code(code: &str) -> Result<Self, JpError> {
+        match code {
             "sales" => Ok(TaxDirection::Sales),
             "purchase" => Ok(TaxDirection::Purchase),
             "none" => Ok(TaxDirection::None),
-            other => Err(format!(
-                "direction の値が不正です: \"{other}\"（有効な値: sales, purchase, none）"
-            )),
+            other => Err(invalid_setting_code("direction", other, Self::CODES)),
         }
+    }
+
+    /// YAML の `direction` フィールドの値を解釈する。
+    ///
+    /// 語彙そのものは [`TaxDirection::from_code`] が持つ（同じ対応表を2つ
+    /// 持たない）。ここで文言を組み立て直しているのは、YAML ロード時の
+    /// エラーが「どのマスタのどの区分か」を呼び出し側（[`TaxCategory::from_raw`]
+    /// の呼び出し元）で付与する形になっているためである。
+    fn parse(s: &str) -> Result<Self, String> {
+        Self::from_code(s).map_err(|_| {
+            format!(
+                "direction の値が不正です: \"{s}\"（有効な値: {}）",
+                Self::CODES.join(", ")
+            )
+        })
     }
 }
 
@@ -181,6 +216,33 @@ mod tests {
             TaxDirection::Purchase
         );
         assert_eq!(TaxDirection::parse("none").unwrap(), TaxDirection::None);
+    }
+
+    // 線上に出す機械可読名と YAML の語彙が同じ1つの表から来ていること
+    // （`DECISIONS.md` D-072。presentation 層で綴りを作り直さないための入口）。
+    #[test]
+    fn tax_direction_code_round_trips_through_the_same_vocabulary() {
+        for direction in [
+            TaxDirection::Sales,
+            TaxDirection::Purchase,
+            TaxDirection::None,
+        ] {
+            let code = direction.as_code();
+            assert!(TaxDirection::CODES.contains(&code), "{code}");
+            assert_eq!(TaxDirection::from_code(code).unwrap(), direction);
+            assert_eq!(TaxDirection::parse(code).unwrap(), direction);
+        }
+        assert_eq!(TaxDirection::CODES.len(), 3);
+    }
+
+    // 未知の機械可読名は既定に落とさず、有効な値を列挙して拒否する。
+    #[test]
+    fn tax_direction_from_code_rejects_unknown_value_listing_the_valid_ones() {
+        let err = TaxDirection::from_code("refund").unwrap_err();
+        assert!(matches!(err, JpError::InvalidSettingCode { .. }));
+        let message = err.to_string();
+        assert!(message.contains("refund"), "{message}");
+        assert!(message.contains("sales"), "{message}");
     }
 
     #[test]
