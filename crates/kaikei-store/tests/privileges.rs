@@ -131,6 +131,24 @@ async fn kaikei_app_period_snapshots_are_insert_only(
     assert_privilege(&roles.migrator, "period_snapshots", "DELETE", false).await;
 }
 
+/// 監査ログ: SELECT/INSERT のみ許可（`docs/07-mcp-server.md` §9・MC-23）。
+///
+/// 帳簿本体と同じ扱いにする。記録の訂正は新しい行の追加で行うのであって、
+/// 既存の行を書き換えることではない。
+#[sqlx::test]
+async fn kaikei_app_audit_log_is_append_only(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+
+    assert_privilege(&roles.migrator, "audit_log", "SELECT", true).await;
+    assert_privilege(&roles.migrator, "audit_log", "INSERT", true).await;
+    assert_privilege(&roles.migrator, "audit_log", "UPDATE", false).await;
+    assert_privilege(&roles.migrator, "audit_log", "DELETE", false).await;
+    assert_privilege(&roles.migrator, "audit_log", "TRUNCATE", false).await;
+}
+
 async fn assert_privilege(pool: &sqlx::PgPool, table: &str, privilege: &str, expected: bool) {
     let actual: bool = sqlx::query_scalar("SELECT has_table_privilege('kaikei_app', $1, $2)")
         .bind(table)

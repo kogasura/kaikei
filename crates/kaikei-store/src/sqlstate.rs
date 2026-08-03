@@ -19,6 +19,7 @@
 //! | `42501` | insufficient_privilege（`kaikei_app` が帳簿を UPDATE 等しようとした） | [`RepoError::AppendOnlyViolation`] |
 //! | `P0010` | `reject_mutation` トリガの発火（append-only 違反。`migrations/0008_distinct_error_codes.sql`） | [`RepoError::AppendOnlyViolation`] |
 //! | `P0011` | `assert_entry_is_balanced` トリガの発火（貸借不一致。store層のバグ検出。同上） | [`RepoError::Corrupt`]（理由は下記） |
+//! | `P0012` | `reject_audit_log_mutation` トリガの発火（監査ログの変更。`migrations/0009_audit_log.sql`） | [`RepoError::Backend`]（理由は下記） |
 //! | `P0001` | raise_exception（ERRCODE を指定しない汎用の `RAISE EXCEPTION`。どのトリガかを断定できない） | [`RepoError::Backend`]（理由は下記） |
 //! | `23505` | unique_violation | [`RepoError::Conflict`] |
 //! | `22003` | numeric_value_out_of_range（`SUM(...)::BIGINT` の桁あふれ等。`DECISIONS.md` D-033） | [`RepoError::OutOfRange`] |
@@ -49,6 +50,25 @@
 //! なのかを一切断定できないため、`AppendOnlyViolation`（「逆仕訳で」という
 //! 特定の対処法を案内する）に寄せることはできない。診断情報を失わせない
 //! `Backend` に写像し、`reason` にメッセージ本文をそのまま含める。
+//!
+//! ## なぜ `P0012`（監査ログ）を `AppendOnlyViolation` にしなかったか（`DECISIONS.md` D-075）
+//!
+//! [`RepoError::AppendOnlyViolation`] の `Display` と `public_message` は
+//! 「訂正は逆仕訳（`reverse_journal_entry`）で行ってください」と案内する。
+//! これは**帳簿本体に対してのみ正しい**案内であり、`audit_log` に対しては
+//! 的外れである（監査ログは逆仕訳で直すものではない。記録の訂正は新しい行の
+//! 追加で行う）。`P0010` と同じバリアントに寄せると、D-038 が潰したのと同じ
+//! 「完全に誤った対処法を案内する」欠陥をそのまま再生産することになる。
+//!
+//! `RepoError` に監査ログ専用のバリアントを足すことは**しなかった**。
+//! この enum は `#[non_exhaustive]` ではなく（`kaikei-app` の `error.rs`
+//! の doc）、バリアント追加は下流の網羅 `match` を壊す破壊的変更である。
+//! 一方 `P0012` が実際に発生するのは「アプリが `audit_log` を
+//! UPDATE/DELETE しようとした」場合だけで、そのようなコードはこの
+//! リポジトリに存在しない（`AuditSink` は INSERT しか持たない）。
+//! つまりこれは**実装のバグでのみ到達する**経路であり、
+//! [`RepoError::Backend`]（「入力の問題ではない。ログを添えて管理者へ」）が
+//! 意味的に最も近い。診断に要る情報は `reason` に残る。
 //!
 //! ## なぜ `23502`/`23514` を `Corrupt` にしたか（`DECISIONS.md` D-037）
 //!
@@ -88,6 +108,13 @@ pub fn map_sqlstate(code: &str, message: &str) -> RepoError {
                 "貸借不一致を検出しました（SQLSTATE P0011）。アプリ層の検証\
                  （JournalEntry::new）を経ずに journal_lines へ書き込まれた\
                  可能性があります（store層のバグ）: {message}"
+            ),
+        },
+        "P0012" => RepoError::Backend {
+            reason: format!(
+                "監査ログ（audit_log）の変更が拒否されました（SQLSTATE P0012）。\
+                 監査ログは追記のみで、記録の訂正は新しい行の追加で行います\
+                 （帳簿の逆仕訳とは別の話です）。ここに到達するのは実装のバグです: {message}"
             ),
         },
         "23505" => RepoError::Conflict {
@@ -150,6 +177,20 @@ mod tests {
         );
         assert!(matches!(err, RepoError::Corrupt { .. }));
         assert!(!err.to_string().contains("逆仕訳"));
+    }
+
+    // D-075: 監査ログのトリガ（P0012）は AppendOnlyViolation に寄せない。
+    // 「訂正は逆仕訳で」は監査ログに対しては的外れな案内であり、
+    // D-038 が潰したのと同じ誤診クラスになる。
+    #[test]
+    fn audit_log_trigger_maps_to_backend_and_never_advises_a_reversal() {
+        let err = map_sqlstate(
+            "P0012",
+            "監査ログ（audit_log）は追記のみです。記録の訂正は新しい行の追加で行ってください",
+        );
+        assert!(matches!(err, RepoError::Backend { .. }));
+        assert_ne!(err.code(), kaikei_app::error::codes::APPEND_ONLY_VIOLATION);
+        assert!(!err.public_message().contains("逆仕訳"));
     }
 
     // 汎用の raise_exception（P0001）はどちらのトリガかを断定できないため Backend。

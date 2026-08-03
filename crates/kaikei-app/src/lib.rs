@@ -19,6 +19,9 @@
 //!   `audit_log` の3箇所で同じ表を手書きすると必ず綴りがずれるため、
 //!   ここに1箇所だけ持つ（`DECISIONS.md` D-072）
 //! - read model 用の DTO: [`view::BalanceRowView`] / [`view::TrialBalanceView`]
+//! - 監査ログ: [`ports::AuditSink`]（ポート）と [`audit`]（記録する値と、
+//!   fail-closed / fail-open の手順 [`audit::with_audit`]）。
+//!   **帳簿とは別のコネクションで2回書く**（`DECISIONS.md` D-070）
 //! - テスト用のインメモリ fake: [`testing`]（`#[cfg(any(test, feature =
 //!   "testing"))]`）
 //!
@@ -69,6 +72,7 @@
 #![warn(missing_docs)]
 
 pub mod amount;
+pub mod audit;
 pub mod clock;
 pub mod context;
 pub mod currency;

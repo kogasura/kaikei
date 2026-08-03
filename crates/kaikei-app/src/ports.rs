@@ -31,8 +31,11 @@
 //!   テストで実際にコンパイルすることを確認している
 //! - [`TrialBalanceQuery`] は `Tx` を通さない read model 用のクエリなので
 //!   `Arc<dyn TrialBalanceQuery>` を axum の `State` に積む設計が自然
+//! - [`AuditSink`] も `Tx` を通さない（**通してはならない**。下記）。
+//!   `&self` のメソッドのみなので `Arc<dyn AuditSink>` として持てる
 //! - [`AppClock`] / [`IdGenerator`] も `&self`/`&dyn` で問題なく使える
 
+use crate::audit::{AuditResult, AuditStart};
 use crate::error::RepoError;
 use crate::view::BalanceRowView;
 use async_trait::async_trait;
@@ -198,6 +201,49 @@ pub trait TrialBalanceQuery: Send + Sync {
         to: AccountingDate,
         group_by: &[TagKey],
     ) -> Result<Vec<BalanceRowView>, RepoError>;
+}
+
+/// 監査ログ（`audit_log`）の記録先。
+///
+/// # ★ [`TxOps`] に生やしてはならない★
+///
+/// リポジトリはすべて `&mut Tx` 経由（[`TxOps`]）で、[`crate::tx::with_tx`] が
+/// commit/rollback を握っている。**監査ログを `TxOps` のメソッドにすると
+/// 必ず帳簿と同一トランザクションになり、失敗した操作の記録が rollback で
+/// 一緒に消える**（`DECISIONS.md` D-070）。「AI が何をしようとしたか」を
+/// 最も知りたいのは失敗したときであり、その記録だけが残らない。
+/// PostgreSQL に autonomous transaction は無いので、経路を分ける以外に
+/// 手段が無い。
+///
+/// したがってこの trait は [`Store`] とも [`TxScope`] とも無関係で、
+/// メソッドは `&self` を取る。実装（`kaikei-store::PgAuditSink`）は
+/// **同じ `PgPool` から別の接続を acquire する**こと。接続プールの枯渇に
+/// 注意（`connect_app` の `max_connections` は 10）。
+///
+/// # 呼ぶ場所
+///
+/// [`crate::tx::with_tx`] の**外側**（開始レコード → `with_tx(..)` →
+/// 結果レコード）。手順そのものは [`crate::audit::with_audit`] に閉じて
+/// あるので、通常はそちらを呼ぶ（fail-closed / fail-open の規律を
+/// ツールごとに手で書かないため。`DECISIONS.md` D-076）。
+#[async_trait]
+pub trait AuditSink: Send + Sync {
+    /// 開始レコード（`status='started'`）を書く。
+    ///
+    /// # Errors
+    ///
+    /// 記録に失敗したら [`RepoError`]。**呼び出し側は操作を実行しては
+    /// ならない**（fail-closed。まだ何も起きていないので拒否して安全）。
+    async fn record_start(&self, record: &AuditStart<'_>) -> Result<(), RepoError>;
+
+    /// 結果レコード（`status='ok' | 'error'`）を書く。
+    ///
+    /// # Errors
+    ///
+    /// 記録に失敗したら [`RepoError`]。**呼び出し側は操作を成功として
+    /// 返す**（fail-open。操作は既に確定しており、拒否しても取り消せない）。
+    /// 開始レコードだけが残った行は「結果不明」として読む。
+    async fn record_result(&self, record: &AuditResult<'_>) -> Result<(), RepoError>;
 }
 
 /// `kaikei_core::Clock` を `Send + Sync` に限定したブランケット trait。
@@ -372,5 +418,13 @@ mod dyn_safety {
 
         let query: Arc<dyn TrialBalanceQuery> = Arc::new(NoopTrialBalanceQuery);
         let _ = query;
+    }
+
+    /// `AuditSink` は `&self` のメソッドのみを持つため `Arc<dyn AuditSink>` に
+    /// できる（`Store`/`TxScope` と無関係であることの静的な裏付けでもある）。
+    #[test]
+    fn audit_sink_can_be_used_as_arc_dyn() {
+        let sink: Arc<dyn AuditSink> = Arc::new(crate::testing::RecordingAuditSink::new());
+        let _ = sink;
     }
 }
