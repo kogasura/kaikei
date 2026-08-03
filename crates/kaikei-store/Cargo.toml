@@ -89,3 +89,8 @@ required-features = ["pg-tests"]
 name = "audit_log"
 path = "tests/audit_log.rs"
 required-features = ["pg-tests"]
+
+[[test]]
+name = "chart_import"
+path = "tests/chart_import.rs"
+required-features = ["pg-tests"]
