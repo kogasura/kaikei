@@ -37,7 +37,7 @@ use kaikei_app::context::{BookSettings, FiscalYearRule};
 use kaikei_app::error::AppError;
 use kaikei_app::ports::{IdGenerator, JournalRepo};
 use kaikei_app::tx::with_tx;
-use kaikei_app::usecase::post_entry::{self, PostEntryInput};
+use kaikei_app::usecase::post_entry::{self, PostEntryInput, PostEntryOutput};
 use kaikei_app::usecase::report::{self, ReportInput};
 use kaikei_core::{
     AccountCode, AccountType, AccountingDate, ChartOfAccounts, Currency, EntryId, FiscalYear,
@@ -93,6 +93,7 @@ impl IdGenerator for SequentialIdGenerator {
 fn settings() -> BookSettings {
     BookSettings {
         fiscal_year_rule: FiscalYearRule::CalendarYear,
+        book_currency: Currency::JPY,
     }
 }
 
@@ -220,7 +221,7 @@ async fn run_post_entry<P>(
     schema: TagSchema,
     id_gen: Arc<SequentialIdGenerator>,
     input: PostEntryInput,
-) -> Result<JournalEntry, AppError>
+) -> Result<PostEntryOutput, AppError>
 where
     P: TaxPolicy + 'static,
 {
@@ -280,7 +281,8 @@ async fn condition_1_exclusive_accounting_generates_tax_line_on_taxable_sale(
         input,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .entry;
 
     assert_eq!(posted.lines().len(), 3, "入力2行 + 税額行1行のはず");
     assert_eq!(posted.debit_total().minor(), posted.credit_total().minor());
@@ -359,7 +361,8 @@ async fn condition_2_reduced_rate_tax_free_and_out_of_scope_categories_are_handl
         input,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .entry;
 
     // 入力5行 + 税額行2行（10%分・8%分）。非課税・不課税は税額行を生成しない。
     assert_eq!(posted.lines().len(), 7);
@@ -419,7 +422,7 @@ async fn condition_3_non_qualified_transitional_measure_is_expressed_in_yaml(
         auto_tax_lines: true,
     };
 
-    let posted = run_post_entry(
+    let posted_output = run_post_entry(
         &store,
         composition.tax_policy.clone(),
         composition.tag_schema.clone(),
@@ -428,6 +431,7 @@ async fn condition_3_non_qualified_transitional_measure_is_expressed_in_yaml(
     )
     .await
     .unwrap();
+    let posted = &posted_output.entry;
 
     // deduction_ratio (0.80) を反映せず rate (0.10) のみで計算する
     // （DECISIONS.md D-059。控除できない部分の帳簿上の処理は税理士確認事項）。
@@ -443,9 +447,26 @@ async fn condition_3_non_qualified_transitional_measure_is_expressed_in_yaml(
     assert_eq!(found.debit_total().minor(), found.credit_total().minor());
 
     // YAMLの deduction_ratio が読み込まれ、控除割合1未満の区分を使うと
-    // PolicyNote が添えられること（`post_entry::execute` の戻り値には
-    // 現れない情報のため、記帳に使ったのと同じ policy インスタンスへ
-    // 直接問い合わせて確認する。DECISIONS.md D-026）。
+    // PolicyNote が添えられ、それが **`post_entry::execute` の戻り値として**
+    // 呼び出し元へ届くこと（PR-B。`DECISIONS.md` D-073）。
+    //
+    // Phase 2 の時点では `post_entry::execute` が `derive_tax_lines(...)?.lines`
+    // として `.notes` を捨てており、同じ policy インスタンスへ直接問い合わせ
+    // 直すことでしか確認できなかった（PROGRESS.md Phase 2 の申し送り）。
+    // その申し送りがここで解消される。
+    assert_eq!(
+        posted_output.notes.len(),
+        1,
+        "経過措置の PolicyNote が post_entry の戻り値に含まれること"
+    );
+    assert!(posted_output.notes[0]
+        .message
+        .contains("PURCHASE_10_NON_QUALIFIED"));
+    // 文言は policy が組み立てたものを素通しする（言い換えない。CLAUDE.md §10）。
+    assert!(posted_output.notes[0].message.contains("税理士"));
+
+    // 戻り値の注記が、同じ policy へ直接問い合わせた結果と一致すること
+    // （post_entry が注記を取りこぼしたり作り変えたりしていない確認）。
     let ctx = TaxContext {
         as_of: AccountingDate::new(2026, 4, 1).unwrap(),
         chart: &composition.chart,
@@ -456,11 +477,7 @@ async fn condition_3_non_qualified_transitional_measure_is_expressed_in_yaml(
         .tax_policy
         .derive_tax_lines(&ctx, std::slice::from_ref(&purchase_line))
         .unwrap();
-    assert_eq!(derivation.notes.len(), 1);
-    assert!(derivation.notes[0]
-        .message
-        .contains("PURCHASE_10_NON_QUALIFIED"));
-    assert!(derivation.notes[0].message.contains("税理士"));
+    assert_eq!(derivation.notes, posted_output.notes);
 }
 
 // ---- 完了条件4 ----
@@ -512,7 +529,8 @@ async fn condition_4_household_split_produces_a_three_line_entry(
         input,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .entry;
 
     assert_eq!(posted.lines().len(), 3);
     assert_eq!(posted.debit_total().minor(), posted.credit_total().minor());
@@ -607,7 +625,8 @@ async fn condition_5_yearly_master_switch_is_based_on_entry_date(
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .entry;
     let legacy_tax = legacy_posted
         .lines()
         .iter()
@@ -636,7 +655,8 @@ async fn condition_5_yearly_master_switch_is_based_on_entry_date(
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .entry;
     let current_tax = current_posted
         .lines()
         .iter()
@@ -708,7 +728,8 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .entry;
     posted_ids.push(sales_posted.id());
 
     // 2b. 課税仕入（適格請求書あり、auto_tax_lines: true）。
@@ -733,7 +754,8 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .entry;
     posted_ids.push(purchase_posted.id());
 
     // 3. household_split で組み立てた3行仕訳を post_entry::execute に入力として渡す。
@@ -762,7 +784,8 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .entry;
     posted_ids.push(split_posted.id());
 
     // 4. report::execute（SQL集計）で試算表を出す。
@@ -834,7 +857,8 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
         "決算振替仕訳が実際に記帳できること \
          （PR-7で「構築は通るが記帳できない」欠陥を3件踏んだことへの回帰検知。\
          DECISIONS.md D-066 の追記を参照）",
-    );
+    )
+    .entry;
     posted_ids.push(closing_posted.id());
 
     let found_closing = find_entry(&store, closing_posted.id())

@@ -185,6 +185,7 @@ impl IdGenerator for SequentialIdGenerator {
 fn settings() -> BookSettings {
     BookSettings {
         fiscal_year_rule: FiscalYearRule::CalendarYear,
+        book_currency: Currency::JPY,
     }
 }
 
@@ -290,12 +291,17 @@ where
 {
     let clock = clock();
     let settings = settings();
+    // `post_entry::execute` は `PostEntryOutput { entry, notes }` を返す（PR-B）。
+    // このファイルの検証対象は永続化（DBに入るか・読み戻せるか）なので、
+    // ここで `entry` だけを取り出す。`notes`（`PolicyNote`）が実際に
+    // 運ばれることの検証は `kaikei-e2e` の `condition_3_*` にある。
     with_tx(store, |tx| {
         Box::pin(async move {
             post_entry::execute(tx, &tax, &schema, &*id_gen, &clock, &settings, input).await
         })
     })
     .await
+    .map(|output| output.entry)
 }
 
 /// `store` に対して1回分の `reverse_entry::execute` を実行する。
@@ -313,6 +319,7 @@ async fn run_reverse_entry(
         })
     })
     .await
+    .map(|output| output.entry)
 }
 
 // ---- E2E-01 ----
@@ -922,8 +929,9 @@ async fn with_tx_rolls_back_journal_and_numbering_together(
 
     let result: Result<(), AppError> = with_tx(&store, |tx| {
         Box::pin(async move {
-            let entry =
-                post_entry::execute(tx, &tax, &schema, &*id_gen, &clock, &settings, input).await?;
+            let entry = post_entry::execute(tx, &tax, &schema, &*id_gen, &clock, &settings, input)
+                .await?
+                .entry;
             // 複数リポジトリを跨ぐ呼び出し（JournalRepo::find_entry /
             // ChartRepo::load_chart）が同じ `&mut Tx` に対して続けて書けることの確認。
             let _ = tx.find_entry(entry.id()).await?;

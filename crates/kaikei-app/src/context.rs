@@ -6,7 +6,7 @@
 use crate::error::RepoError;
 use crate::period_guard::ClosedPeriodGuard;
 use crate::ports::{ChartRepo, PeriodRepo};
-use kaikei_core::{AccountingDate, ChartOfAccounts, FiscalYear};
+use kaikei_core::{AccountingDate, ChartOfAccounts, Currency, FiscalYear};
 use kaikei_policy::CounterpartyIndex;
 
 /// 帳簿全体で共通の設定。
@@ -14,10 +14,35 @@ use kaikei_policy::CounterpartyIndex;
 /// 勘定科目表やタグスキーマのような可変データ（YAML 由来、`kaikei-jp` が
 /// 読み込む）とは異なり、会計年度の区切り方のような、より安定した規則を
 /// ここに持たせる。
+///
+/// **フィールドは全て必須にする（`Option` にしない・`Default` を実装しない）。**
+/// 指定し忘れが会計上の実害になる設定に既定値を与えると、事故が起きても
+/// 構築時にエラーにならず気づけない（`DECISIONS.md` D-057 が
+/// `is_taxable_business` について下したのと同じ判断。D-074）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BookSettings {
     /// 会計年度の区切り規則。
     pub fiscal_year_rule: FiscalYearRule,
+
+    /// 帳簿通貨（通貨コードと小数桁数）。
+    ///
+    /// 金額の入力に通貨が明示されなかったときに使う既定であり、
+    /// 「この帳簿は何建てか」という事業者設定そのもの
+    /// （`docs/07-mcp-server.md` §5 / §7）。
+    ///
+    /// - **`Option` にしない。既定で JPY にフォールバックしない。**
+    ///   `kaikei_core::Currency` はコードと**小数桁数**の組であり、
+    ///   桁数を1つ間違えると金額が100倍ずれて記帳される
+    ///   （`CLAUDE.md` §8）。合成ルート（`kaikei-mcp` の `config.rs`）が
+    ///   設定から必ず解決して渡す。未設定なら起動を中止する。
+    /// - コード文字列から解決する場合は
+    ///   [`crate::currency::currency_from_code`] を使う。この関数は
+    ///   **未知のコードの桁数を推測せずエラーにする**。その方針を
+    ///   迂回して `Currency::new(code, 0)` を書かないこと。
+    /// - この設定は「既定の通貨」であって「唯一許される通貨」ではない。
+    ///   1つの仕訳の中に異なる通貨が混在すれば
+    ///   `kaikei_core::JournalEntry::new` が `CurrencyMismatch` を返す。
+    pub book_currency: Currency,
 }
 
 /// 会計年度の区切り規則。
@@ -101,6 +126,22 @@ mod tests {
         assert!(fy.contains(date));
     }
 
+    // BookSettings は帳簿通貨を必須で保持し、その解決は
+    // `currency::currency_from_code`（未知のコードを推測しない）を通す。
+    #[test]
+    fn book_settings_holds_a_book_currency_resolved_without_guessing() {
+        let settings = BookSettings {
+            fiscal_year_rule: FiscalYearRule::CalendarYear,
+            book_currency: crate::currency::currency_from_code("JPY").unwrap(),
+        };
+        assert_eq!(settings.book_currency.code(), "JPY");
+        assert_eq!(settings.book_currency.minor_unit(), 0);
+
+        // 未知の通貨コードは桁数を推測せずエラーになるため、
+        // `BookSettings` をそもそも組み立てられない（既定値へは落ちない）。
+        assert!(crate::currency::currency_from_code("KWD").is_err());
+    }
+
     #[tokio::test]
     async fn load_posting_context_reads_chart_counterparties_and_closed_through() {
         let store = InMemoryStore::new();
@@ -108,6 +149,7 @@ mod tests {
         store.set_closed_through(2026, closed_through_date);
         let settings = BookSettings {
             fiscal_year_rule: FiscalYearRule::CalendarYear,
+            book_currency: Currency::JPY,
         };
         let entry_date = AccountingDate::new(2026, 4, 1).unwrap();
 

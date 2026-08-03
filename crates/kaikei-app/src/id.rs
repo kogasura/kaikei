@@ -29,6 +29,20 @@ pub fn entry_id_from_uuid(uuid: Uuid) -> EntryId {
     EntryId::new(uuid.as_u128())
 }
 
+/// 仕訳IDを **UUID の正準表記**（小文字ハイフン付き36文字）の文字列にする。
+///
+/// 仕訳IDを人間・AI に見せる場所（エラーメッセージ、MCP / API の応答、
+/// `audit_log.entry_id`）は**必ずこの表記に揃える**
+/// （`docs/07-mcp-server.md` §3）。
+///
+/// `EntryId::as_u128()` の10進表記（最大39桁）を使ってはならない。
+/// AI が送ってきた UUID 文字列と突き合わせられず、「見つからない仕訳ID」を
+/// 提示されても次に何をすればよいか分からなくなる（`CLAUDE.md` §11）。
+/// この関数を1箇所に置くのは、その表記が実装のあちこちで再発明されないため。
+pub fn entry_id_to_uuid_string(id: EntryId) -> String {
+    entry_id_to_uuid(id).to_string()
+}
+
 /// 実行時に UUID v7 で仕訳IDを生成する [`IdGenerator`] 実装。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UuidV7IdGenerator;
@@ -55,6 +69,27 @@ mod tests {
         let a = new_entry_id();
         let b = new_entry_id();
         assert_ne!(a.as_u128(), b.as_u128());
+    }
+
+    #[test]
+    fn entry_id_to_uuid_string_uses_the_canonical_hyphenated_form() {
+        let uuid = Uuid::parse_str("0192a7b3-1234-7abc-8def-0123456789ab").unwrap();
+        let id = entry_id_from_uuid(uuid);
+        let text = entry_id_to_uuid_string(id);
+
+        assert_eq!(text, "0192a7b3-1234-7abc-8def-0123456789ab");
+        assert_eq!(text.len(), 36);
+        assert_eq!(text.matches('-').count(), 4);
+        // 10進表記（39桁になりうる）ではないこと。
+        assert!(text.contains('-'));
+        assert_ne!(text, id.as_u128().to_string());
+    }
+
+    #[test]
+    fn entry_id_to_uuid_string_round_trips_through_parse() {
+        let id = new_entry_id();
+        let parsed = Uuid::parse_str(&entry_id_to_uuid_string(id)).unwrap();
+        assert_eq!(entry_id_from_uuid(parsed).as_u128(), id.as_u128());
     }
 
     #[test]

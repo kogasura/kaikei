@@ -23,7 +23,7 @@ use crate::context::{load_posting_context, BookSettings, PostingContext};
 use crate::error::AppError;
 use crate::ports::{AppClock, IdGenerator, TxOps};
 use kaikei_core::{AccountingDate, CoreError, JournalEntry, JournalLine, NewEntry, TagSchema};
-use kaikei_policy::{TaxContext, TaxPolicy};
+use kaikei_policy::{PolicyNote, TaxContext, TaxPolicy};
 
 /// [`execute`] への入力。
 #[derive(Debug, Clone)]
@@ -39,10 +39,44 @@ pub struct PostEntryInput {
     pub auto_tax_lines: bool,
 }
 
+/// [`execute`] の戻り値。
+///
+/// `JournalEntry` 単体ではなくこの構造体を返すのは、**`PolicyNote` を
+/// 呼び出し元まで届ける**ため（`DECISIONS.md` D-070 の決定3 / D-073。
+/// Phase 2 の申し送り「`PolicyNote` が永続化されない」への回答）。
+///
+/// 非適格の経過措置（`deduction_ratio < 1`）や簡易課税のように、**税額計算
+/// には反映されず注記にしか現れない情報**があり（D-059）、`notes` を捨てると
+/// AI も監査ログも「控除割合の制限があった」ことを知る手段が無くなる。
+///
+/// フィールドを追加しても**読み取り側**は壊れない（構築するのはこの
+/// ユースケースだけなので `#[non_exhaustive]` は付けていない。ただし
+/// `let PostEntryOutput { .. } = out;` のような網羅的な分解を書いている
+/// 呼び出し元はフィールド追加時に壊れる）。
+#[derive(Debug, Clone)]
+pub struct PostEntryOutput {
+    /// 記帳された仕訳（確定後の明細を含む）。
+    pub entry: JournalEntry,
+
+    /// `tax.derive_tax_lines` が添えた注記。
+    ///
+    /// 文言は `kaikei-policy` の実装が組み立てたものを**そのまま**運ぶ。
+    /// 上位層で税務判断を断定する言い換えをしないこと（`CLAUDE.md` §10）。
+    ///
+    /// **空であることは「注記が無い」を意味するとは限らない。**
+    /// `input.auto_tax_lines` が `false` のときは `derive_tax_lines` 自体を
+    /// 呼ばないので、常に空になる（`validate_tag` は注記を返さない）。
+    /// 呼び出し元は自分が渡した `auto_tax_lines` を知っているので、
+    /// この2つの区別が必要ならそちらで判断する。
+    pub notes: Vec<PolicyNote>,
+}
+
 /// 仕訳を記帳する。
 ///
 /// トランザクションの開始・確定・破棄は行わない（呼び出し側が
 /// [`crate::tx::with_tx`] で管理する）。実行順序は本モジュール doc を参照。
+///
+/// 戻り値は [`PostEntryOutput`]（記帳された仕訳 + `PolicyNote` の一覧）。
 ///
 /// # Errors
 ///
@@ -63,7 +97,7 @@ pub async fn execute<Tx>(
     clock: &dyn AppClock,
     settings: &BookSettings,
     input: PostEntryInput,
-) -> Result<JournalEntry, AppError>
+) -> Result<PostEntryOutput, AppError>
 where
     Tx: TxOps,
 {
@@ -94,10 +128,12 @@ where
 
     // 3. 純関数: 税額行の導出（1回だけ）。derive_tax_lines は「確定後の明細
     //    一覧」を返すため、追加ではなく置き換える。
-    let lines = if input.auto_tax_lines {
-        tax.derive_tax_lines(&tax_ctx, &input.lines)?.lines
+    //    `notes` は捨てずに戻り値へ運ぶ（D-070 の決定3）。
+    let (lines, notes) = if input.auto_tax_lines {
+        let derivation = tax.derive_tax_lines(&tax_ctx, &input.lines)?;
+        (derivation.lines, derivation.notes)
     } else {
-        input.lines
+        (input.lines, Vec::new())
     };
 
     // 4. I/O: 失敗しうる検証を全て終えた直後・INSERT の直前で採番する。
@@ -123,7 +159,7 @@ where
     // 6. I/O
     tx.insert_entry(&entry).await?;
 
-    Ok(entry)
+    Ok(PostEntryOutput { entry, notes })
 }
 
 #[cfg(test)]
@@ -132,8 +168,49 @@ mod tests {
     use crate::test_support::{fixed_clock, sample_chart, sample_chart_with_tax_account, settings};
     use crate::testing::{InMemoryStore, SequentialIdGenerator};
     use crate::tx::with_tx;
-    use kaikei_core::{AccountCode, Currency, Money, Side, TagSet};
+    use kaikei_core::{AccountCode, AccountDef, Currency, Money, RoundMode, Side, TagSet};
     use kaikei_policy::testing::{FlatRateTaxPolicy, NoTaxPolicy};
+    use kaikei_policy::{NoteSeverity, PolicyError, TaxDerivation};
+
+    /// 明細を一切変えずに `PolicyNote` だけを添える `TaxPolicy`。
+    ///
+    /// `kaikei-jp` の「非適格の経過措置」（`deduction_ratio < 1` の税区分）が
+    /// 取る挙動そのものを最小化したもの: **税額計算には反映せず、注記にだけ
+    /// 現れる**（`DECISIONS.md` D-059）。`kaikei-app` は `kaikei-jp` に依存
+    /// できないため（`CLAUDE.md` §1）、その形をここで再現する。実際の区分
+    /// （`PURCHASE_10_NON_QUALIFIED`）を使った検証は `kaikei-e2e` 側にある。
+    struct DeductionRatioNotingTaxPolicy;
+
+    impl TaxPolicy for DeductionRatioNotingTaxPolicy {
+        fn validate_tag(
+            &self,
+            _ctx: &TaxContext<'_>,
+            _tags: &TagSet,
+            _account: &AccountDef,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+
+        fn derive_tax_lines(
+            &self,
+            _ctx: &TaxContext<'_>,
+            lines: &[JournalLine],
+        ) -> Result<TaxDerivation, PolicyError> {
+            Ok(TaxDerivation {
+                lines: lines.to_vec(),
+                notes: vec![PolicyNote {
+                    severity: NoteSeverity::Warning,
+                    message: "控除割合の制限がある税区分が含まれています。\
+                              適用可否は税理士にご確認ください"
+                        .to_string(),
+                }],
+            })
+        }
+
+        fn round_mode(&self, _ctx: &TaxContext<'_>) -> RoundMode {
+            RoundMode::Floor
+        }
+    }
 
     fn balanced_lines() -> Vec<JournalLine> {
         vec![
@@ -173,15 +250,17 @@ mod tests {
             auto_tax_lines: false,
         };
 
-        let result: Result<JournalEntry, AppError> = with_tx(&store, |tx| {
+        let result: Result<PostEntryOutput, AppError> = with_tx(&store, |tx| {
             Box::pin(
                 async move { execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await },
             )
         })
         .await;
 
-        let entry = result.unwrap();
-        assert_eq!(entry.entry_no().as_u32(), 1);
+        let output = result.unwrap();
+        assert_eq!(output.entry.entry_no().as_u32(), 1);
+        // auto_tax_lines: false のときは derive_tax_lines を呼ばないので notes は空。
+        assert!(output.notes.is_empty());
         assert_eq!(store.committed_entries().len(), 1);
     }
 
@@ -220,7 +299,7 @@ mod tests {
             auto_tax_lines: false,
         };
 
-        let result: Result<JournalEntry, AppError> = with_tx(&store, |tx| {
+        let result: Result<PostEntryOutput, AppError> = with_tx(&store, |tx| {
             Box::pin(
                 async move { execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await },
             )
@@ -253,7 +332,7 @@ mod tests {
             auto_tax_lines: false,
         };
 
-        let result: Result<JournalEntry, AppError> = with_tx(&store, |tx| {
+        let result: Result<PostEntryOutput, AppError> = with_tx(&store, |tx| {
             Box::pin(
                 async move { execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await },
             )
@@ -307,14 +386,15 @@ mod tests {
             auto_tax_lines: true,
         };
 
-        let result: Result<JournalEntry, AppError> = with_tx(&store, |tx| {
+        let result: Result<PostEntryOutput, AppError> = with_tx(&store, |tx| {
             Box::pin(
                 async move { execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await },
             )
         })
         .await;
 
-        let entry = result.unwrap();
+        let output = result.unwrap();
+        let entry = &output.entry;
         assert_eq!(entry.lines().len(), 4);
         assert_eq!(entry.debit_total().minor(), entry.credit_total().minor());
         assert_eq!(entry.credit_total().minor(), 110_000);
@@ -340,14 +420,14 @@ mod tests {
             auto_tax_lines: false,
         };
 
-        let result: Result<JournalEntry, AppError> = with_tx(&store, |tx| {
+        let result: Result<PostEntryOutput, AppError> = with_tx(&store, |tx| {
             Box::pin(
                 async move { execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await },
             )
         })
         .await;
 
-        assert_eq!(result.unwrap().lines().len(), 2);
+        assert_eq!(result.unwrap().entry.lines().len(), 2);
     }
 
     // PE-6: 未知の勘定科目コードを指定すると UnknownAccount になる
@@ -386,7 +466,7 @@ mod tests {
             auto_tax_lines: false,
         };
 
-        let result: Result<JournalEntry, AppError> = with_tx(&store, |tx| {
+        let result: Result<PostEntryOutput, AppError> = with_tx(&store, |tx| {
             Box::pin(
                 async move { execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await },
             )
@@ -407,7 +487,7 @@ mod tests {
         store: &InMemoryStore,
         id_gen_start: u128,
         input: PostEntryInput,
-    ) -> Result<JournalEntry, AppError> {
+    ) -> Result<PostEntryOutput, AppError> {
         let tax = NoTaxPolicy;
         let schema = TagSchema::empty();
         let id_gen = SequentialIdGenerator::starting_at(id_gen_start);
@@ -465,7 +545,7 @@ mod tests {
         };
         let succeeding_result = run_post_entry(&store, 2, succeeding_input).await;
 
-        assert_eq!(succeeding_result.unwrap().entry_no().as_u32(), 1);
+        assert_eq!(succeeding_result.unwrap().entry.entry_no().as_u32(), 1);
     }
 
     // PE-8（修正5-1）: 明細が0行だと TooFewLines で弾かれる。
@@ -539,7 +619,7 @@ mod tests {
             auto_tax_lines: true,
         };
 
-        let result: Result<JournalEntry, AppError> = with_tx(&store, |tx| {
+        let result: Result<PostEntryOutput, AppError> = with_tx(&store, |tx| {
             Box::pin(
                 async move { execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await },
             )
@@ -556,7 +636,70 @@ mod tests {
             auto_tax_lines: false,
         };
         let succeeding_result = run_post_entry(&store, 2, succeeding_input).await;
-        assert_eq!(succeeding_result.unwrap().entry_no().as_u32(), 1);
+        assert_eq!(succeeding_result.unwrap().entry.entry_no().as_u32(), 1);
+    }
+
+    // PE-11（PR-B）: `derive_tax_lines` が返した `PolicyNote` が戻り値に含まれる。
+    // Phase 2 の申し送り「`PolicyNote` が永続化されない（`.notes` を捨てている）」
+    // への回答（`DECISIONS.md` D-070 の決定3 / D-073）。
+    #[tokio::test]
+    async fn post_entry_returns_policy_notes_from_derive_tax_lines() {
+        let store = InMemoryStore::with_chart(sample_chart());
+        let tax = DeductionRatioNotingTaxPolicy;
+        let schema = TagSchema::empty();
+        let id_gen = SequentialIdGenerator::starting_at(1);
+        let clock = fixed_clock();
+        let settings = settings();
+
+        let input = PostEntryInput {
+            entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
+            description: "控除割合に制限のある仕入".to_string(),
+            lines: balanced_lines(),
+            auto_tax_lines: true,
+        };
+
+        let result: Result<PostEntryOutput, AppError> = with_tx(&store, |tx| {
+            Box::pin(
+                async move { execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await },
+            )
+        })
+        .await;
+
+        let output = result.unwrap();
+        assert_eq!(output.notes.len(), 1, "注記が戻り値から落ちている");
+        assert_eq!(output.notes[0].severity, NoteSeverity::Warning);
+        // policy が組み立てた文言をそのまま素通しする（言い換えない。CLAUDE.md §10）。
+        assert!(output.notes[0].message.contains("税理士"));
+        // 注記は税額計算に反映されない（明細は入力のまま2行）。
+        assert_eq!(output.entry.lines().len(), 2);
+    }
+
+    // PE-12（PR-B）: `auto_tax_lines: false` では `derive_tax_lines` を呼ばないため
+    // 注記は生じない（policy が注記を返す実装であっても空になる）。
+    #[tokio::test]
+    async fn post_entry_returns_no_notes_when_auto_tax_lines_is_disabled() {
+        let store = InMemoryStore::with_chart(sample_chart());
+        let tax = DeductionRatioNotingTaxPolicy;
+        let schema = TagSchema::empty();
+        let id_gen = SequentialIdGenerator::starting_at(1);
+        let clock = fixed_clock();
+        let settings = settings();
+
+        let input = PostEntryInput {
+            entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
+            description: "税額行の自動生成なし".to_string(),
+            lines: balanced_lines(),
+            auto_tax_lines: false,
+        };
+
+        let result: Result<PostEntryOutput, AppError> = with_tx(&store, |tx| {
+            Box::pin(
+                async move { execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await },
+            )
+        })
+        .await;
+
+        assert!(result.unwrap().notes.is_empty());
     }
 
     // ---- プロパティテスト（修正6-a） ----
@@ -665,13 +808,13 @@ mod tests {
                     .enable_all()
                     .build()
                     .unwrap();
-                let result: Result<JournalEntry, AppError> = runtime.block_on(with_tx(&store, |tx| {
+                let result: Result<PostEntryOutput, AppError> = runtime.block_on(with_tx(&store, |tx| {
                     Box::pin(async move {
                         execute(tx, &tax, &schema, &id_gen, &clock, &settings, input).await
                     })
                 }));
 
-                let entry = result.unwrap();
+                let entry = result.unwrap().entry;
                 prop_assert_eq!(entry.debit_total().minor(), entry.credit_total().minor());
             }
         }

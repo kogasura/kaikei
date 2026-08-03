@@ -10,8 +10,8 @@
 
 use crate::context::{BookSettings, FiscalYearRule};
 use kaikei_core::{
-    AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, FixedClock, PeriodGuard,
-    PeriodStatus, Timestamp,
+    AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, Currency, FixedClock,
+    PeriodGuard, PeriodStatus, Timestamp,
 };
 
 /// 現金(100・資産)と売上高(500・収益)のみを持つ最小の勘定科目表。
@@ -64,10 +64,11 @@ pub(crate) fn sample_chart_with_tax_account() -> ChartOfAccounts {
     .unwrap()
 }
 
-/// 暦年ルールの `BookSettings`。
+/// 暦年ルール・帳簿通貨 JPY の `BookSettings`。
 pub(crate) fn settings() -> BookSettings {
     BookSettings {
         fiscal_year_rule: FiscalYearRule::CalendarYear,
+        book_currency: Currency::JPY,
     }
 }
 
