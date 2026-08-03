@@ -3885,3 +3885,113 @@ target ディレクトリのロックで詰まりうるので、テストは tar
   後に書いた指定だけが使われます」と書いてある
 - `wire.rs` のテストは「重複キーは**この層に届く前に**畳み込まれている」ことを
   固定するものに書き換え、**何を検証していないか**を doc に明記した
+
+---
+
+## D-086 読み取り系ツールは read model と `JournalRepo` を使い分け、`get_entry` に read model を新設しない
+
+**決定**: Phase 3 PR-G（読み取り系7ツール）の経路を次のとおりに確定する。
+
+| ツール | 読む先 | 理由 |
+|---|---|---|
+| `get_trial_balance` | **read model 直行**（`kaikei_store::query::PgTrialBalanceQuery` → `kaikei_app::usecase::report::execute`） | SQL 集計そのもの。`CLAUDE.md` §6 |
+| `list_accounts` | `ChartRepo::load_chart`（`with_tx`） | 記帳が科目を解決するのと**同じ経路**。応答に無いコードは記帳にも使えない、という対応が保たれる |
+| `get_entry` | **`JournalRepo::find_entry`**（`with_tx`）。`query/entry_detail.rs` は**新設しない** | 下記 |
+| `list_tax_categories` / `get_settings` / `suggest_tax_category` / `validate_invoice_number` | `kaikei-jp`（合成ルートが保持する値） | `kaikei-app` を経由しない（`docs/07-mcp-server.md` §4 の経路 (c)） |
+
+**却下した選択肢**: `docs/07-mcp-server.md` §2 が当初挙げていた
+`crates/kaikei-store/src/query/entry_detail.rs`（`get_entry` 用の read model）を
+新設する。却下理由:
+
+1. `CLAUDE.md` §6 が read model を分離する対象は「**SQL 集計**」であり、
+   `get_entry` は集計ではなく**集約1件の取得**である
+2. D-031 が read model を要求したのは `TrialBalance` / `BalanceRow` が
+   **`kaikei-core` の外から構築できない**（`GroupKey` に公開コンストラクタが
+   無い）ためである。`JournalEntry` にその制約は無く、
+   `JournalEntry::rehydrate` を使って `kaikei-store` が既に組み立てている
+3. 同じ「仕訳1件を読む」ことに SQL 経路をもう1本作ると、
+   `reverse_journal_entry` が読む姿と `get_entry` が返す姿が**別々に育つ**。
+   訂正の関係（`reverses` / `reverse_reason`）が2つの実装で食い違うと、
+   AI はどちらが帳簿の事実か判断できない
+
+**トレードオフ**: `get_entry` は仕訳1件ぶんの明細を毎回ドメインモデルに
+復元する。件数で伸びる操作ではないので、read model を1本増やす代償
+（SQL の二重管理・`.sqlx` キャッシュ・DTO の追加）に見合わない。
+`search_entries` / `get_ledger`（PR-H）は**複数件の絞り込みと集計**なので
+read model の新設が要る——この線引きを崩さないこと。
+
+**関連する決定（同じ PR で確定した3点）**:
+
+- **読み取り系も監査ログを通る。** `docs/07-mcp-server.md` §9 の1行目
+  （「MCP 経由の操作は**読み取り系も含めて全て**記録する」＝`ROADMAP.md`
+  Phase 3 の完了条件）をそのまま適用し、`dispatch::call` の経路を分岐させない。
+  読み取りで `audit_log` が伸びることは受け入れる。**「誰がいつ何を読んだか」も
+  監査の対象**であり（§9「個人情報は入る前提で考える」は `search_entries` の
+  検索語まで含めて機微だと述べている）、書き込みだけを記録する形にすると
+  「AI が何を見て次の記帳を決めたか」が追えなくなる（D-070）。
+  読み取りだけを間引く仕組みを入れると、**間引きの条件そのものが
+  監査ログを通らない経路**になる（D-084 が塞いだ形の再来）。
+  行数が問題になる規模になったら、経路ではなく保管（パーティション・保存期間）で
+  解くこと。
+- **`Runtime` に `trial_balance`（read model）と `chart_differences` を足した。**
+  前者は `PgStore::pool()` が `pub(crate)` で `kaikei-mcp` からプールを取れない
+  ため、合成ルートで組み立てて持たせる。後者は下記 D-087。
+- **`get_entry` は「空の結果」と「見つからない」を区別する。** 存在しない
+  仕訳IDは `not_found`（仕訳IDは **UUID の正準表記**。MC-14）であり、
+  `{"entry": null}` の類にしない。逆に**0件の期間の試算表・0件の科目一覧は
+  成功**（空配列）である。入力の誤りを静かに成功させないこと、成功を
+  エラーに見せないことは別々の要件であり、両方が要る。
+
+---
+
+## D-087 提案系は「その日に有効なマスタの列挙＋根拠」までとし、摘要から推論しない
+
+**決定**: `suggest_tax_category` は次の形にする。
+
+1. 候補は**取引日の時点で有効な消費税区分マスタに登録されている区分**であり、
+   `direction`（`sales` / `purchase` / `none`）を指定したときだけそれで絞る
+2. **1件に絞らない。順位・信頼度・推奨を付けない**（`recommended` /
+   `confidence` / `score` のようなキーを応答に置かない）
+3. 候補ごとの `reason` は**マスタに書かれている事実**（どのマスタの適用期間か・
+   向き・税率・適格請求書の要否・注記）で構成する
+4. `description`（取引内容）は**受け取るが絞り込みに使わない**。応答に
+   そのまま echo し、`filtered_by.description_used_for_filtering: false` と
+   `disclaimer` で「文面からの推論は行っていない」ことを明示する
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 摘要の語から税区分を推論して1件（または上位N件）を返す | 摘要の語から税区分を決める規則は**このリポジトリのどの層にも無い**（仕訳化ルールは `kaikei-import`＝Phase 4 以降）。無い規則を presentation 層で発明するのは D-072 が禁じている「業務判断を MCP 層に書く」ことそのものである。語の一致だけを根拠に1件返すと AI はそれを確定として使い、税区分の取り違えは税額計算を丸ごと変える |
+| `description` を受け取らない | 呼び出し元は取引内容を持っており、渡せない形にすると「なぜ渡せないのか」が分からない。**受け取ったうえで、使っていないことを明示する**方が誠実である（黙って捨てると「摘要を書けば絞られる」と誤解される） |
+| 候補を返さず「候補は list_tax_categories で見てください」と案内する | `suggest_*` の存在意義（根拠を添える）が消える。`CLAUDE.md` §10 が求めているのは「候補と根拠」であって、候補を出さないことではない |
+
+**理由**: `CLAUDE.md` §10「提案系の機能は候補と根拠を返し、確定は人間に残す」。
+MC-08 の「根拠が空でない」は、**推論の説明ではなくマスタの記載事項**で満たせる。
+こちらは検証可能で、言い換えによる断定が混じらない。
+
+**トレードオフ**: `direction` を指定しても候補は数件残る（同梱 2026 年度マスタで
+売上側3件）。AI から見れば「絞り切れていない」が、絞る根拠を持たないまま
+絞ることの方が実害が大きい。Phase 4 で `kaikei-import` の仕訳化ルールが入れば、
+**その規則を根拠として**絞り込める（`suggest_journal_entry` の
+`reasoning` / `similar_entries` と同じ形。付録 A）。
+
+**同じ PR で確定した2点**:
+
+- **`get_settings` に `chart_differences` を載せた**（PR-E からの申し送り。
+  `docs/07-mcp-server.md` §7）。起動時の科目投入がテンプレートと食い違った
+  場合（`ImportChartOutput::kept_existing`。D-081）、それまで**唯一の出口が
+  stderr** だった。D-082 は「未設定を警告付きで既定値にする」案を
+  「警告は stderr にしか出ず、AI にも利用者にも届かない」という理由で却下して
+  おり、同じ理由がここにも当てはまる。合成ルートが `kept_existing` を
+  `Runtime` に持たせ、`get_settings` が科目コード・相違フィールド・
+  **帳簿が使っている定義**（`in_use`）と**採用されなかったテンプレート**
+  （`template`）・`ChartDifference::describe()` の文言をそのまま返す。
+  食い違いが無ければ空配列（キーは必ず出す）。
+- **`TaxDirection::as_code` / `from_code` / `CODES` を `kaikei-jp` に足した。**
+  線上に `direction` を出すのは PR-G が最初だが、綴りの表を `kaikei-mcp` に
+  書くと D-072 が禁じた「同じ対応表を複数の presentation 層に手書きする」形に
+  なる。置き場は `TaxMode::as_code` / `round_mode_code` と同じ
+  `kaikei_jp::tax` である（`kaikei-app` は `kaikei-jp` に依存できない）。
+  YAML ロード側の `TaxDirection::parse` も `from_code` に委譲させ、
+  **対応表を1つに保った**（`kaikei-core` / `kaikei-policy` は変更していない）。

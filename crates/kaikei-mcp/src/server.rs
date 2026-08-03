@@ -210,30 +210,61 @@ pub fn server_info() -> ServerInfo {
 /// のは `dispatch.rs` と `error.rs` だけ。`tests/audit_is_structural.rs`）で
 /// ある。
 ///
-/// **このPR（Phase 3 PR-F）では2件**（書き込み系）。読み取り系・提案系は
-/// PR-G / PR-H。追加してよいのは `docs/07-mcp-server.md` §2 の表で
-/// **Phase 3** と書かれた11件だけで、「存在させないツール」の4件を
-/// ここに足してはならない。
+/// **PR-F で書き込み系2件、PR-G で読み取り系・提案系7件**を登録した。
+/// 残るのは `search_entries` / `get_ledger`（PR-H。read model の新設が要る）。
+/// 追加してよいのは `docs/07-mcp-server.md` §2 の表で **Phase 3** と書かれた
+/// 11件だけで、「存在させないツール」の4件をここに足してはならない
+/// （`tests/forbidden_tools.rs` の
+/// `every_registered_tool_is_one_of_the_eleven_phase_3_tools` が
+/// **許可リスト側からも**閉じている）。
 pub fn tool_registry() -> ToolRegistry {
+    use crate::tools::get_entry::GetEntry;
+    use crate::tools::get_settings::GetSettings;
+    use crate::tools::get_trial_balance::GetTrialBalance;
+    use crate::tools::list_accounts::ListAccounts;
+    use crate::tools::list_tax_categories::ListTaxCategories;
     use crate::tools::post_journal_entry::PostJournalEntry;
     use crate::tools::reverse_journal_entry::ReverseJournalEntry;
+    use crate::tools::suggest_tax_category::SuggestTaxCategory;
+    use crate::tools::validate_invoice_number::ValidateInvoiceNumber;
 
     ToolRegistry::new()
+        // 書き込み系（PR-F）。
         .with::<PostJournalEntry>()
         .with::<ReverseJournalEntry>()
+        // 読み取り系（PR-G）。
+        .with::<ListAccounts>()
+        .with::<GetEntry>()
+        .with::<GetTrialBalance>()
+        .with::<ListTaxCategories>()
+        .with::<GetSettings>()
+        // 提案系・検証系（PR-G。帳簿を変更しない）。
+        .with::<SuggestTaxCategory>()
+        .with::<ValidateInvoiceNumber>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // PR-F の時点で登録されているのは書き込み系の2件（読み取り系・提案系は
-    // PR-G / PR-H）。件数そのものではなく「その2件が居ること」を見る
-    // （件数のリテラルは PR-G で必ず古くなる）。
+    // PR-F の書き込み系2件と、PR-G の読み取り系・提案系7件が登録されている。
+    // 件数そのものではなく「その9件が居ること」を見る
+    // （件数のリテラルは PR-H で必ず古くなる。上限側は
+    // `tests/forbidden_tools.rs` の許可リスト検査が見ている）。
     #[test]
-    fn the_write_tools_are_registered() {
+    fn the_write_and_read_tools_are_registered() {
         let names = registered_tool_names();
-        for expected in ["post_journal_entry", "reverse_journal_entry"] {
+        for expected in [
+            "post_journal_entry",
+            "reverse_journal_entry",
+            "list_accounts",
+            "get_entry",
+            "get_trial_balance",
+            "list_tax_categories",
+            "get_settings",
+            "suggest_tax_category",
+            "validate_invoice_number",
+        ] {
             assert!(names.iter().any(|name| name == expected), "{expected}");
         }
     }
@@ -332,6 +363,31 @@ mod tests {
             let schema = serde_json::to_value(&tool.input_schema).expect("スキーマは JSON");
             let mut descriptions = Vec::new();
             schema_descriptions(&schema, &mut descriptions);
+
+            // ★引数を1つも取らないツールは説明すべき引数が無い★（PR-G）
+            //
+            // `schemars` が載せるのは**プロパティごと**の説明であり、構造体の
+            // doc コメント（トップレベルの `description`）は `schema_for_input`
+            // が落とす（`get_settings` の実応答で確認済み）。したがって
+            // 引数ゼロのツールでは `descriptions` が必ず空になる。
+            // ここで「引数の説明が無い」と落とすのは事実に反するので、
+            // **プロパティが無いこと**を確かめたうえで読み飛ばす。
+            // ツール自体の説明文（`tools/list` の `description`）は
+            // `every_registered_tool_has_a_description_and_an_object_input_schema`
+            // が別に見ている。
+            let has_properties = schema
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+                .is_some_and(|properties| !properties.is_empty());
+            if !has_properties {
+                assert!(
+                    descriptions.is_empty(),
+                    "{name} の inputSchema にプロパティが無いのに説明文があります\
+                     （抽出が壊れている可能性があります）: {descriptions:?}"
+                );
+                continue;
+            }
+
             assert!(
                 !descriptions.is_empty(),
                 "{name} の inputSchema に説明文が1つも無い（AI が引数の意味を読めない）"
@@ -350,6 +406,116 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 設計書（`docs/07-mcp-server.md`）。
+    ///
+    /// ツール名の候補を**そこから導出する**ために埋め込む。一覧をテスト側に
+    /// 手で書き写すと、Phase 4 のツールが1つ増えたときに検査が黙って
+    /// 見逃す（`PROGRESS.md` Phase 1 の教訓6「手で維持する一覧は必ず腐る」）。
+    const DESIGN_DOC: &str = include_str!("../../../docs/07-mcp-server.md");
+
+    /// 設計書 §2 の表に載っているツール名（Phase 3 / Phase 4 以降を問わず）。
+    ///
+    /// §2 の各行は `| ` + バッククォート括りのツール名 + ` | Phase ...` の形を
+    /// している。「Phase」を含む行に限ることで、§6 のエラーコード表など
+    /// 他の表を拾わない。
+    fn tool_names_named_in_the_design_doc() -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for line in DESIGN_DOC.lines() {
+            let line = line.trim();
+            if !line.starts_with("| `") || !line.contains("Phase") {
+                continue;
+            }
+            let Some(name) = line
+                .strip_prefix("| `")
+                .and_then(|rest| rest.split('`').next())
+            else {
+                continue;
+            };
+            if name.contains('_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+            {
+                names.insert(name.to_string());
+            }
+        }
+        names
+    }
+
+    /// `text` の中に `name` が**識別子として**現れるか。
+    fn mentions(text: &str, name: &str) -> bool {
+        let bytes = text.as_bytes();
+        let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        text.match_indices(name).any(|(at, _)| {
+            let before_ok = at == 0 || !is_ident(bytes[at - 1]);
+            let after = at + name.len();
+            let after_ok = after >= bytes.len() || !is_ident(bytes[after]);
+            before_ok && after_ok
+        })
+    }
+
+    // ★AI に見せる面から、登録されていないツールへ誘導しない★
+    //
+    // PR-F レビュー3巡目 D-1 の再発防止。当時 `post_journal_entry` の
+    // `account` の説明が「list_accounts で取得できるコードを指定します」と
+    // 書いており、`list_accounts` は未登録だった。指示どおり呼ぶと
+    // `-32602 tool not found` が返り、AI からは「サーバが壊れている」ように
+    // しか見えない（`DECISIONS.md` D-038 の誤診クラス）。
+    //
+    // PR-G でこの誘導を**戻した**ので、今度は逆向き（登録より先に文言だけが
+    // 進む）の事故を機械的に塞ぐ。候補となるツール名は設計書 §2 の表から
+    // 導出する（テスト側に一覧を書き写さない）。
+    #[test]
+    fn no_description_points_the_caller_at_a_tool_that_is_not_registered() {
+        let candidates = tool_names_named_in_the_design_doc();
+        assert!(
+            candidates.len() >= 11,
+            "設計書 §2 から抽出できたツール名が {} 件しかありません。\
+             表の書式が変わって抽出が当たらなくなった可能性があります\
+             （このまま通すと、未登録のツールへ誘導しても検査が発火しません）: {candidates:?}",
+            candidates.len()
+        );
+
+        for name in registered_tool_names() {
+            let tool = tool_definition(&name).unwrap_or_else(|| panic!("{name} の定義が引けない"));
+            let schema = serde_json::to_value(&tool.input_schema).expect("スキーマは JSON");
+            let mut texts = Vec::new();
+            schema_descriptions(&schema, &mut texts);
+            texts.push(tool.description.clone().unwrap_or_default().to_string());
+
+            for text in texts {
+                for candidate in &candidates {
+                    if !mentions(&text, candidate) {
+                        continue;
+                    }
+                    assert!(
+                        is_registered_tool(candidate),
+                        "{name} の説明文が、登録されていないツール {candidate} へ\
+                         誘導しています。指示どおり呼ぶと「tool not found」が返り、\
+                         AI からはサーバーの故障にしか見えません。\
+                         そのツールを登録するか、文言からその名前を外してください:\n  {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    // 上の検査が働いていること（対照実験）。設計書には Phase 4 以降のツール名も
+    // 載っており、それらは**登録されていない**。
+    #[test]
+    fn the_design_doc_also_names_tools_that_are_deliberately_not_registered() {
+        let candidates = tool_names_named_in_the_design_doc();
+        let unregistered: Vec<&String> = candidates
+            .iter()
+            .filter(|name| !is_registered_tool(name))
+            .collect();
+        assert!(
+            !unregistered.is_empty(),
+            "設計書に載っているツールが全て登録済みです。\
+             上の検査が「常に真」で緑になっていないか確認してください: {candidates:?}"
+        );
     }
 
     // サーバーは tools capability を名乗り、名前とバージョンを持つ。

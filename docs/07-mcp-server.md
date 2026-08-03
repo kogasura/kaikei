@@ -3,9 +3,19 @@
 **このプロジェクトの差別化の本体。**
 AI エージェントが会計操作を安全に行うための標準インタフェース。
 
-> **この文書の版**: Phase 3 **PR-F**（dispatch 層 + 書き込み系ツール2件）時点
-> （`DECISIONS.md` D-085 まで。**レビュー反映済み**）を反映している。
-> PR-F で**内容が変わったのは6箇所**:
+> **この文書の版**: Phase 3 **PR-G**（読み取り系・提案系ツール7件）時点
+> （`DECISIONS.md` D-087 まで）を反映している。
+> PR-G で**内容が変わったのは5箇所**:
+>
+> | 節 | 変わった点 | 決定 |
+> |---|---|---|
+> | §2 | `get_entry` の read model（`query/entry_detail.rs`）の新設を**取り下げた**（`JournalRepo::find_entry` を使う）。PR-H が新設するのは `search.rs` / `ledger.rs` の2本である | D-086 |
+> | §3 | 読み取り系・提案系7件の入出力を**実サーバの応答**で追記した | D-086 / D-087 |
+> | §4 | 経路 (b) から `get_entry` を外し、`list_accounts` と並べて「`Tx` 経由で読む」側に置いた | D-086 |
+> | §7 | 「PR-G への申し送り: `kept_existing` の出口を stderr だけにしない」を**実装済み**にした（`get_settings` の `chart_differences`） | D-087 |
+> | §10 | MC-08 / MC-13 / MC-14 / MC-15 / MC-18 / MC-19 / MC-28 の実装箇所と、MC-11 の残り（PR-H の2件）を書いた | D-086 |
+>
+> PR-F（1つ前の版）で変わったのは次の6箇所である:
 >
 > | 節 | 変わった点 | 決定 |
 > |---|---|---|
@@ -117,10 +127,20 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 | `list_pending_transactions` | Phase 4 以降 | 未仕訳の取込明細。**延期理由: `kaikei-import` 未着手**（crate もテーブルも存在しない） |
 | `search_documents` | Phase 4 以降 | 証憑検索（日付・金額・取引先）。**延期理由: `kaikei-blob` 未着手**（`documents` / `entry_documents` は Phase 4 で設計する。`docs/03-database.md` §1 の注記） |
 
-`search_entries` / `get_ledger` / `get_entry` は read model が未実装。
-`crates/kaikei-store/src/query/` に `ledger.rs` / `search.rs` / `entry_detail.rs` を新設し、
+`search_entries` / `get_ledger` は read model が未実装。
+`crates/kaikei-store/src/query/` に `ledger.rs` / `search.rs` を新設し、
 `kaikei-app::view` の DTO へ直行する（書き込み側 `Store`/`PgTx` を経由しない。
 `CLAUDE.md` §6・D-031）。実装方針は §4。
+
+> **`get_entry` の read model（`entry_detail.rs`）は作らない**（PR-G。D-086）。
+> 初版はこの3つを並べていたが、`get_entry` は**集計ではなく集約1件の取得**で
+> あり、`JournalRepo::find_entry` が既に `JournalEntry`（明細・タグ・訂正の
+> 関係を含む）を返す。D-031 が read model を要求したのは `TrialBalance` /
+> `BalanceRow` が core の外から構築できないためで、`JournalEntry` にその制約は
+> 無い（`rehydrate` があり `kaikei-store` が実際に使っている）。
+> 同じ「仕訳1件を読む」経路を2本持つと、`reverse_journal_entry` が読む姿と
+> `get_entry` が返す姿が別々に育つ。**PR-H が新設するのは `search.rs` /
+> `ledger.rs` の2本である。**
 
 ### 書き込み系
 
@@ -662,6 +682,256 @@ AI の自己修正を一段速くする効果は大きいが、
 - **0件は成功。** 該当する仕訳が無い期間は `rows: []` を返し、エラーにしない
   （エラーにするのは `from > to` の入力ミスだけ）。
 
+実サーバの応答（`from > to` と 0 行の期間。**どちらも実物**）:
+
+```json
+{ "error": "rejected",
+  "message": "集計期間の開始日が終了日より後です: from=2026-12-31 to=2026-01-01。from と to を入れ替えるか、正しい期間を指定してください" }
+```
+
+```json
+{ "from": "2020-01-01", "to": "2020-12-31", "currency": "JPY",
+  "debit_total": "0", "credit_total": "0", "rows": [] }
+```
+
+### list_accounts（PR-G）
+
+```json
+{ "postable_only": true }
+```
+
+- 引数は `postable_only`（既定 `false`）だけ。`true` なら**記帳に使える科目**
+  （`postable: true`）に絞る。絞ったことは応答にも残す
+  （件数が少ないのが帳簿の状態なのか絞り込みの結果なのかを、応答だけで
+  判断できるようにする）。
+- 読むのは **DB の `accounts`**（`ChartRepo::load_chart`）であり、
+  埋め込みテンプレートではない（§4）。並びは科目コード昇順。
+  表示順（`sort`）は返さない（D-061）。
+
+実サーバの応答（同梱テンプレート投入直後。56件のうち先頭2件）:
+
+```json
+{
+  "count": 56,
+  "postable_only": true,
+  "accounts": [
+    { "account": "100", "name": "現金", "account_type": "asset", "postable": true },
+    { "account": "110", "name": "普通預金", "account_type": "asset", "postable": true }
+  ]
+}
+```
+
+`parent` は親科目がある科目にだけ現れる（`null` を置かない）。
+**科目が0件でも成功**（`accounts: []`）であり、「見つからない」ではない。
+
+### get_entry（PR-G）
+
+```json
+{ "entry_id": "019fc7c8-21e0-7600-8246-0a29b67d371d" }
+```
+
+実サーバの応答（`auto_tax_lines: true` で起こした仕訳。税額行を含む3行）:
+
+```json
+{
+  "entry_id": "019fc7c8-21e0-7600-8246-0a29b67d371d",
+  "entry_no": 1,
+  "fiscal_year": 2026,
+  "entry_date": "2026-04-15",
+  "description": "A社への請求",
+  "lines": [
+    { "account": "135", "side": "debit",  "amount": "110000", "currency": "JPY", "tags": {} },
+    { "account": "500", "side": "credit", "amount": "100000", "currency": "JPY",
+      "tags": { "tax_category": "SALES_10" } },
+    { "account": "330", "side": "credit", "amount": "10000",  "currency": "JPY",
+      "tags": { "tax_category": "SALES_10" } }
+  ],
+  "debit_total": "110000",
+  "credit_total": "110000"
+}
+```
+
+- `reverses` / `reverse_reason` は**逆仕訳のときだけ**現れる。`null` を置くと
+  「逆仕訳ではない」と「訂正理由が空」の区別が応答から消える
+  （`lines[].memo` と同じ扱い。`PROGRESS.md` Phase 1 の教訓3）。
+- 存在しない仕訳IDは**空の成功にしない**（MC-14）。実サーバの応答:
+
+  ```json
+  { "error": "not_found",
+    "message": "見つかりません: 仕訳が見つかりません（仕訳ID: 0192a7b3-1234-7abc-8def-0123456789ab）。仕訳IDが正しいか確認してください" }
+  ```
+
+  文言は `reverse_journal_entry` が組み立てるものと同一（**仕訳IDは UUID の
+  正準表記**）。「UUID ですらない文字列」は `invalid_entry_id` であり、
+  `not_found` と区別する（§6。AI が取るべき次の手が違う）。
+- **`recorded_at`（記帳時刻）は返していない。** `Timestamp` を線上の表記に
+  する入口が `kaikei-app` に無く、MCP 層で組み立てると `chrono` を名指しする
+  ことになる（MC-30 の許可リストに無い）。必要になったら
+  `kaikei-app` 側に入口を足すこと（`entry_id_to_uuid_string` と同じ形）。
+
+### list_tax_categories（PR-G）
+
+```json
+{ "date": "2026-04-15" }
+```
+
+実サーバの応答（9件のうち先頭1件）:
+
+```json
+{
+  "date": "2026-04-15",
+  "table": {
+    "label": "kaikei-jp-data/tax/jp/2026.yaml",
+    "applies_from": "2026-01-01",
+    "range": "2026-01-01 〜 無期限"
+  },
+  "count": 9,
+  "categories": [
+    { "code": "SALES_10", "label": "課税売上 10%", "direction": "sales",
+      "rate": "0.10", "requires_qualified_invoice": false, "tax_account": "330" }
+  ]
+}
+```
+
+- **どのマスタを見た結果かを必ず返す**（`table`）。取引日で切り替わる以上、
+  「いつ時点の一覧か」が応答から読めないと、AI は別の年度の区分を使い回す。
+- `rate` / `deduction_ratio` は**文字列**（number にしない。§5 と同じ理由）。
+  `applies_to` / `rate` / `deductible` / `tax_account` / `note` は値が無ければ
+  **キーごと出さない**（`deductible: null` を「控除できない」と読ませない）。
+- `direction` は `kaikei_jp::tax::TaxDirection::as_code`（`sales` /
+  `purchase` / `none`）。**この綴りを MCP 層で作らない**（PR-G で
+  `kaikei-jp` に `as_code` / `from_code` / `CODES` を足した。D-087）。
+- 同梱していない日付は**空配列ではなくエラー**（実物）:
+
+  ```json
+  { "error": "no_applicable_rule_set",
+    "message": "取引日 2000-01-01 に適用される消費税区分マスタがありません（読み込まれているマスタの適用期間: 2026-01-01 〜 無期限）。取引日を確認してください" }
+  ```
+
+  この文言は `TaxRuleSets::require_for_date` が組み立てる。**MCP 層で
+  書き起こさない**（D-072）。
+
+### get_settings（PR-G）
+
+引数は無い（`{}`。日付も取らない。D-057）。実サーバの応答:
+
+```json
+{
+  "tax_mode": "exclusive",
+  "rounding": "floor",
+  "rounding_unit": "line",
+  "is_taxable_business": true,
+  "simplified_taxation": false,
+  "fiscal_year_rule": "calendar_year",
+  "book_currency": { "code": "JPY", "minor_unit": 0 },
+  "chart_differences": []
+}
+```
+
+- 機械可読名はすべて `kaikei_jp::tax` / `kaikei_app::wire` の入口を通す。
+- `book_currency` は**コードと小数桁数の組**で返す（桁数を1つ間違えると
+  金額が100倍ずれる。`CLAUDE.md` §8）。
+- **`chart_differences`**（PR-E からの申し送り。§7）: 起動時の科目投入で
+  テンプレートと定義が食い違い、**既存を残した**科目
+  （`ImportChartOutput::kept_existing`。D-081）。要素の形は
+
+  ```json
+  { "account": "500", "fields": ["name"],
+    "in_use":   { "account": "500", "name": "売上（本業）", "account_type": "revenue", "postable": true },
+    "template": { "account": "500", "name": "売上高",       "account_type": "revenue", "postable": true },
+    "message": "科目 500 の定義が既存と異なります（相違: name）。既存の定義を残し、テンプレートでは上書きしていません。…" }
+  ```
+
+  `message` は `ChartDifference::describe()` をそのまま使う（起動時に stderr へ
+  出しているものと同一。言い換えると説明が2つに育つ）。
+  食い違いが無ければ空配列（**キーは必ず出す**）。
+
+### suggest_tax_category（PR-G）
+
+```json
+{ "date": "2026-04-15", "direction": "sales", "description": "A社へのコンサル料" }
+```
+
+実サーバの応答（3件のうち先頭1件）:
+
+```json
+{
+  "date": "2026-04-15",
+  "table": { "label": "kaikei-jp-data/tax/jp/2026.yaml",
+             "applies_from": "2026-01-01", "range": "2026-01-01 〜 無期限" },
+  "filtered_by": { "direction": "sales", "description_used_for_filtering": false },
+  "description": "A社へのコンサル料",
+  "count": 3,
+  "candidates": [
+    { "code": "SALES_10", "label": "課税売上 10%", "direction": "sales",
+      "rate": "0.10", "requires_qualified_invoice": false, "tax_account": "330",
+      "reason": "2026-04-15 時点で有効なマスタ「kaikei-jp-data/tax/jp/2026.yaml」（2026-01-01 〜 無期限）に、売上側の区分「課税売上 10%」として登録されています。税率は 0.10 です" }
+  ],
+  "disclaimer": "候補と根拠のみを返しています。どの区分を使うかの判断はこのサーバーでは行いません。候補は、指定された取引日の時点で有効な消費税区分マスタに登録されている区分です。取引内容の文面からの推論は行っていません。"
+}
+```
+
+**★断定しない形を仕様として固定する★**（`CLAUDE.md` §10 / D-087）:
+
+- **1件に絞らない。** 順位・信頼度・推奨に相当するキー（`recommended` /
+  `confidence` / `score` / `rank` / `selected` / `best`）を応答に置かない
+  （`crates/kaikei-mcp/src/tools/suggest_tax_category.rs` の
+  `the_response_does_not_single_out_one_category_or_rank_them` が
+  キー名を機械的に検査する）。
+- **`reason` はマスタに書かれている事実だけ**で構成する（適用期間・向き・
+  税率・適格請求書の要否・注記）。推論の説明ではないので、断定にも
+  言い換えにもならない。注記はマスタの文言をそのまま運ぶ。
+- **`description` は絞り込みに使わない。** 受け取ってそのまま echo し、
+  `filtered_by.description_used_for_filtering: false` と `disclaimer` で
+  使っていないことを明示する。摘要の語から税区分を決める規則は
+  このリポジトリのどの層にも無く（仕訳化ルールは Phase 4 の
+  `kaikei-import`）、無い規則を MCP 層で発明しないためである。
+  回帰検知は `the_description_is_echoed_but_never_used_to_filter`
+  （摘要を付けても候補が変わらないことを見る）。
+- 帳簿は一切変更しない（MC-08 の (2)。`Tx` を開かず DB にも触らない）。
+
+### validate_invoice_number（PR-G）
+
+```json
+{ "registration_number": "T7123456789012" }
+```
+
+実サーバの応答:
+
+```json
+{
+  "format_valid": true,
+  "registration_number": "T7123456789012",
+  "corporate_number": "7123456789012",
+  "checked": [
+    "先頭が T であること",
+    "T に続く部分が13文字であること",
+    "13文字がすべて半角数字であること",
+    "先頭1桁の検査用数字が残り12桁から計算した値と一致すること"
+  ],
+  "not_checked": [
+    "その番号が国税庁に実在登録されているかどうか",
+    "登録されている事業者が現時点で適格請求書発行事業者として有効かどうか",
+    "その事業者名・所在地がこの取引の相手方と一致するかどうか"
+  ],
+  "message": "形式（先頭の T・桁数・文字種・チェックデジット）は確認しました。この番号が実在するか、適格請求書発行事業者として有効かどうかは確認していません。取引先が適格請求書発行事業者かどうかの判断はこのサーバーでは行いません"
+}
+```
+
+- **キー名を `valid` にしない**（「登録番号として有効」と読める）。
+  確認したのは形式だけなので `format_valid` である。
+- **`checked` と `not_checked` を必ず並べる**（MC-28。§10 の「税務判断を
+  断定しない」はこの並記で担保する）。
+- 形式が不正なら**最初に失敗した観点だけ**を返す（D-053）。前後の空白は
+  トリムしない（D-052）ので、貼り付け由来の空白はここで見つかる（実物）:
+
+  ```json
+  { "error": "invoice_reg_no_missing_prefix",
+    "message": "インボイス登録番号は先頭が \"T\"（大文字）である必要があります: \" T7123456789012\"" }
+  ```
+
+  4つの観点が別々の分類コードを持つ理由は §6。
+
 ---
 
 ## 4. 実装方針
@@ -884,10 +1154,14 @@ D-071 の「ドメインのエラーは全てツール結果エラー」と両�
 | 経路 | 対象ツール | 呼び方 |
 |---|---|---|
 | (a) 書き込み | `post_journal_entry` / `reverse_journal_entry` | `usecase::post_entry::execute` / `reverse_entry::execute` を `tx::with_tx` で包んで呼ぶ。**`post_entry::execute` / `preview` は失敗値が `PostEntryFailure`（`error` + `notes`）なので `tx::with_tx_err` を使う**（`with_tx` は `AppError` 固定。両者は同じ実装を通る） |
-| (b) 読み取り（read model 直行） | `get_trial_balance` / `search_entries` / `get_ledger` / `get_entry` | `Tx` を通さず read model クエリを呼ぶ（`usecase::report::execute` は `ports::TrialBalanceQuery` と `context::BookSettings` を受け取る。`CLAUDE.md` §6「Repository を通さず SQL から DTO へ直行」） |
+| (b) 読み取り（read model 直行） | `get_trial_balance` / `search_entries` / `get_ledger` | `Tx` を通さず read model クエリを呼ぶ（`usecase::report::execute` は `ports::TrialBalanceQuery` と `context::BookSettings` を受け取る。`CLAUDE.md` §6「Repository を通さず SQL から DTO へ直行」） |
 | (c) 税制の問い合わせ | `list_tax_categories` / `get_settings` / `suggest_tax_category` / `validate_invoice_number` | `kaikei-app` を経由せず、合成ルートが保持する `kaikei-jp` の値（`TaxRuleSets::require_for_date`（該当なしをエラーにする入口。`for_date` は `Option` のまま） / `JpSettings` / `InvoiceRegistrationNo::parse`）から直接組み立てる |
 
-`list_accounts` は DB の `accounts`（`ChartRepo::load_chart`）を読む。
+`list_accounts` と **`get_entry`** は `Tx` 経由で読む（それぞれ
+`ChartRepo::load_chart` と `JournalRepo::find_entry`。集計ではなく
+「マスタ1枚」「集約1件」の取得であり、read model を新設しない。D-086）。
+記帳が科目・仕訳を解決するのと同じ経路なので、**ツールの応答と記帳が見ている
+帳簿が食い違わない**。
 
 ### Phase 3 で新設が必要なもの
 
@@ -1458,7 +1732,7 @@ AI が取るべき次の手が違う。
 | 5 | **接続ロールの権限検査**（§8） | stderr。保持している権限を名指しし、`kaikei_app` を指すよう案内する |
 | 6 | **勘定科目マスタの投入**（追加のみ・冪等。D-081） | stderr。投入件数と、既存を優先した科目の差異 |
 
-### PR-G への申し送り: `kept_existing` の出口を stderr だけにしない
+### `kept_existing` の出口を stderr だけにしない（**PR-G で実装済み**）
 
 勘定科目マスタの投入は、DB の科目定義がテンプレートと食い違っていても
 **既存を残して起動を続ける**（D-081）。記帳は DB の chart を正とするので
@@ -1475,6 +1749,12 @@ AI が取るべき次の手が違う。
 科目コードと相違フィールドを返す（`ChartDifference::describe` の文言をそのまま
 使えばよい）。AI が `get_settings` を読めば、`list_accounts` が返す名称が
 テンプレートと違う理由を自分で説明できるようになる。
+
+→ **PR-G で実装した**（D-087）。合成ルート（`startup::assemble`）が
+`imported.kept_existing` を `Runtime::chart_differences` に持たせ、
+`get_settings` が `chart_differences` として返す（形は §3）。
+**stderr への出力はやめていない**——起動時の診断としては引き続き出し、
+出口を1つ増やしただけである。
 
 `defaults_as_of`（`ComposeOptions`）には**起動時点の UTC 日付**を渡す。
 「今日が何日か」の決定は presentation 層の責務であり、`kaikei-app` の
@@ -1969,20 +2249,20 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 
 | # | ケース | 期待 |
 |---|---|---|
-| MC-08 | `suggest_tax_category` | (1) 根拠が空でない、(2) 呼び出しの前後で**帳簿が一切変わらない**（試算表と仕訳件数が不変。§1 ② の機械的検証） |
-| MC-28 | `validate_invoice_number` の出力 | 形式検証の結果のみを述べ、「実在する／実在しない」と断定しない（`CLAUDE.md` §10） |
+| MC-08 | `suggest_tax_category` | (1) 根拠が空でない、(2) 呼び出しの前後で**帳簿が一切変わらない**（試算表と仕訳件数が不変。§1 ② の機械的検証）。**PR-G で実装**: 候補ごとの `reason` は `crates/kaikei-mcp/src/tools/suggest_tax_category.rs` の `every_candidate_carries_a_non_empty_reason`、帳簿が動かないことは `crates/kaikei-e2e/tests/mcp_stdio_server.rs` の `the_read_tools_answer_through_the_real_binary_and_are_audited`（読み取り・提案を8回呼んで `journal_entries` が1件のまま）。**断定しないこと**は `the_response_does_not_single_out_one_category_or_rank_them`（順位・信頼度のキーが無い）と `the_description_is_echoed_but_never_used_to_filter`（摘要で候補が変わらない）が見る（D-087） |
+| MC-28 | `validate_invoice_number` の出力 | 形式検証の結果のみを述べ、「実在する／実在しない」と断定しない（`CLAUDE.md` §10）。**PR-G で実装**: `crates/kaikei-mcp/src/tools/validate_invoice_number.rs` の `a_well_formed_number_reports_the_format_only_without_claiming_it_exists`（`not_checked` が空でないこと・断定に読める語が無いこと・キー名が `valid` でないこと）と `each_failed_check_has_its_own_error_code`（D-053 の4観点） |
 
 ### 読み取り系
 
 | # | ケース | 期待 |
 |---|---|---|
-| MC-13 | `list_accounts` | 科目種別（`account_type`）と**記帳可否（`postable`）**を含めて返す |
-| MC-14 | `get_entry` | 存在する仕訳の明細・タグを返す。存在しない ID では次の手が分かる NotFound を返し、**仕訳IDは UUID の正準表記**で示す（10進表記にしない。§3。`reverse_journal_entry` 側は PR-B で解決済み） |
-| MC-15 | `get_trial_balance` | 期間で絞り込める。`group_by` 指定が効く。借方合計＝貸方合計。`from > to` はエラー（空結果にしない） |
+| MC-13 | `list_accounts` | 科目種別（`account_type`）と**記帳可否（`postable`）**を含めて返す。**PR-G で実装**: `crates/kaikei-mcp/src/tools/list_accounts.rs` の `every_account_carries_its_type_and_whether_it_can_be_posted_to`（並びが科目コード昇順であることも見る）と `postable_only_hides_the_headings_and_says_so_in_the_response`。実バイナリ経由は `crates/kaikei-e2e/tests/mcp_stdio_server.rs`。**同梱テンプレートの科目は現時点で全て記帳可能**なので、見出し科目を含む絞り込みの検査は単体側にある |
+| MC-14 | `get_entry` | 存在する仕訳の明細・タグを返す。存在しない ID では次の手が分かる NotFound を返し、**仕訳IDは UUID の正準表記**で示す（10進表記にしない。§3。`reverse_journal_entry` 側は PR-B で解決済み）。**PR-G で実装**: `crates/kaikei-mcp/src/tools/get_entry.rs` の `a_missing_entry_is_reported_as_not_found_with_the_canonical_uuid`（10進表記が漏れていないことも見る）／`a_reversal_entry_points_at_the_original_and_carries_the_reason`。read model は新設していない（`JournalRepo::find_entry`。D-086） |
+| MC-15 | `get_trial_balance` | 期間で絞り込める。`group_by` 指定が効く。借方合計＝貸方合計。`from > to` はエラー（空結果にしない）。**PR-G で実装**: 実 DB は `crates/kaikei-e2e/tests/mcp_stdio_server.rs` の `the_read_tools_answer_through_the_real_binary_and_are_audited`（`group_by: ["tax_category"]` が効くこと）と `the_read_tools_tell_an_empty_result_apart_from_a_bad_request`（0行の期間は成功・`from > to` は `rejected`）。応答の詰め替えは `crates/kaikei-mcp/src/tools/get_trial_balance.rs` の単体検査 |
 | MC-16 | `search_entries` | 日付・金額・科目・摘要で絞り込める。**0件でも成功として空配列を返す**（エラーにしない） |
 | MC-17 | `get_ledger` | 科目別に借方・貸方・残高を返す。期間指定が効く |
-| MC-18 | `list_tax_categories` | 指定日時点で有効な区分のみを返す。取引日で切り替わる（D-050 / D-055）。該当マスタが無い日付では**エラー**で、メッセージに有効期間が含まれる |
-| MC-19 | `get_settings` | 起動時に合成した `JpSettings`（税抜/税込・端数処理・端数処理単位・課税事業者区分・簡易課税）をそのまま返す。日付引数を取らない |
+| MC-18 | `list_tax_categories` | 指定日時点で有効な区分のみを返す。取引日で切り替わる（D-050 / D-055）。該当マスタが無い日付では**エラー**で、メッセージに有効期間が含まれる。**PR-G で実装**: `crates/kaikei-mcp/src/tools/list_tax_categories.rs` の `the_categories_valid_on_the_given_date_are_returned_with_their_source_table` / `a_date_outside_the_embedded_masters_is_an_error_that_shows_the_available_range`。**収録外になるのは開始日より前**である（同梱マスタの `applies_to` は未指定＝未来側は開いている） |
+| MC-19 | `get_settings` | 起動時に合成した `JpSettings`（税抜/税込・端数処理・端数処理単位・課税事業者区分・簡易課税）をそのまま返す。日付引数を取らない。**PR-G で実装**: `crates/kaikei-mcp/src/tools/get_settings.rs` の `the_composed_settings_are_returned_with_their_machine_readable_codes` / `the_input_takes_no_arguments` / `accounts_kept_from_the_database_are_reported_in_the_response`（§7 の申し送り。D-087） |
 
 ### プロトコル・契約
 
@@ -2012,7 +2292,7 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 
 | # | ケース | 期待 |
 |---|---|---|
-| MC-11 | 全ツール呼び出しが audit_log に記録される | 1回のツール呼び出しにつき**同一 `request_id` で2行**（`status='started'` と `status='ok'\|'error'`）が残る。`tool` 列が呼び出したツール名と一致する。書き込み系は結果レコードの `entry_id` が返した仕訳IDと一致する。**Phase 3 の全11ツールに対して総当たりで確認する**（1ツールだけのサンプル検査にしない）。**PR-F で書き込み系2件を実装**（`crates/kaikei-e2e/tests/mcp_write_tools.rs`）。残り9件は PR-G / PR-H。なお**「総当たり」の性質そのものは PR-F で大部分が構造に移った**——ツールをレジストリに載せる経路が `ToolRegistry::with::<T: McpTool>` の1本しか無く、その中身が必ず `dispatch::call`（監査ログで挟む）である。ただし「監査ログを通らないツールを書けない」を成立させているのは**型だけではない**（`rmcp` を直接名指しすれば別のルータを作れる）。そこを閉じているのは `rmcp` を名指しできるファイルの許可リスト（`crates/kaikei-mcp/tests/audit_is_structural.rs` の `rmcp_is_named_only_in_the_files_allowed_to_name_it`。D-084 の訂正注記3）である。総当たりのテストは、その構造が守られていることを実 DB で追認するものになった |
+| MC-11 | 全ツール呼び出しが audit_log に記録される | 1回のツール呼び出しにつき**同一 `request_id` で2行**（`status='started'` と `status='ok'\|'error'`）が残る。`tool` 列が呼び出したツール名と一致する。書き込み系は結果レコードの `entry_id` が返した仕訳IDと一致する。**Phase 3 の全11ツールに対して総当たりで確認する**（1ツールだけのサンプル検査にしない）。**PR-F で書き込み系2件を実装**（`crates/kaikei-e2e/tests/mcp_write_tools.rs`）。**PR-G で読み取り系・提案系7件**（`crates/kaikei-e2e/tests/mcp_stdio_server.rs`。呼び出した順に `(tool, status)` の対を突き合わせる）。残り2件（`search_entries` / `get_ledger`）は PR-H。なお**「総当たり」の性質そのものは PR-F で大部分が構造に移った**——ツールをレジストリに載せる経路が `ToolRegistry::with::<T: McpTool>` の1本しか無く、その中身が必ず `dispatch::call`（監査ログで挟む）である。ただし「監査ログを通らないツールを書けない」を成立させているのは**型だけではない**（`rmcp` を直接名指しすれば別のルータを作れる）。そこを閉じているのは `rmcp` を名指しできるファイルの許可リスト（`crates/kaikei-mcp/tests/audit_is_structural.rs` の `rmcp_is_named_only_in_the_files_allowed_to_name_it`。D-084 の訂正注記3）である。総当たりのテストは、その構造が守られていることを実 DB で追認するものになった |
 | MC-20 | 開始レコードの書き込みが失敗する状況（audit 用接続を落とす、または `REVOKE INSERT ON audit_log FROM kaikei_app`）で post | ツールは `isError: true` を返し、**帳簿には1件も入っていない**（fail-closed） |
 | MC-21 | 結果レコードの書き込みだけが失敗 | 記帳は成功として返り、警告が添えられる。開始レコードだけが残り「結果不明」として識別できる（fail-open） |
 | MC-22 | 記帳が失敗（貸借不一致等）してトランザクションが rollback される | **開始レコードは audit_log に残る。** D-070 の存在理由そのもの（同一トランザクションで書く実装に退行したら、このテストだけが落ちる） |
@@ -2036,7 +2316,16 @@ PR-C の同名テストは `AuditSink` と `with_tx` を直接組み合わせて
 （`an_unbalanced_entry_is_rejected_with_a_hint_while_the_audit_rows_survive`）。
 
 MC-11 のうち「**Phase 3 の全11ツールに対して総当たり**」は、書き込み系2件が
-PR-F で済み、残り9件が PR-G / PR-H の担当として残る。
+PR-F、読み取り系・提案系7件が **PR-G**（`crates/kaikei-e2e/tests/mcp_stdio_server.rs`
+の `the_read_tools_answer_through_the_real_binary_and_are_audited` と
+`the_read_tools_tell_an_empty_result_apart_from_a_bad_request` が、
+**呼び出した順に `(tool, status)` の対**を突き合わせる）で済んだ。
+残るのは `search_entries` / `get_ledger` の2件（PR-H）である。
+
+**読み取り系も同じ経路（`dispatch::call`）を通り、成功・失敗を問わず2行残る**
+（§9 の1行目。D-086）。読み取りで `audit_log` が伸びることは受け入れる——
+「誰がいつ何を読んだか」も監査の対象であり、間引く仕組みを入れると
+**間引きの条件そのものが監査ログを通らない経路**になる。
 
 ### Phase 4 以降に延期したケース（行を消さない）
 

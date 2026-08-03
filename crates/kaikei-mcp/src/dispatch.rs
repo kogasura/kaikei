@@ -147,9 +147,11 @@ use kaikei_app::clock::SystemClock;
 use kaikei_app::context::BookSettings;
 use kaikei_app::error::codes;
 use kaikei_app::id::UuidV7IdGenerator;
+use kaikei_app::usecase::import_chart::ChartDifference;
 use kaikei_core::EntryId;
 use kaikei_jp::compose::Composition;
 use kaikei_store::pool::PgStore;
+use kaikei_store::query::PgTrialBalanceQuery;
 use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
 use rmcp::handler::server::tool::{schema_for_input, ToolCallContext};
 use rmcp::model::{
@@ -244,6 +246,24 @@ impl<'a> ToolContext<'a> {
     /// 帳簿の読み書き（`kaikei_app` ロール）。
     pub fn store(&self) -> &'a PgStore {
         self.runtime.store.as_ref()
+    }
+
+    /// 試算表の read model（`Store` / `Tx` を経由しない。`CLAUDE.md` §6）。
+    ///
+    /// 読み取り系ツールはここから引き、`store()` 側の
+    /// [`kaikei_app::ports::JournalRepo`] で全件ロードして自分で集計する
+    /// ようなことはしない（`DECISIONS.md` D-086）。
+    pub fn trial_balance_query(&self) -> &'a PgTrialBalanceQuery {
+        self.runtime.trial_balance.as_ref()
+    }
+
+    /// 起動時にテンプレートと定義が食い違い、**既存を残した**科目
+    /// （`DECISIONS.md` D-081 / D-086）。
+    ///
+    /// `get_settings` がこれを応答に載せる。stderr だけを出口にしないため
+    /// （`docs/07-mcp-server.md` §7 の PR-G への申し送り）。
+    pub fn chart_differences(&self) -> &'a [ChartDifference] {
+        &self.runtime.chart_differences
     }
 
     /// `kaikei-jp` の組み立て結果（税額計算 policy・タグ定義・科目テンプレート）。

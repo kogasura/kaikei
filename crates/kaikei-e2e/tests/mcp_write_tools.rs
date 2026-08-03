@@ -54,6 +54,7 @@ use kaikei_mcp::tools::post_journal_entry::PostJournalEntry;
 use kaikei_mcp::tools::reverse_journal_entry::ReverseJournalEntry;
 use kaikei_store::audit::PgAuditSink;
 use kaikei_store::pool::PgStore;
+use kaikei_store::query::PgTrialBalanceQuery;
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -111,6 +112,9 @@ async fn runtime_with(app: &PgPool, options: ComposeOptions) -> Runtime {
     seed_chart(app, &composition.chart).await;
     Runtime {
         store: Arc::new(PgStore::new(app.clone())),
+        // read model は書き込み側（`PgStore`）を経由しない
+        // （`CLAUDE.md` §6。本番の `assemble` と同じ形）。
+        trial_balance: Arc::new(PgTrialBalanceQuery::new(app.clone())),
         // 帳簿と**同じプール**から別の接続を acquire する（本番と同じ形。
         // 分離の実体は「別プール」ではなく「トランザクションを経由しない」
         // ことである。`docs/07-mcp-server.md` §9）。
@@ -119,6 +123,10 @@ async fn runtime_with(app: &PgPool, options: ComposeOptions) -> Runtime {
         book_settings: book_settings(),
         id_gen: UuidV7IdGenerator,
         clock: SystemClock,
+        // このテストはテンプレートと同じ定義を投入するので食い違いは出ない
+        // （食い違いを `get_settings` が返すことは `kaikei-mcp` 側の単体検査が
+        // 見る。`DECISIONS.md` D-086）。
+        chart_differences: Vec::new(),
     }
 }
 

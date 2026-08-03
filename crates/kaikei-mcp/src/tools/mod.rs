@@ -18,8 +18,15 @@
 //! - **業務判断**。税額行を足すかどうか、締まっているかどうかの判定は
 //!   `kaikei-app` のユースケースと `kaikei-jp` の policy が行う。
 
+pub mod get_entry;
+pub mod get_settings;
+pub mod get_trial_balance;
+pub mod list_accounts;
+pub mod list_tax_categories;
 pub mod post_journal_entry;
 pub mod reverse_journal_entry;
+pub mod suggest_tax_category;
+pub mod validate_invoice_number;
 
 use kaikei_app::error::AppError;
 use kaikei_core::{AccountingDate, CoreError};

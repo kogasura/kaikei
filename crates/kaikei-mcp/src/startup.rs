@@ -45,7 +45,7 @@ use kaikei_app::clock::SystemClock;
 use kaikei_app::context::BookSettings;
 use kaikei_app::id::UuidV7IdGenerator;
 use kaikei_app::tx::with_tx;
-use kaikei_app::usecase::import_chart;
+use kaikei_app::usecase::import_chart::{self, ChartDifference};
 use kaikei_core::{AccountingDate, Clock};
 use kaikei_jp::compose::{compose, ComposeError, ComposeOptions, Composition};
 use kaikei_jp::error::JpError;
@@ -53,6 +53,7 @@ use kaikei_jp::tax::TaxRuleSets;
 use kaikei_store::audit::PgAuditSink;
 use kaikei_store::convert::{naive_date_to_accounting_date, timestamp_to_datetime};
 use kaikei_store::pool::{connect_app_with, inspect_journal_privileges, PgStore};
+use kaikei_store::query::PgTrialBalanceQuery;
 use std::fmt;
 use std::sync::Arc;
 
@@ -69,6 +70,13 @@ pub struct Runtime {
     ///
     /// trait object にせず具象型を持つ（`DECISIONS.md` D-029）。
     pub store: Arc<PgStore>,
+
+    /// 試算表の read model（**`Store` / `Tx` を経由しない**）。
+    ///
+    /// `CLAUDE.md` §6「read model は物理的に分離する。Repository を通さず
+    /// SQL から DTO へ直行する」。書き込み側（[`Runtime::store`]）とは
+    /// 別の入口としてここに置く（PR-G。`DECISIONS.md` D-086）。
+    pub trial_balance: Arc<PgTrialBalanceQuery>,
 
     /// 監査ログの記録先。**帳簿とは別のコネクション**で書く
     /// （`DECISIONS.md` D-070 / D-075）。
@@ -95,6 +103,21 @@ pub struct Runtime {
 
     /// 記帳時刻の取得。`Utc::now()` を直に呼ばずこれを通す（`CLAUDE.md` §7）。
     pub clock: SystemClock,
+
+    /// 起動時の科目投入で、**テンプレートと定義が食い違ったため既存を残した**
+    /// 科目（`DECISIONS.md` D-081 の `ImportChartOutput::kept_existing`）。
+    ///
+    /// # なぜ実行時依存として持つのか（PR-E からの申し送り）
+    ///
+    /// `docs/07-mcp-server.md` §7「PR-G への申し送り」より: この食い違いの
+    /// **唯一の出口が stderr** だった。`DECISIONS.md` D-082 は「未設定を
+    /// 警告付きで既定値にする」案を「警告は stderr にしか出ず、AI にも
+    /// 利用者にも届かない（MCP クライアントがサーバの stderr を表示する
+    /// 保証は無い）」という理由で却下しており、同じ理由がここにも当てはまる。
+    ///
+    /// `get_settings` がこれを返すことで、AI は `list_accounts` が返す名称が
+    /// テンプレートと違う理由を自分で説明できるようになる。
+    pub chart_differences: Vec<ChartDifference>,
 }
 
 /// [`assemble`] の結果。
@@ -186,6 +209,9 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
     }
 
     let store = Arc::new(PgStore::new(pool.clone()));
+    // read model は書き込み側（`PgStore`）を経由せず、自前で同じプールから
+    // 引く（`CLAUDE.md` §6）。
+    let trial_balance = Arc::new(PgTrialBalanceQuery::new(pool.clone()));
     let audit_sink = Arc::new(PgAuditSink::new(pool));
 
     // 4. 勘定科目マスタの投入（追加のみ・冪等。`DECISIONS.md` D-081）。
@@ -215,16 +241,20 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
         imported.summary(),
     ];
     // 差異は握り潰さない（既存を残したことと、その内容を必ず知らせる）。
+    // **stderr だけを出口にしない**（`Runtime::chart_differences` に持たせ、
+    // `get_settings` からも読めるようにする。§7 の PR-G への申し送り）。
     diagnostics.extend(imported.kept_existing.iter().map(|d| d.describe()));
 
     Ok(Startup {
         runtime: Arc::new(Runtime {
             store,
+            trial_balance,
             audit_sink,
             composition: Arc::new(composition),
             book_settings: config.book_settings,
             id_gen: UuidV7IdGenerator,
             clock,
+            chart_differences: imported.kept_existing,
         }),
         diagnostics,
     })
