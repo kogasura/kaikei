@@ -2789,3 +2789,137 @@ docs/07 §3 が挙げた3案のうち (a)）。
 （`UnregisteredTagKey` / `InvalidTagValue` / `DuplicateTagKeyInInput` /
 `NoApplicableTaxRuleSet`）に対する分類コードは、`JpError` 用の対応表ごと
 `kaikei-mcp` 側に置く（D-072 トレードオフの項、`docs/07-mcp-server.md` §6）。
+→ **PR-D で完了**（D-080）。
+
+---
+
+## D-078 `kaikei-mcp` の「してはいけないこと」は許可リストと禁止リストの両方で閉じる
+
+**決定**: Phase 3 PR-D（`kaikei-mcp` の骨組み）で、この層に対する機械的な歯止めを
+2つ置く。どちらも**許可リストと禁止リストの両方**から閉じる。
+
+1. **ツールレジストリ**（`docs/07-mcp-server.md` §10 MC-10）
+   - 禁止側: `delete_journal_entry` / `update_journal_entry` / `execute_sql` /
+     `reopen_period` の4件を**テスト側の定数**にして**ループで**検査する
+     （`crates/kaikei-mcp/tests/forbidden_tools.rs`）。
+   - 許可側: 登録されているツールが `docs/07-mcp-server.md` §2 の
+     **Phase 3 の11件**のいずれかであることも検査する。
+   - 検査対象はレジストリ（`ToolRouter`）から導出する。実装側のツール名の
+     一覧をテストに書き写さない。
+2. **依存の最小性**（同 §10 MC-30）
+   - `.github/workflows/architecture.yml` の既存ジョブ `dependency-direction` に
+     **ステップを追加**する（新しいジョブは作らない）。
+   - **許可リスト**方式にする: `kaikei-core` / `kaikei-app` / `kaikei-jp` /
+     `kaikei-store` / `rmcp` / `tokio` / `serde` / `serde_json` / `schemars`。
+   - `cargo tree` に `--edges` を**指定しない**（既定の `normal,build,dev`）。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 禁止4件のうち代表1件だけを検査する | `docs/07-mcp-server.md` §10 が明示的に禁じている。1件だけの検査では他の3件が復活しても緑のまま通る。4件は**理由が同じではない**（D-014 の3件と、締めが Phase 4 以降だから作りようがない `reopen_period`）ので、片方の理由が変わったときに巻き添えで検査が消えるのも避けたい |
+| 禁止リストだけで閉じる（許可リストを作らない） | `drop_journal_entries` のような**新しい名前**の破壊的ツールが増えても緑のまま通る。禁止リストは「既に思いついた名前」しか守れない |
+| 許可リストだけで閉じる（禁止リストを作らない） | 禁止4件は「なぜ無いのか」の記録そのものである。一覧が消えると実装者が善意で復活させる（`docs/07-mcp-server.md` §10 の「行を消さない」と同じ理由） |
+| 実装側のツール名一覧をテストに手で持つ | 「手で維持する一覧は必ず腐る」（`PROGRESS.md` Phase 1 の教訓6）。許可リストは**設計書 §2 の写し**なので手で持つが、**実装側の一覧は必ずレジストリから導出する** |
+| MC-10 を実プロセスの stdio ハンドシェイク（`tools/list` の JSON）で検査する | `tools/call` を直接叩くには `RequestContext` が要り、その構築に必要な `rmcp::service::Peer::new` は `pub(crate)` で外部 crate から組み立てられない。実プロセスで見るには起動バイナリ（＝合成ルート。PR-E）と実 DB が要る。`#[tool_handler]` が生成する `list_tools` / `get_tool` は同じ `ToolRouter` を引くので、レジストリを見る検査と結果は同一である |
+| 依存検査を**禁止リスト**（`uuid` / `rust_decimal` を弾く）にする | 「uuid と rust_decimal さえ無ければよい」ではない。線上表現を `kaikei-app` / `kaikei-jp` から取る限りこの層に依存が増える理由は無く、増えたこと自体が「MCP は薄い層」（`docs/07-mcp-server.md` §4）を疑うべき兆候である。次に何が生えるかを先に列挙できない |
+| 依存検査を `--edges normal` で行う（他のステップと揃える） | `uuid` を **dev-dependency** として足してテストで使う抜け道が残る（D-047 の注記、`kaikei-e2e` のステップと同型の穴）。実測でも `--edges normal` では dev-dependency の `rust_decimal` が見えず、既定の edges では検出できた |
+| 依存検査を新しい CI ジョブにする | 新しいジョブは必須チェックへの登録（ブランチ保護の変更）が要り、登録を忘れると「失敗してもマージできる」状態になる（`CLAUDE.md` §13）。既存ジョブへのステップ追加なら、その日から `dependency-direction` の一部として必須チェックに含まれる |
+| `sqlx` を許可リストに入れる | `kaikei-mcp` は合成ルートなので `PgStore` は要るが、接続の生成（`connect_app`）も含めて `kaikei-store` が公開している。sqlx の型を MCP 層が直接触りたくなったら、それは `kaikei-store` の公開 API が足りていないという**別の問題**であり、ここで許可して隠してはいけない |
+| `kaikei-store` を許可リストから外す（PR-E で足させる） | `kaikei-mcp` が本番で最初の合成ルートになることは `docs/07-mcp-server.md` §4 で決まっており、`Arc<PgStore>` を持つのは既定路線である。ここで外すと PR-E が「CI を緩める PR」になり、検査を緩めること自体が普通の作業に見えてしまう。**判断はこの決定で済ませ、PR-E は CI を触らない** |
+
+**理由**: この層で守りたいのは「AI に開いてよい操作の集合」と「薄さ」の2つで、
+どちらも**書き忘れではなく書き足しによって壊れる**性質を持つ。
+書き足しを検出するには、既知の悪い名前を並べるだけでは足りない。
+
+**トレードオフ**: 許可リストが2箇所（テストの `PHASE_3_TOOLS` と CI の
+`ALLOWED`）に増えた。前者は設計書 §2 の写しなので、ツールを増やす PR は
+設計書とテストの両方を触ることになる（これは意図した摩擦である）。
+後者は依存を増やす PR に説明を強制する。どちらも「増やすとき」にだけ効く
+コストで、日常の作業には現れない。
+
+---
+
+## D-079 線上の金額は `wire.rs` の `AmountStr` にし、`serde_json::Value` 経由で number を拒否する
+
+**決定**:
+
+1. 金額の線上型は `crates/kaikei-mcp/src/wire.rs` の **`AmountStr`**（newtype）にする。
+   **`kaikei-mcp/src/amount.rs` は作らない**（`docs/07-mcp-server.md` §5）。
+   文字列化は `kaikei_app::amount::money_to_plain_string` に委ね、
+   この層は詰め替えだけを行う。
+2. `Deserialize` は手書きし、**一度 `serde_json::Value` として受けてから**
+   文字列かどうかを判定する。文字列以外（number / bool / null / 配列 /
+   オブジェクト）はすべて同じ**日本語**のメッセージで拒否する。
+3. `JsonSchema` は `#[schemars(with = "String")]` で `"type": "string"` を出す。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| 素の `String` フィールドにする | serde が組み立てる `invalid type: integer 110000, expected a string` という**英語の型エラー**しか AI に届かない。`CLAUDE.md` §11 を満たさない（D-019 が `{:?}` の英語バリアント名を禁じたのと同型） |
+| `deserializer.deserialize_str(..)` + 独自 Visitor | number を受け取った時点で **serde 側が** `invalid_type` を組み立ててしまい、Visitor に制御が渡らない。custom メッセージが無視される（実測） |
+| `deserialize_any` + 独自 Visitor（`visit_i64` / `visit_f64` …） | 機能的には成立するが、`visit_f64` の引数型としてソースに浮動小数点の型名が現れ、`.github/workflows/architecture.yml` の「f64 が金額に使われていない」ステップ（コメント行以外の該当語を全て落とす）が**必ず赤になる**。この CI は `CLAUDE.md` §8 の中核であり、迂回のために緩めない |
+| 整数の number だけ受理する（警告を添える） | D-013 の訂正注記で Phase 3 が却下済み。サーバに届いた時点では、クライアント側で既に倍精度に丸められたかどうかを**サーバから検出できない**。受理すれば「警告付きで壊れた金額を記帳する」ことになる |
+| `kaikei-mcp/src/amount.rs` に整形も含めて置く（初版の構成案） | 同じ整形が `kaikei-app` と2箇所に育つ。`kaikei-api`（Phase 4）も同じ形式を返す必要があり、presentation 層ごとに持つと必ずずれる（`docs/07-mcp-server.md` §5・D-072） |
+| `Money` に `Serialize` / `Deserialize` を実装する | `kaikei-core` への serde 参照は CI が機械的に禁じている。上位層の都合で凍結層に依存を足さない（`CLAUDE.md` §1） |
+
+**理由**: 「number を弾く」は仕様だが、**どう弾くか**が `CLAUDE.md` §11 と §8 の
+両方に触れる。§11（日本語で次の手を示す）を満たそうとして §8 の CI（f64 禁止）を
+踏む、という組み合わせが実在したため、両方を満たす形を決定として残す。
+
+**トレードオフ**: `serde_json::Value` を1度経由するぶん、自己記述的でない
+シリアライズ形式では使えない。MCP の入力は常に JSON なので実害は無いが、
+将来 `kaikei-api` が別形式を受けるようになったらここは再検討になる。
+また `AmountStr` は**書式の検証をしない**（`Money::parse` に通すまで
+「金額として妥当か」は分からない）。通貨ごとに小数桁が違う以上、通貨を
+伴わずに検証はできないので、これは意図した分業である。
+
+---
+
+## D-080 `JpError` の分類コードは既存語彙を最優先で再利用し、ロード失敗は1つに集約する
+
+**決定**: `crates/kaikei-mcp/src/error.rs` に `jp_error_code`（**網羅 `match`**）を置く。
+`kaikei-app` は `kaikei-jp` に依存できない（`CLAUDE.md` §1）ため、
+`JpError` の写像表はここが唯一の置き場になる（`docs/07-mcp-server.md` §6）。
+
+- **既存語彙を再利用する**: `UnregisteredTagKey` → `unknown_tag_key`、
+  `InvalidTagValue` → `tag_type_mismatch`、`NoApplicableTaxRuleSet` →
+  `no_applicable_rule_set`、`UnknownTaxCategoryCode` → `unknown_tax_category`、
+  `InvalidBusinessRatio` → `invalid_value`、`InvalidHouseholdSplitTotal` →
+  `invalid_amount`、`Core(_)` は中身の `CoreError` へ委譲。
+- **新しく起こすのは6件だけ**: `invoice_reg_no_missing_prefix` /
+  `invoice_reg_no_wrong_length` / `invoice_reg_no_non_digit` /
+  `invoice_reg_no_check_digit` / `duplicate_tag_key` / `invalid_setting_code`。
+- **マスタ・設定のロード失敗10件は `invalid_policy_data` に集約する**
+  （`YamlParse` / `Io` / `InvalidTaxCategoryTable` / `OverlappingTaxPeriods` /
+  `InvalidChart` / `InvalidTagSchema` / `MissingClosingAccount` /
+  `NotPostableClosingAccount` / `DuplicateClosingAccount` /
+  `ClosingTagSchemaMismatch`）。
+- 応答は `ToolError` にまとめ、**`CallToolResult::structured_error`**
+  （`isError: true` + `structuredContent` + 同じ JSON のテキスト）で返す。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `JpError` にも層ごとの接頭辞付きコードを新しく起こす（`jp_unknown_tag_key` 等） | 層ごとの接頭辞を付けないのが D-072 の規約。AI が読むのは「何が起きたか」であって「どの crate が返したか」ではない。同じ意味に2つの綴りがあると、AI の分岐が両方を知らないと動かなくなる |
+| 登録番号の4件を1つのコード（`invalid_invoice_reg_no`）にまとめる | 検証順は「先頭文字 → 桁数 → 文字種 → チェックデジット」に固定されており、**最初に失敗した観点だけ**が返る（D-053）。1つに潰すと、AI は何を直すのかを本文の日本語から推測するしかない。分類コードを機械可読にしている意味が消える |
+| `DuplicateTagKeyInInput` を `unknown_tag_key` に寄せる | 次の手が違う（綴りを直すのではなく、重複した指定を1つにまとめる）。`invalid_entry_id` を `not_found` と分けたのと同型の判断（D-072） |
+| マスタ・設定のロード失敗に新しいコード（`master_data_invalid` 等）を起こす | `PolicyError::InvalidPolicyData` が既に「policy が構築時に受け取ったデータが不正」であり、意味が一致する。**既に語彙がある概念に別名を作らない**（`docs/07-mcp-server.md` §6）。なおこれらは通常ツール応答に現れない——設定・マスタの不備は起動時に検出して起動を中止する（同 §7） |
+| ロード失敗を `internal` に潰す | `internal` は**下流が知らないバリアントに出会ったときの受け皿**であり、既知のエラーに使う値ではない（`kaikei_app::error::codes::INTERNAL` の doc） |
+| ロード失敗を `backend` に寄せる（`Io` は I/O 失敗だから） | `backend` は `RepoError::Backend`＝**永続化層**の失敗である。同梱 YAML が読めないことに対して「時間をおいて再試行するか管理者に連絡」と案内するのは誤診で、D-038 が潰したのと同じクラスの欠陥になる |
+| `jp_error_code` にワイルドカードの腕を置く | `JpError` は `#[non_exhaustive]` ではない（意図的。`kaikei-jp/src/error.rs` の doc）。受け皿があるとバリアント追加時にコンパイルが壊れず、新しいバリアントが黙って既定コードになる（D-072 訂正注記と同じ理由） |
+| 応答を `CallToolResult::error`（テキストのみ）で返す | 構造化コンテンツを読むクライアントに対して `error` / `message` を機械的に取り出す経路が無くなる。逆に `structured` だけにすると、構造化コンテンツをモデルに見せないクライアントで本文が AI に届かない。`structured_error` は**同じ JSON をテキストとしても**載せるので両方を満たす |
+| ドメインのエラーを JSON-RPC のプロトコルエラーで返す | D-071 で却下済み。プロトコルエラーを使うのは未知のツール名など、ツール呼び出しに到達できない異常に限る |
+
+**理由**: 分類コードは AI の分岐に使われる**安定した識別子**であり、
+増やすこと自体にコストがある（`audit_log.error_code` を読む側も追随が要る）。
+一方で、意味の違うものを同じコードに潰すと AI が誤った次の手に進む。
+「既存語彙を最優先で再利用し、次の手が違うものだけ新しく起こす」を判断基準にする。
+
+**トレードオフ**: `invalid_policy_data` に10バリアントが集まったため、
+このコードだけを見ても「YAML の構文エラー」なのか「決算科目の設定ミス」なのかは
+分からない。ただし区別が要るのは**運用者**であって AI ではなく、運用者向けの
+情報は `message`（`JpError` の `Display`。どのファイルの何が悪いかを含む）と
+サーバのログに残っている。
