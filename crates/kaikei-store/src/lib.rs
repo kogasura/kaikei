@@ -17,6 +17,10 @@
 //!   の実装本体と、`JournalRepo`/`ChartRepo`/`PeriodRepo`/`NumberingRepo` の
 //!   各 PostgreSQL 実装（`PgTx` 自体は crate 内部の実装詳細であり公開しない。
 //!   利用側は [`pool::PgStore`] と `kaikei_app::tx::with_tx` を経由する）
+//! - [`audit`][]: `AuditSink`（監査ログ）の実装（[`audit::PgAuditSink`]）。
+//!   **帳簿とは別のコネクション**で書く（`PgTx` を経由しない）。
+//!   `with_tx` の rollback で監査ログが消えないことが設計の要点
+//!   （`DECISIONS.md` D-070 / D-075）
 //! - [`query`]: `TrialBalanceQuery`（試算表）の SQL 集計による実装
 //!   （`kaikei_app::ports::TrialBalanceQuery` を実装する
 //!   `query::PgTrialBalanceQuery`）。書き込みと違い `Store`/`PgTx` を
@@ -26,6 +30,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod audit;
 mod chart;
 pub mod convert;
 pub mod error;

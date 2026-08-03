@@ -84,3 +84,8 @@ required-features = ["pg-tests"]
 name = "e2e_usecase"
 path = "tests/e2e_usecase.rs"
 required-features = ["pg-tests"]
+
+[[test]]
+name = "audit_log"
+path = "tests/audit_log.rs"
+required-features = ["pg-tests"]
