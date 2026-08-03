@@ -657,8 +657,15 @@ AI の自己修正を一段速くする効果は大きいが、
   登録＝ブランチ保護の変更は不要。`CLAUDE.md` §13）。**禁止リストではなく
   許可リスト**にしてある（`kaikei-core` / `kaikei-app` / `kaikei-jp` /
   `kaikei-store` / `rmcp` / `tokio` / `serde` / `serde_json` / `schemars`）。
-  `--edges` を指定せず既定（`normal,build,dev`）で見るので、
-  **dev-dependency 経由で `uuid` を足す抜け道も塞がっている**（D-079）。
+  依存の取得は **`cargo metadata --no-deps`**（`packages[].dependencies[].name`）で
+  行う。`cargo tree` は既定でホストターゲットに解決される依存しか見ないため、
+  `[target.'cfg(windows)'.dependencies]` の下に `uuid` を置くと ubuntu-latest の
+  CI を素通りする（レビュー2巡目で実測）。`cargo metadata` の宣言一覧は
+  **kind（normal / dev / build）・target 指定・optional を問わず全て**現れるので、
+  **dev-dependency 経由の抜け道も target-cfg 経由の抜け道も塞がる**（D-078）。
+  許可リストとの照合は `case " $ALLOWED " in *" $d "*)` による**完全一致**。
+  `grep -qw` は `-` を単語構成文字として扱わないため、`kaikei` / `core` /
+  `app` のような**成分名の crate** を足すと緑のまま通ってしまう（同じく実測）。
   以下は申し送り当時の記述:
   §3 の表と2本のプローブ（`crates/{kaikei-app,kaikei-jp}/tests/contract_from_downstream.rs`）は
   「線上表現を MCP 層で再発明しない」ことを狙っているが、**プローブでは
@@ -1054,13 +1061,22 @@ AI が取るべき次の手が違う。
 | `InvalidSettingCode` | `invalid_setting_code` | **新規** |
 | `InvalidBusinessRatio` | `invalid_value` | 既存 |
 | `InvalidHouseholdSplitTotal` | `invalid_amount` | 既存 |
-| `YamlParse` / `Io` / `InvalidTaxCategoryTable` / `OverlappingTaxPeriods` / `InvalidChart` / `InvalidTagSchema` / `MissingClosingAccount` / `NotPostableClosingAccount` / `DuplicateClosingAccount` / `ClosingTagSchemaMismatch` | `invalid_policy_data` | 既存 |
+| `InvalidChart` | `invalid_chart` | 既存（`CoreError::InvalidChart` と同義） |
+| `YamlParse` / `Io` / `InvalidTaxCategoryTable` / `OverlappingTaxPeriods` / `InvalidTagSchema` / `MissingClosingAccount` / `NotPostableClosingAccount` / `DuplicateClosingAccount` / `ClosingTagSchemaMismatch` | `invalid_policy_data` | 既存 |
 
 登録番号の4件を別コードにしているのは、検証順が「先頭文字 → 桁数 → 文字種 →
 チェックデジット」に固定されており（D-053）、**最初に失敗した観点だけが返る**
 ため。1つに潰すと AI は何を直せばよいかを本文の日本語から推測するしかない。
 
-最後の10件を1つにまとめているのは、いずれも**サーバ側の同梱マスタ・起動設定が
+`InvalidChart` だけをロード失敗の集約から外しているのは、`invalid_chart`
+（「勘定科目表そのものが不正」）が既に語彙にあり、`CoreError::InvalidChart` が
+そちらに写像されているため。`JpError::InvalidChart` は
+`ChartOfAccounts::new` が返した `CoreError::InvalidChart` を包み直したものを
+**含む**（`crates/kaikei-jp/src/chart.rs` の `from_raw`）ので、集約に入れると
+**同一の条件が経路によって2つのコードになる**——このセクションが禁じている
+「既に語彙がある概念に別名を作る」そのものになる（レビュー2巡目で是正）。
+
+最後の9件を1つにまとめているのは、いずれも**サーバ側の同梱マスタ・起動設定が
 不正**で、呼び出し元の入力を直しても解消しない——つまり
 `PolicyError::InvalidPolicyData`（「policy が構築時に受け取ったデータが不正」）
 と意味が一致するため（別名を作らない）。なお通常これらはツール応答に現れない
@@ -1332,7 +1348,7 @@ CREATE INDEX ON audit_log (occurred_at);
 | MC-27 | 出力の金額 | 全て JSON 文字列である（入力だけでなく出力側も number にしない。§5） |
 | MC-24 | 事業者設定（`is_taxable_business` / `simplified_taxation` 等）を与えずに起動 | 既定値にフォールバックせず**起動が失敗**し、不足項目を名指しするメッセージが出る（§7。D-057） |
 | MC-29 | 未登録のタグキー（例: `tax_cat`）で post | **エラー**（黙って落とさない）。メッセージに**有効なタグキー一覧**が含まれる（§3。`CLAUDE.md` §4・§11）。型に合わない値（`business_ratio: "3割"`）も同様に、期待する書式を示すエラー |
-| MC-30 | `kaikei-mcp` の依存 | `Cargo.toml` が `kaikei-app` / `kaikei-jp` / `kaikei-core` / MCP SDK / 非同期ランタイム / シリアライズ以外に依存していない（`uuid` / `rust_decimal` を自前で足していない）。**CI で機械的に検査する**（§4 の申し送り。プローブでは検査できない）。**PR-D で実装済み**: 既存ジョブ `dependency-direction` への**ステップ追加**（新しいジョブではないので必須チェックの登録は不要。`CLAUDE.md` §13）。`uuid` を normal / dev のどちらで足しても落ちることをローカルで実測して確認した |
+| MC-30 | `kaikei-mcp` の依存 | `Cargo.toml` が `kaikei-app` / `kaikei-jp` / `kaikei-core` / MCP SDK / 非同期ランタイム / シリアライズ以外に依存していない（`uuid` / `rust_decimal` を自前で足していない）。**CI で機械的に検査する**（§4 の申し送り。プローブでは検査できない）。**PR-D で実装済み**: 既存ジョブ `dependency-direction` への**ステップ追加**（新しいジョブではないので必須チェックの登録は不要。`CLAUDE.md` §13）。依存の取得は `cargo metadata --no-deps` の `packages[].dependencies[].name`（`cargo tree` はホストターゲットの依存しか見ず、`[target.'cfg(...)'.dependencies]` を素通りする）、許可リストとの照合は `case` による完全一致（`grep -qw` は `kaikei` のような成分名を通す）。`uuid` を normal / dev / target-cfg のいずれで足しても、また `kaikei` という名前の crate を足しても落ちることを実測した（照合部分は ubuntu:24.04 コンテナでも同じ結果を確認） |
 
 ### 監査ログ
 
