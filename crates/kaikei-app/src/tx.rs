@@ -4,7 +4,7 @@
 //! エラーも警告も出ずに何も保存されない（会計データでは致命的）。この
 //! ヘルパに閉じることで、commit 漏れが構造的に起きにくくなる。
 
-use crate::error::AppError;
+use crate::error::{AppError, RepoError};
 use crate::ports::{Store, TxScope};
 use std::future::Future;
 use std::pin::Pin;
@@ -44,11 +44,54 @@ pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// （証憑ファイルの書き込み・外部API・LLM呼び出し等）を行わないこと。
 /// トランザクション（例: 採番カウンタの行ロック）を握ったまま外部応答を
 /// 待つ状態（idle-in-transaction）を防ぐため。
+///
+/// # エラー型は [`AppError`]
+///
+/// ユースケース専用のエラー型（[`crate::usecase::post_entry::PostEntryFailure`]
+/// のように、失敗経路でも `PolicyNote` を運ぶもの）を返すクロージャには
+/// [`with_tx_err`] を使う。両者は同じ実装を通る。
+///
+/// **この関数を総称化しなかった**のは、`Ok(..)` しか書かないクロージャ
+/// （読み取りだけのトランザクション）で `E` が推論できなくなり、
+/// 呼び出し側すべてに turbofish か型注釈が要るようになるため
+/// （実測で `kaikei-store` / `kaikei-e2e` の pg-tests が8箇所壊れた）。
+/// **最も多い書き方が最も短く書ける**ようにしてある。
 pub async fn with_tx<S, T, F>(store: &S, f: F) -> Result<T, AppError>
 where
     S: Store,
     T: Send,
     F: for<'a> FnOnce(&'a mut S::Tx) -> BoxFut<'a, Result<T, AppError>> + Send,
+{
+    with_tx_err(store, f).await
+}
+
+/// [`with_tx`] の、**エラー型について総称**な版。
+///
+/// ユースケースが `AppError` 以外の失敗値を返す場合に使う。現状の唯一の
+/// 利用者は [`crate::usecase::post_entry::execute`] /
+/// [`crate::usecase::post_entry::preview`]（失敗経路でも `PolicyNote` を運ぶ
+/// [`crate::usecase::post_entry::PostEntryFailure`] を返す）。
+///
+/// `E` に要求するのは `From<RepoError>` だけ（`begin` / `commit` の失敗を
+/// そのエラー型で表現できる必要があるため）。
+///
+/// トランザクションの扱い（commit / rollback の条件、クロージャに渡せるもの、
+/// ネスト・外部 I/O の禁止）は [`with_tx`] と完全に同じ——**同じ関数本体**である。
+/// 分けているのは型推論の都合だけで、規律を二重に持っているわけではない。
+///
+/// ```ignore
+/// // ユースケースの戻り値の型が E を決めるので、注釈は要らない。
+/// let out = with_tx_err(&store, |tx| {
+///     Box::pin(async move { post_entry::execute(tx, /* .. */).await })
+/// })
+/// .await?;
+/// ```
+pub async fn with_tx_err<S, T, E, F>(store: &S, f: F) -> Result<T, E>
+where
+    S: Store,
+    T: Send,
+    E: From<RepoError>,
+    F: for<'a> FnOnce(&'a mut S::Tx) -> BoxFut<'a, Result<T, E>> + Send,
 {
     let mut tx = store.begin().await?;
     // ★ ここで `match f(&mut tx).await { .. }` と書くと E0505 になる。
