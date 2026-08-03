@@ -144,6 +144,16 @@ pub struct TagCatalog {
 }
 
 impl TagCatalog {
+    /// **同梱スキーマ**（`kaikei-jp-data/tags.yaml`）から読み込む。
+    ///
+    /// [`crate::tax::TaxRuleSets::from_embedded`] と同じ形の入口である。
+    /// `kaikei-jp-data` を直接依存に持てない層（`kaikei-mcp` は依存の
+    /// 許可リストで縛られている。`docs/07-mcp-server.md` §10 MC-30）が
+    /// **合成ルートを組み立てずに**同梱スキーマを見るために使う。
+    pub fn bundled() -> Result<Self, JpError> {
+        Self::from_embedded(kaikei_jp_data::TAGS)
+    }
+
     /// `kaikei-jp-data` の埋め込み YAML から読み込む。
     pub fn from_embedded(embedded: EmbeddedYaml) -> Result<Self, JpError> {
         let raw: TagSchemaRaw = crate::yaml::load_embedded(embedded)?;
@@ -824,6 +834,19 @@ tags:
             .parse_tag_set(Vec::<(String, String)>::new())
             .unwrap();
         assert!(tags.is_empty());
+    }
+
+    /// `TagCatalog::bundled` は `from_embedded(kaikei_jp_data::TAGS)` と同じ
+    /// （引数を取らない入口が別のスキーマを読んでいない）。
+    #[test]
+    fn bundled_reads_the_same_schema_as_from_embedded() {
+        let bundled = TagCatalog::bundled().unwrap();
+        let explicit = TagCatalog::from_embedded(kaikei_jp_data::TAGS).unwrap();
+        assert_eq!(bundled.label(), explicit.label());
+        assert_eq!(
+            format!("{:?}", bundled.defs()),
+            format!("{:?}", explicit.defs())
+        );
     }
 
     /// `load_embedded`（`TagSchema` だけを返す既存の入口）と

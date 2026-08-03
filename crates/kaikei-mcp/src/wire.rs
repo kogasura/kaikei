@@ -21,7 +21,7 @@ use std::fmt;
 // （`DECISIONS.md` D-047 と同型の問題。`kaikei-app` のクレート doc
 // 「`kaikei-policy` 型の再エクスポート」を参照）。
 use kaikei_app::PolicyNote;
-use kaikei_core::{CoreError, Currency, JournalLine, Money, TagSet};
+use kaikei_core::{AccountDef, CoreError, Currency, JournalLine, Money, TagSet};
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
@@ -228,6 +228,32 @@ pub fn reversal_ref_to_json(reversal: &kaikei_app::view::ReversalRef) -> Value {
     })
 }
 
+/// 勘定科目1件を線上の JSON にする（`list_accounts` / `get_settings`）。
+///
+/// **`postable` を必ず出す**（`docs/07-mcp-server.md` §2）。`postable: false`
+/// は見出し科目で、記帳に使うと `not_postable` になる。
+/// `account_type` は [`kaikei_app::wire::account_type_code`]。
+/// `parent` は親科目が無ければ**キーごと出さない**（`null` を置くと
+/// 「親が無い」と「親を知らない」の区別を呼び出し側に押し付けることになる。
+/// `memo` と同じ扱い）。
+///
+/// 表示順（テンプレートの `sort`）は `kaikei_core::AccountDef` が保持して
+/// いないので返さない（`DECISIONS.md` D-061）。
+pub fn account_def_to_json(def: &AccountDef) -> Value {
+    let mut object = Map::new();
+    object.insert("account".to_string(), json!(def.code.as_str()));
+    object.insert("name".to_string(), json!(def.name));
+    object.insert(
+        "account_type".to_string(),
+        json!(kaikei_app::wire::account_type_code(def.account_type)),
+    );
+    object.insert("postable".to_string(), json!(def.postable));
+    if let Some(parent) = &def.parent {
+        object.insert("parent".to_string(), json!(parent.as_str()));
+    }
+    Value::Object(object)
+}
+
 /// `PolicyNote` の一覧を線上の JSON 配列にする。
 ///
 /// **文言は `kaikei-policy` の実装が組み立てたものをそのまま素通しする**
@@ -406,6 +432,35 @@ mod tests {
         )
         .unwrap();
         assert!(line_to_json(&line).get("memo").is_none());
+    }
+
+    // 科目は記帳可否（`postable`）を必ず持ち、親が無ければキーごと出さない。
+    #[test]
+    fn account_def_to_json_always_carries_postable_and_omits_an_absent_parent() {
+        use kaikei_core::{AccountCode, AccountType};
+
+        let heading = AccountDef {
+            code: AccountCode::parse("900").unwrap(),
+            name: "経費".to_string(),
+            account_type: AccountType::Expense,
+            parent: None,
+            postable: false,
+        };
+        let value = account_def_to_json(&heading);
+        assert_eq!(value["account"], json!("900"));
+        assert_eq!(value["name"], json!("経費"));
+        assert_eq!(value["account_type"], json!("expense"));
+        assert_eq!(value["postable"], json!(false));
+        assert!(value.get("parent").is_none(), "{value}");
+
+        let child = AccountDef {
+            code: AccountCode::parse("901").unwrap(),
+            name: "消耗品費".to_string(),
+            account_type: AccountType::Expense,
+            parent: Some(AccountCode::parse("900").unwrap()),
+            postable: true,
+        };
+        assert_eq!(account_def_to_json(&child)["parent"], json!("900"));
     }
 
     // 注記の文言は素通しし、severity は凍結済みの語彙を使う。

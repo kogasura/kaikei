@@ -128,8 +128,14 @@ where
             // 仕訳IDは **UUID の正準表記**で返す（`docs/07-mcp-server.md` §3）。
             // `EntryId::as_u128()` の10進表記（最大39桁）で組み立てると、
             // 呼び出し元が送った UUID 文字列と突き合わせられない。
+            //
+            // `RepoError::NotFound` の `Display` は `"見つかりません: {reason}"`
+            // である。`reason` 側にも「見つかりません」と書くと応答が同じことを
+            // 2回言うので、ここが担うのは「**何が**見つからなかったか」と
+            // 「次の手」だけにする（Phase 3 PR-G レビュー D-2。
+            // `kaikei-mcp` の `get_entry` も同じ文言）。
             reason: format!(
-                "仕訳が見つかりません（仕訳ID: {}）。\
+                "指定された仕訳（仕訳ID: {}）。\
                  仕訳IDが正しいか確認してください",
                 entry_id_to_uuid_string(input.original_id)
             ),
@@ -601,10 +607,11 @@ mod tests {
 
         let result = run_reverse_entry(&store, 100, input).await;
 
-        let message = match result {
-            Err(AppError::Repo(RepoError::NotFound { reason })) => reason,
+        let error = match result {
+            Err(AppError::Repo(error @ RepoError::NotFound { .. })) => error,
             other => panic!("NotFound を期待したが: {other:?}"),
         };
+        let message = error.public_message();
         assert!(
             message.contains("0192a7b3-1234-7abc-8def-0123456789ab"),
             "UUID の正準表記が含まれていない: {message}"
@@ -612,6 +619,15 @@ mod tests {
         assert!(
             !message.contains(&missing.as_u128().to_string()),
             "10進表記が混ざっている: {message}"
+        );
+        // ★同じことを2回言わない★（Phase 3 PR-G レビュー D-2）。
+        // `Display` は `"見つかりません: {reason}"` なので、`reason` 側に
+        // 同じ語を入れると応答が「見つかりません: 仕訳が見つかりません（…）」
+        // になる。
+        assert_eq!(
+            message.matches("見つかりません").count(),
+            1,
+            "同じことを2回言っています: {message}"
         );
     }
 }

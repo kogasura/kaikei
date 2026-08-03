@@ -45,7 +45,7 @@ use kaikei_mcp::tools::reverse_journal_entry::ReverseJournalEntry;
 use kaikei_mcp::tools::search_entries::SearchEntries;
 use kaikei_store::audit::PgAuditSink;
 use kaikei_store::pool::PgStore;
-use kaikei_store::query::{PgLedgerQuery, PgSearchEntriesQuery};
+use kaikei_store::query::{PgLedgerQuery, PgSearchEntriesQuery, PgTrialBalanceQuery};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -96,8 +96,11 @@ async fn runtime(app: &PgPool) -> Runtime {
         id_gen: UuidV7IdGenerator,
         clock: SystemClock,
         // read model は書き込み側を経由しない（`CLAUDE.md` §6）。
+        trial_balance: Arc::new(PgTrialBalanceQuery::new(app.clone())),
         search_query: Arc::new(PgSearchEntriesQuery::new(app.clone())),
         ledger_query: Arc::new(PgLedgerQuery::new(app.clone())),
+        // テンプレートと同じ定義を投入するので食い違いは出ない（D-086）。
+        chart_differences: Vec::new(),
     }
 }
 

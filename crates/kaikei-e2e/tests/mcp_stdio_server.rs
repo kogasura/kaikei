@@ -588,6 +588,13 @@ async fn reversing_through_the_real_binary_goes_through_the_same_audited_path(
         .expect("entry_id")
         .to_string();
 
+    // ★訂正前★ この時点では誰も訂正していない（キーごと出ない）。
+    let before = server
+        .call_tool("get_entry", json!({ "entry_id": original_id }))
+        .await;
+    assert!(!is_error(&before), "{before}");
+    assert!(body(&before).get("reversed_by").is_none(), "{before}");
+
     let reversed = server
         .call_tool(
             "reverse_journal_entry",
@@ -619,22 +626,518 @@ async fn reversing_through_the_real_binary_goes_through_the_same_audited_path(
     assert!(is_error(&refused), "{refused}");
     assert_eq!(body(&refused)["error"], json!("empty_reverse_reason"));
 
+    // ★訂正後★（PR-G レビュー B）
+    //
+    // 帳簿は追記のみなので原仕訳そのものは1バイトも変わらない。それでも
+    // **「既に訂正済みである」ことは応答から読めなければならない**
+    // （`CLAUDE.md` §2 の訂正履歴。`get_trial_balance` では残高が0になって
+    // いるのに `get_entry` では生きているように見える、という状態にしない）。
+    let after = server
+        .call_tool("get_entry", json!({ "entry_id": original_id }))
+        .await;
+    assert!(!is_error(&after), "{after}");
+    assert_ne!(
+        body(&before),
+        body(&after),
+        "訂正済みの仕訳が未訂正のときと同じ応答です: {after}"
+    );
+    assert_eq!(body(&after)["reversed_by"], json!(reversal_id), "{after}");
+    assert_eq!(body(&after)["reversed_by_entry_no"], json!(2), "{after}");
+    // 向きを取り違えていない（原仕訳は誰も訂正していない）。
+    assert!(body(&after).get("reverses").is_none(), "{after}");
+
+    // 逆仕訳の側は逆向きの関係（`reverses`）を持ち、誰にも訂正されていない。
+    let reversal_entry = server
+        .call_tool("get_entry", json!({ "entry_id": reversal_id }))
+        .await;
+    assert!(!is_error(&reversal_entry), "{reversal_entry}");
+    assert_eq!(body(&reversal_entry)["reverses"], json!(original_id));
+    assert!(
+        body(&reversal_entry).get("reversed_by").is_none(),
+        "{reversal_entry}"
+    );
+
     server.shutdown().await;
 
     // 元仕訳・逆仕訳の2件が残る（元仕訳は書き換わらない。`CLAUDE.md` §2）。
     assert_eq!(journal_entry_count(&app).await, 2);
 
-    // 3回の tools/call でそれぞれ2行、計6行。
+    // 6回の tools/call でそれぞれ2行、計12行。
     let rows = audit_rows(&app).await;
-    assert_eq!(rows.len(), 6, "{rows:?}");
+    assert_eq!(rows.len(), 12, "{rows:?}");
     assert_audited_pair(&rows[0..2], "post_journal_entry", "ok");
-    assert_audited_pair(&rows[2..4], "reverse_journal_entry", "ok");
-    assert_audited_pair(&rows[4..6], "reverse_journal_entry", "error");
+    assert_audited_pair(&rows[2..4], "get_entry", "ok");
+    assert_audited_pair(&rows[4..6], "reverse_journal_entry", "ok");
+    assert_audited_pair(&rows[6..8], "reverse_journal_entry", "error");
+    assert_audited_pair(&rows[8..10], "get_entry", "ok");
+    assert_audited_pair(&rows[10..12], "get_entry", "ok");
     assert_eq!(
-        rows[3].entry_id.map(|id| id.to_string()).as_deref(),
+        rows[5].entry_id.map(|id| id.to_string()).as_deref(),
         Some(reversal_id.as_str())
     );
-    assert_eq!(rows[5].error_code.as_deref(), Some("empty_reverse_reason"));
+    assert_eq!(rows[7].error_code.as_deref(), Some("empty_reverse_reason"));
+}
+
+// ---------------------------------------------------------------------------
+// 読み取り系・提案系（Phase 3 PR-G）
+// ---------------------------------------------------------------------------
+
+/// `audit_log` を「1回の呼び出し＝2行」の組に切って、ツール名の並びを返す。
+///
+/// 読み取り系も**同じ経路（`dispatch::call`）を通る**ので、呼び出した順に
+/// `started` / `ok`（または `error`）の対が並ぶ（`docs/07-mcp-server.md` §9。
+/// MC-11 の「全11ツールに対して総当たり」の PR-G ぶん）。
+fn audited_calls(rows: &[AuditRow]) -> Vec<(String, String)> {
+    assert_eq!(
+        rows.len() % 2,
+        0,
+        "監査ログの行数が奇数です（開始と結果の対になっていない）: {rows:?}"
+    );
+    rows.chunks(2)
+        .map(|pair| {
+            assert_eq!(pair[0].request_id, pair[1].request_id, "{pair:?}");
+            assert_eq!(pair[0].status, "started", "{pair:?}");
+            assert_eq!(pair[0].tool, pair[1].tool, "{pair:?}");
+            assert_eq!(pair[0].actor, "mcp", "{pair:?}");
+            (pair[0].tool.clone(), pair[1].status.clone())
+        })
+        .collect()
+}
+
+/// ★PR-G の本命★ 読み取り系・提案系7件を実バイナリに通し、
+/// **応答の中身**と**監査ログが1呼び出しにつき2行残ること**を同時に見る。
+///
+/// 帳簿に1件記帳してから読む（0件のときだけ通る実装になっていないこと）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_read_tools_answer_through_the_real_binary_and_are_audited(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts.clone()).await;
+    let mut server = McpServer::start(&conn_opts).await;
+
+    let posted = server
+        .call_tool(
+            "post_journal_entry",
+            json!({
+                "entry_date": "2026-04-15",
+                "description": "A社への請求",
+                "lines": [
+                    { "account": "135", "side": "debit",  "amount": "110000" },
+                    { "account": "500", "side": "credit", "amount": "100000",
+                      "tags": { "tax_category": "SALES_10" } }
+                ],
+                "auto_tax_lines": true
+            }),
+        )
+        .await;
+    assert!(!is_error(&posted), "{posted}");
+    let entry_id = body(&posted)["entry_id"]
+        .as_str()
+        .expect("entry_id")
+        .to_string();
+
+    // ---- list_accounts ----
+    let accounts = server.call_tool("list_accounts", json!({})).await;
+    assert!(!is_error(&accounts), "{accounts}");
+    let listed = body(&accounts)["accounts"]
+        .as_array()
+        .expect("配列")
+        .clone();
+    assert!(
+        !listed.is_empty(),
+        "起動時に投入した科目が1件も無い: {accounts}"
+    );
+    let posted_account = listed
+        .iter()
+        .find(|account| account["account"] == json!("135"))
+        .unwrap_or_else(|| panic!("記帳に使った科目が一覧に無い: {accounts}"));
+    // MC-13: 種別と記帳可否を必ず返す。
+    assert_eq!(posted_account["account_type"], json!("asset"), "{accounts}");
+    assert_eq!(posted_account["postable"], json!(true), "{accounts}");
+    // **全件が `postable` を持つ**（記帳できない科目に当たって初めて分かる、
+    // という形にしない）。
+    //
+    // 同梱テンプレートの科目は現時点で全て記帳可能なので、ここで
+    // 「`postable: false` の科目が居ること」は確かめられない。見出し科目を
+    // 含む場合の絞り込みは `kaikei-mcp` 側の単体検査
+    // （`list_accounts.rs` の `postable_only_hides_the_headings_...`）が持つ。
+    for account in &listed {
+        assert!(account["postable"].is_boolean(), "{account}");
+        assert!(account["account_type"].is_string(), "{account}");
+    }
+
+    // ---- get_entry ----
+    let entry = server
+        .call_tool("get_entry", json!({ "entry_id": entry_id }))
+        .await;
+    assert!(!is_error(&entry), "{entry}");
+    assert_eq!(body(&entry)["entry_id"], json!(entry_id));
+    assert_eq!(body(&entry)["description"], json!("A社への請求"));
+    // 税額行が自動生成されているので明細は3行。
+    assert_eq!(
+        body(&entry)["lines"].as_array().unwrap().len(),
+        3,
+        "{entry}"
+    );
+    // MC-27: 金額は文字列。
+    assert_eq!(body(&entry)["debit_total"], json!("110000"));
+    assert_eq!(body(&entry)["credit_total"], json!("110000"));
+    // 逆仕訳ではないのでキーごと出ない。
+    assert!(body(&entry).get("reverses").is_none(), "{entry}");
+
+    // ---- get_trial_balance ----
+    let trial_balance = server
+        .call_tool(
+            "get_trial_balance",
+            json!({ "from": "2026-01-01", "to": "2026-12-31" }),
+        )
+        .await;
+    assert!(!is_error(&trial_balance), "{trial_balance}");
+    let tb = body(&trial_balance);
+    assert_eq!(tb["currency"], json!("JPY"));
+    assert_eq!(tb["debit_total"], json!("110000"));
+    assert_eq!(tb["credit_total"], json!("110000"));
+    let rows = tb["rows"].as_array().expect("配列");
+    assert_eq!(rows.len(), 3, "{trial_balance}");
+    let sales = rows
+        .iter()
+        .find(|row| row["account"] == json!("500"))
+        .unwrap_or_else(|| panic!("売上の行が無い: {trial_balance}"));
+    assert_eq!(sales["account_type"], json!("revenue"));
+    assert_eq!(sales["credit_total"], json!("100000"));
+    assert_eq!(sales["balance"], json!("100000"));
+    assert_eq!(sales["group"], json!({}), "group_by 未指定なら空");
+
+    // ---- get_trial_balance（group_by が効く）----
+    let grouped = server
+        .call_tool(
+            "get_trial_balance",
+            json!({
+                "from": "2026-01-01",
+                "to": "2026-12-31",
+                "group_by": ["tax_category"]
+            }),
+        )
+        .await;
+    assert!(!is_error(&grouped), "{grouped}");
+    assert!(
+        body(&grouped)["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["group"]["tax_category"] == json!("SALES_10")),
+        "group_by が効いていない: {grouped}"
+    );
+
+    // ---- list_tax_categories ----
+    let categories = server
+        .call_tool("list_tax_categories", json!({ "date": "2026-04-15" }))
+        .await;
+    assert!(!is_error(&categories), "{categories}");
+    let listed = body(&categories)["categories"].as_array().expect("配列");
+    assert!(
+        listed
+            .iter()
+            .any(|category| category["code"] == json!("SALES_10")),
+        "記帳に使った区分が一覧に無い: {categories}"
+    );
+    assert!(
+        body(&categories)["table"]["range"].is_string(),
+        "{categories}"
+    );
+
+    // ---- get_settings ----
+    let settings = server.call_tool("get_settings", json!({})).await;
+    assert!(!is_error(&settings), "{settings}");
+    let s = body(&settings);
+    // 起動時に環境変数で渡した設定がそのまま返る（既定値に落ちていない）。
+    assert_eq!(s["tax_mode"], json!("exclusive"));
+    assert_eq!(s["rounding"], json!("floor"));
+    assert_eq!(s["rounding_unit"], json!("line"));
+    assert_eq!(s["is_taxable_business"], json!(true));
+    assert_eq!(s["simplified_taxation"], json!(false));
+    assert_eq!(s["fiscal_year_rule"], json!("calendar_year"));
+    assert_eq!(s["book_currency"]["code"], json!("JPY"));
+    // テンプレートどおりに投入した直後なので食い違いは無い（キーは必ず出る）。
+    // **起動時点の観測であることが応答に残る**（PR-G レビュー C-3）。
+    assert_eq!(s["chart_differences"]["items"], json!([]), "{settings}");
+    assert_eq!(
+        s["chart_differences"]["as_of"],
+        json!("startup"),
+        "{settings}"
+    );
+
+    // ---- suggest_tax_category ----
+    let suggested = server
+        .call_tool(
+            "suggest_tax_category",
+            json!({ "date": "2026-04-15", "direction": "sales" }),
+        )
+        .await;
+    assert!(!is_error(&suggested), "{suggested}");
+    // 帳簿の設定が根拠として並ぶ（PR-G レビュー C-1）。起動時に環境変数で
+    // 渡した値がそのまま出る（`get_settings` と同じ値）。
+    let filtered_by = &body(&suggested)["filtered_by"];
+    assert_eq!(filtered_by["tax_mode"], json!("exclusive"), "{suggested}");
+    assert_eq!(
+        filtered_by["is_taxable_business"],
+        json!(true),
+        "{suggested}"
+    );
+    assert_eq!(
+        filtered_by["simplified_taxation"],
+        json!(false),
+        "{suggested}"
+    );
+    assert_eq!(
+        filtered_by["book_settings_used_for_filtering"],
+        json!(false),
+        "{suggested}"
+    );
+    let candidates = body(&suggested)["candidates"].as_array().expect("配列");
+    assert!(
+        candidates.len() > 1,
+        "候補が絞り込まれています: {suggested}"
+    );
+    for candidate in candidates {
+        assert_eq!(candidate["direction"], json!("sales"), "{candidate}");
+        // MC-08 (1): 根拠が空でない。
+        assert!(
+            !candidate["reason"]
+                .as_str()
+                .expect("reason")
+                .trim()
+                .is_empty(),
+            "{candidate}"
+        );
+    }
+
+    // ---- validate_invoice_number ----
+    let invoice = server
+        .call_tool(
+            "validate_invoice_number",
+            json!({ "registration_number": "T7123456789012" }),
+        )
+        .await;
+    assert!(!is_error(&invoice), "{invoice}");
+    assert_eq!(body(&invoice)["format_valid"], json!(true));
+    // MC-28: 実在すると断定しない。
+    assert!(
+        !body(&invoice)["not_checked"]
+            .as_array()
+            .expect("配列")
+            .is_empty(),
+        "{invoice}"
+    );
+
+    server.shutdown().await;
+
+    // ★MC-08 (2)★ 提案系・読み取り系は帳簿を1行も変えない。
+    assert_eq!(journal_entry_count(&app).await, 1, "帳簿が変わっています");
+
+    // ★MC-11★ 1回の呼び出しにつき2行。読み取り系も同じ経路を通る。
+    let calls = audited_calls(&audit_rows(&app).await);
+    assert_eq!(
+        calls,
+        vec![
+            ("post_journal_entry".to_string(), "ok".to_string()),
+            ("list_accounts".to_string(), "ok".to_string()),
+            ("get_entry".to_string(), "ok".to_string()),
+            ("get_trial_balance".to_string(), "ok".to_string()),
+            ("get_trial_balance".to_string(), "ok".to_string()),
+            ("list_tax_categories".to_string(), "ok".to_string()),
+            ("get_settings".to_string(), "ok".to_string()),
+            ("suggest_tax_category".to_string(), "ok".to_string()),
+            ("validate_invoice_number".to_string(), "ok".to_string()),
+        ],
+    );
+}
+
+/// ★空の結果と「見つからない」を区別する★（PR-G）
+///
+/// 読み取り系で最も危ういのは、**入力の誤りを「0件」として静かに成功させる**
+/// ことである（`docs/07-mcp-server.md` §2 / §3。`from > to` を空の試算表に
+/// しない、という要件がその代表）。ここでは
+///
+/// | 呼び出し | 期待 |
+/// |---|---|
+/// | 仕訳が1件も無い期間の試算表 | **成功**（`rows: []`。通貨と合計 `"0"` は返る） |
+/// | 開始日が終了日より後 | **エラー**（`rejected`） |
+/// | 未登録のタグキーで `group_by` | **エラー**（`unknown_tag_key`。「aggregatable = false」とは言わない） |
+/// | 登録済みだが集計軸に使えないタグキーで `group_by` | **エラー**（`not_aggregatable`。上と別コード） |
+/// | 存在しない仕訳ID | **エラー**（`not_found`。UUID の正準表記を含む） |
+/// | 仕訳IDが UUID ですらない | **エラー**（`invalid_entry_id`。`not_found` と区別する） |
+/// | 同梱していない日付の税区分 | **エラー**（有効期間を示す。空配列にしない） |
+///
+/// を1本で見る。失敗した呼び出しも `audit_log` に2行残る（D-070）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_read_tools_tell_an_empty_result_apart_from_a_bad_request(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts.clone()).await;
+    let mut server = McpServer::start(&conn_opts).await;
+
+    // 仕訳が1件も無い期間は**成功**（空の試算表）。
+    let empty = server
+        .call_tool(
+            "get_trial_balance",
+            json!({ "from": "2026-01-01", "to": "2026-12-31" }),
+        )
+        .await;
+    assert!(!is_error(&empty), "{empty}");
+    assert_eq!(body(&empty)["rows"], json!([]));
+    assert_eq!(
+        body(&empty)["currency"],
+        json!("JPY"),
+        "0行でも通貨を名乗る"
+    );
+    assert_eq!(body(&empty)["debit_total"], json!("0"));
+
+    // 開始日 > 終了日 は**エラー**（0件の空の試算表として成功させない）。
+    let reversed_period = server
+        .call_tool(
+            "get_trial_balance",
+            json!({ "from": "2026-12-31", "to": "2026-01-01" }),
+        )
+        .await;
+    assert!(is_error(&reversed_period), "{reversed_period}");
+    assert_eq!(body(&reversed_period)["error"], json!("rejected"));
+    let message = body(&reversed_period)["message"].as_str().unwrap();
+    assert!(message.contains("2026-12-31"), "{message}");
+
+    // ★未登録のキーと「集計軸に使えないキー」を区別する★（PR-G レビュー C-2）
+    //
+    // `TagSchema::is_aggregatable` はどちらにも `false` を返すので、素直に
+    // 流すと未登録のキーにも「（aggregatable = false）」という成立していない
+    // 事実が返る。どちらの応答にも選べるキーの一覧が付く（§11）。
+    let unregistered = server
+        .call_tool(
+            "get_trial_balance",
+            json!({ "from": "2026-01-01", "to": "2026-12-31", "group_by": ["memo"] }),
+        )
+        .await;
+    assert!(is_error(&unregistered), "{unregistered}");
+    assert_eq!(body(&unregistered)["error"], json!("unknown_tag_key"));
+    let message = body(&unregistered)["message"].as_str().unwrap();
+    assert!(message.contains("登録されていません"), "{message}");
+    assert!(
+        !message.contains("aggregatable = false"),
+        "未登録のキーに成立していない事実を述べています: {message}"
+    );
+    assert_eq!(
+        body(&unregistered)["aggregatable_group_by_keys"],
+        json!(["counterparty", "project", "tax_category"]),
+        "{unregistered}"
+    );
+
+    let not_aggregatable = server
+        .call_tool(
+            "get_trial_balance",
+            json!({ "from": "2026-01-01", "to": "2026-12-31", "group_by": ["business_ratio"] }),
+        )
+        .await;
+    assert!(is_error(&not_aggregatable), "{not_aggregatable}");
+    assert_eq!(
+        body(&not_aggregatable)["error"],
+        json!("not_aggregatable"),
+        "登録済みのキーが未登録扱いになっています: {not_aggregatable}"
+    );
+    assert_eq!(
+        body(&not_aggregatable)["aggregatable_group_by_keys"],
+        json!(["counterparty", "project", "tax_category"]),
+        "{not_aggregatable}"
+    );
+
+    // 存在しない仕訳IDは**見つからない**（空の成功にしない）。
+    let missing = server
+        .call_tool(
+            "get_entry",
+            json!({ "entry_id": "0192a7b3-1234-7abc-8def-0123456789ab" }),
+        )
+        .await;
+    assert!(is_error(&missing), "{missing}");
+    assert_eq!(body(&missing)["error"], json!("not_found"));
+    assert!(
+        body(&missing)["message"]
+            .as_str()
+            .unwrap()
+            .contains("0192a7b3-1234-7abc-8def-0123456789ab"),
+        "{missing}"
+    );
+
+    // 「IDが UUID ですらない」は `not_found` と混同しない（次の手が違う）。
+    let malformed = server
+        .call_tool("get_entry", json!({ "entry_id": "42" }))
+        .await;
+    assert!(is_error(&malformed), "{malformed}");
+    assert_eq!(body(&malformed)["error"], json!("invalid_entry_id"));
+
+    // 同梱していない日付の税区分は**空配列ではなくエラー**。
+    let out_of_range = server
+        .call_tool("list_tax_categories", json!({ "date": "2000-01-01" }))
+        .await;
+    assert!(is_error(&out_of_range), "{out_of_range}");
+    assert_eq!(
+        body(&out_of_range)["error"],
+        json!("no_applicable_rule_set")
+    );
+    assert!(
+        body(&out_of_range)["message"]
+            .as_str()
+            .unwrap()
+            .contains("2026"),
+        "有効期間が本文に無い: {out_of_range}"
+    );
+
+    // 記帳可能な科目だけに絞れる（絞ったことが応答に残る）。
+    let postable = server
+        .call_tool("list_accounts", json!({ "postable_only": true }))
+        .await;
+    assert!(!is_error(&postable), "{postable}");
+    assert_eq!(body(&postable)["postable_only"], json!(true));
+    assert!(body(&postable)["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|account| account["postable"] == json!(true)));
+
+    // 形式が不正な登録番号は、最初に失敗した観点だけを返す。
+    let invalid_invoice = server
+        .call_tool(
+            "validate_invoice_number",
+            json!({ "registration_number": " T7123456789012" }),
+        )
+        .await;
+    assert!(is_error(&invalid_invoice), "{invalid_invoice}");
+    assert_eq!(
+        body(&invalid_invoice)["error"],
+        json!("invoice_reg_no_missing_prefix"),
+        "前後の空白をトリムしていないか: {invalid_invoice}"
+    );
+
+    server.shutdown().await;
+
+    // 帳簿は1行も動いていない（読み取りと検証しか呼んでいない）。
+    assert_eq!(journal_entry_count(&app).await, 0);
+
+    // 失敗した呼び出しも2行残る（D-070。「AI が何をしようとしたか」）。
+    let calls = audited_calls(&audit_rows(&app).await);
+    assert_eq!(
+        calls,
+        vec![
+            ("get_trial_balance".to_string(), "ok".to_string()),
+            ("get_trial_balance".to_string(), "error".to_string()),
+            ("get_trial_balance".to_string(), "error".to_string()),
+            ("get_trial_balance".to_string(), "error".to_string()),
+            ("get_entry".to_string(), "error".to_string()),
+            ("get_entry".to_string(), "error".to_string()),
+            ("list_tax_categories".to_string(), "error".to_string()),
+            ("list_accounts".to_string(), "ok".to_string()),
+            ("validate_invoice_number".to_string(), "error".to_string()),
+        ],
+    );
 }
 
 /// `tools/call` **以外**のプロトコル入口が生えていない。
