@@ -580,6 +580,22 @@ mod tests {
     /// リポジトリ直下の `README.md`（同上）。
     const README: &str = include_str!("../../../README.md");
 
+    /// `haystack` に `name` が**識別子として**現れるか。
+    ///
+    /// 素の `contains` だと、ある項目名が別の項目名の**接頭辞**になっている
+    /// ときに検出できない（`KAIKEI_ROUNDING` は `KAIKEI_ROUNDING_UNIT` の
+    /// 接頭辞なので、前者を消してもテストが緑のまま通る）。それでは
+    /// このテストが塞ごうとしている「実装は緑のまま誘導先だけが嘘になる」
+    /// を防げないので、**直後が識別子の構成文字でないこと**まで見る。
+    fn mentions_variable(haystack: &str, name: &str) -> bool {
+        haystack.match_indices(name).any(|(at, _)| {
+            haystack[at + name.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+        })
+    }
+
     // 必須項目が `.env.example` に書かれている。
     //
     // `REQUIRED_ENV_VARS` と `from_lookup` の実挙動は上のテストで
@@ -590,7 +606,7 @@ mod tests {
     fn every_required_variable_appears_in_the_env_example() {
         for name in REQUIRED_ENV_VARS {
             assert!(
-                ENV_EXAMPLE.contains(name),
+                mentions_variable(ENV_EXAMPLE, name),
                 "{name} が .env.example に載っていません。\
                  起動に失敗したときのメッセージは .env.example を一次情報として\
                  案内するため、項目を足したら同じ PR で .env.example にも足すこと"
@@ -603,12 +619,34 @@ mod tests {
     fn every_required_variable_appears_in_the_readme() {
         for name in REQUIRED_ENV_VARS {
             assert!(
-                README.contains(name),
+                mentions_variable(README, name),
                 "{name} が README.md に載っていません。\
                  起動に失敗したときのメッセージは README を一次情報として\
                  案内するため、項目を足したら同じ PR で README にも足すこと"
             );
         }
+    }
+
+    // 上の2つが「接頭辞だけの一致」を通さない。
+    //
+    // これを置かないと、`mentions_variable` を素の `contains` に
+    // 書き戻しても両テストが緑のまま通る（＝ガードのガードが無い）。
+    #[test]
+    fn a_variable_that_only_appears_as_a_prefix_is_not_counted() {
+        assert!(mentions_variable(
+            "KAIKEI_ROUNDING=floor",
+            "KAIKEI_ROUNDING"
+        ));
+        assert!(!mentions_variable(
+            "KAIKEI_ROUNDING_UNIT=line",
+            "KAIKEI_ROUNDING"
+        ));
+        assert!(mentions_variable(
+            "\"KAIKEI_ROUNDING\": \"floor\"",
+            "KAIKEI_ROUNDING"
+        ));
+        // 末尾に現れる場合（直後の文字が無い）も見つける。
+        assert!(mentions_variable("… KAIKEI_ROUNDING", "KAIKEI_ROUNDING"));
     }
 
     // 誘導先の名前が実際のファイル名と一致している（メッセージの中の
