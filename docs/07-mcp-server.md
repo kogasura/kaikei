@@ -3,10 +3,10 @@
 **このプロジェクトの差別化の本体。**
 AI エージェントが会計操作を安全に行うための標準インタフェース。
 
-> **この文書の版**: Phase 3 **PR-D**（`kaikei-mcp` の骨組み）時点
-> （`DECISIONS.md` D-080 まで）を反映している。§9（監査ログ）は
-> PR-C で実装済みの内容に更新済み（D-077 まで）。
-> それ以前は PR-B **2巡目**（D-074 まで、D-072〜D-074 の訂正注記を含む）だった。
+> **この文書の版**: Phase 3 **PR-E**（合成ルート）時点
+> （`DECISIONS.md` D-083 まで）を反映している。§7（起動と設定）は
+> PR-E で**内容が変わった**——`tax_mode` / `rounding` / `rounding_unit` も
+> 明示必須にした（D-082）。§9（監査ログ）は PR-C 時点のまま（D-077）。
 > D-072 以降の決定でここに書かれた内容が覆った場合、**決定を入れた PR の中で
 > この文書も直すこと**。設計書は一度書いたら終わりではなく、直さないと
 > 「却下済みの設計を後続の実装者に指示する文書」に劣化する
@@ -129,6 +129,13 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 `kaikei-app` に専用のユースケースを新設して行う（D-070）。
 `kaikei_jp::compose` が返す `chart` は埋め込みテンプレート由来であり、
 `ChartRepo::load_chart` が読む DB の `accounts` とは別物である点に注意。
+
+**PR-E で実装済み**: `kaikei_app::usecase::import_chart::execute` と
+ポート `kaikei_app::ports::ChartWriteRepo`（PostgreSQL 実装は
+`crates/kaikei-store/src/chart.rs`）。合成ルートが**起動のたびに**呼び、
+**追加しか行わない**（既存の科目定義は上書きしない。D-081）。
+`ChartWriteRepo` を `TxOps` の束ねに入れていないので、記帳の経路が
+マスタ書き込みの能力を持つことはない。
 
 ### 提案系・検証系（帳簿を変更しない）
 
@@ -636,7 +643,12 @@ AI の自己修正を一段速くする効果は大きいが、
   DTO は `kaikei-app/src/view.rs` に置く（core の型は外から構築できない。D-031）。
   `.sqlx` オフラインキャッシュの再生成が要る
   （`.github/workflows/database.yml` の `cargo sqlx prepare --workspace --check`）。
-- `kaikei-app` の**勘定科目マスタ投入ユースケース**（D-070）。
+- ~~`kaikei-app` の**勘定科目マスタ投入ユースケース**（D-070）。~~
+  → **PR-E で完了**（`kaikei_app::usecase::import_chart` /
+  `kaikei_app::ports::ChartWriteRepo` / `kaikei_store` の実装。D-081）。
+  `crates/kaikei-e2e/tests/e2e_jp.rs` の `seed_chart` も**この経路を呼ぶ形に
+  書き換えた**ので、テスト用シードと本番の投入経路は同じ1本である
+  （二重管理にしない。D-047）。
 - ~~**audit_log 書き込みポート**（§9）~~
   → **PR-C で完了**（`kaikei_app::ports::AuditSink` /
   `kaikei_app::audit::with_audit` / `kaikei_store::audit::PgAuditSink` /
@@ -700,9 +712,9 @@ AI の自己修正を一段速くする効果は大きいが、
 
 ```
 kaikei-mcp/src/
-├── main.rs               起動（設定ロード → 合成 → stdio サーバ）        ← PR-E
-├── startup.rs            合成ルート。kaikei_jp::compose::compose + PgStore の結線 ← PR-E
-├── config.rs             事業者設定の読み込みと必須検証（欠けていたら起動失敗。§7） ← PR-E
+├── main.rs               起動（設定ロード → 合成 → stdio サーバ）        ← PR-E で新設
+├── startup.rs            合成ルート。kaikei_jp::compose::compose + PgStore の結線 ← PR-E で新設
+├── config.rs             事業者設定の読み込みと必須検証（欠けていたら起動失敗。§7） ← PR-E で新設
 ├── audit.rs              audit_log。別コネクション・2回書き・fail-closed/fail-open（§9） ← PR-F
 ├── wire.rs               線上の DTO（AmountStr 等）。★整形は書かない★       ← PR-D で新設
 ├── server.rs             tool_router の合成、rmcp の ServerHandler 実装     ← PR-D で新設
@@ -754,8 +766,15 @@ kaikei-mcp/src/
 接続ごと落ちる。既存コードには `tracing::warn!`（D-039 の commit 忘れ警告など）が
 実在し、購読者の設定次第で stdout に出る。
 
-→ ログ・診断出力は必ず **stderr** に出す（`tracing_subscriber` の writer を
-stderr に固定する）。`println!` を書かない。
+→ ログ・診断出力は必ず **stderr** に出す。`println!` を書かない。
+
+**PR-E の実装**: `kaikei-mcp` は `tracing_subscriber` を持たない
+（MC-30 の許可リストにも無い）。購読者を登録しない限り `tracing` の
+イベントはどこにも出力されないため、下位層の `tracing::warn!` が
+stdout に漏れることは**構造上起きない**。診断は `eprintln!` で stderr に出す。
+**将来購読者を入れる場合は writer を stderr に固定すること**
+（既定は stdout であり、入れた瞬間にプロトコルが壊れる）。
+検査は §10 MC-33。
 
 ---
 
@@ -1106,22 +1125,64 @@ AI が取るべき次の手が違う。
 設定ファイルで省略して `Default` に落ちる実装にすると、
 **無言で免税事業者として税額計算される**。
 
-| 設定 | 内容 |
-|---|---|
-| `tax_mode` / `rounding` / `rounding_unit` | 上書きの有無（省略時はマスタの `settings_defaults`） |
-| `is_taxable_business` | 課税事業者か（**必須**） |
-| `simplified_taxation` | 簡易課税か（**必須**） |
-| 決算3科目 | 元入金・事業主貸・事業主借（`ClosingAccounts`。構築時に実在検証される。D-066） |
-| `closing_tax_category` | 決算振替のゼロ化明細に付ける税区分コード |
-| 帳簿通貨 | コード＋小数桁。`kaikei_app::context::BookSettings::book_currency` に詰める（§5。**必須**。既定で JPY にフォールバックしない。D-074） |
-| 会計年度の区切り規則 | `BookSettings::fiscal_year_rule`（現状 `CalendarYear` のみ） |
-| `APP_DATABASE_URL` | `kaikei_app` ロールの接続文字列（§8） |
+### 設定項目（**PR-E で全て必須に確定**。環境変数で渡す）
 
-- 検証は `config.rs` に閉じ、`main.rs` は「読めなければ起動しない」だけにする。
+| 環境変数 | 内容 |
+|---|---|
+| `APP_DATABASE_URL` | `kaikei_app` ロールの接続文字列（§8） |
+| `KAIKEI_BOOK_CURRENCY` | 帳簿通貨のコード。`kaikei_app::currency::currency_from_code` が桁数まで解決する（§5。既定で JPY にフォールバックしない。D-074） |
+| `KAIKEI_FISCAL_YEAR_RULE` | 会計年度の区切り規則（`BookSettings::fiscal_year_rule`。現状 `calendar_year` のみ） |
+| `KAIKEI_TAX_MODE` | 経理方式（`exclusive` / `inclusive`） |
+| `KAIKEI_ROUNDING` | 端数処理方式（`floor` / `ceil` / `half_up`） |
+| `KAIKEI_ROUNDING_UNIT` | 端数処理の単位（`line` / `document`） |
+| `KAIKEI_IS_TAXABLE_BUSINESS` | 課税事業者か（`true` / `false`） |
+| `KAIKEI_SIMPLIFIED_TAXATION` | 簡易課税か（`true` / `false`） |
+| `KAIKEI_CLOSING_ACCOUNT_CAPITAL` / `_OWNER_DRAWINGS` / `_OWNER_CONTRIBUTIONS` | 決算3科目（元入金・事業主貸・事業主借。`ClosingAccounts`。**科目の実在は `JpSoleProprietorClosingPolicy::new` が構築時に検証する**。D-066） |
+| `KAIKEI_CLOSING_TAX_CATEGORY` | 決算振替のゼロ化明細に付ける税区分コード |
+
+> **PR-E での変更（D-082）**: 本節の初版は `tax_mode` / `rounding` /
+> `rounding_unit` を「省略時はマスタの `settings_defaults`」としていた。
+> **PR-E でこの3つも必須にした。** 税抜/税込は課税事業者区分と同じく
+> **税務判断そのもの**であり、「たまたまその年度のマスタが推奨している値」で
+> 黙って動くのは D-057 が `is_taxable_business` について避けた事故と同型である。
+> `JpSettingsOverrides` の型は変えていない（3つとも `Option` のまま）。
+> 変わったのは**合成ルートが常に `Some` を詰める**という点だけで、
+> `kaikei-jp` 側の契約には手を触れていない。
+
+### 実装（PR-E）
+
+- 検証は `config.rs`（`ServerConfig::from_env`）に閉じ、`main.rs` は
+  「読めなければ起動しない」だけ。値の語彙（`exclusive` / `floor` /
+  `line` / `calendar_year`）は `kaikei_jp::tax` と `kaikei_app::wire` の
+  `from_code` を通す（同じ綴りの表を MCP 層で作らない。D-072）。
+- **不足・不正は最初の1件で打ち切らず、全部まとめて返す**
+  （1件ずつ潰させると12回起動し直すことになる。`CLAUDE.md` §11）。
+- **空文字は「設定した」ことにしない**（`"KEY": ""` / `KEY=` は未設定と
+  同じ扱いで起動を止める。ただし文言では区別する）。
+- 真偽値は `true` / `false` のみ。`1` / `yes` / `on` は受けない
+  （受け入れ方言が増えるほど「設定したつもりで効いていない」事故が増える）。
+- `ServerConfig` の `Debug` は**接続文字列を伏せる**（§8。パスワードが平文で入る）。
 - `kaikei_jp::compose` が返す `ComposeError` の日本語メッセージは、
   そのまま起動失敗の理由として stderr に出す（言い換えない）。
 - `get_settings` は起動時に合成した `JpSettings` をそのまま返すツールであり、
   **未設定時に既定値を返すことはない**（そもそも起動していない）。
+
+### 起動時に行うこと（すべて失敗したら起動を中止する）
+
+| # | 内容 | 失敗したときに出る場所 |
+|---|---|---|
+| 1 | 事業者設定の検証（`config.rs`） | stderr。不足項目を全て名指し |
+| 2 | 同梱 YAML のロードと policy の構築（`kaikei_jp::compose::compose`） | stderr。`ComposeError` の文言をそのまま |
+| 3 | `APP_DATABASE_URL` への接続 | stderr。**接続文字列そのものは出さない**（変数名だけ） |
+| 4 | **接続ロールの権限検査**（§8） | stderr。`kaikei_app` を指すよう案内する |
+| 5 | **勘定科目マスタの投入**（追加のみ・冪等。D-081） | stderr。投入件数と、既存を優先した科目の差異 |
+
+`defaults_as_of`（`ComposeOptions`）には**起動時点の UTC 日付**を渡す。
+「今日が何日か」の決定は presentation 層の責務であり、`kaikei-app` の
+`SystemClock` は `Timestamp` までしか返さない（`CLAUDE.md` §7）。
+この日付が影響するのは「その時点で有効な税区分マスタが同梱されているか」だけで、
+事業者設定を全て明示必須にした結果、マスタの `settings_defaults` は1項目も
+採用されない。**取引日はこれとは別物**で、常にツールの引数として渡ってくる。
 
 ---
 
@@ -1155,8 +1216,26 @@ Phase 3 で認証用のフィールド・設定項目を先取りで用意しな
 丸ごと消えてトリガ（`0004`）だけが残る。**接続先の環境変数を1つ間違えるだけで
 本プロジェクトの中核防御が1層失われる。**
 
-起動時に接続ロールを検査し、`kaikei_migrator` なら起動を中止するのが望ましい
-（§7 の「未設定は起動失敗」と同じ思想）。
+**PR-E で実装した。** ただしロール名の文字列比較ではなく、
+**守りたい性質そのもの**を見る:
+
+```sql
+SELECT current_user::text,
+       has_table_privilege('journal_entries', 'UPDATE'),
+       has_table_privilege('journal_entries', 'DELETE')
+```
+
+どちらかが真なら起動を中止する（`kaikei_store::pool::inspect_journal_privileges`
+が生データを返し、**起動を止めるかどうかの判断は合成ルート**が行う。
+「起動時に何を致命的とするか」は presentation 層の方針であって永続化層が
+決めることではない）。ロール名を変えた環境や、`kaikei_app` に誤って
+`GRANT UPDATE` してしまった環境でも検出できる。
+
+実際に `kaikei_migrator` で接続して拒否されることは
+`crates/kaikei-mcp/tests/startup_pg.rs` の
+`assembling_with_the_owner_role_is_refused` が確認する
+（**対照実験になっていることが要点**——`kaikei_app` では通り
+`kaikei_migrator` では落ちる、を両方見る）。
 
 ### 設定ファイルの取り扱い
 
@@ -1456,6 +1535,13 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
   日本語識別子は使わない）。
 - 置き場は `crates/kaikei-mcp/tests/`。実 PostgreSQL が要るものは `pg-tests` feature 配下。
   **`kaikei-e2e` のコードを流用・依存しない**（D-068 の制約を壊さない）。
+- **`kaikei-mcp` の `pg-tests` は使い捨てDBを作れない。** この crate は
+  `sqlx` に依存しない（MC-30 の許可リスト）ため `#[sqlx::test]` が使えず、
+  `APP_DATABASE_URL` が指す DB をそのまま使う。したがって**書き込むのは
+  勘定科目マスタだけ**（追加のみ・冪等）に留め、仕訳は書かない。
+  実 DB に仕訳を書くテスト（記帳が通ること・試算表・決算）は
+  `kaikei-e2e` 側に置く（あちらは `#[sqlx::test]` でテストごとに
+  使い捨てDBを作れる）。
 
 ### 書き込み系
 
@@ -1495,9 +1581,18 @@ CREATE INDEX idx_audit_log_occurred ON audit_log (occurred_at);
 | MC-10 | 存在させないツール4件 | `tools/list` の応答に `delete_journal_entry` / `update_journal_entry` / `execute_sql` / `reopen_period` のいずれも現れず、それらの名前で `tools/call` すると未知ツールとして拒否される。**禁止リストをテスト側の定数にして4件すべてをループで検査する**（1件だけの検査では他が復活しても緑のまま通る）。**PR-D で実装済み**（`crates/kaikei-mcp/tests/forbidden_tools.rs`）。検査はレジストリ（`ToolRouter`）から導出しており、`tools/list` が返す集合と同一。`tools/call` 側は `ServerHandler::get_tool` と `ToolRouter::has_route` で見る（`rmcp::service::Peer::new` が `pub(crate)` で `RequestContext` を外部 crate から組み立てられないため、`call` を直接叩けない）。**許可リスト側（Phase 3 の11件）からも閉じてある**——禁止4件だけを見張ると新しい名前の破壊的ツールが素通りする |
 | MC-26 | ドメインエラー（貸借不一致等） | JSON-RPC のプロトコルエラーではなく `isError: true` のツール結果として返る（D-071） |
 | MC-27 | 出力の金額 | 全て JSON 文字列である（入力だけでなく出力側も number にしない。§5） |
-| MC-24 | 事業者設定（`is_taxable_business` / `simplified_taxation` 等）を与えずに起動 | 既定値にフォールバックせず**起動が失敗**し、不足項目を名指しするメッセージが出る（§7。D-057） |
+| MC-24 | 事業者設定（`is_taxable_business` / `simplified_taxation` 等）を与えずに起動 | 既定値にフォールバックせず**起動が失敗**し、不足項目を名指しするメッセージが出る（§7。D-057）。**PR-E で実装済み**: `crates/kaikei-mcp/tests/startup_config.rs`。**必須項目を1つずつ外して総当たりで**（1項目だけの検査では他が既定値に落ちても緑のまま通る）、実際に `cargo` がビルドしたバイナリを子プロセスとして起動して確かめる——`config.rs` の単体テストだけでは「その検証が起動経路に繋がっているか」を見られない。単体側（`ServerConfig::from_lookup`）にも同じ総当たりがある |
 | MC-29 | 未登録のタグキー（例: `tax_cat`）で post | **エラー**（黙って落とさない）。メッセージに**有効なタグキー一覧**が含まれる（§3。`CLAUDE.md` §4・§11）。型に合わない値（`business_ratio: "3割"`）も同様に、期待する書式を示すエラー |
 | MC-30 | `kaikei-mcp` の依存 | `Cargo.toml` が `kaikei-app` / `kaikei-jp` / `kaikei-core` / MCP SDK / 非同期ランタイム / シリアライズ以外に依存していない（`uuid` / `rust_decimal` を自前で足していない）。**CI で機械的に検査する**（§4 の申し送り。プローブでは検査できない）。**PR-D で実装済み**: 既存ジョブ `dependency-direction` への**ステップ追加**（新しいジョブではないので必須チェックの登録は不要。`CLAUDE.md` §13）。依存の取得は `cargo metadata --no-deps` の `packages[].dependencies[].name`（`cargo tree` はホストターゲットの依存しか見ず、`[target.'cfg(...)'.dependencies]` を素通りする）、許可リストとの照合は `case` による完全一致（`grep -qw` は `kaikei` のような成分名を通す）。`uuid` を normal / dev / target-cfg のいずれで足しても、また `kaikei` という名前の crate を足しても落ちることを実測した（照合部分は ubuntu:24.04 コンテナでも同じ結果を確認）。`jq` の出力は `tr -d '\r'` を通す——Git Bash の `jq.exe` は stdout をテキストモードで開くため、これが無いと Windows の開発機では**健全な状態でも全依存が「禁止された依存」になる**（手元で回せない検査は回されなくなる）。許可リストは「足してよい上限」であって「足さねばならない一覧」ではないので、実際の `Cargo.toml` と一致していなくてよい（PR-D 時点では `tokio` を宣言していない。使うのは合成ルートを置く PR-E） |
+
+### 起動と合成ルート（**PR-E で追加**）
+
+| # | ケース | 期待 |
+|---|---|---|
+| MC-33 | 起動しても **stdout に JSON-RPC 以外が出ない** | 3段で見る。(1) `crates/kaikei-mcp/src/` に `println!` / `print!` / `io::stdout` が現れない（`tests/stdout_is_json_rpc_only.rs`。**`eprintln!` を `println!` と取り違えない**ことも検査する——取り違えると「stderr に出せ」という指示に従ったコードが落ちる）、(2) 起動に失敗したとき stdout が**1バイトも**出ない（`tests/startup_config.rs`）、(3) 実際に起動して `initialize` を送ったとき、stdout に出た行が JSON-RPC のメッセージである（`tests/startup_pg.rs`。`pg-tests`） |
+| MC-34 | 勘定科目マスタの投入が**冪等** | 2回流しても2回目は1行も追加されない。既存と定義が異なる科目は**上書きせず既存を残し**、差異を診断として返す（D-081）。単体は `crates/kaikei-app/src/usecase/import_chart.rs`、実 DB は `crates/kaikei-store/tests/chart_import.rs` と `crates/kaikei-e2e/tests/e2e_jp.rs` |
+| MC-35 | 投入した後に**記帳が通る** | 「構築は通るが記帳できない」（`PROGRESS.md` Phase 2 の教訓2）への回帰検知。`crates/kaikei-e2e/tests/e2e_jp.rs` の `chart_import_is_idempotent_and_posting_still_works`。同ファイルの既存テストも `seed_chart` が本番の投入経路を呼ぶ形になったので、全て同じ経路を通っている |
+| MC-36 | `APP_DATABASE_URL` に `kaikei_migrator` を渡して起動 | 起動を**中止**する（§8）。`kaikei_app` では通り `kaikei_migrator` では落ちる、という対照で見る（`crates/kaikei-mcp/tests/startup_pg.rs`） |
 
 ### 監査ログ
 

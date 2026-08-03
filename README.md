@@ -68,7 +68,7 @@ READMEおよびドキュメントでの表現は
 | Phase 0 | `kaikei-core`（貸借不一致の仕訳がプログラム上に存在できない簿記エンジン） | ✅ 完了 |
 | Phase 1 | `kaikei-policy`（trait）/ `kaikei-store`（PostgreSQL）/ `kaikei-app`（ユースケース3本） | ✅ 完了 |
 | Phase 2 | `kaikei-jp`（消費税の税額計算・勘定科目テンプレート・家事按分・決算振替） | ✅ 完了 |
-| Phase 3 | `kaikei-mcp`（rmcp / stdio。読み取り系7 + 書き込み系2 + 提案系・検証系2 + audit_log） | 未着手 |
+| Phase 3 | `kaikei-mcp`（rmcp / stdio。読み取り系7 + 書き込み系2 + 提案系・検証系2 + audit_log） | 実装中（合成ルートまで完了。ツールは未実装） |
 | Phase 4〜5 | CSV 取込・証憑 / 帳票・決算 | 未着手 |
 
 各 Phase の実績・設計変更・申し送りは `PROGRESS.md`、設計判断の記録は
@@ -109,6 +109,17 @@ set -a; . ./.env; set +a
 cargo test -p kaikei-store --features pg-tests
 ```
 
+```sh
+set -a; . ./.env; set +a
+cargo test -p kaikei-e2e --features pg-tests   # 合成ルートを模したE2E
+cargo test -p kaikei-mcp --features pg-tests   # MCP サーバーの起動（下記の注意）
+```
+
+`kaikei-mcp` の `pg-tests` だけは**使い捨てDBを作らない**。この crate は
+`sqlx` に依存しない（`docs/07-mcp-server.md` §10 MC-30）ため `#[sqlx::test]`
+を使えず、`APP_DATABASE_URL` が指すデータベースをそのまま使う。
+書き込むのは**勘定科目マスタだけ**（追加のみ・冪等）で、仕訳は1件も書かない。
+
 `pg-tests` を付けない `cargo test --workspace` は DB を必要としない
 （`SQLX_OFFLINE=true` と `.sqlx/` のオフラインキャッシュでコンパイルする）。
 `#[ignore]` による無言スキップは使っていない。ローカルで実行されないまま
@@ -122,6 +133,89 @@ named volume（`kaikei_pgdata`）ごと作り直せば、次回起動時に
 
 逆に、**`docker compose down`（`-v` なし）や再起動ではデータは消えない**。
 帳簿は named volume に永続化されており、コンテナを作り直しても残る。
+
+## MCP サーバーを起動する（Phase 3）
+
+`kaikei-mcp` は MCP クライアント（Claude Code 等）が**子プロセスとして起動する**
+stdio サーバーです。ソケットは開きません（`docs/07-mcp-server.md` §8）。
+
+### 1. 事業者設定を用意する
+
+**設定が1つでも欠けているとサーバーは起動しません。**
+既定値にはフォールバックしません（`DECISIONS.md` D-057 / D-082）。
+課税事業者かどうか・税抜経理かどうかといった判断は、このソフトウェアが
+代わりに決めるべきものではないためです。
+
+必要な項目と値の例は `.env.example` の「kaikei-mcp（MCP サーバー）の事業者設定」
+節にまとまっています。
+
+### 2. 起動する
+
+```sh
+docker compose up -d
+set -a; . ./.env; set +a
+cargo run -p kaikei-store --bin kaikei-migrate   # 初回のみ
+cargo run -p kaikei-mcp
+```
+
+起動時に次のことが行われます。**どれかが失敗したらサーバーは起動しません**
+（ツール応答に到達させない。`docs/07-mcp-server.md` §7）。
+
+1. 事業者設定の検証（不足・不正は**まとめて**stderr に出ます）
+2. 同梱 YAML（勘定科目テンプレート・タグ定義・消費税区分マスタ）のロード
+3. `APP_DATABASE_URL` への接続と、**接続ロールの権限検査**
+   （帳簿への `UPDATE` / `DELETE` を持つロールなら起動を中止します）
+4. **勘定科目マスタの投入**（後述）
+
+診断とエラーはすべて **stderr** に出ます。stdout は JSON-RPC 専用チャネルです。
+
+### 3. 勘定科目マスタの投入について
+
+サーバーは起動のたびに、同梱テンプレート（`kaikei-jp-data/chart/sole_proprietor.yaml`）の
+科目を `accounts` に投入します。**追加しか行いません**（`DECISIONS.md` D-081）。
+
+| 投入しようとした科目 | 動作 |
+|---|---|
+| DB に無い | 追加する |
+| DB にあり、定義が一致 | 何もしない |
+| DB にあり、定義が異なる | **既存を残す**。stderr に差異を出す |
+
+編集した科目名が起動のたびにテンプレートへ戻る、ということは起きません。
+テンプレート側を採用したい場合は勘定科目マスタを直接編集してください。
+
+### 4. MCP クライアントに登録する
+
+```jsonc
+{
+  "mcpServers": {
+    "kaikei": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "-p", "kaikei-mcp"],
+      "env": {
+        "APP_DATABASE_URL": "postgres://kaikei_app:******@localhost:5432/kaikei",
+        "KAIKEI_BOOK_CURRENCY": "JPY",
+        "KAIKEI_FISCAL_YEAR_RULE": "calendar_year",
+        "KAIKEI_TAX_MODE": "exclusive",
+        "KAIKEI_ROUNDING": "floor",
+        "KAIKEI_ROUNDING_UNIT": "line",
+        "KAIKEI_IS_TAXABLE_BUSINESS": "true",
+        "KAIKEI_SIMPLIFIED_TAXATION": "false",
+        "KAIKEI_CLOSING_ACCOUNT_CAPITAL": "400",
+        "KAIKEI_CLOSING_ACCOUNT_OWNER_DRAWINGS": "410",
+        "KAIKEI_CLOSING_ACCOUNT_OWNER_CONTRIBUTIONS": "420",
+        "KAIKEI_CLOSING_TAX_CATEGORY": "NOT_APPLICABLE"
+      }
+    }
+  }
+}
+```
+
+この設定ファイルには **DB パスワードが平文で置かれます**。ファイル権限に
+注意してください（`docs/07-mcp-server.md` §8）。
+
+**Phase 3 PR-E 時点でツールは1件も登録されていません**（`tools/list` は空）。
+記帳・照会のツールは PR-F / PR-G で追加します。現時点で確認できるのは
+「起動でき、勘定科目が入り、記帳できる状態になっている」ところまでです。
 
 ## 仕訳番号と欠番
 
