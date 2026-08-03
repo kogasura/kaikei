@@ -56,12 +56,10 @@ READMEおよびドキュメントでの表現は
 | 7 | `docs/04-jp-tax.md` | 日本税制アダプタ、YAMLスキーマ |
 | 8 | `docs/05-csv-import.md` | CSV取込設計 |
 | 9 | `docs/06-documents.md` | 証憑ファイル管理（Content-Addressed Storage） |
-| 10 | `docs/07-mcp-server.md` | MCPツール定義 |
+| 10 | `docs/07-mcp-server.md` | MCPツール定義と Phase 3 の実装方針 |
 | 11 | `docs/08-compliance.md` | 電帳法・インボイス制度の要件整理 |
 | 12 | `DECISIONS.md` | 設計判断と却下した選択肢の記録 |
 | 13 | `ROADMAP.md` | Phase 0〜5 |
-
-`skeleton/` にはワークスペースの `Cargo.toml`、CI設定、データファイルの雛形がある。
 
 ## 進捗
 
@@ -70,7 +68,8 @@ READMEおよびドキュメントでの表現は
 | Phase 0 | `kaikei-core`（貸借不一致の仕訳がプログラム上に存在できない簿記エンジン） | ✅ 完了 |
 | Phase 1 | `kaikei-policy`（trait）/ `kaikei-store`（PostgreSQL）/ `kaikei-app`（ユースケース3本） | ✅ 完了 |
 | Phase 2 | `kaikei-jp`（消費税の税額計算・勘定科目テンプレート・家事按分・決算振替） | ✅ 完了 |
-| Phase 3〜5 | MCP サーバー / CSV 取込 / 帳票 | 未着手 |
+| Phase 3 | `kaikei-mcp`（rmcp / stdio。読み取り系7 + 書き込み系2 + 提案系・検証系2 + audit_log） | 未着手 |
+| Phase 4〜5 | CSV 取込・証憑 / 帳票・決算 | 未着手 |
 
 各 Phase の実績・設計変更・申し送りは `PROGRESS.md`、設計判断の記録は
 `DECISIONS.md` を参照。

@@ -206,6 +206,16 @@ core は意味を解釈しない。ただし `TagSchema` による形式検証�
 **トレードオフ**: AI が number を渡してくることがある。
 → エラーメッセージで明示的に案内する。整数なら警告付きで受理する余地を残す。
 
+> 【後日の訂正】この「整数なら警告付きで受理する余地」は Phase 3（`kaikei-mcp`
+> の設計確定）で**却下した**。`{"amount": 110000}` がサーバに届いた時点では、
+> クライアント側で既に IEEE 754 倍精度に丸められたかどうかを**サーバから
+> 検出できない**。受理すれば「警告付きで壊れた金額を記帳する」ことになり、
+> `CLAUDE.md` 冒頭「会計データは間違うと実害が出る」に反する。
+> **number は整数であってもエラーにする。** JSON スキーマ上も金額フィールドを
+> `"type": "string"` にし、number を受ける余地を型で塞ぐ
+> （実装形は `docs/07-mcp-server.md` §5）。本決定（金額を文字列で扱うこと
+> そのもの）は有効。
+
 ---
 
 ## D-014 削除系の MCP ツールを作らない
@@ -227,6 +237,20 @@ D-006（DB 権限）と多層防御になる。
 デフォルトで `127.0.0.1` にのみバインドし、外部公開時の注意を README に書く。
 
 **留保**: Phase 5 でトークン認証を追加する余地を残す（構造上、後から入れられる）。
+
+> 【後日の訂正】本決定は「バインドするソケットがある」ことを前提に書かれているが、
+> Phase 3 の `kaikei-mcp` は **stdio トランスポート**（D-071）であり、
+> **ソケットを一切開かない**。MCP クライアントが子プロセスとして spawn する
+> ため、バインドアドレス・ポートという概念が存在せず、listen アドレスの
+> 設定項目を作ってはならない。`kaikei-mcp` の信頼境界は「このプロセスを
+> 起動できる OS ユーザー」と「接続に使う DB ロール」の2つだけであり、
+> 認証機構を持たないのは**延期ではなく、認証する対象がそもそも無いため**である。
+>
+> 「デフォルトで `127.0.0.1` にのみバインドする」が実際に効いているのは
+> (a) PostgreSQL のポート公開（`docker-compose.yml` の
+> `127.0.0.1:5432:5432`。実装済み）と (b) Phase 4 の `kaikei-api`（axum / HTTP）
+> であり、外部公開時の注意書きの宛先もそちらである。トークン認証の留保が
+> 論点になるのも `kaikei-api` 以降（`docs/07-mcp-server.md` §8）。
 
 ---
 
@@ -2132,10 +2156,20 @@ crate からも依存されない」という制約自体を CI で守り続け�
 
 ## D-069 `JpStatementPolicy` の `chart` は決算書生成の直前に都度読み直したもので構築する（起動時に長期保持しない）
 
-**決定**: `kaikei-e2e::compose` が返す `Composition` に `JpStatementPolicy` を
-含めない。`JpStatementPolicy::new(chart)` は、決算書（BS/PL）を組み立てる
-直前に、その時点で読み込んだ `ChartOfAccounts` から**都度**呼び出すこと、と
-`kaikei-e2e/src/lib.rs` のクレート doc に方針として明記する。
+**決定**: `kaikei_jp::compose::compose` が返す `Composition` に
+`JpStatementPolicy` を含めない。`JpStatementPolicy::new(chart)` は、決算書
+（BS/PL）を組み立てる直前に、その時点で読み込んだ `ChartOfAccounts` から
+**都度**呼び出すこと、と `crates/kaikei-jp/src/compose.rs`（および `kaikei-jp`
+のクレート doc）に方針として明記する。
+
+> 【後日の訂正】本決定の初版は組み立ての置き場を `kaikei-e2e::compose` と
+> 書いていた。**誤り。** D-068 の訂正注記のとおり `compose()` は PR-23 で
+> `kaikei-jp` へ移っており、`kaikei-e2e` 側は
+> `pub use kaikei_jp::compose::{...}` の再エクスポートに過ぎない。
+> Phase 3 の実装者は `kaikei-e2e` に依存できない（`architecture.yml` の
+> 「kaikei-e2e は誰からも依存されない」ステップ）ため、初版の記述のままでは
+> **方針の置き場所を辿れない**。決定の内容（`JpStatementPolicy` を長期保持
+> しない）は変わらない。
 
 **却下した選択肢**:
 
@@ -2163,3 +2197,129 @@ crate からも依存されない」という制約自体を CI で守り続け�
 「表示される科目名が古い」という誤診に近いバグ（`CLAUDE.md` §11・
 `PROGRESS.md` Phase 1 の教訓「誤診は誤値と同じ実害を持つ」）を構造的に
 避けられる利点の方が大きいと判断した。
+
+---
+
+## D-070 Phase 3（`kaikei-mcp`）のスコープを11ツールに確定し、残りは名前を予約したまま延期する
+
+**決定**: Phase 3 で MCP に**登録する**ツールを次の11件に確定する。
+
+- 読み取り系(7): `list_accounts` / `get_entry` / `get_trial_balance` /
+  `search_entries` / `get_ledger` / `list_tax_categories` / `get_settings`
+- 書き込み系(2): `post_journal_entry` / `reverse_journal_entry`
+- 提案系・検証系(2): `suggest_tax_category` / `validate_invoice_number`
+
+次の11件は `docs/07-mcp-server.md` の表に**残したまま「Phase 4 以降」と明記**し、
+Phase 3 では MCP に登録しない（登録しないツールは AI からは存在しないのと同じ）。
+
+| 延期するツール | 延期理由 |
+|---|---|
+| `get_statements` / `explain_balance` | `TrialBalance` / `BalanceRow` を `kaikei-core` の外から構築できない（D-031。`GroupKey` に公開コンストラクタが無い） |
+| `close_period` | 締めスナップショットの `checksum` が Phase 5 の `kaikei verify` と**同一の計算式**である必要があるが、その式が未定義（`0007_period_snapshots.sql` は「対象仕訳のハッシュ連鎖」とコメントするのみ）。仕様が固まる前に不可逆操作を実装しない |
+| `list_pending_transactions` / `journalize_transaction` / `ignore_transaction` / `upsert_journalize_rule` / `suggest_journal_entry` | `kaikei-import` が未着手（crate もテーブルも存在しない） |
+| `search_documents` / `attach_document` | `kaikei-blob` が未着手（`documents` / `entry_documents` は Phase 4 で設計する） |
+| `upsert_counterparty` | `ChartRepo` に書き込みメソッドが無い（DB 権限は既にある） |
+
+`delete_journal_entry` / `update_journal_entry` / `execute_sql` / `reopen_period` は
+**将来も作らない**（D-014。「Phase 4 以降」ではない）。
+
+あわせて、このスコープに伴う次の事項を確定する。
+
+1. **`search_entries` / `get_ledger` / `get_entry` は Phase 3 に含める**
+   （`ROADMAP.md` Phase 3 の成果物「読み取り系ツール」を採る）。read model
+   （`kaikei-store/src/query/{search,ledger,entry_detail}.rs`）を Phase 3 で新設し、
+   `crates/kaikei-store/src/query/mod.rs` の「Phase 5 で実装する」という注記を
+   Phase 3 に直す。
+2. **勘定科目マスタの投入は MCP ツールにしない。** `kaikei-app` に専用の
+   ユースケースを新設して行う（`ChartRepo` の doc が言う「マスタの編集は本 crate
+   のユースケースの対象外」はこの範囲で改める）。現状これが無いため
+   `kaikei-e2e/tests/e2e_jp.rs` の `seed_chart` が migrator ロールで生 SQL を
+   発行しており、本番の合成ルートには流用できない。
+3. **`PolicyNote` を `post_journal_entry` の戻り値に含め、`audit_log.output` にも残す。**
+   `post_entry::execute` は現在 `derive_tax_lines(...)?.lines` として `notes` を
+   捨てており、戻り値の拡張（`PostEntryOutput { entry, notes }` 相当）が Phase 3 の
+   スコープに入る（Phase 2 の申し送りへの回答。D-059）。
+4. **audit_log は別コネクションで2回書く**（開始レコード `status='started'` →
+   操作 → 結果レコード `status='ok'|'error'`。`request_id` で対応付ける）。
+   開始レコードの書き込み失敗は **fail-closed**（操作しない）、結果レコードの
+   失敗は **fail-open**（操作は成功として返し警告を添える）。
+5. **事業者設定は明示必須。未設定は起動失敗**（既定値にフォールバックしない。D-057）。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| `docs/07-mcp-server.md` の22ツールをそのまま Phase 3 の対象として実装する | 半数は依存する crate（`kaikei-import` / `kaikei-blob`）もテーブルも存在せず、`get_statements` / `explain_balance` は D-031 により core の外から `TrialBalance` を構築できないため原理的に実装できない。ROADMAP の「読み取り系ツール全部」と表を併読した実装者が、必ず実装不能なツールに着手する |
+| 延期するツールの節・行を設計書から**削除**する | 「なぜ無いのか」が失われ、後の実装者が善意で復活させる。とくに `suggest_journal_entry` の「`reasoning` と `similar_entries` を必須にする」という設計意図は、このプロジェクトの差別化そのものであり、消すと再発明できない。**残したうえで Phase を明記する**方が安全 |
+| `close_period` を Phase 3 に入れ、`checksum` は暫定の式で実装しておく | 締めは不可逆操作であり、後から式を変えると**既に締めた記録を検証できなくなる**。`kaikei verify`（Phase 5）と式が一致しない締めスナップショットは、検証機能から見れば「壊れた記録」と区別できない |
+| `search_entries` / `get_ledger` を Phase 5 に送り（`query/mod.rs` の現行注記に従う）、Phase 3 は `get_trial_balance` だけにする | Phase 3 は「自分の帳簿を付け始める」ドッグフーディングの起点（`ROADMAP.md`）であり、記帳した仕訳を引けないと記帳の誤りに気づけない。検索と元帳が無い状態で帳簿を付け始めるのは、`post` の誤りを検出する手段を持たないまま運用を始めることを意味する |
+| 監査ログを操作と同一トランザクションで1回だけ書く（列を増やさない） | **失敗した操作の記録が rollback で一緒に消える。** 「AI が何をしようとしたか」を最も知りたいのは失敗したときであり、この設計では最も重要な記録だけが残らない |
+
+**理由**: `PROGRESS.md` Phase 2 の教訓1は「設計書が却下済みの設計を指示したまま
+になる事故が3回起きた」である。`docs/07-mcp-server.md` は Initial commit 以降
+一度も更新されておらず、D-021〜D-069 が1件も反映されていない状態でこの
+Phase の実装者に渡ろうとしていた。同じ事故のより大きな版になる。
+ツール一覧に **Phase 列**を入れて「いつ作るか」を1件ずつ明示するのが、
+文書を読んだ実装者が実装不能なツールに着手することを防ぐ最小の手当てだった。
+
+**トレードオフ**: Phase 3 で新設する層が増える（read model 3本、勘定科目投入
+ユースケース、audit_log 用ポートと `kaikei-store` 実装、`post_entry::execute` の
+戻り値拡張）。「MCP はユースケースを呼ぶ薄い層」という当初の見積もりより
+Phase 3 の作業量は大きい。ただしこれは見積もりが実態に合っていなかっただけで、
+どの層に置くかを曖昧にしたまま進めれば MCP 層に SQL やビジネスロジックが
+染み出す（`CLAUDE.md` §1・§6 の違反）ため、先に置き場を決める方を選んだ。
+また audit_log の2行構成は書き込み回数が倍になるが、単一ユーザー・自己ホスト
+前提（D-015）の規模では問題にならないと判断した。
+
+---
+
+## D-071 MCP SDK は `rmcp` 3.x（stdio）を使い、エラーはツール結果エラー（`isError: true`）で返す
+
+**決定**: `kaikei-mcp` の MCP 実装には公式 Rust SDK の **`rmcp` 3.x** を使う。
+
+```toml
+rmcp = { version = "3", default-features = false, features = [
+    "server", "macros", "transport-io", "schemars",
+] }
+```
+
+- トランスポートは **stdio**（MCP クライアントが子プロセスとして起動する）。
+  サーバはソケットを開かない。
+- 入力は `Parameters<T>` で受け、`T` に `#[derive(Deserialize, JsonSchema)]` を
+  付けて input_schema を生成する（`schemars` feature）。
+- 1ツール1ファイルは、各ファイルの
+  `#[tool_router(router = <ツール名>_router, vis = "pub")]` を `server.rs` で
+  `+` 合成して実現する。
+- **ドメインのエラーはツール結果エラー（`CallToolResult::error`。`isError: true`）
+  で返す。** JSON-RPC のプロトコルエラー（rmcp では `Err(ErrorData)`）は、
+  ツール呼び出しに到達できない異常（未知のツール名など）に限る。
+- `crates/kaikei-mcp` を workspace の `members` に追加し、`rust-version` は
+  workspace 既定の `1.80` を継承せず**個別に `1.88` を宣言する**。
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| JSON-RPC 2.0 と MCP のハンドシェイクを手書きする（依存を増やさない） | MCP は仕様が更新され続けているプロトコルであり、`initialize` のバージョン折衝・`tools/list` のスキーマ形・通知の扱いを自前で追随し続けることになる。会計の正しさに寄与しない保守負債であり、`CLAUDE.md` §1 の「依存を増やしたくなったら設計を疑う」は**下位層（core）**の話であって、presentation 層でプロトコル SDK を使わない理由にはならない |
+| 第三者製の MCP crate を使う | 公式 SDK が存在する領域でメンテナンス主体が不明な実装に依存する理由が無い。7年保存の会計データを扱う基盤で保守されないライブラリを選ばない（`serde_yaml` → `serde_norway` の判断と同じ。D-049） |
+| HTTP（SSE / Streamable HTTP）トランスポートにする | Phase 3 の利用形態は「Claude Code がローカルで spawn する」の1つだけであり、ソケットを開くと認証・バインドアドレス・CORS という論点が一式付いてくる（D-015 の留保）。stdio なら信頼境界が「このプロセスを起動できる OS ユーザー」に閉じる。HTTP が要るのは Phase 4 の `kaikei-api` |
+| ドメインエラーを JSON-RPC のプロトコルエラー（`error` オブジェクト）で返す | **クライアントが `error.data` をモデルに見せる保証が無い。** 不透明な文言（"Tool result missing due to internal error" 等）に置き換えて描画されると、`CLAUDE.md` §11 が要求する「次の手が分かる文言」が AI に届かず、原則そのものが空文になる。「貸借不一致のとき AI が自己修正できる」は Phase 3 の完了条件（`ROADMAP.md`）である |
+| `rust-version` を workspace 既定の `1.80` のままにする | `rmcp` 3.x が要求する MSRV に届かない。workspace 全体を 1.88 に引き上げると、`kaikei-core` 以下の下位 crate まで presentation 層の都合で MSRV が上がる。上位 crate 側で個別に宣言すれば影響を閉じ込められる |
+| `default-features = true` のまま使う | 使わないトランスポート（HTTP/SSE 等）とその依存が入る。`cargo-deny`（`supply-chain.yml`）の監査面と、ソケットを開く経路をビルドに含めない意味の両方で、必要な feature だけを明示する |
+
+**理由**: MCP はこのプロジェクトの差別化の本体（`ROADMAP.md` Phase 3）であり、
+価値はプロトコル実装そのものではなく「会計操作を安全に AI へ開くこと」にある。
+プロトコル部分は公式 SDK に委ね、こちらは `CLAUDE.md` §11 の
+エラーメッセージ設計・§10 の表現規律・監査ログに労力を割く。
+エラーの返し方を SDK 採用と同じ決定に含めたのは、この2つが実装上分離できない
+（`Err(ErrorData)` と `Ok(CallToolResult::error(...))` のどちらを返すかは
+rmcp のハンドラのシグネチャで毎回選ぶ）ためである。
+
+**トレードオフ**: `rmcp` の破壊的変更に追随する必要がある（3.x 系のマイナー
+更新でマクロの形が変わる可能性がある）。また `#[tool]` がツール説明文を
+**関数の doc コメント**から採るため、`CLAUDE.md` §10・§11 の表現規律が
+doc コメントにも及ぶ（doc コメントが AI に読まれる文書になる、という
+これまでに無い性質が加わる）。stdio を選んだことで、**stdout は JSON-RPC
+専用チャネル**になり、`println!` や stdout に出る `tracing` が1行でも
+混ざるとプロトコルが壊れるという運用上の制約を負う
+（ログは stderr に固定する。`docs/07-mcp-server.md` §4）。

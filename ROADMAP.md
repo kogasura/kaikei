@@ -100,10 +100,19 @@ MCP サーバー。**差別化の本体。**
 
 ### 成果物
 
-- 読み取り系ツール全部
-- `post_journal_entry`, `reverse_journal_entry`
-- `suggest_tax_category`
-- `audit_log`
+**MCP に登録するのは11ツール**（一覧と延期したツールの理由は
+`docs/07-mcp-server.md` §2、`DECISIONS.md` D-070）。
+
+- 読み取り系(7): `list_accounts` / `get_entry` / `get_trial_balance` /
+  `search_entries` / `get_ledger` / `list_tax_categories` / `get_settings`
+  - `get_statements` / `explain_balance` は Phase 4 以降。
+    core の `TrialBalance` / `BalanceRow` を外から構築できないため（D-031）
+  - `list_pending_transactions` / `search_documents` も Phase 4 以降
+    （`kaikei-import` / `kaikei-blob` が未着手）
+- 書き込み系(2): `post_journal_entry` / `reverse_journal_entry`
+- 提案系・検証系(2): `suggest_tax_category` / `validate_invoice_number`
+- `audit_log`（別コネクションで開始・結果の2行を書く。D-070）
+- MCP SDK は `rmcp` 3.x / stdio（D-071）
 
 ### 完了条件
 

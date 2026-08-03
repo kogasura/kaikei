@@ -30,8 +30,10 @@
 //!
 //! # ここに置いてよいもの・置いてはいけないもの
 //!
-//! - 置いてよい: 合成ルートが起動時に一度だけ行う**組み立て**
-//!   （YAMLロード → policy 構築）を1箇所にまとめたヘルパ（[`compose`]）
+//! - 置いてよい: **実 DB に繋ぐ E2E テストだけ**
+//! - 置いてはいけない: 組み立て（[`compose`]）の実装。本体は `kaikei-jp` にあり
+//!   （`DECISIONS.md` D-068 の訂正注記）、この crate はそれを再エクスポート
+//!   しているだけである
 //! - 置いてはいけない: 税額計算・按分・決算処理そのもの（それは
 //!   `kaikei-jp` の責務）。この crate に業務ロジックを書き始めたら、それは
 //!   本来 Phase 3 の `kaikei-mcp`（または Phase 4 の `kaikei-api`）に
@@ -40,27 +42,14 @@
 //! # `JpStatementPolicy` の `chart` について（`DECISIONS.md` D-069）
 //!
 //! [`compose`] が返す [`Composition`] は `JpStatementPolicy` を**含まない**。
+//! 決算書（BS/PL）を組み立てる**直前**に、その時点で読み込んだ `chart` から
+//! 都度 `JpStatementPolicy::new(chart)` すること。
 //!
-//! `JpTaxPolicy`（年度別マスタ）や `JpSoleProprietorClosingPolicy`
-//! （決算科目3つの実在検証）が保持するデータは YAML 由来で、変更するには
-//! プロセス再起動が要る（`DECISIONS.md` D-025/D-057/D-066）。これらは
-//! 起動時に一度組み立てて長期保持するのが自然である。
-//!
-//! 一方 `JpStatementPolicy` が保持する `chart` は**DBから読み直される
-//! 可変データ**であり、`kaikei-app/src/context.rs` の
-//! `load_posting_context` が記帳のたびに `tx.load_chart()` で読み直して
-//! いるのと同じ性質を持つ（ユーザーが科目名を編集する経路が存在する）。
-//! `JpStatementPolicy` を起動時に一度だけ構築して長期保持すると、
-//! 「科目名を変更したのに決算書には古い名前が表示される」という
-//! バグになりうる。
-//!
-//! `JpStatementPolicy::new` はYAML解釈や構築時検証を一切行わない単純な
-//! ラッパ（`ChartOfAccounts` を保持するだけ）であり、構築コストは
-//! 無視できるほど小さい。そのため方針は
-//! **「決算書（BS/PL）を組み立てる直前に、その時点で読み込んだ `chart`
-//! から都度 `JpStatementPolicy::new(chart)` する」**とし、`compose` の
-//! 戻り値には含めない。呼び出し側（合成ルート）は決算書生成のリクエストの
-//! たびに `chart` を読み直してから構築すること。
+//! 理由（`chart` は記帳のたびに読み直される可変データであり、長期保持すると
+//! 「科目名を変更したのに決算書には古い名前が表示される」バグになる）は
+//! `kaikei-jp` のクレート doc「`JpStatementPolicy` の `chart` について」に
+//! 置いてある。**方針の置き場は `kaikei-jp` 側**であり、`kaikei-e2e` に
+//! 依存できない Phase 3 以降の合成ルート（`kaikei-mcp`）からも辿れる。
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

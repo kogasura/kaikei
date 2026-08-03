@@ -25,6 +25,35 @@
 //!   `kaikei-policy::ClosingPolicy` の実装。`docs/04-jp-tax.md` §9。PR-7）
 //! - [`statement`][]: 財務諸表の様式（[`statement::JpStatementPolicy`]。
 //!   `kaikei-policy::StatementPolicy` の実装。`docs/04-jp-tax.md` §9・§10。PR-7）
+//! - [`compose`][]: 合成ルートが起動時に一度だけ行う組み立て（YAMLロード →
+//!   policy 構築。[`compose::compose`] / [`compose::Composition`]）。
+//!   Phase 3 の `kaikei-mcp` と Phase 4 の `kaikei-api` はいずれもここを入口に
+//!   する（`DECISIONS.md` D-068、`docs/07-mcp-server.md` §4。PR-23）
+//!
+//! # `JpStatementPolicy` の `chart` について（`DECISIONS.md` D-069）
+//!
+//! [`compose::compose`] が返す [`compose::Composition`] は
+//! [`statement::JpStatementPolicy`] を**含まない**。
+//!
+//! [`tax::JpTaxPolicy`]（年度別マスタ）や
+//! [`closing::JpSoleProprietorClosingPolicy`]（決算科目3つの実在検証）が
+//! 保持するデータは YAML 由来で、変更するにはプロセス再起動が要る
+//! （`DECISIONS.md` D-025/D-057/D-066）。これらは起動時に一度組み立てて
+//! 長期保持するのが自然である。
+//!
+//! 一方 `JpStatementPolicy` が保持する `chart` は**DBから読み直される可変
+//! データ**であり、`kaikei-app/src/context.rs` の `load_posting_context` が
+//! 記帳のたびに `tx.load_chart()` で読み直しているのと同じ性質を持つ
+//! （ユーザーが科目名を編集する経路が存在する）。`JpStatementPolicy` を
+//! 起動時に一度だけ構築して長期保持すると、「科目名を変更したのに決算書には
+//! 古い名前が表示される」というバグになりうる。
+//!
+//! `JpStatementPolicy::new` はYAML解釈や構築時検証を一切行わない単純な
+//! ラッパ（`ChartOfAccounts` を保持するだけ）であり、構築コストは無視できる。
+//! そのため方針は**「決算書（BS/PL）を組み立てる直前に、その時点で読み込んだ
+//! `chart` から都度 `JpStatementPolicy::new(chart)` する」**とし、`compose` の
+//! 戻り値には含めない。合成ルートは決算書生成のリクエストのたびに `chart` を
+//! 読み直してから構築すること。
 //!
 //! # ローダの命名規約
 //!

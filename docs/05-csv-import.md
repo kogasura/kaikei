@@ -129,8 +129,8 @@ pub struct ImportResult {
 
 銀行ごとにフォーマットが違う地獄への対処。**コードでなくデータ。**
 
-`kaikei-import-data/profiles/*.yaml`
-（例は `skeleton/data/csv-profile-example.yaml`）
+`crates/kaikei-import-data/profiles/*.yaml`
+（例は `crates/kaikei-import-data/profiles/csv-profile-example.yaml`）
 
 ### スキーマ
 
