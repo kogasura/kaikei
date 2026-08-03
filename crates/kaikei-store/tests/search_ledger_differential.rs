@@ -88,20 +88,40 @@ fn line(account_code: &str, side: Side, amount: i128, tags: TagSet) -> JournalLi
 }
 
 fn counterparty(value: &str) -> TagSet {
-    let mut tags = TagSet::new();
-    tags.insert(key("counterparty"), TagValue::Code(value.to_string()));
-    tags
+    tags(&[("counterparty", value)])
+}
+
+/// 複数キーのタグ袋（`(キー, 値)` の並びから作る）。
+fn tags(pairs: &[(&str, &str)]) -> TagSet {
+    let mut set = TagSet::new();
+    for (k, v) in pairs {
+        set.insert(key(k), TagValue::Code(v.to_string()));
+    }
+    set
 }
 
 fn schema() -> TagSchema {
-    TagSchema::new(vec![(
-        key("counterparty"),
-        TagDef {
-            value_type: TagValueType::Code,
-            aggregatable: true,
-            required_for: vec![],
-        },
-    )])
+    TagSchema::new(vec![
+        (
+            key("counterparty"),
+            TagDef {
+                value_type: TagValueType::Code,
+                aggregatable: true,
+                required_for: vec![],
+            },
+        ),
+        // ★2キー以上のタグ検索を検査するために要る★
+        // 1キーしか無いと `NOT EXISTS (... WHERE NOT EXISTS (...))`（AND）を
+        // 「いずれかを満たす」（OR）に書き換えても結果が変わらない。
+        (
+            key("tax_category"),
+            TagDef {
+                value_type: TagValueType::Code,
+                aggregatable: true,
+                required_for: vec![],
+            },
+        ),
+    ])
 }
 
 fn chart() -> ChartOfAccounts {
@@ -111,6 +131,11 @@ fn chart() -> ChartOfAccounts {
         account("600", "消耗品費", AccountType::Expense),
         // 二重訂正の検査だけに使う科目（他の検査の合計を動かさないため）。
         account("700", "支払手数料", AccountType::Expense),
+        // 実帳簿の形（仮払消費税を含む3行以上の仕訳）だけに使う科目。
+        // 800 は**同じ仕訳の中に2行**現れ、820 は**同じ相手科目を2度**持つ。
+        account("800", "通信費", AccountType::Expense),
+        account("810", "仮払消費税等", AccountType::Asset),
+        account("820", "未払金", AccountType::Liability),
     ])
     .unwrap()
 }
@@ -159,9 +184,40 @@ async fn insert_account(pool: &PgPool, def: &AccountDef) {
     .unwrap();
 }
 
+/// 明細を DB へ書き込む**物理的な順序**。
+///
+/// # なぜ選べるようにするのか（PR-H レビュー2巡目）
+///
+/// テーブルの行の並びは `line_no` と一致するとは限らない
+/// （seq scan が返す順序はヒープ上の並びであり、`VACUUM FULL` や
+/// `pg_repack` による書き換え・parallel seq scan で変わりうる）。
+/// **read model はその並びに依存してはならない。**
+///
+/// `ledger.rs` の残高の累計は
+/// `OVER (ORDER BY e.entry_date, e.entry_no, e.id, l.line_no …)` と
+/// 4項で並べており、`l.line_no` を落とすと**同一仕訳内の同じ科目の2行**が
+/// 同順位（peer）になる。PostgreSQL は同順位の行の相対順序を保証しないが、
+/// 行が少ないうちは入力順（＝ヒープ上の並び）をそのまま返すため、
+/// **明細を `line_no` 順に INSERT している限り、`l.line_no` を落としても
+/// 正しい答えが返ってしまう**。
+///
+/// そこで 9 番の仕訳だけ、`line_no` は正しいまま**逆順に INSERT** する。
+/// 正しい実装は物理順に依存しないのでこの土台でも答えは変わらないが、
+/// `l.line_no` を落とした実装は `running_balance` が表示順と食い違う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhysicalOrder {
+    /// `line_no` の昇順に INSERT する（本番の記帳と同じ）。
+    SameAsLineNo,
+    /// `line_no` の降順に INSERT する（並びに依存していないことを見るため）。
+    ReverseOfLineNo,
+}
+
 /// 構築済みの仕訳を、`kaikei-store` の共有変換関数を使って DB へ INSERT する
 /// （`tests/trial_balance_differential.rs` と同じ形）。
-async fn insert_entry(pool: &PgPool, entry: &JournalEntry) {
+///
+/// `physical_order` が [`PhysicalOrder::ReverseOfLineNo`] のときは、
+/// **`line_no` は正しいまま、行を逆順に INSERT する**（下の doc）。
+async fn insert_entry(pool: &PgPool, entry: &JournalEntry, physical_order: PhysicalOrder) {
     let mut tx = pool.begin().await.unwrap();
 
     let id = Uuid::from_u128(entry.id().as_u128());
@@ -182,8 +238,17 @@ async fn insert_entry(pool: &PgPool, entry: &JournalEntry) {
     .await
     .unwrap();
 
-    for (i, line) in entry.lines().iter().enumerate() {
-        let line_no = i16::try_from(i + 1).unwrap();
+    let mut numbered: Vec<(i16, &JournalLine)> = entry
+        .lines()
+        .iter()
+        .enumerate()
+        .map(|(i, line)| (i16::try_from(i + 1).unwrap(), line))
+        .collect();
+    if physical_order == PhysicalOrder::ReverseOfLineNo {
+        numbered.reverse();
+    }
+
+    for (line_no, line) in numbered {
         let (amount_minor, currency, minor_unit) = money_to_columns(line.amount()).unwrap();
         sqlx::query(
             "INSERT INTO journal_lines \
@@ -208,7 +273,7 @@ async fn insert_entry(pool: &PgPool, entry: &JournalEntry) {
     tx.commit().await.unwrap();
 }
 
-/// 差分テストの土台。8件の仕訳を作る。
+/// 差分テストの土台。10件の仕訳を作る。
 ///
 /// | # | 取引日 | 内容 | 科目 |
 /// |---|---|---|---|
@@ -220,6 +285,36 @@ async fn insert_entry(pool: &PgPool, entry: &JournalEntry) {
 /// | 6 | 2026-05-10 | 振込手数料 | **700** / 100 |
 /// | 7 | 2026-05-20 | 6 の赤伝 | **700** / 100 |
 /// | 8 | 2026-05-30 | ★6 の赤伝（**二重訂正**）★ | **700** / 100 |
+/// | 9 | 2026-06-10 | ★通信費2回線＋仮払消費税（**4行**）★ | 810 + **800 + 800** / 820 |
+/// | 10 | 2026-06-20 | 郵便料金 | 800 / 820 |
+///
+/// # なぜ実帳簿の形（9・10）を土台に入れるのか（PR-H レビュー2巡目）
+///
+/// 1〜8 は**すべて2行の仕訳**で、同じ科目が同じ仕訳に2度現れることも、
+/// 明細の金額がばらけることも無かった。そのため次の4つの退行が
+/// **両スイート緑のまま**通っていた:
+///
+/// | 退行 | 9・10 が無いと何が起きないか |
+/// |---|---|
+/// | `array_agg(DISTINCT … ORDER BY …)` から `DISTINCT`/`ORDER BY` を落とす | 相手科目が1件しかないので重複も並び替えも起きない |
+/// | 残高の累計のウィンドウから `l.line_no` を落とす | 同じ仕訳に同じ科目の2行が無いので並びが一意に決まる |
+/// | 最終の `ORDER BY … line_no` を `line_no DESC` にする | 同上 |
+/// | 金額範囲の `EXISTS` を min 用・max 用の2つに割る | 1仕訳の明細金額が全て同額なので「min と max を別の行が満たす」が起きない |
+///
+/// 9 は 810（仮払消費税等 3,000）+ 800（通信費 10,000）+ 800（通信費 20,000）
+/// / 820（未払金 33,000）の4行で、
+///
+/// - **800 が同じ仕訳に2行**ある（`line_no` 2 と 3。金額も異なる）
+/// - **820 から見た相手科目が 810・800・800** と重複し、記帳順（810 が先）が
+///   コード順（800 が先）と**逆**である
+/// - 明細の金額が 3,000 / 10,000 / 20,000 / 33,000 と**ばらけている**
+///
+/// タグも 9 と 10 で**組み合わせが違う**（9 は `counterparty` と
+/// `tax_category` の両方、10 は `tax_category` だけ）。これが無いと
+/// タグの AND を OR に書き換えても結果が変わらない。
+///
+/// 既存の期待値を動かさないよう、**専用の科目（800 / 810 / 820）**だけを使う
+/// （100 / 500 / 600 / 700 の元帳は 9・10 の追加で1行も変わらない）。
 ///
 /// # なぜ二重訂正を土台に入れるのか（PR-H レビュー C-2）
 ///
@@ -354,8 +449,56 @@ async fn seed(pool: &PgPool) -> Vec<JournalEntry> {
     }
     entries.insert(5, double_reversed);
 
+    // ★実帳簿の形★ 仮払消費税を含む4行仕訳。同じ科目（800）が2行あり、
+    // 相手科目（820 から見て）が重複し、金額がばらける（上の doc）。
+    entries.push(entry(
+        9,
+        9,
+        date(2026, 6, 10),
+        "6月の通信費（2回線分と仮払消費税）",
+        vec![
+            line(
+                "810",
+                Side::Debit,
+                3_000,
+                tags(&[("tax_category", "PURCHASE_10")]),
+            ),
+            line("800", Side::Debit, 10_000, TagSet::new()),
+            line("800", Side::Debit, 20_000, TagSet::new()),
+            line("820", Side::Credit, 33_000, counterparty("CP0009")),
+        ],
+        &fy,
+        &chart,
+        &schema,
+    ));
+    // タグの組み合わせが 9 と違う（`tax_category` はあるが `counterparty` は無い）。
+    entries.push(entry(
+        10,
+        10,
+        date(2026, 6, 20),
+        "郵便料金",
+        vec![
+            line(
+                "800",
+                Side::Debit,
+                1_000,
+                tags(&[("tax_category", "PURCHASE_10")]),
+            ),
+            line("820", Side::Credit, 1_000, TagSet::new()),
+        ],
+        &fy,
+        &chart,
+        &schema,
+    ));
+
     for e in &entries {
-        insert_entry(pool, e).await;
+        // 9 番だけ明細を逆順に INSERT する（[`PhysicalOrder`] の doc）。
+        let physical_order = if e.id() == EntryId::new(9) {
+            PhysicalOrder::ReverseOfLineNo
+        } else {
+            PhysicalOrder::SameAsLineNo
+        };
+        insert_entry(pool, e, physical_order).await;
     }
     entries
 }
@@ -541,6 +684,153 @@ async fn every_filter_matches_the_same_predicate_applied_to_the_domain_model(
     assert!(!expected.is_empty(), "対照が空では検査にならない");
 }
 
+/// ★金額の範囲は「明細1行」と比べる★（`docs/07-mcp-server.md` §3）
+///
+/// `min_amount` / `max_amount` は**同じ1行**が両方を満たすことを求める
+/// （仕訳の合計でも、別々の行の組み合わせでもない）。
+///
+/// # ここでしか落ちない退行（PR-H レビュー2巡目）
+///
+/// `search.rs` の1つの `EXISTS` を min 用・max 用の2つに割ると、
+/// **min と max を別々の明細行が満たしてよい**ことになる。
+/// 1仕訳の明細金額が全て同額の土台（1〜8）では両者が一致してしまうため、
+/// 金額のばらけた仕訳（9）が要る。
+#[sqlx::test]
+async fn the_amount_range_must_be_satisfied_by_one_single_line(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    let entries = seed(&roles.migrator).await;
+    let query = PgSearchEntriesQuery::new(roles.app.clone());
+
+    let (min, max) = (4_000_i128, 9_000_i128);
+
+    // 対照: 範囲の内側に明細が1行も無く、かつ**範囲をまたぐ**仕訳がある
+    // （下回る行と上回る行を別々に持つ）。この形が無ければ検査にならない。
+    let straddling: Vec<&JournalEntry> = entries
+        .iter()
+        .filter(|e| {
+            e.lines().iter().any(|l| l.amount().minor() < min)
+                && e.lines().iter().any(|l| l.amount().minor() > max)
+        })
+        .collect();
+    assert_eq!(straddling.len(), 1, "範囲をまたぐ仕訳が土台に無い");
+    assert_eq!(straddling[0].id(), EntryId::new(9));
+    assert!(
+        entries
+            .iter()
+            .flat_map(|e| e.lines())
+            .all(|l| !(min..=max).contains(&l.amount().minor())),
+        "範囲の内側に明細がある。検査にならない"
+    );
+
+    let mut by_amount = params(100);
+    by_amount.min_amount = Some(Money::from_minor(min, Currency::JPY));
+    by_amount.max_amount = Some(Money::from_minor(max, Currency::JPY));
+    let page = query.search_entries(&by_amount).await.unwrap();
+    assert_eq!(
+        page.total_matches,
+        0,
+        "min と max を別々の明細行が満たしています: {:?}",
+        page.entries
+            .iter()
+            .map(|e| e.entry_no.as_u32())
+            .collect::<Vec<_>>()
+    );
+
+    // 対照実験: 1行で両方を満たす範囲なら見つかる（空振りの検査ではない）。
+    let mut hit = params(100);
+    hit.min_amount = Some(Money::from_minor(3_000, Currency::JPY));
+    hit.max_amount = Some(Money::from_minor(3_000, Currency::JPY));
+    let expected: Vec<&JournalEntry> = entries
+        .iter()
+        .filter(|e| e.lines().iter().any(|l| l.amount().minor() == 3_000))
+        .collect();
+    assert!(expected.len() >= 2, "対照が薄すぎる");
+    let page = query.search_entries(&hit).await.unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|e| entry_id_to_uuid_string(e.entry_id))
+            .collect::<Vec<_>>(),
+        sorted_ids(&expected)
+    );
+}
+
+/// ★複数のタグは AND★（`search_entries.rs` の契約 /
+/// `docs/07-mcp-server.md` §3）
+///
+/// 複数指定した場合は**すべてを満たす**仕訳だけが返る。
+///
+/// # ここでしか落ちない退行（PR-H レビュー2巡目）
+///
+/// `NOT EXISTS ( … WHERE NOT EXISTS ( … ))` を「いずれかを満たせばよい」に
+/// 書き換えても、**タグのキーが1つ**なら AND と OR は一致する。
+/// 2キー以上で、かつ**片方だけを満たす仕訳**が土台にあって初めて分かれる。
+#[sqlx::test]
+async fn every_tag_must_match_not_just_one_of_them(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    let entries = seed(&roles.migrator).await;
+    let query = PgSearchEntriesQuery::new(roles.app.clone());
+
+    // 対照実装: 指定した (キー, 値) を**すべて**（どれかの明細行が）満たす仕訳。
+    let matching = |pairs: &[(&str, &str)]| -> Vec<&JournalEntry> {
+        entries
+            .iter()
+            .filter(|e| {
+                pairs.iter().all(|(k, v)| {
+                    e.lines()
+                        .iter()
+                        .any(|l| l.tags().get(&key(k)) == Some(&TagValue::Code(v.to_string())))
+                })
+            })
+            .collect()
+    };
+
+    // 土台の形を先に確かめる: 片方だけを満たす仕訳が両側にある。
+    assert_eq!(matching(&[("counterparty", "CP0009")]).len(), 1);
+    assert_eq!(matching(&[("tax_category", "PURCHASE_10")]).len(), 2);
+
+    for pairs in [
+        // 両方を満たすのは 9 だけ（10 は tax_category しか持たない）。
+        &[("counterparty", "CP0009"), ("tax_category", "PURCHASE_10")][..],
+        // どちらも単独では当たるが、両方を満たす仕訳は無い。
+        &[("counterparty", "CP0002"), ("tax_category", "PURCHASE_10")][..],
+    ] {
+        let expected = matching(pairs);
+        let mut by_tags = params(100);
+        by_tags.tags = pairs
+            .iter()
+            .map(|(k, v)| (key(k), (*v).to_string()))
+            .collect();
+        let page = query.search_entries(&by_tags).await.unwrap();
+
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|e| entry_id_to_uuid_string(e.entry_id))
+                .collect::<Vec<_>>(),
+            sorted_ids(&expected),
+            "{pairs:?}: すべてのタグを満たす仕訳だけが返るはず"
+        );
+        assert_eq!(page.total_matches, expected.len() as u64, "{pairs:?}");
+    }
+
+    // 1件だけ当たる側が空振りでないことを確かめる（上のループの片方は0件）。
+    assert_eq!(
+        matching(&[("counterparty", "CP0009"), ("tax_category", "PURCHASE_10")]).len(),
+        1
+    );
+    assert_eq!(
+        matching(&[("counterparty", "CP0002"), ("tax_category", "PURCHASE_10")]).len(),
+        0
+    );
+}
+
 /// 検索語に含まれる `%` / `_` はワイルドカードとして効かない
 /// （効くと「多すぎる結果」が正しい結果として返る）。
 #[sqlx::test]
@@ -585,10 +875,21 @@ async fn wildcards_in_the_search_term_are_matched_literally(
     );
 }
 
-/// ★ページングの差分★ 1件ずつ最後まで辿った結果が、一度に全件取った
-/// 結果と完全に一致する（取りこぼしも重複も無い）。
+/// ★ページングの差分★ 最後まで辿った結果が、一度に全件取った結果と
+/// 完全に一致する（取りこぼしも重複も無い）。
+///
+/// # なぜ `limit = 1` だけでは足りないのか（PR-H レビュー2巡目）
+///
+/// 1件ずつ辿ると**ページの先頭と末尾が同じ**になるため、
+/// `search.rs` の `entries.last()`（次のカーソルはページの**末尾**）を
+/// `entries.first()` に書き換えても結果が変わらない。
+/// `limit >= 2` で回して初めて、先頭をカーソルにした場合の
+/// **重複と終わらないページング**が現れる。
+///
+/// `limit` を超える件数を返していないことも各ページで見る
+/// （`headers.truncate(limit)` を落とすと `returned` が `limit + 1` になる）。
 #[sqlx::test]
-async fn paging_one_entry_at_a_time_yields_exactly_the_same_sequence(
+async fn paging_yields_exactly_the_same_sequence_at_every_page_size(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
@@ -598,37 +899,46 @@ async fn paging_one_entry_at_a_time_yields_exactly_the_same_sequence(
 
     let all = query.search_entries(&params(100)).await.unwrap();
     assert_eq!(all.entries.len(), entries.len());
+    let expected: Vec<String> = all
+        .entries
+        .iter()
+        .map(|e| entry_id_to_uuid_string(e.entry_id))
+        .collect();
 
-    let mut collected: Vec<String> = Vec::new();
-    let mut cursor: Option<EntryCursor> = None;
-    loop {
-        let mut page = params(1);
-        page.cursor = cursor;
-        let page = query.search_entries(&page).await.unwrap();
+    // ★1件ずつだけでなく2件・3件ずつでも辿る★（上の doc）。
+    for limit in [1_u32, 2, 3] {
+        let mut collected: Vec<String> = Vec::new();
+        let mut cursor: Option<EntryCursor> = None;
+        loop {
+            let mut page = params(limit);
+            page.cursor = cursor;
+            let page = query.search_entries(&page).await.unwrap();
 
-        // 総件数はページによらず一定。
-        assert_eq!(page.total_matches, all.total_matches);
-        assert!(page.entries.len() <= 1);
-        collected.extend(
-            page.entries
-                .iter()
-                .map(|e| entry_id_to_uuid_string(e.entry_id)),
-        );
+            // 総件数はページによらず一定。
+            assert_eq!(page.total_matches, all.total_matches);
+            assert!(
+                page.entries.len() <= limit as usize,
+                "limit={limit} なのに {} 件返っている",
+                page.entries.len()
+            );
+            collected.extend(
+                page.entries
+                    .iter()
+                    .map(|e| entry_id_to_uuid_string(e.entry_id)),
+            );
 
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+            assert!(
+                collected.len() <= entries.len(),
+                "limit={limit}: ページングが終わらない"
+            );
         }
-        assert!(collected.len() <= entries.len(), "ページングが終わらない");
-    }
 
-    assert_eq!(
-        collected,
-        all.entries
-            .iter()
-            .map(|e| entry_id_to_uuid_string(e.entry_id))
-            .collect::<Vec<_>>()
-    );
+        assert_eq!(collected, expected, "limit={limit}");
+    }
 }
 
 /// 取り消された仕訳と赤伝が、どちらも**それと分かる形**で返る
@@ -760,6 +1070,37 @@ async fn a_doubly_reversed_entry_is_returned_once_by_search_and_once_per_line_by
     assert_eq!(occurrences, 1, "二重訂正された仕訳の行が2行出ている");
     // 費用（借方が正）。500 − 500 − 500 = −500。
     assert_eq!(page.closing_balance.minor(), -500);
+
+    // ★元帳側でも「どちらの赤伝が付いたか」を見る★（PR-H レビュー2巡目）
+    //
+    // D-088 は `reversed_by` を**最も古い赤伝1件**と決めている。
+    // 元帳が `occurrences` と `closing_balance` しか見ていないと、
+    // `LEFT JOIN LATERAL` の `ORDER BY` を DESC に（＝最新の赤伝を返すように）
+    // 書き換えても緑のまま通る。どちらの赤伝でも行数も残高も変わらないためである。
+    let row = page
+        .rows
+        .iter()
+        .find(|r| r.entry_id == EntryId::new(6))
+        .unwrap();
+    let marker = row.reversed_by.as_ref().expect("取り消されている");
+    assert_eq!(
+        marker.entry_id,
+        EntryId::new(7),
+        "最も古い赤伝ではなく別の赤伝が付いている"
+    );
+    assert_eq!(marker.entry_no, EntryNumber::new(7));
+    assert_eq!(marker.entry_date, date(2026, 5, 20));
+
+    // 赤伝の行自体には `reversed_by` が付かない（赤伝は訂正されていない）。
+    for id in [7_u128, 8] {
+        let red = page
+            .rows
+            .iter()
+            .find(|r| r.entry_id == EntryId::new(id))
+            .expect("赤伝の行も残る");
+        assert_eq!(red.reverses, Some(EntryId::new(6)));
+        assert!(red.reversed_by.is_none(), "赤伝は取り消されていない");
+    }
 }
 
 /// 検索の `account` に**勘定科目マスタに無い**コードを渡すと `NotFound`
@@ -1060,6 +1401,126 @@ async fn ledger_rows_and_running_balance_match_the_domain_model(
     assert_eq!(page.closing_balance.minor(), running);
 }
 
+/// ★同じ仕訳に同じ科目が2行ある場合★ 行の並び・残高の累計・相手科目が
+/// ドメインモデルと一致する（PR-H レビュー2巡目）。
+///
+/// # ここでしか落ちない退行
+///
+/// | 退行 | 現れ方 |
+/// |---|---|
+/// | 残高の累計のウィンドウから `l.line_no` を落とす | 同じ仕訳の2行の間で `running_balance` と表示順が食い違う |
+/// | 最終の `ORDER BY … line_no` を `line_no DESC` にする | 同じ仕訳の2行が逆順に並ぶ |
+/// | `array_agg(DISTINCT c.account_code ORDER BY c.account_code)` から `DISTINCT` を落とす | 相手科目に同じコードが2度出る |
+/// | 同じく `ORDER BY` を落とす | 相手科目が記帳順（810 → 800）で出る |
+///
+/// 対照実装（[`expected_rows`] と素朴な `sort` / `dedup`）は
+/// 「仕訳を順に見る」だけなので、SQL 側の書き方と独立している。
+#[sqlx::test]
+async fn lines_of_the_same_account_in_one_entry_keep_their_order_balance_and_counter_accounts(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    let entries = seed(&roles.migrator).await;
+    let query = PgLedgerQuery::new(roles.app.clone());
+
+    let from = date(2026, 1, 1);
+    let to = date(2026, 12, 31);
+
+    // 対照が「同じ仕訳に同じ科目の2行」を含むことを先に確かめる
+    // （含まなければ、この検査は並びを見ていない）。
+    let two_lines = entries.iter().any(|e| {
+        e.lines()
+            .iter()
+            .filter(|l| l.account() == &code("800"))
+            .count()
+            == 2
+    });
+    assert!(two_lines, "800 が2行ある仕訳が土台に無い");
+
+    // 対照が「相手科目が重複し、記帳順とコード順が逆」であることも確かめる。
+    let entry9 = entries
+        .iter()
+        .find(|e| e.id() == EntryId::new(9))
+        .expect("4行仕訳がある");
+    let counter_in_posting_order: Vec<&str> = entry9
+        .lines()
+        .iter()
+        .filter(|l| l.side() == Side::Debit)
+        .map(|l| l.account().as_str())
+        .collect();
+    assert_eq!(
+        counter_in_posting_order,
+        vec!["810", "800", "800"],
+        "相手科目が重複せず、記帳順とコード順も逆になっていない"
+    );
+
+    // 借方が正の科目（800）と貸方が正の科目（820）の両方で見る。
+    for (account, debit_normal) in [("800", true), ("820", false)] {
+        let account_code = code(account);
+        let page = query
+            .ledger(&ledger_params(account, from, to))
+            .await
+            .unwrap();
+        let expected = expected_rows(&entries, &account_code, from, to);
+
+        assert_eq!(page.rows.len(), expected.len(), "{account}: 行数");
+        assert!(page.next_cursor.is_none(), "{account}: 1ページに収まる想定");
+
+        let mut running = 0_i128;
+        for (row, (expected_entry, line_no, expected_line)) in page.rows.iter().zip(&expected) {
+            // ★並び★ 同じ仕訳の中では `line_no` の昇順。
+            assert_eq!(row.entry_id, expected_entry.id(), "{account}: 仕訳の並び");
+            assert_eq!(row.line_no, *line_no as u16, "{account}: 行番号の並び");
+            assert_eq!(&row.amount, expected_line.amount(), "{account}: 金額");
+
+            // ★残高の累計★ 行の並びと同じ順で加減した値になる。
+            let delta = match expected_line.side() {
+                Side::Debit => expected_line.amount().minor(),
+                Side::Credit => -expected_line.amount().minor(),
+            };
+            running += delta;
+            let signed = if debit_normal { running } else { -running };
+            assert_eq!(
+                row.running_balance.minor(),
+                signed,
+                "{account}: {} 行目の残高の累計が表示順と食い違う",
+                line_no
+            );
+
+            // ★相手科目★ 重複を除いてコード順。
+            let mut want: Vec<String> = expected_entry
+                .lines()
+                .iter()
+                .filter(|l| l.side() != expected_line.side())
+                .map(|l| l.account().as_str().to_string())
+                .collect();
+            want.sort();
+            want.dedup();
+            assert_eq!(
+                row.counter_accounts
+                    .iter()
+                    .map(|c| c.as_str().to_string())
+                    .collect::<Vec<_>>(),
+                want,
+                "{account}: 相手科目"
+            );
+        }
+    }
+
+    // 820 の1行目の相手科目は 810・800・800 の重複を畳んだ2件になる
+    // （対照実装ごと壊れていないことの、独立した目視可能な期待値）。
+    let page = query.ledger(&ledger_params("820", from, to)).await.unwrap();
+    assert_eq!(
+        page.rows[0]
+            .counter_accounts
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["800".to_string(), "810".to_string()],
+    );
+}
+
 /// 収益科目（貸方が正）の残高は符号が逆になる（`DOMAIN.md` §2）。
 #[sqlx::test]
 async fn a_credit_normal_account_reports_the_balance_with_the_opposite_sign(
@@ -1123,8 +1584,29 @@ async fn the_opening_balance_carries_everything_before_the_period(
     assert_eq!(first.running_balance.minor(), expected_opening + delta);
 }
 
-/// ★ページングの差分★ 1行ずつ辿った結果が一度に取った結果と一致し、
+/// ★ページングの差分★ 辿った結果が一度に取った結果と一致し、
 /// **残高の累計もページをまたいで連続する**（ページ内で数え直さない）。
+///
+/// # `limit >= 2` で回す理由（PR-H レビュー2巡目）
+///
+/// 1行ずつ辿ると**ページの先頭行と末尾行が同じ**になるので、
+/// `ledger.rs` の `rows.last()`（次のカーソルはページの**末尾**）を
+/// `rows.first()` に書き換えても結果が変わらない。この検査は
+/// 「ページングが終わらない」ガードを持っているが、`limit = 1` では
+/// そのガードが**一度も踏まれない**。
+///
+/// # 行数の上限も見る理由
+///
+/// `ledger.rs` は続きの有無を見るために `limit + 1` 行取り、
+/// `take(limit)` で切る。この `take` を落としても
+/// 「合計が合う」「並びが同じ」だけを見ていると気付けない
+/// （最終ページ以外が1行ずつ多くなり、MCP の `returned` /
+/// `truncation_note` が `limit + 1` 行を「返した」と報告する）。
+///
+/// # 同じ仕訳に2行ある科目（800）でも回す
+///
+/// カーソルは `(entry_date, entry_no, entry_id, line_no)` の4項である。
+/// 1仕訳1行の科目しか辿らないと、`line_no` を落としても止まらない。
 #[sqlx::test]
 async fn paging_the_ledger_keeps_the_running_balance_continuous(
     pool_opts: PgPoolOptions,
@@ -1136,52 +1618,71 @@ async fn paging_the_ledger_keeps_the_running_balance_continuous(
 
     let from = date(2026, 1, 1);
     let to = date(2026, 12, 31);
-    let all = query.ledger(&ledger_params("100", from, to)).await.unwrap();
-    assert!(all.rows.len() >= 4, "対照が薄すぎる");
 
-    let mut collected = Vec::new();
-    let mut cursor: Option<LedgerCursor> = None;
-    loop {
-        let mut params = ledger_params("100", from, to);
-        params.limit = 1;
-        params.cursor = cursor;
-        let page = query.ledger(&params).await.unwrap();
+    for account in ["100", "800"] {
+        let all = query
+            .ledger(&ledger_params(account, from, to))
+            .await
+            .unwrap();
+        assert!(all.rows.len() >= 3, "{account}: 対照が薄すぎる");
 
-        // 合計・行数はページによらず期間全体の値。
-        assert_eq!(page.total_lines, all.total_lines);
-        assert_eq!(page.debit_total, all.debit_total);
-        assert_eq!(page.credit_total, all.credit_total);
-        assert_eq!(page.opening_balance, all.opening_balance);
-        assert_eq!(page.closing_balance, all.closing_balance);
+        let expected: Vec<_> = all
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.entry_id,
+                    r.line_no,
+                    r.amount.minor(),
+                    r.running_balance.minor(),
+                )
+            })
+            .collect();
 
-        collected.extend(page.rows.iter().map(|r| {
-            (
-                r.entry_id,
-                r.line_no,
-                r.amount.minor(),
-                r.running_balance.minor(),
-            )
-        }));
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
+        // ★1行ずつだけでなく2行・3行ずつでも辿る★（上の doc）。
+        for limit in [1_u32, 2, 3] {
+            let mut collected = Vec::new();
+            let mut cursor: Option<LedgerCursor> = None;
+            loop {
+                let mut params = ledger_params(account, from, to);
+                params.limit = limit;
+                params.cursor = cursor;
+                let page = query.ledger(&params).await.unwrap();
+
+                // 合計・行数はページによらず期間全体の値。
+                assert_eq!(page.total_lines, all.total_lines);
+                assert_eq!(page.debit_total, all.debit_total);
+                assert_eq!(page.credit_total, all.credit_total);
+                assert_eq!(page.opening_balance, all.opening_balance);
+                assert_eq!(page.closing_balance, all.closing_balance);
+                // ★上限を超える行を返さない★
+                assert!(
+                    page.rows.len() <= limit as usize,
+                    "{account}: limit={limit} なのに {} 行返っている",
+                    page.rows.len()
+                );
+
+                collected.extend(page.rows.iter().map(|r| {
+                    (
+                        r.entry_id,
+                        r.line_no,
+                        r.amount.minor(),
+                        r.running_balance.minor(),
+                    )
+                }));
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+                assert!(
+                    collected.len() <= all.rows.len(),
+                    "{account}: limit={limit}: ページングが終わらない"
+                );
+            }
+
+            assert_eq!(collected, expected, "{account}: limit={limit}");
         }
-        assert!(collected.len() <= all.rows.len(), "ページングが終わらない");
     }
-
-    let expected: Vec<_> = all
-        .rows
-        .iter()
-        .map(|r| {
-            (
-                r.entry_id,
-                r.line_no,
-                r.amount.minor(),
-                r.running_balance.minor(),
-            )
-        })
-        .collect();
-    assert_eq!(collected, expected);
 }
 
 /// 元帳にも「取り消された」ことが出る（`DECISIONS.md` D-088）。

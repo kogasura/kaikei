@@ -168,10 +168,33 @@ fn assert_two_rows(rows: &[AuditRow], tool: &str, expected_status: &str) {
 // 素材（本番の経路で記帳する）
 // ---------------------------------------------------------------------------
 
-/// 5件の仕訳を記帳し、うち1件を赤伝で1回、もう1件を**2回**取り消す。
+/// 7件の仕訳を記帳し、うち1件を赤伝で1回、もう1件を**2回**取り消す。
 ///
 /// 戻り値は記帳順の仕訳ID:
-/// `[売上A, 消耗品, 売上B, 取消対象, 赤伝, 二重訂正の対象, 赤伝1, 赤伝2]`。
+/// `[売上A, 消耗品, 売上B, 取消対象, 赤伝, 二重訂正の対象, 赤伝1, 赤伝2,
+///   通信費4行, 郵便料金]`。
+///
+/// # 実帳簿の形（末尾2件）を土台に入れる理由（PR-H レビュー2巡目）
+///
+/// 6件目までは**すべて2行の仕訳**で、
+///
+/// - 同じ科目が同じ仕訳に2度現れない
+/// - 1つの仕訳の明細金額が全て同額
+/// - 1つの仕訳に載るタグのキーが実質1種類
+///
+/// だった。そのため read model の SQL を次のように壊しても
+/// **両スイート緑のまま**通っていた:
+/// 相手科目の `DISTINCT`/`ORDER BY` を落とす、残高の累計のウィンドウから
+/// `l.line_no` を落とす、明細の並びを `line_no DESC` にする、
+/// 金額範囲の `EXISTS` を min 用・max 用に割る、タグの AND を OR にする。
+///
+/// そこで **仮払消費税等（180）を含む4行仕訳**を足す。
+/// 通信費（604）が**同じ仕訳に2行**あり、未払金（325）から見た相手科目が
+/// **重複**し、明細の金額が 3,000 / 10,000 / 20,000 / 33,000 と**ばらける**。
+/// タグも `tax_category` と `counterparty` の2種類が別々の行に載る。
+///
+/// 既存の期待値を動かさないよう、**この2件だけが使う科目（604 / 180 / 325）**
+/// を選んである（609 / 500 / 620 の元帳は1行も変わらない）。
 ///
 /// # 二重訂正を土台に入れる理由（PR-H レビュー C-2）
 ///
@@ -256,6 +279,49 @@ async fn post_sample_entries(runtime: &Runtime) -> Vec<String> {
     // 記帳順（4の赤伝 → 620の赤伝2件）に並べ直す。
     ids.insert(4, single_reversal);
     ids.extend(double_reversals);
+
+    // ★実帳簿の形★ 仮払消費税等（180）を含む4行仕訳と、その対照になる
+    // 2行仕訳（上の doc）。既存の添字を動かさないよう**末尾に足す**。
+    for (entry_date, description, lines) in [
+        (
+            "2026-06-10",
+            "6月の通信費（2回線分と仮払消費税）",
+            json!([
+                // 記帳順が科目コード順と逆になるよう仮払消費税を先頭に置く
+                // （相手科目の整列が効いていることを見るため）。
+                { "account": "180", "side": "debit", "amount": "3000" },
+                { "account": "604", "side": "debit", "amount": "10000",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "604", "side": "debit", "amount": "20000",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "325", "side": "credit", "amount": "33000",
+                  "tags": { "counterparty": "CP0009" } }
+            ]),
+        ),
+        (
+            "2026-06-20",
+            "郵便料金",
+            // `tax_category` はあるが `counterparty` は無い（タグの AND 用）。
+            json!([
+                { "account": "604", "side": "debit", "amount": "1000",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "325", "side": "credit", "amount": "1000" }
+            ]),
+        ),
+    ] {
+        let response = call::<PostJournalEntry>(
+            runtime,
+            json!({
+                "entry_date": entry_date,
+                "description": description,
+                "lines": lines
+            }),
+        )
+        .await;
+        assert!(!is_error(&response), "記帳に失敗しました: {response}");
+        ids.push(body(&response)["entry_id"].as_str().unwrap().to_string());
+    }
+
     ids
 }
 
@@ -624,6 +690,20 @@ async fn a_doubly_reversed_entry_is_returned_only_once_by_search_and_by_the_ledg
         .find(|r| r["entry_id"] == json!(original))
         .unwrap();
     assert!(plain.get("reverse_reason").is_none(), "{plain}");
+
+    // ★元帳側でも「どちらの赤伝が付いたか」を見る★（PR-H レビュー2巡目）
+    //
+    // D-088 は `reversed_by` を**最も古い赤伝1件**と決めている。
+    // 元帳が行数と残高しか見ていないと、`LEFT JOIN LATERAL` の `ORDER BY` を
+    // DESC に（＝最新の赤伝を返すように）書き換えても緑のまま通る。
+    // どちらの赤伝が付いても行数も残高も変わらないためである。
+    assert_eq!(
+        plain["reversed_by"]["entry_id"],
+        json!(first_reversal),
+        "最も古い赤伝ではなく別の赤伝が付いています: {plain}"
+    );
+    // 赤伝の行自体は取り消されていない。
+    assert!(red.get("reversed_by").is_none(), "{red}");
 }
 
 /// ★打ち間違いを0件の成功にしない★（PR-H レビュー C-3）
@@ -913,7 +993,24 @@ async fn an_empty_period_succeeds_but_an_unknown_account_is_not_found(
 
 /// ★元帳も上限で切ったことが応答から分かる★（D-089）
 ///
-/// 1行ずつ辿っても**残高の累計が連続する**（ページ内で数え直さない）。
+/// 辿っても**残高の累計が連続する**（ページ内で数え直さない）。
+///
+/// # `limit >= 2` で回す理由（PR-H レビュー2巡目）
+///
+/// 1行ずつ辿ると**ページの先頭行と末尾行が同じ**になるため、
+/// `ledger.rs` の `rows.last()`（次のカーソルはページの**末尾**）を
+/// `rows.first()` に書き換えても結果が変わらない。
+///
+/// # `returned` が `limit` を超えないことも見る理由
+///
+/// `ledger.rs` は続きの有無を見るために `limit + 1` 行取り、`take(limit)`
+/// で切る。この `take` を落とすと、**MCP の `returned` /
+/// `truncation_note` が `limit + 1` 行を「返した」と報告する**。
+///
+/// # 同じ仕訳に2行ある科目（604）でも回す理由
+///
+/// カーソルは `(entry_date, entry_no, entry_id, line_no)` の4項である。
+/// 1仕訳1行の科目しか辿らないと `line_no` の役割が現れない。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn a_truncated_ledger_says_so_and_keeps_the_running_balance_continuous(
     _pool_opts: PgPoolOptions,
@@ -923,62 +1020,273 @@ async fn a_truncated_ledger_says_so_and_keeps_the_running_balance_continuous(
     let runtime = runtime(&app).await;
     post_sample_entries(&runtime).await;
 
-    let all = call::<GetLedger>(
+    for account in ["609", "604"] {
+        let all = call::<GetLedger>(
+            &runtime,
+            json!({ "account": account, "from": "2026-01-01", "to": "2026-12-31" }),
+        )
+        .await;
+        assert!(!is_error(&all), "{all}");
+        let all = body(&all).clone();
+        let expected: Vec<(String, String)> = all["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["entry_id"].as_str().unwrap().to_string(),
+                    r["running_balance"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(expected.len() >= 3, "{account}: 対照が薄すぎる");
+
+        // ★1行ずつだけでなく2行ずつでも辿る★（上の doc）。
+        for limit in [1_u64, 2] {
+            let mut collected: Vec<(String, String)> = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let mut arguments = json!({
+                    "account": account, "from": "2026-01-01", "to": "2026-12-31",
+                    "limit": limit
+                });
+                if let Some(cursor) = &cursor {
+                    arguments["cursor"] = json!(cursor);
+                }
+                let response = call::<GetLedger>(&runtime, arguments).await;
+                assert!(!is_error(&response), "{response}");
+                let page = body(&response);
+
+                // 合計と行数はページによらず期間全体の値。
+                for key in [
+                    "total_lines",
+                    "debit_total",
+                    "credit_total",
+                    "closing_balance",
+                ] {
+                    assert_eq!(page[key], all[key], "{account}: {key}");
+                }
+                // ★上限を超える行を「返した」と報告しない★
+                let returned = page["returned"].as_u64().unwrap();
+                assert!(
+                    returned <= limit,
+                    "{account}: limit={limit} なのに returned={returned}: {page}"
+                );
+                assert_eq!(returned as usize, page["rows"].as_array().unwrap().len());
+
+                collected.extend(page["rows"].as_array().unwrap().iter().map(|r| {
+                    (
+                        r["entry_id"].as_str().unwrap().to_string(),
+                        r["running_balance"].as_str().unwrap().to_string(),
+                    )
+                }));
+
+                if page["has_more"] == json!(true) {
+                    let note = page["truncation_note"]
+                        .as_str()
+                        .expect("切ったことが応答から分かること");
+                    assert!(note.contains("期間全体"), "{note}");
+                    cursor = Some(page["next_cursor"].as_str().unwrap().to_string());
+                } else {
+                    assert!(page.get("next_cursor").is_none());
+                    assert!(page.get("truncation_note").is_none());
+                    break;
+                }
+                assert!(
+                    collected.len() <= expected.len(),
+                    "{account}: limit={limit}: ページングが終わらない"
+                );
+            }
+
+            assert_eq!(
+                collected, expected,
+                "{account}: limit={limit}: ページをまたぐと残高が食い違う"
+            );
+        }
+    }
+}
+
+/// ★同じ仕訳に同じ科目が2行ある元帳★（PR-H レビュー2巡目）
+///
+/// 仮払消費税等を含む4行仕訳を本番の経路で記帳し、
+///
+/// - 明細が `line_no` の昇順に並ぶ
+/// - `running_balance` がその並びどおりに積み上がる
+/// - `counter_accounts` が**重複を除いてコード順**で返る
+///
+/// ことを見る。2行の仕訳しか土台に無いと、この3つはどれも
+/// 壊しても気付けない（相手科目が1件しか無く、並びが一意に決まるため）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_ledger_orders_and_accumulates_two_lines_of_the_same_account_in_one_entry(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let runtime = runtime(&app).await;
+    let posted = post_sample_entries(&runtime).await;
+    let (four_line, two_line) = (posted[8].clone(), posted[9].clone());
+
+    // --- 通信費（604。4行仕訳の中に2行ある） ---
+    let response = call::<GetLedger>(
         &runtime,
-        json!({ "account": "609", "from": "2026-01-01", "to": "2026-12-31" }),
+        json!({ "account": "604", "from": "2026-01-01", "to": "2026-12-31" }),
     )
     .await;
-    let expected: Vec<String> = body(&all)["rows"]
-        .as_array()
-        .unwrap()
+    assert!(!is_error(&response), "{response}");
+    let page = body(&response);
+
+    assert_eq!(page["total_lines"], json!(3), "{page}");
+    assert_eq!(page["debit_total"], json!("31000"));
+    assert_eq!(page["closing_balance"], json!("31000"));
+
+    let rows = page["rows"].as_array().unwrap();
+    // ★並び★ 同じ仕訳の2行は line_no の昇順（2 → 3）。
+    let order: Vec<(&str, u64)> = rows
         .iter()
-        .map(|r| r["running_balance"].as_str().unwrap().to_string())
+        .map(|r| {
+            (
+                r["entry_id"].as_str().unwrap(),
+                r["line_no"].as_u64().unwrap(),
+            )
+        })
         .collect();
+    assert_eq!(
+        order,
+        vec![
+            (four_line.as_str(), 2),
+            (four_line.as_str(), 3),
+            (two_line.as_str(), 1),
+        ],
+        "{page}"
+    );
+    // ★残高の累計★ その並びどおりに 10,000 → 30,000 → 31,000。
+    let balances: Vec<&str> = rows
+        .iter()
+        .map(|r| r["running_balance"].as_str().unwrap())
+        .collect();
+    assert_eq!(balances, vec!["10000", "30000", "31000"], "{page}");
+    let amounts: Vec<&str> = rows.iter().map(|r| r["amount"].as_str().unwrap()).collect();
+    assert_eq!(amounts, vec!["10000", "20000", "1000"], "{page}");
 
-    let mut collected: Vec<String> = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let arguments = match &cursor {
-            None => json!({
-                "account": "609", "from": "2026-01-01", "to": "2026-12-31", "limit": 1
-            }),
-            Some(cursor) => json!({
-                "account": "609", "from": "2026-01-01", "to": "2026-12-31", "limit": 1,
-                "cursor": cursor
-            }),
-        };
-        let response = call::<GetLedger>(&runtime, arguments).await;
-        assert!(!is_error(&response), "{response}");
-        let page = body(&response);
+    // --- 未払金（325。相手科目が 180 / 604 / 604 と重複する） ---
+    let response = call::<GetLedger>(
+        &runtime,
+        json!({ "account": "325", "from": "2026-01-01", "to": "2026-12-31" }),
+    )
+    .await;
+    assert!(!is_error(&response), "{response}");
+    let page = body(&response);
+    let rows = page["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{page}");
 
-        // 合計と行数はページによらず期間全体の値。
-        assert_eq!(page["total_lines"], json!(3));
-        assert_eq!(page["debit_total"], json!("2300"));
-        assert_eq!(page["closing_balance"], json!("1500"));
+    // ★相手科目★ 記帳順は 180 → 604 → 604 だが、重複を畳んでコード順で返る。
+    assert_eq!(rows[0]["entry_id"], json!(four_line));
+    assert_eq!(rows[0]["counter_accounts"], json!(["180", "604"]), "{page}");
+    assert_eq!(rows[1]["counter_accounts"], json!(["604"]), "{page}");
+}
 
-        collected.extend(
-            page["rows"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|r| r["running_balance"].as_str().unwrap().to_string()),
-        );
+/// ★金額の範囲は「明細1行」と比べる★（`docs/07-mcp-server.md` §3）
+///
+/// `min_amount` / `max_amount` は**同じ1行**が両方を満たすことを求める。
+/// min を満たす行と max を満たす行が別々でよいことにすると、
+/// 「4,000〜9,000 円の明細を含む仕訳」の検索に
+/// **3,000 円と 10,000 円しか持たない仕訳**が混ざる。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_amount_range_must_be_satisfied_by_one_single_line(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let runtime = runtime(&app).await;
+    post_sample_entries(&runtime).await;
 
-        if page["has_more"] == json!(true) {
-            let note = page["truncation_note"]
-                .as_str()
-                .expect("切ったことが応答から分かること");
-            assert!(note.contains("期間全体"), "{note}");
-            cursor = Some(page["next_cursor"].as_str().unwrap().to_string());
-        } else {
-            assert!(page.get("next_cursor").is_none());
-            assert!(page.get("truncation_note").is_none());
-            break;
-        }
-        assert!(collected.len() <= 3, "ページングが終わらない");
-    }
+    // 土台の明細金額は 10,000 / 1,500 / 3,000 / 800 / 500 / 33,000 /
+    // 20,000 / 1,000 で、4,000〜9,000 に入るものは1行も無い。
+    let response = call::<SearchEntries>(
+        &runtime,
+        json!({ "min_amount": "4000", "max_amount": "9000" }),
+    )
+    .await;
+    assert!(!is_error(&response), "{response}");
+    assert_eq!(
+        body(&response)["total_matches"],
+        json!(0),
+        "min と max を別々の明細行が満たしています: {}",
+        body(&response)
+    );
 
-    assert_eq!(collected, expected, "ページをまたぐと残高が食い違う");
+    // 対照実験: 1行で両方を満たす範囲なら見つかる（空振りの検査ではない）。
+    let response = call::<SearchEntries>(
+        &runtime,
+        json!({ "min_amount": "20000", "max_amount": "33000" }),
+    )
+    .await;
+    assert!(!is_error(&response), "{response}");
+    assert_eq!(body(&response)["total_matches"], json!(1), "{response}");
+}
+
+/// ★複数のタグは AND★（`search_entries.rs` の契約 /
+/// `docs/07-mcp-server.md` §3）
+///
+/// 複数指定した場合は**すべてを満たす**仕訳だけが返る。
+/// タグのキーが1つしか無い検査では、AND を OR に書き換えても結果が
+/// 変わらないため、**2キー以上**で、かつ**片方だけを満たす仕訳**が
+/// 土台にある状態で見る。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn every_tag_must_match_not_just_one_of_them(
+    _pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let runtime = runtime(&app).await;
+    let posted = post_sample_entries(&runtime).await;
+    let four_line = posted[8].clone();
+
+    let matches = |response: &Value| -> u64 {
+        assert!(!is_error(response), "{response}");
+        body(response)["total_matches"].as_u64().unwrap()
+    };
+
+    // 片方ずつなら、どちらも2件以上に当たる。
+    let only_counterparty =
+        call::<SearchEntries>(&runtime, json!({ "tags": { "counterparty": "CP0009" } })).await;
+    assert_eq!(matches(&only_counterparty), 1, "{only_counterparty}");
+    let only_tax_category = call::<SearchEntries>(
+        &runtime,
+        json!({ "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } }),
+    )
+    .await;
+    assert!(
+        matches(&only_tax_category) >= 4,
+        "{only_tax_category}: 対照が薄すぎる"
+    );
+
+    // 両方を満たすのは4行仕訳だけ（郵便料金は tax_category しか持たない）。
+    let both = call::<SearchEntries>(
+        &runtime,
+        json!({ "tags": {
+            "counterparty": "CP0009",
+            "tax_category": "PURCHASE_10_QUALIFIED"
+        } }),
+    )
+    .await;
+    assert_eq!(
+        matches(&both),
+        1,
+        "すべてのタグを満たす仕訳だけが返るはず: {both}"
+    );
+    assert_eq!(body(&both)["entries"][0]["entry_id"], json!(four_line));
+
+    // どちらも単独では当たるが、両方を満たす仕訳が無い組み合わせは0件。
+    let none = call::<SearchEntries>(
+        &runtime,
+        json!({ "tags": {
+            "counterparty": "CP0009",
+            "tax_category": "SALES_10"
+        } }),
+    )
+    .await;
+    assert_eq!(matches(&none), 0, "{none}");
 }
 
 /// ★元帳にも「取り消された」ことが出る★（D-088）
