@@ -161,3 +161,83 @@ async fn assert_privilege(pool: &sqlx::PgPool, table: &str, privilege: &str, exp
         "kaikei_app の {table} に対する {privilege} 権限が期待と異なります"
     );
 }
+
+/// `inspect_journal_privileges`（合成ルートが起動時に呼ぶ検査）が
+/// **`journal_lines` への GRANT も検出する**。
+///
+/// # なぜこの対照実験が要るか
+///
+/// この検査は「持っていないこと」を主張するため、見ている対象が狭くても
+/// 健全な環境では緑のまま通る。実際、初版は `journal_entries` の
+/// UPDATE / DELETE しか見ておらず、`journal_lines` に UPDATE を与えた環境で
+/// 起動が素通りした（明細だけを書き換えれば貸借も金額も変えられる）。
+/// `0003_journal.sql` の REVOKE は2テーブル × UPDATE / DELETE / TRUNCATE を
+/// 対象にしているので、検査もその全部を見る。
+///
+/// ここでは実際に GRANT を発行して、検出されることを確かめる
+/// （`#[sqlx::test]` の使い捨てDBに閉じた変更であり、他のテストには波及しない）。
+#[sqlx::test]
+async fn inspect_journal_privileges_detects_a_grant_on_journal_lines(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    use kaikei_store::pool::inspect_journal_privileges;
+
+    let roles = common::roles(pool_opts, conn_opts).await;
+
+    // 前提: マイグレーション直後の kaikei_app は append-only。
+    let before = inspect_journal_privileges(&roles.app).await.unwrap();
+    assert!(
+        before.is_append_only(),
+        "前提が崩れています（{} が {} を持っています）",
+        before.role,
+        before.describe_granted()
+    );
+
+    // 誤って明細テーブルにだけ権限を与えてしまった環境を作る（所有者ロールで
+    // GRANT する。ci-allow: append-only-probe）。
+    sqlx::query("GRANT UPDATE ON journal_lines TO kaikei_app")
+        .execute(&roles.migrator)
+        .await
+        .unwrap();
+
+    let after = inspect_journal_privileges(&roles.app).await.unwrap();
+    assert!(
+        !after.is_append_only(),
+        "journal_lines への GRANT が検出されていません（検査が journal_entries しか\
+         見ていない可能性があります）"
+    );
+    let described = after.describe_granted();
+    assert!(
+        described.contains("journal_lines") && described.contains("UPDATE"),
+        "どのテーブルのどの権限が余計なのかが分かること: {described}"
+    );
+}
+
+/// TRUNCATE 権限も検出する（1行ずつは消せなくてもテーブルごと空にできる
+/// ロールを見逃さない）。
+#[sqlx::test]
+async fn inspect_journal_privileges_detects_a_truncate_grant(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    use kaikei_store::pool::inspect_journal_privileges;
+
+    let roles = common::roles(pool_opts, conn_opts).await;
+
+    sqlx::query("GRANT TRUNCATE ON journal_entries TO kaikei_app")
+        .execute(&roles.migrator)
+        .await
+        .unwrap();
+
+    let after = inspect_journal_privileges(&roles.app).await.unwrap();
+    let described = after.describe_granted();
+    assert!(
+        !after.is_append_only(),
+        "TRUNCATE の GRANT が検出されていません"
+    );
+    assert!(
+        described.contains("journal_entries") && described.contains("TRUNCATE"),
+        "{described}"
+    );
+}
