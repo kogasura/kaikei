@@ -94,7 +94,7 @@ kaikei-api / kaikei-mcp
     done
 ```
 
-`skeleton/architecture-ci.yml` に完全版がある。**設計を人間の意志ではなく仕組みで守る。**
+完全版は `.github/workflows/architecture.yml`。**設計を人間の意志ではなく仕組みで守る。**
 
 ---
 
@@ -157,7 +157,11 @@ journal/
 
 ## 5. application 層は縦に切る
 
-`(P2+)` は Phase 2 以降で追加するもの。それ以外は Phase 1 完了時点で存在する。
+`(P3)` / `(P4+)` は、その Phase で追加する**まだ存在しない**ファイル。
+それ以外は Phase 2 完了時点で実在する。
+
+（Phase 2 完了時点で `usecase/` にあるのは `post_entry.rs` / `reverse_entry.rs` /
+`report.rs` の3つだけである。Phase 2 で追加されたものは無い。）
 
 ```
 kaikei-app/src/
@@ -176,11 +180,18 @@ kaikei-app/src/
     ├── post_entry.rs       仕訳を起こす
     ├── reverse_entry.rs    赤伝を起こす
     ├── report.rs           試算表
-    ├── import_csv.rs       CSV取込                        (P2+)
-    ├── journalize.rs       取込明細を仕訳化（★翻訳層）    (P2+)
-    ├── attach_document.rs  証憑を紐付ける                 (P2+)
-    └── close_period.rs     期間を締める                   (P2+)
+    ├── import_chart.rs     勘定科目マスタの投入           (P3)
+    ├── import_csv.rs       CSV取込                        (P4+)
+    ├── journalize.rs       取込明細を仕訳化（★翻訳層）    (P4+)
+    ├── attach_document.rs  証憑を紐付ける                 (P4+)
+    └── close_period.rs     期間を締める                   (P4+)
 ```
+
+Phase 3（`kaikei-mcp`）で `kaikei-app` に追加するのは上記の `import_chart.rs`
+（`DECISIONS.md` D-070）のほか、`ports.rs` への監査ログ用ポートと
+read model クエリ trait（`search` / `ledger` / `entry_detail`）、
+`post_entry::execute` の戻り値拡張（`PolicyNote` を返す）である。
+詳細は `docs/07-mcp-server.md` §4。
 
 **ユースケース1つ = 1ファイル = 1関数。**
 `AccountingService` のような巨大構造体を作らない（定番の崩壊パターン）。
@@ -282,10 +293,14 @@ pub trait TxOps: JournalRepo + ChartRepo + PeriodRepo + NumberingRepo + Send {}
 `Arc<Mutex<..>>` で隠さず型に出すことで、借用チェッカが
 「トランザクションを跨いだ並行アクセス」をコンパイル時に禁じる。
 
-### 合成ルート（axum の `State`）
+### 合成ルート（Phase 3: `kaikei-mcp` / Phase 4: `kaikei-api`）
+
+**本番で最初の合成ルートは Phase 3 の `kaikei-mcp`（rmcp / stdio。D-071）。**
+axum は Phase 4 の `kaikei-api` から。どちらも起動時の組み立ては
+`kaikei_jp::compose::compose` を入口にする（D-068。同じ組み立てを複製しない）。
 
 `Arc<dyn Store<Tx = ..>>` のような trait object ではなく、**具象型
-`Arc<PgStore>`** を `State` に積む。`Store` は関連型 `Tx` を持つため、
+`Arc<PgStore>`** を（axum なら `State` に、`kaikei-mcp` ならサーバの状態に）積む。`Store` は関連型 `Tx` を持つため、
 trait object 化するには `Tx` を dyn 化の時点で具象型に固定する必要があり、
 その時点で「実装を差し替えられる」という抽象化の利点がほとんど残らない
 （本番で使う `Store` 実装は `kaikei-store::PgStore` の1つだけ）。
@@ -375,7 +390,8 @@ R1 と R2 は一体の設計。`aggregatable: true` を宣言したキーだけ�
 
 | 項目 | 選定 | 理由 |
 |---|---|---|
-| Web | axum | tower/hyper エコシステム。薄い |
+| Web | axum | tower/hyper エコシステム。薄い（Phase 4 の `kaikei-api`） |
+| MCP SDK | **rmcp 3.x**（`server`/`macros`/`transport-io`/`schemars`、stdio） | 公式 SDK。手書き JSON-RPC と第三者 SDK は却下（D-071） |
 | DB | **PostgreSQL 固定** | JSONB、GIN、テーブル単位の権限制御が必要 |
 | DB アクセス | sqlx | ORM を使わない。Data Mapper を手書きする |
 | Decimal | rust_decimal | 按分率・税率の計算に使用 |

@@ -142,7 +142,7 @@ YAML の読み込みは合成ルートの起動時 I/O であり、`TaxPolicy` �
 
 ## 3. 税区分マスタ（年度別 YAML）
 
-`kaikei-jp-data/tax/jp/2026.yaml` の例は `skeleton/data/tax-jp-2026.yaml` を参照。
+実物は `crates/kaikei-jp-data/tax/jp/2026.yaml`。
 
 ### スキーマ
 
@@ -172,7 +172,7 @@ categories:
 
 ## 4. タグスキーマ
 
-`kaikei-jp-data/tags.yaml`（`skeleton/data/tags.yaml` を参照）
+実物は `crates/kaikei-jp-data/tags.yaml`。
 
 新しいタグキーを使う前に必ずここへ登録する。core が未登録キーを拒否する。
 
@@ -185,7 +185,7 @@ categories:
 
 ## 5. 勘定科目テンプレート
 
-`kaikei-jp-data/chart/sole_proprietor.yaml`（`skeleton/data/chart-sole-proprietor.yaml`）
+実物は `crates/kaikei-jp-data/chart/sole_proprietor.yaml`。
 
 個人事業主（青色申告）向けの標準的な科目体系。ユーザーは複製して自由に編集できる。
 

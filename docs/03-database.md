@@ -27,11 +27,19 @@ REVOKE UPDATE, DELETE, TRUNCATE ON journal_entries, journal_lines FROM kaikei_ap
 -- 可変テーブルは通常通り（DELETE は許可しない。物理削除ではなく active フラグで無効化する）
 GRANT SELECT, INSERT, UPDATE ON accounts, counterparties, entry_counters TO kaikei_app;
 GRANT SELECT, INSERT ON period_snapshots TO kaikei_app;
+
+-- 監査ログ（Phase 3 で追加。docs/07-mcp-server.md §9）も帳簿本体と同じ扱いにする。
+-- 専用のトリガ関数と専用 ERRCODE を割り当てること（reject_mutation() を流用すると
+-- 「訂正は逆仕訳で行ってください」という的外れな案内になる。D-038 と同じ誤診クラス）。
+GRANT SELECT, INSERT ON audit_log TO kaikei_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM kaikei_app;
 ```
 
 これで**バグでも AI でも帳簿を書き換えられない**。
-電子帳簿保存法における真実性の確保について、タイムスタンプ付与か
-訂正削除履歴が残るシステムのいずれかが求められるが、この構造は後者に対応する。
+
+訂正削除の履歴が構造的に残る形を目指した設計だが、**法令要件を満たすと
+主張するものではない**（`CLAUDE.md` §10。書いてよいのは「〜の機能要件を
+意識した設計」まで。`docs/08-compliance.md` §1 を参照）。
 
 ### 補助的にトリガでも防ぐ（多層防御）
 
