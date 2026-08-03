@@ -48,9 +48,18 @@ use kaikei_core::{AccountCode, AccountDef, ChartOfAccounts};
 
 /// [`execute`] の結果。
 ///
-/// 3つのフィールドの件数の合計は、投入しようとしたテンプレートの科目数に等しい
-/// （どの科目も必ず「追加した」「一致していた」「異なるので既存を残した」の
-/// いずれか1つに分類される）。
+/// `inserted.len() + unchanged + kept_existing.len()` が、投入しようとした
+/// テンプレートの科目数に等しい（どの科目も必ず「追加しようとした」
+/// 「一致していた」「異なるので既存を残した」のいずれか1つに分類される）。
+///
+/// **[`inserted_rows`] はこの合計に使えない。** これは実際に挿入された行数で
+/// あり、同時起動時には `inserted.len()` より小さくなりうる（下記）。
+/// [`summary`] が印字するのは `inserted_rows` の方なので、その1件が起きた
+/// 起動ログでは3つの数の合計だけがテンプレートの科目数に届かない。
+/// そのときは `summary` が差分を明示する。
+///
+/// [`inserted_rows`]: ImportChartOutput::inserted_rows
+/// [`summary`]: ImportChartOutput::summary
 #[derive(Debug, Clone)]
 pub struct ImportChartOutput {
     /// DB に存在しなかったため**投入した**科目コード（テンプレートの並び順）。
@@ -77,12 +86,29 @@ pub struct ImportChartOutput {
 impl ImportChartOutput {
     /// 起動ログ1行分の要約（日本語）。**stdout ではなく stderr に出すこと**
     /// （`docs/07-mcp-server.md` §4）。
+    ///
+    /// 「追加」に出すのは実際に挿入された行数（[`inserted_rows`]）である。
+    /// 挿入しようとした件数（`inserted.len()`）と食い違った場合はその旨を
+    /// 添える——黙って小さい数だけを出すと、**3つの数の合計がテンプレートの
+    /// 科目数に合わない**のに理由が読み取れないログになる。
+    ///
+    /// [`inserted_rows`]: ImportChartOutput::inserted_rows
     pub fn summary(&self) -> String {
-        format!(
+        let base = format!(
             "勘定科目マスタ: 追加 {} 件 / 変更なし {} 件 / 既存を優先 {} 件",
             self.inserted_rows,
             self.unchanged,
             self.kept_existing.len()
+        );
+        if self.inserted_rows == self.inserted.len() {
+            return base;
+        }
+        format!(
+            "{base}（{} 件を追加しようとして {} 件が入りました。\
+             差分を取ってから挿入するまでの間に、別のプロセスが同じ科目を\
+             投入したときに起きます。既存行は書き換えていません）",
+            self.inserted.len(),
+            self.inserted_rows,
         )
     }
 }
@@ -346,6 +372,36 @@ mod tests {
         assert!(text.contains("asset"), "text = {text}");
         assert!(text.contains("上書きしていません"), "text = {text}");
         assert!(text.contains("編集"), "text = {text}");
+    }
+
+    // 起動ログの要約: 通常は3つの数がテンプレートの科目数に合う。
+    #[tokio::test]
+    async fn summary_reports_the_three_buckets() {
+        let store = InMemoryStore::new();
+        let out = import(&store, &template()).await;
+        assert_eq!(
+            out.summary(),
+            "勘定科目マスタ: 追加 2 件 / 変更なし 0 件 / 既存を優先 0 件"
+        );
+    }
+
+    // 同時起動で挿入行数が減った場合、要約が黙って小さい数だけを出さない
+    // （`inserted_rows` と `inserted.len()` の食い違いを明示する）。
+    #[test]
+    fn summary_explains_a_row_count_that_fell_short_of_the_attempt() {
+        let out = ImportChartOutput {
+            inserted: vec![
+                AccountCode::parse("100").unwrap(),
+                AccountCode::parse("500").unwrap(),
+            ],
+            inserted_rows: 1,
+            unchanged: 0,
+            kept_existing: Vec::new(),
+        };
+        let text = out.summary();
+        assert!(text.contains("追加 1 件"), "text = {text}");
+        assert!(text.contains("2 件を追加しようとして"), "text = {text}");
+        assert!(text.contains("別のプロセス"), "text = {text}");
     }
 
     // 空のテンプレートを投入しても壊れない（ポートを呼ばない）。
