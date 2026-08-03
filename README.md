@@ -68,7 +68,7 @@ READMEおよびドキュメントでの表現は
 | Phase 0 | `kaikei-core`（貸借不一致の仕訳がプログラム上に存在できない簿記エンジン） | ✅ 完了 |
 | Phase 1 | `kaikei-policy`（trait）/ `kaikei-store`（PostgreSQL）/ `kaikei-app`（ユースケース3本） | ✅ 完了 |
 | Phase 2 | `kaikei-jp`（消費税の税額計算・勘定科目テンプレート・家事按分・決算振替） | ✅ 完了 |
-| Phase 3 | `kaikei-mcp`（rmcp / stdio。読み取り系7 + 書き込み系2 + 提案系・検証系2 + audit_log） | 実装中（合成ルートまで完了。ツールは未実装） |
+| Phase 3 | `kaikei-mcp`（rmcp / stdio。読み取り系7 + 書き込み系2 + 提案系・検証系2 + audit_log） | 実装中（`audit_log` と書き込み系2件まで完了。残り9件は未実装） |
 | Phase 4〜5 | CSV 取込・証憑 / 帳票・決算 | 未着手 |
 
 各 Phase の実績・設計変更・申し送りは `PROGRESS.md`、設計判断の記録は
@@ -111,9 +111,20 @@ cargo test -p kaikei-store --features pg-tests
 
 ```sh
 set -a; . ./.env; set +a
+cargo build -p kaikei-mcp                      # ★先に必要（下記）
 cargo test -p kaikei-e2e --features pg-tests   # 合成ルートを模したE2E
 cargo test -p kaikei-mcp --features pg-tests   # MCP サーバーの起動（下記の注意）
 ```
+
+`kaikei-e2e` の `tests/mcp_stdio_server.rs` は **`kaikei-mcp` の実行ファイルを
+子プロセスとして起動**し、stdio で `initialize` → `tools/call` を送って
+「`journal_entries` が増える／増えない」と「`audit_log` に開始・結果の2行が
+残る」を確かめる（`DECISIONS.md` D-084 訂正注記4）。
+`CARGO_BIN_EXE_<name>` は同じ package のテストにしか渡らないので、
+このテストは `target/<profile>/` から実行ファイルを辿る。**先に
+`cargo build -p kaikei-mcp` しておくこと**（無い場合・`crates/kaikei-mcp/` の
+どのファイルより古い場合は、その旨を書いて落ちる）。
+`cargo test --workspace` を先に回していればビルド済みになっている。
 
 `kaikei-mcp` の `pg-tests` だけは**使い捨てDBを作らない**。この crate は
 `sqlx` に依存しない（`docs/07-mcp-server.md` §10 MC-30）ため `#[sqlx::test]`
@@ -221,9 +232,30 @@ cargo run -p kaikei-mcp
 この設定ファイルには **DB パスワードが平文で置かれます**。ファイル権限に
 注意してください（`docs/07-mcp-server.md` §8）。
 
-**Phase 3 PR-E 時点でツールは1件も登録されていません**（`tools/list` は空）。
-記帳・照会のツールは PR-F / PR-G で追加します。現時点で確認できるのは
-「起動でき、勘定科目が入り、記帳できる状態になっている」ところまでです。
+**Phase 3 PR-F 時点で登録されているツールは2件です**（`tools/list` は
+`post_journal_entry` / `reverse_journal_entry` を返します）。
+
+| ツール | できること |
+|---|---|
+| `post_journal_entry` | 仕訳を1件起こす。金額は**文字列**で渡します（例: `"110000"`）。貸借が一致しない仕訳は記帳されず、差額（`difference`）が返ります。修正案（`hint`）が付くのは `auto_tax_lines` を指定していない呼び出しだけで、内容は帳簿の設定で変わります——税抜経理の課税事業者では消費税額の行を足した `suggested_lines`、税込経理や免税事業者では「なぜ税額行が作れないか」の `policy_notes` だけ（それも無ければ `hint` は付きません） |
+| `reverse_journal_entry` | 逆仕訳（赤伝）で訂正する。元の仕訳は書き換わりません |
+
+照会系・提案系（`get_trial_balance` / `search_entries` / `list_accounts` など
+残り9件）は PR-G / PR-H で追加します。
+
+**削除・更新のツールは存在しません**（`delete_journal_entry` /
+`update_journal_entry` / `execute_sql` / `reopen_period` は登録されておらず、
+DB のロール権限とトリガでも塞いであります）。
+
+ツールの呼び出しは `audit_log` に**開始レコードと結果レコードの2行**として
+記録します。ただし2行が揃わない場合があり、それぞれ意味が違います。
+
+| 状況 | 残る行 | 応答 |
+|---|---|---|
+| 通常 | 開始 + 結果の2行 | 通常の成功／失敗 |
+| 開始レコードが書けない | 0行 | **操作を実行しません**（fail-closed）。帳簿は変更されません |
+| 結果レコードだけが書けない | 開始の1行 | 操作は実行され、応答に `warnings` が付きます（fail-open）。その呼び出しは「結果不明」として識別できます |
+| 登録されていないツール名 | 0行 | ツール呼び出しに到達しないため、プロトコルエラー（`tool not found`）になります |
 
 ## 仕訳番号と欠番
 

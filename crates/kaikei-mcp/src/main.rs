@@ -29,7 +29,11 @@
 //! で終わる。ツール応答に到達させない（`docs/07-mcp-server.md` §7）。
 
 use kaikei_mcp::config::ServerConfig;
-use kaikei_mcp::server::{serve_stdio, KaikeiServer};
+// `serve_stdio` は `dispatch` にある。stdio トランスポートを名指しするには
+// `rmcp` を書く必要があり、それが許されるのは `dispatch.rs` と `error.rs`
+// だけであるため（`crates/kaikei-mcp/src/dispatch.rs` のモジュール doc）。
+use kaikei_mcp::dispatch::serve_stdio;
+use kaikei_mcp::server::KaikeiServer;
 use kaikei_mcp::startup::{self, StartupError};
 use std::process::ExitCode;
 use std::sync::Arc;

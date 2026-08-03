@@ -25,13 +25,14 @@
 //! それを見るために DB 接続を要求しない。検査は
 //! `kaikei_mcp::server` の自由関数（`registered_tool_names` /
 //! `is_registered_tool` / `tool_definition`）を通す。3つとも
-//! サーバー本体と**同じ `tool_router()`** から導出しており、
-//! `#[tool_handler]` が生成する `list_tools` / `call_tool` / `get_tool` が
-//! 引くのと同じ集合を見る（対応表は `src/server.rs` のモジュール doc）。
+//! サーバー本体と**同じ `tool_registry()`** から導出しており、
+//! `src/dispatch.rs` が手書きしている `list_tools` / `call_tool` / `get_tool`
+//! が引くのと同じ集合を見る（対応表は `src/server.rs` のモジュール doc）。
 //!
 //! 本物の `KaikeiServer`（`ServerHandler::get_tool` 経由）でも同じ結果に
 //! なることは、`Runtime` を組み立てられる `tests/startup_pg.rs`
-//! （`pg-tests`）が確かめる。
+//! （`pg-tests`）が確かめる。**実バイナリに `tools/call` を送ったときの
+//! 振る舞い**は `crates/kaikei-e2e/tests/mcp_stdio_server.rs` が見る。
 
 use kaikei_mcp::server::{is_registered_tool, registered_tool_names, tool_definition};
 
@@ -63,8 +64,9 @@ const PHASE_3_TOOLS: [&str; 11] = [
 
 // MC-10 (1): `tools/list` の応答に4件のいずれも現れない。
 //
-// `registered_tool_names` はレジストリ（`ToolRouter::list_all`）から
-// 導出しており、`#[tool_handler]` が生成する `list_tools` が返す集合と同一。
+// `registered_tool_names` はレジストリ（`ToolRegistry::list_all`）から
+// 導出しており、`src/dispatch.rs` が手書きしている `list_tools` が返す集合と
+// 同一である。
 #[test]
 fn forbidden_tools_are_absent_from_the_tool_list() {
     let registered = registered_tool_names();
@@ -87,7 +89,7 @@ fn forbidden_tools_are_absent_from_the_tool_list() {
 
 // MC-10 (2): 4件の名前で `tools/call` すると**未知のツール**として拒否される。
 //
-// `ToolRouter::call` は未登録の名前に対して
+// `ToolRegistry::call`（内側の `rmcp` のルータ）は未登録の名前に対して
 // `ErrorData::invalid_params("tool not found")` を返す（＝プロトコルエラー）。
 // これは `docs/07-mcp-server.md` §6 が認めている唯一の例外
 // （「ツール呼び出しに到達できない異常」）である。
@@ -96,10 +98,14 @@ fn forbidden_tools_are_absent_from_the_tool_list() {
 // `rmcp::service::Peer::new` は `pub(crate)` のため外部 crate からは組み立て
 // られない。そこで、同じレジストリを引く2つの入口を検査する:
 //
-// - `tool_definition`（`tool_router.get(name)`。`#[tool_handler]` が生成する
-//   `get_tool` の実体と同じ）
-// - `is_registered_tool`（`tool_router.has_route(name)`。`call` が
+// - `tool_definition`（`ToolRegistry::get(name)`。`src/dispatch.rs` が
+//   手書きしている `get_tool` の実体と同じ）
+// - `is_registered_tool`（`ToolRegistry::has_route(name)`。`call` が
 //   「tool not found」を返すかどうかを決めているのはこの述語）
+//
+// **未登録の名前が実際に `-32602 tool not found` になること**は、実バイナリ
+// に送って確かめる経路が別にある（`crates/kaikei-e2e/tests/mcp_stdio_server.rs`
+// と同じ形。D-084 の実測欄）。
 #[test]
 fn calling_a_forbidden_tool_is_rejected_as_an_unknown_tool() {
     assert_eq!(

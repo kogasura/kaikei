@@ -205,7 +205,22 @@ impl TaxPolicy for JpTaxPolicy {
         }
 
         // 税込経理、または免税事業者は税行を生成しない（`docs/04-jp-tax.md` §7）。
-        if self.settings.tax_mode == TaxMode::Inclusive || !self.settings.is_taxable_business {
+        //
+        // ★生成しなかったことを黙らない★
+        // 明細をそのまま返すだけだと、呼び出し側（AI）には
+        // 「auto_tax_lines: true を渡したのに貸借が合わない」ことしか
+        // 見えず、**金額を書き換える**という誤った修正に進む
+        // （`docs/07-mcp-server.md` §3）。ここで積むのは
+        // **設定の事実**であって税務判断ではない（`CLAUDE.md` §10）。
+        let inclusive = self.settings.tax_mode == TaxMode::Inclusive;
+        let tax_exempt = !self.settings.is_taxable_business;
+        if inclusive {
+            notes.push(inclusive_no_tax_lines_note());
+        }
+        if tax_exempt {
+            notes.push(tax_exempt_no_tax_lines_note());
+        }
+        if inclusive || tax_exempt {
             return Ok(TaxDerivation {
                 lines: lines.to_vec(),
                 notes,
@@ -447,6 +462,35 @@ fn deduction_ratio_note(category: &TaxCategory, ratio: Ratio) -> PolicyNote {
             category.label,
             ratio.as_decimal(),
         ),
+    }
+}
+
+/// 税込経理の設定のため税額行を生成しなかったことを知らせる注記。
+///
+/// **設定の事実の提示であって税務判断ではない**（`CLAUDE.md` §10）。
+/// どちらの経理方式を採るべきかは述べない。文言が
+/// `docs/07-mcp-server.md` §3 の失敗応答の例に現れるので、
+/// **例文だけがあって生成経路が無い**状態にしないこと（同 §3）。
+fn inclusive_no_tax_lines_note() -> PolicyNote {
+    PolicyNote {
+        severity: NoteSeverity::Info,
+        message: "税込経理の設定のため税額行を生成していません\
+                  （tax_mode=inclusive）。消費税額は本体価額に含めて記帳する\
+                  設定であり、auto_tax_lines を true にしても明細は増えません"
+            .to_string(),
+    }
+}
+
+/// 免税事業者の設定のため税額行を生成しなかったことを知らせる注記。
+///
+/// 同上。**免税事業者であるべきか**には触れない（`CLAUDE.md` §10）。
+fn tax_exempt_no_tax_lines_note() -> PolicyNote {
+    PolicyNote {
+        severity: NoteSeverity::Info,
+        message: "免税事業者の設定のため税額行を生成していません\
+                  （is_taxable_business=false）。auto_tax_lines を true に\
+                  しても明細は増えません"
+            .to_string(),
     }
 }
 
@@ -703,6 +747,21 @@ mod tests {
         ];
         let derivation = policy.derive_tax_lines(&ctx, &input).unwrap();
         assert_eq!(derivation.lines.len(), 2);
+
+        // ★生成しなかったことを黙らない★ 明細をそのまま返すだけだと、
+        // 呼び出し側には「貸借が合わない」ことしか見えない
+        // （`docs/07-mcp-server.md` §3。設定の事実であって税務判断ではない）。
+        assert_eq!(derivation.notes.len(), 1, "{:?}", derivation.notes);
+        assert_eq!(derivation.notes[0].severity, NoteSeverity::Info);
+        assert!(
+            derivation.notes[0]
+                .message
+                .contains("税込経理の設定のため税額行を生成していません"),
+            "{}",
+            derivation.notes[0].message
+        );
+        // 次の手が読める（`CLAUDE.md` §11）。
+        assert!(derivation.notes[0].message.contains("auto_tax_lines"));
     }
 
     #[test]
@@ -723,6 +782,66 @@ mod tests {
         ];
         let derivation = policy.derive_tax_lines(&ctx, &input).unwrap();
         assert_eq!(derivation.lines.len(), 2);
+
+        assert_eq!(derivation.notes.len(), 1, "{:?}", derivation.notes);
+        assert_eq!(derivation.notes[0].severity, NoteSeverity::Info);
+        assert!(
+            derivation.notes[0]
+                .message
+                .contains("免税事業者の設定のため税額行を生成していません"),
+            "{}",
+            derivation.notes[0].message
+        );
+    }
+
+    // 税抜経理・課税事業者では「生成していません」の注記が出ない
+    // （上2つが「常に注記を積む」で緑になっていないことの対照実験）。
+    #[test]
+    fn derive_tax_lines_adds_no_such_note_when_tax_lines_are_generated() {
+        let policy = policy_from_embedded(default_settings());
+        let chart = empty_chart();
+        let schema = empty_schema();
+        let counterparties = CounterpartyIndex::empty();
+        let ctx = embedded_context!(chart, schema, counterparties);
+
+        let input = vec![
+            line("130", Side::Debit, 110_000, TagSet::new()),
+            line("500", Side::Credit, 100_000, tags_with_category("SALES_10")),
+        ];
+        let derivation = policy.derive_tax_lines(&ctx, &input).unwrap();
+        assert_eq!(derivation.lines.len(), 3);
+        assert!(derivation.notes.is_empty(), "{:?}", derivation.notes);
+    }
+
+    // 税込経理かつ免税事業者なら、両方の事実が読める（片方に潰さない）。
+    #[test]
+    fn derive_tax_lines_states_both_reasons_when_both_apply() {
+        let settings = JpSettings {
+            tax_mode: TaxMode::Inclusive,
+            is_taxable_business: false,
+            ..default_settings()
+        };
+        let policy = policy_from_embedded(settings);
+        let chart = empty_chart();
+        let schema = empty_schema();
+        let counterparties = CounterpartyIndex::empty();
+        let ctx = embedded_context!(chart, schema, counterparties);
+
+        let derivation = policy.derive_tax_lines(&ctx, &[]).unwrap();
+        let messages: Vec<&str> = derivation
+            .notes
+            .iter()
+            .map(|note| note.message.as_str())
+            .collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(
+            messages.iter().any(|m| m.contains("税込経理")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("免税事業者")),
+            "{messages:?}"
+        );
     }
 
     // ---- rounding_unit: Line と Document で結果が変わること ----
@@ -1094,9 +1213,14 @@ mod tests {
         let counterparties = CounterpartyIndex::empty();
         let ctx = embedded_context!(chart, schema, counterparties);
 
+        // 簡易課税の注記（Warning）と、税込経理で税額行を生成しなかった
+        // ことの注記（Info）の2件。どちらも早期 return より前に積まれる。
         let derivation = policy.derive_tax_lines(&ctx, &[]).unwrap();
-        assert_eq!(derivation.notes.len(), 1);
+        assert_eq!(derivation.notes.len(), 2, "{:?}", derivation.notes);
         assert_eq!(derivation.notes[0].severity, NoteSeverity::Warning);
+        assert!(derivation.notes[0].message.contains("簡易課税"));
+        assert_eq!(derivation.notes[1].severity, NoteSeverity::Info);
+        assert!(derivation.notes[1].message.contains("税込経理"));
     }
 
     // ---- 適用マスタが無い取引日 ----

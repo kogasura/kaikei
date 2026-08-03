@@ -15,9 +15,16 @@
 
 use std::fmt;
 
-use kaikei_core::{CoreError, Currency, Money};
+// `PolicyNote` は `kaikei-app` の再エクスポート経由で参照する。
+// `kaikei-policy` を直接 `use` すると、この crate の `Cargo.toml` に
+// `kaikei-policy` を足すことになり MC-30（依存の許可リスト）に反する
+// （`DECISIONS.md` D-047 と同型の問題。`kaikei-app` のクレート doc
+// 「`kaikei-policy` 型の再エクスポート」を参照）。
+use kaikei_app::PolicyNote;
+use kaikei_core::{CoreError, Currency, JournalLine, Money, TagSet};
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{json, Map, Value};
 
 /// JSON の number で金額を渡されたときのエラーメッセージ。
 ///
@@ -131,6 +138,96 @@ impl<'de> Deserialize<'de> for AmountStr {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 線上の `tags`
+// ---------------------------------------------------------------------------
+//
+// ★MCP 経由では重複キーを検出できない★（PR-F レビュー B-2。D-085 の訂正注記）
+//
+// 当初ここには `TagPairs`（出現順のペアを保持する手書き `Deserialize`）が
+// あり、「重複キーを畳み込まないので `JpError::DuplicateTagKeyInInput` に
+// 到達できる」と主張していた。**それは成立していなかった。**
+//
+// rmcp の `CallToolRequestParams::arguments` は `Option<JsonObject>`
+// （＝ `serde_json::Map`）であり、JSON-RPC メッセージ全体が `serde_json` で
+// パースされる時点——つまり `dispatch::call` に入るより前——で重複キーは
+// **後勝ちで畳み込まれている**。ツール側の受け型を何にしても、届く時点で
+// 既に1件になっている。`wire.rs` の単体テストが緑だったのは、本番と違う
+// 入口（`serde_json::from_str` に生のテキストを渡す）を通していたためで、
+// 本番経路を再現していなかった。
+//
+// 生の JSON テキストを MCP 層まで持ち込むには rmcp の stdio トランスポートを
+// 自前に置き換えることになり、得るものに対して代償が大きい。**提供できない
+// 保証を主張しない**ほうを採り、型ごと削除した（`tags` は
+// `BTreeMap<String, String>` で受ける）。制約は
+// `docs/07-mcp-server.md` §3 と D-085 に明記してある。
+
+/// [`TagSet`] を線上の `tags`（文字列マップ）にする。
+///
+/// 値の文字列化は [`kaikei_jp::tags::tag_value_to_string`] に委ねる
+/// （線上とDBで別の書き方を発明しない。`docs/07-mcp-server.md` §3）。
+pub fn tag_set_to_json(tags: &TagSet) -> Value {
+    let mut object = Map::new();
+    for (key, value) in tags.iter() {
+        object.insert(
+            key.as_str().to_string(),
+            json!(kaikei_jp::tags::tag_value_to_string(value)),
+        );
+    }
+    Value::Object(object)
+}
+
+/// 確定後の明細1行を線上の JSON にする。
+///
+/// 金額は**区切り無しの文字列**（`docs/07-mcp-server.md` §5）。
+/// `side` は [`kaikei_app::wire::side_code`]。`memo` は指定されていた場合だけ
+/// 現れる（`null` を置くと「メモが空文字である」と区別できない）。
+pub fn line_to_json(line: &JournalLine) -> Value {
+    let mut object = Map::new();
+    object.insert("account".to_string(), json!(line.account().as_str()));
+    object.insert(
+        "side".to_string(),
+        json!(kaikei_app::wire::side_code(line.side())),
+    );
+    object.insert(
+        "amount".to_string(),
+        json!(AmountStr::from_money(line.amount()).as_str()),
+    );
+    object.insert(
+        "currency".to_string(),
+        json!(line.amount().currency().code()),
+    );
+    object.insert("tags".to_string(), tag_set_to_json(line.tags()));
+    if let Some(memo) = line.memo() {
+        object.insert("memo".to_string(), json!(memo));
+    }
+    Value::Object(object)
+}
+
+/// 明細の一覧を線上の JSON 配列にする。
+pub fn lines_to_json(lines: &[JournalLine]) -> Value {
+    Value::Array(lines.iter().map(line_to_json).collect())
+}
+
+/// `PolicyNote` の一覧を線上の JSON 配列にする。
+///
+/// **文言は `kaikei-policy` の実装が組み立てたものをそのまま素通しする**
+/// （税務判断を断定する言い換えをしない。`CLAUDE.md` §10）。
+/// `severity` は [`kaikei_app::wire::note_severity_code`]。
+pub fn policy_notes_to_json(notes: &[PolicyNote]) -> Value {
+    Value::Array(
+        notes
+            .iter()
+            .map(|note| {
+                json!({
+                    "severity": kaikei_app::wire::note_severity_code(note.severity),
+                    "message": note.message,
+                })
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +314,98 @@ mod tests {
         let schema = schemars::schema_for!(AmountStr);
         let json = serde_json::to_value(&schema).unwrap();
         assert_eq!(json.get("type").and_then(|t| t.as_str()), Some("string"));
+    }
+
+    // ★MCP 経由では `tags` の重複キーを検出できない★（B-2）
+    //
+    // 本番経路では、JSON-RPC メッセージ全体が `serde_json` でパースされる
+    // 時点で重複キーが後勝ちで畳み込まれ、ツール層には既に1件になった
+    // `serde_json::Map` が届く。**このテストはその事実を固定するもので、
+    // 「重複を検出できる」ことを検証してはいない。**
+    //
+    // ここで `serde_json::from_str` に生のテキストを渡しているのは、
+    // 畳み込みが**どこで起きるか**（＝ MCP 層より前）を示すためである。
+    // 以前ここにあった `TagPairs` のテストは、同じ入口を使いながら
+    // 「重複キーが保持される」ことを主張しており、本番経路で成立しない
+    // 保証を緑のテストで裏書きしていた（誤診は誤値と同じ実害を持つ。
+    // `PROGRESS.md` Phase 1 の教訓3）。
+    #[test]
+    fn duplicate_tag_keys_are_already_collapsed_before_reaching_this_layer() {
+        let collapsed: Map<String, Value> =
+            serde_json::from_str(r#"{"tax_category":"SALES_10","tax_category":"SALES_8_REDUCED"}"#)
+                .unwrap();
+
+        assert_eq!(collapsed.len(), 1, "重複キーは畳み込まれる: {collapsed:?}");
+        // 後勝ち。前の指定は跡形も無い（＝MCP 層からは検出しようがない）。
+        assert_eq!(collapsed["tax_category"], json!("SALES_8_REDUCED"));
+    }
+
+    // 出力側の整形は `kaikei-app` / `kaikei-jp` に委ねている。
+    #[test]
+    fn line_to_json_uses_the_frozen_wire_vocabulary() {
+        use kaikei_core::{AccountCode, Side, TagKey, TagValue};
+
+        let mut tags = TagSet::new();
+        tags.insert(
+            TagKey::parse("tax_category").unwrap(),
+            TagValue::Code("SALES_10".to_string()),
+        );
+        let line = JournalLine::new(
+            AccountCode::parse("135").unwrap(),
+            Side::Debit,
+            Money::from_minor(110_000, Currency::JPY),
+            tags,
+            Some("4月分".to_string()),
+        )
+        .unwrap();
+
+        let value = line_to_json(&line);
+        assert_eq!(value["account"], json!("135"));
+        assert_eq!(
+            value["side"],
+            json!(kaikei_app::wire::side_code(Side::Debit))
+        );
+        // 金額は区切り無しの文字列（number にしない。§5）。
+        assert_eq!(value["amount"], json!("110000"));
+        assert!(value["amount"].is_string());
+        assert_eq!(value["currency"], json!("JPY"));
+        assert_eq!(value["tags"]["tax_category"], json!("SALES_10"));
+        assert_eq!(value["memo"], json!("4月分"));
+    }
+
+    // メモが無ければキーごと出さない（`null` と空文字を混同させない）。
+    #[test]
+    fn line_to_json_omits_the_memo_key_when_absent() {
+        use kaikei_core::{AccountCode, Side};
+
+        let line = JournalLine::new(
+            AccountCode::parse("100").unwrap(),
+            Side::Credit,
+            Money::from_minor(1, Currency::JPY),
+            TagSet::new(),
+            None,
+        )
+        .unwrap();
+        assert!(line_to_json(&line).get("memo").is_none());
+    }
+
+    // 注記の文言は素通しし、severity は凍結済みの語彙を使う。
+    //
+    // 文言そのものは `kaikei-policy` の実装（`kaikei-jp`）が決める。
+    // ここで**実在する文言をリテラルで置くと、grep したときに
+    // 「その文言が実装されている」ように見えてしまう**ので、
+    // 明らかに検査用と分かる文字列を使う（実在する注記の生成経路と文言は
+    // `crates/kaikei-jp/src/tax/policy.rs` のテストが持つ）。
+    #[test]
+    fn policy_notes_to_json_passes_the_message_through_verbatim() {
+        use kaikei_app::NoteSeverity;
+
+        let notes = [PolicyNote {
+            severity: NoteSeverity::Info,
+            message: "（検査用の注記本文）".to_string(),
+        }];
+        let value = policy_notes_to_json(&notes);
+        assert_eq!(value[0]["severity"], json!("info"));
+        assert_eq!(value[0]["message"], json!("（検査用の注記本文）"));
     }
 }

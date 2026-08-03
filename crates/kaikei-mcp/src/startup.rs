@@ -76,7 +76,16 @@ pub struct Runtime {
 
     /// `kaikei-jp` の組み立て結果（勘定科目テンプレート・タグ定義・
     /// 税額計算 policy・決算 policy）。
-    pub composition: Composition,
+    ///
+    /// # なぜ `Arc` で持つのか（PR-F）
+    ///
+    /// `kaikei_app::tx::with_tx` / `with_tx_err` に渡すクロージャは HRTB で
+    /// 全称量化されており、**`'static` でない借用をキャプチャできない**
+    /// （`crates/kaikei-app/src/tx.rs` の doc「クロージャに渡せるもの」）。
+    /// 素の `Composition` のままだと、記帳のたびに `JpTaxPolicy`（＝税区分
+    /// マスタ一式）を丸ごと `clone` して持ち込むことになる。
+    /// `Arc` にしておけば複製は参照カウントの増加で済む。
+    pub composition: Arc<Composition>,
 
     /// 帳簿全体の設定（帳簿通貨・会計年度の区切り規則）。
     pub book_settings: BookSettings,
@@ -212,7 +221,7 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
         runtime: Arc::new(Runtime {
             store,
             audit_sink,
-            composition,
+            composition: Arc::new(composition),
             book_settings: config.book_settings,
             id_gen: UuidV7IdGenerator,
             clock,

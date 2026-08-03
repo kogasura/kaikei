@@ -188,6 +188,22 @@ pub enum AuditOutcome<'a> {
         /// 制約定義が混じりうる）。[`with_audit`] がここを自動で埋めるため、
         /// 呼び出し側が `to_string()` を渡す余地は無い。
         public_message: &'a str,
+        /// **AI に返した応答本文そのもの**の JSON テキスト（あれば）。
+        ///
+        /// 成功時（[`AuditOutcome::Succeeded`]）は応答 body 全体が
+        /// `output` に載るのに、失敗時は `public_message` だけ——という
+        /// 非対称を埋めるための欄である。失敗応答に載る
+        /// `hint` / `candidate_accounts` / `difference` / `policy_notes` /
+        /// `line` は、**AI の次の一手を直接決める提案**であり、
+        /// 「サーバが何を返して次の一手を誘導したか」を後から追う
+        /// （`DECISIONS.md` D-070、`docs/07-mcp-server.md` §9）ために要る。
+        ///
+        /// 組み立てるのは presentation 層（[`AuditableError::audit_output_json`]）。
+        /// **`Display` を混ぜないこと。** ここに載せてよいのは
+        /// `public_message()` 由来の本文と、presentation 層が自分で組み立てた
+        /// 機械可読フィールドだけである。`None` なら永続化層は
+        /// `public_message` だけを載せる。
+        output_json: Option<&'a str>,
     },
 }
 
@@ -258,6 +274,18 @@ pub trait AuditableError {
     /// `Display`（`to_string()`）を返してはならない。下位層の生メッセージ
     /// （接続文字列・ロール名を含みうる）が `audit_log.output` に落ちる。
     fn audit_public_message(&self) -> String;
+
+    /// **AI に返した失敗応答の本文**（JSON テキスト）。既定は `None`。
+    ///
+    /// 実装すると [`AuditOutcome::Failed::output_json`] に載り、成功時と
+    /// 同じ密度で `audit_log.output` に残る。`kaikei-app` は serde を
+    /// 持たない（`CLAUDE.md` §1）ので、組み立てるのは presentation 層である。
+    ///
+    /// **`Display` を混ぜないこと**（[`AuditableError::audit_public_message`]
+    /// と同じ理由）。
+    fn audit_output_json(&self) -> Option<String> {
+        None
+    }
 }
 
 impl AuditableError for crate::error::AppError {
@@ -378,16 +406,48 @@ pub struct AuditResultNotRecorded {
 }
 
 impl AuditResultNotRecorded {
-    /// **外部（応答）に添える警告文**。
+    /// **外部（応答）に添える警告文**（操作が**成功**した場合）。
     ///
     /// **再実行を促す文言にしない**（二重計上を招く。
     /// `docs/07-mcp-server.md` §9）。操作は完了している。
+    ///
+    /// 操作が**失敗**した呼び出しにこの文言を添えてはならない
+    /// （[`AuditResultNotRecorded::public_message_when_operation_failed`]）。
     #[must_use]
     pub fn public_message(&self) -> String {
         format!(
             "操作は完了しましたが、監査ログの結果記録に失敗しました。\
              request_id={} の行（開始レコードのみが残っています）を確認してください。\
              操作は既に完了しているため、やり直さないでください",
+            self.request_id_text
+        )
+    }
+
+    /// **外部（応答）に添える警告文**（操作が**失敗**した場合）。
+    ///
+    /// # なぜ成功時と文言を分けるのか
+    ///
+    /// 拒否応答（`isError: true`）に
+    /// 「操作は完了しました……やり直さないでください」が付くと、
+    /// 同じ応答が別の場所で示している次の手（「入力を直して送り直す」）と
+    /// **真っ向から矛盾**し、AI は再送してよいのかを判断できなくなる
+    /// （`CLAUDE.md` §11）。fail-open の警告は「監査ログの結果記録が
+    /// できなかった」という**別の事実**の通知であって、操作の成否を
+    /// 述べ直すものではない。
+    ///
+    /// # 「この呼び出しによる変更は確定していない」と言える前提
+    ///
+    /// 操作を [`crate::tx::with_tx`] / [`crate::tx::with_tx_err`] で包むこと
+    /// （`Err` なら必ず rollback される）。[`with_audit`] の `operation` は
+    /// ふつうその呼び出しであり、そうでない操作を渡す場合はこの文言が
+    /// 事実と合うかを呼び出し側が確かめること。
+    #[must_use]
+    pub fn public_message_when_operation_failed(&self) -> String {
+        format!(
+            "この呼び出しは失敗しており、帳簿は変更されていません。\
+             あわせて監査ログの結果記録にも失敗したため、\
+             request_id={} の行には開始レコードだけが残っています。\
+             エラーの内容に従って入力を直し、同じ操作を送り直してかまいません",
             self.request_id_text
         )
     }
@@ -403,11 +463,15 @@ impl AuditResultNotRecorded {
 /// しかもそれは**正常系のテストでは検出できない**
 /// （D-076 が fail-closed について挙げた却下理由と同じ性質）。
 ///
-/// そのため中身は private にし、取り出す口を2つに絞ってある。
+/// そのため中身は private にし、取り出す口を3つに絞ってある。
+/// **どれも警告を必ず手渡す。**
 ///
 /// - [`AuditedCall::into_result`][]（**既定**）: 警告があれば注記の
 ///   `Vec<String>` に本文を積んでから結果を返す。呼び出し側は注記の入れ物を
 ///   渡さないと結果を受け取れない
+/// - [`AuditedCall::into_result_noting_outcome`][]（**既定**）: 同じだが、
+///   積む文言を操作の成否で切り替える（拒否応答に「操作は完了しました」を
+///   載せない）
 /// - [`AuditedCall::into_parts_unchecked`][]: 結果と警告を**同時に**取り出す
 ///   （警告を自前で組み立てる presentation 層向け）
 ///
@@ -443,6 +507,30 @@ impl<T, E> AuditedCall<T, E> {
     pub fn into_result(self, notes: &mut Vec<String>) -> Result<T, E> {
         if let Some(warning) = self.warning {
             notes.push(warning.public_message());
+        }
+        self.result
+    }
+
+    /// **結果を取り出し、操作の成否に合った文言で警告を `notes` に積む。**
+    ///
+    /// [`AuditedCall::into_result`] と同じ既定経路だが、fail-open の警告文を
+    /// 操作が成功したか失敗したかで切り替える
+    /// （[`AuditResultNotRecorded::public_message`] /
+    /// [`AuditResultNotRecorded::public_message_when_operation_failed`]）。
+    ///
+    /// 拒否応答に「操作は完了しました……やり直さないでください」が載ると、
+    /// 同じ応答の中の「入力を直して送り直す」と矛盾する（`CLAUDE.md` §11）。
+    /// **応答が成功・失敗の両方になりうる呼び出し側（MCP の `dispatch::call`）は
+    /// こちらを使うこと。**
+    ///
+    /// 警告を捨てられない性質は [`AuditedCall::into_result`] と同じである
+    /// （結果を受け取るには注記の入れ物を渡すしかない）。
+    pub fn into_result_noting_outcome(self, notes: &mut Vec<String>) -> Result<T, E> {
+        if let Some(warning) = self.warning {
+            notes.push(match &self.result {
+                Ok(_) => warning.public_message(),
+                Err(_) => warning.public_message_when_operation_failed(),
+            });
         }
         self.result
     }
@@ -544,18 +632,22 @@ where
 
     // 結果レコードに載せる値を、借用が生きる形で先に組み立てる。
     let success = result.as_ref().ok().map(describe);
-    let failure = result
-        .as_ref()
-        .err()
-        .map(|err| (err.audit_error_code(), err.audit_public_message()));
+    let failure = result.as_ref().err().map(|err| {
+        (
+            err.audit_error_code(),
+            err.audit_public_message(),
+            err.audit_output_json(),
+        )
+    });
 
     let outcome = match (&success, &failure) {
         (Some(success), _) => AuditOutcome::Succeeded {
             output_json: success.output_json.as_deref(),
         },
-        (None, Some((error_code, public_message))) => AuditOutcome::Failed {
+        (None, Some((error_code, public_message, output_json))) => AuditOutcome::Failed {
             error_code,
             public_message,
+            output_json: output_json.as_deref(),
         },
         // `Result` は Ok/Err のどちらかなので到達しない。
         (None, None) => unreachable!("Result が Ok でも Err でもない状態は存在しない"),
@@ -816,6 +908,139 @@ mod tests {
         );
     }
 
+    // AUD-05c（PR-F レビュー C-2）: 操作が**失敗**した呼び出しの fail-open
+    // 警告に「操作は完了しました／やり直さないでください」を載せない。
+    // 拒否応答は同じ本文の中で「入力を直して送り直す」を案内しており、
+    // 成功時の文言を使い回すと AI が再送の可否を判断できなくなる。
+    #[tokio::test]
+    async fn a_failed_operation_gets_a_warning_that_permits_resending() {
+        let sink = RecordingAuditSink::failing_on_result();
+        let request_id = RequestId::new_v7();
+
+        let audited = with_audit(
+            &sink,
+            &SystemClock,
+            &call(request_id, None),
+            || async {
+                Err::<u32, _>(AppError::Rejected {
+                    reason: "テスト用の意図的な失敗".to_string(),
+                })
+            },
+            |_| AuditSuccess::default(),
+        )
+        .await
+        .expect("開始レコードは書けるはず");
+
+        let mut notes = Vec::new();
+        assert!(audited.into_result_noting_outcome(&mut notes).is_err());
+        assert_eq!(notes.len(), 1, "fail-open の警告が注記に積まれていない");
+        let message = &notes[0];
+        assert!(message.contains(&request_id.to_uuid_string()), "{message}");
+        assert!(
+            !message.contains("操作は完了しました"),
+            "失敗した呼び出しに成功時の文言が載っている: {message}"
+        );
+        assert!(
+            !message.contains("やり直さないでください"),
+            "失敗した呼び出しで再送を禁じている: {message}"
+        );
+        assert!(message.contains("帳簿は変更されていません"), "{message}");
+        assert!(message.contains("送り直してかまいません"), "{message}");
+    }
+
+    // 成功した呼び出しでは従来どおり「やり直さないでください」を載せる
+    // （上の検査が「常に失敗側の文言」で緑になっていないことの対照実験）。
+    #[tokio::test]
+    async fn a_successful_operation_keeps_the_do_not_retry_warning() {
+        let sink = RecordingAuditSink::failing_on_result();
+
+        let audited = with_audit(
+            &sink,
+            &SystemClock,
+            &call(RequestId::new_v7(), None),
+            || async { Ok::<_, AppError>(1_u32) },
+            |_| AuditSuccess::default(),
+        )
+        .await
+        .expect("開始レコードは書けるはず");
+
+        let mut notes = Vec::new();
+        assert_eq!(audited.into_result_noting_outcome(&mut notes).unwrap(), 1);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("操作は完了しました"), "{}", notes[0]);
+        assert!(notes[0].contains("やり直さないでください"), "{}", notes[0]);
+    }
+
+    // AUD-06b（PR-F レビュー C-4）: 失敗の結果レコードにも
+    // **AI に返した応答本文**が載る（成功時と対称）。
+    #[tokio::test]
+    async fn a_failure_can_carry_the_whole_response_body_into_the_result_record() {
+        struct FailureWithBody;
+
+        impl AuditableError for FailureWithBody {
+            fn audit_error_code(&self) -> &'static str {
+                codes::UNBALANCED
+            }
+            fn audit_public_message(&self) -> String {
+                "貸借不一致: 借方 110,000 / 貸方 100,000".to_string()
+            }
+            fn audit_output_json(&self) -> Option<String> {
+                Some(r#"{"error":"unbalanced","difference":"10000"}"#.to_string())
+            }
+        }
+
+        let sink = RecordingAuditSink::new();
+        let audited = with_audit(
+            &sink,
+            &SystemClock,
+            &call(RequestId::new_v7(), None),
+            || async { Err::<u32, _>(FailureWithBody) },
+            |_| AuditSuccess::default(),
+        )
+        .await
+        .expect("開始レコードは書けるはず");
+
+        let mut notes = Vec::new();
+        assert!(audited.into_result_noting_outcome(&mut notes).is_err());
+
+        let rows = sink.rows();
+        assert_eq!(rows[1].status, status::ERROR);
+        assert_eq!(
+            rows[1].output_json.as_deref(),
+            Some(r#"{"error":"unbalanced","difference":"10000"}"#),
+            "失敗の結果レコードに応答本文が載っていない"
+        );
+        // 本文（public_message）は失われない。
+        assert!(rows[1]
+            .public_message
+            .as_deref()
+            .is_some_and(|m| m.contains("貸借不一致")));
+    }
+
+    // 既定（`audit_output_json` を実装しない）では従来どおり None であり、
+    // 永続化層は public_message だけを載せる。
+    #[tokio::test]
+    async fn an_error_without_a_response_body_records_no_output_json() {
+        let sink = RecordingAuditSink::new();
+        let audited = with_audit(
+            &sink,
+            &SystemClock,
+            &call(RequestId::new_v7(), None),
+            || async {
+                Err::<u32, _>(AppError::Rejected {
+                    reason: "テスト用の意図的な失敗".to_string(),
+                })
+            },
+            |_| AuditSuccess::default(),
+        )
+        .await
+        .expect("開始レコードは書けるはず");
+
+        let mut notes = Vec::new();
+        assert!(audited.into_result_noting_outcome(&mut notes).is_err());
+        assert_eq!(sink.rows()[1].output_json, None);
+    }
+
     // AUD-06: 結果レコードに載る本文は public_message() であり、
     // 下位層の生メッセージ（接続文字列を含みうる）を転記しない。
     #[tokio::test]
@@ -874,6 +1099,7 @@ mod tests {
         let failed = AuditOutcome::Failed {
             error_code: codes::UNBALANCED,
             public_message: "貸借不一致",
+            output_json: None,
         };
         assert_eq!(failed.status_code(), status::ERROR);
         assert_eq!(failed.error_code(), Some(codes::UNBALANCED));
