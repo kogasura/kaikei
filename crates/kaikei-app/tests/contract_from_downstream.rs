@@ -1,13 +1,13 @@
-//! ★契約凍結点★ の検証: PR-B で確定した契約が、**下流の crate から見て**
-//! そのまま使えることを確かめる。
-//!
-//! 統合テスト（`tests/*.rs`）は `kaikei-app` を外部 crate としてリンクするため、
-//! ここでのコンパイル可否は `kaikei-mcp` / `kaikei-api` から見た可否と同じになる
-//! （`#[cfg(test)]` は効かず、`pub` でないものは見えない）。
+//! ★契約凍結点★ の検証: PR-B で確定した契約を使う側のコードを実際に書いてみる
+//! プローブ（`kaikei-mcp` が書くであろうコードの雛形）。
 //! `PROGRESS.md` Phase 1 の教訓2「契約を凍結する前に、その契約を使う側の
 //! コードを実際に書いてみる」に従う。
 //!
-//! ここで踏むのは次の点:
+//! # このテストが検査できること
+//!
+//! 統合テスト（`tests/*.rs`）は `kaikei-app` を**外部 crate としてリンクする**。
+//! `#[cfg(test)]` のものは見えず、`pub` でないものも見えない。したがって
+//! 「**公開 API だけで下流の写像が書けるか**」は本当に検査できている。
 //!
 //! 1. エラーコードの語彙（`codes` の定数と4つの入口）が外から引けること
 //! 2. **`#[non_exhaustive]` の受け皿が実際に効くこと。** 下流の `match` では
@@ -16,28 +16,52 @@
 //! 3. `BookSettings` を外から構築できること（帳簿通貨を含む）
 //! 4. 書き込み系ユースケースの戻り値（`PostEntryOutput` / `ReverseEntryOutput`）
 //!    のフィールドが外から読めること
-//!
-//! PR-B 2巡目で追加した点（1巡目の消費側が「書けない／間違った書き方が
-//! 通ってしまう」と指摘した箇所）:
-//!
 //! 5. **応答の JSON をこの crate だけで組み立てられること**——金額の
 //!    区切り無し文字列（`amount`）、列挙型の機械可読名（`side` /
-//!    `account_type` / `severity`）、仕訳IDの UUID 表記（入力・出力の両方向）が
-//!    すべて `kaikei-app` から取れる。**下流が `uuid` や独自の `match` を
-//!    足さずに済むこと**そのものを検査する
+//!    `account_type` / `severity`）、仕訳IDの UUID 正準表記（入力・出力の
+//!    両方向）が、すべて `kaikei-app` の**公開 API から取れる**
 //! 6. **エラー本文の外向きの入口**（`public_message`）が下位層の生メッセージを
 //!    含まないこと
 //! 7. **dry-run（`preview`）が `kaikei-app` にあること**——`hint.suggested_lines`
 //!    を組み立てるのに MCP 層が `load_posting_context` / `TaxContext` /
 //!    `sum_money` を自分で書かずに済む
 //! 8. 失敗経路でも `PolicyNote` が届くこと（`PostEntryFailure`）
+//!
+//! # このテストが検査**できない**こと（PR-B 3巡目の訂正）
+//!
+//! **「下流の crate の依存が増えないこと」はここでは検査できない。**
+//! 2巡目までこのファイルは検査項目5で「下流が `uuid` や独自の `match` を
+//! 足さずに済むことそのものを検査する」と名乗っていたが、**それは成り立たない**。
+//!
+//! 統合テストのターゲットには `kaikei-app` の `[dependencies]` と
+//! `[dev-dependencies]` の**両方**がリンクされる。`uuid` は `kaikei-app` の
+//! 依存なので、このファイルに `Uuid::parse_str` を1行足してもコンパイルは
+//! 通り、全テストが ok になる（2巡目の消費側が実測した）。一方、実在する
+//! 下流（`kaikei-mcp`）は自分の `Cargo.toml` に `uuid` を書かない限り
+//! その行を書けない。**同じ意味の検査になっていない。**
+//! `tokio` / `async-trait`（`kaikei-app` の dev-dependencies）も同様に
+//! 見えてしまう。
+//!
+//! 効いていない検査を「効いている」と書くのは、実バグと同格の欠陥として扱う
+//! （`PROGRESS.md` Phase 1 の教訓3。誤診を招く記述）。ここでできるのは
+//! 次の2つだけである:
+//!
+//! - **自制を機械的に固定する。** このプローブ自身が `kaikei-app` の外の
+//!   crate に手を伸ばしていないことを
+//!   [`the_probe_itself_does_not_reach_for_crates_outside_kaikei_app`] が
+//!   ソースを読んで検査する。これは「プローブが本物の下流と同じ制約下で
+//!   書かれている」ことの担保であって、**下流の依存の検査ではない**。
+//! - **本物の検査は PR-D に申し送る。** `kaikei-mcp` を新設する PR で、
+//!   その `Cargo.toml` の依存が最小であること（`kaikei-app` / `kaikei-jp` /
+//!   MCP SDK / 非同期ランタイム以外を足していないこと）を CI で検査する
+//!   （`docs/07-mcp-server.md` §4「Phase 3 で新設が必要なもの」）。
 
 use async_trait::async_trait;
 use kaikei_app::amount::{money_to_plain_string, strip_thousands_separators};
 use kaikei_app::context::{BookSettings, FiscalYearRule};
 use kaikei_app::currency::currency_from_code;
 use kaikei_app::error::{codes, core_error_code, policy_error_code, AppError, RepoError};
-use kaikei_app::id::{entry_id_from_uuid, entry_id_from_uuid_string, entry_id_to_uuid_string};
+use kaikei_app::id::{entry_id_from_uuid_string, entry_id_to_uuid_string};
 use kaikei_app::ports::{JournalRepo, NumberingRepo, Store, TrialBalanceQuery, TxScope};
 use kaikei_app::testing::{InMemoryStore, SequentialIdGenerator};
 use kaikei_app::tx::{with_tx, with_tx_err};
@@ -199,6 +223,58 @@ async fn seed_entry(store: &InMemoryStore, id: u128, date: AccountingDate) -> En
     tx.insert_entry(&entry).await.unwrap();
     tx.commit().await.unwrap();
     entry.id()
+}
+
+// ---- 0. プローブ自身の制約（PR-B 3巡目） ----
+
+/// このプローブが、`kaikei-app` の外の crate に手を伸ばしていないことを
+/// **ソースを読んで**検査する。
+///
+/// # なぜコンパイラに任せられないのか
+///
+/// 統合テストのターゲットには `kaikei-app` の `[dependencies]` と
+/// `[dev-dependencies]` の両方がリンクされる。したがって `uuid` を直接
+/// 使ってもコンパイルは通ってしまい、**本物の下流（`kaikei-mcp`）なら
+/// 書けないコードがここでは書けてしまう**（モジュールdoc「検査できないこと」）。
+/// コンパイラで縛れない以上、せめて機械的に見張る。
+///
+/// # この検査の限界（過信しないこと）
+///
+/// これは**プローブ自身の自制**を固定するだけで、`kaikei-mcp` の
+/// `Cargo.toml` が何に依存するかは一切見ていない。本物の検査は
+/// PR-D（`kaikei-mcp` 新設）で CI に置く。
+///
+/// # 実装上の注意
+///
+/// 検査対象の crate 名は実行時にパス区切りを連結して組み立てる。ソースに
+/// crate 名とパス区切りを続けて書くと、この検査自身の文字列リテラルが
+/// ヒットして常に失敗するため（doc コメントで crate 名に触れるときも
+/// パス区切りを続けて書かないこと）。
+#[test]
+fn the_probe_itself_does_not_reach_for_crates_outside_kaikei_app() {
+    const SOURCE: &str = include_str!("contract_from_downstream.rs");
+
+    // 下流（kaikei-mcp）が「kaikei-app を呼びたいだけ」なのに自分の
+    // Cargo.toml へ足す羽目になったら負け、という crate 群。
+    // `uuid`: D-047 と同型の問題（`kaikei_app::id` の2関数で足りる）
+    // `rust_decimal`: 金額・比率の線上表現は `kaikei_app::amount` で足りる
+    // `serde_json` / `sqlx` / `chrono`: 応答の組み立て・永続化・時刻は
+    //   それぞれ下流の DTO / `kaikei-store` / `Clock` の担当で、
+    //   契約の消費側がここで触る理由が無い
+    for name in ["uuid", "rust_decimal", "serde_json", "sqlx", "chrono"] {
+        let path_prefix = format!("{name}{}", "::");
+        let use_stmt = format!("use {name}");
+        assert!(
+            !SOURCE.contains(&path_prefix),
+            "このプローブが {name} を直接使っている。\
+             kaikei-app の公開 API に入口が無いなら、それは契約の穴である\
+             （下流は同じ行を書けない）"
+        );
+        assert!(
+            !SOURCE.contains(&use_stmt),
+            "このプローブが {name} を use している（同上）"
+        );
+    }
 }
 
 // ---- 1. エラーコードの語彙 ----
@@ -369,8 +445,9 @@ async fn reverse_entry_output_and_empty_reason_rejection_are_visible_downstream(
 #[tokio::test]
 async fn not_found_message_carries_a_canonical_uuid_downstream() {
     let store = InMemoryStore::with_chart(chart());
-    let missing =
-        entry_id_from_uuid(uuid::Uuid::parse_str("0192a7b3-1234-7abc-8def-0123456789ab").unwrap());
+    // 下流は `uuid` crate の `Uuid` 型ではなく、この入口を通る
+    // （モジュールdocの「検査できないこと」も参照）。
+    let missing = entry_id_from_uuid_string("0192a7b3-1234-7abc-8def-0123456789ab").unwrap();
 
     let input = ReverseEntryInput {
         original_id: missing,
@@ -493,10 +570,13 @@ fn the_unbalanced_error_amounts_can_be_rendered_in_the_same_format_as_success() 
 
 /// 仕訳IDは**入力側も**この crate から扱える。
 ///
-/// 1巡目は出力（`entry_id_to_uuid_string`）しか無く、下流が
-/// `uuid::Uuid::parse_str` を直に書くしかなかった。`kaikei-app` は `uuid` を
-/// 再エクスポートしていないので、それは下流に `uuid` 依存を強いる
+/// 1巡目は出力（`entry_id_to_uuid_string`）しか無く、下流が `uuid` crate の
+/// `Uuid` を直に書くしかなかった。`kaikei-app` は `uuid` を再エクスポート
+/// していないので、それは下流に `uuid` 依存を強いる
 /// （`DECISIONS.md` D-047 が潰したのと同じ状態）。
+///
+/// **この入口が在ることは検査できるが、下流が `uuid` を足さないことは
+/// ここでは検査できない**（モジュールdoc「検査できないこと」）。
 #[test]
 fn entry_ids_can_be_parsed_and_rendered_through_kaikei_app() {
     let text = "0192a7b3-1234-7abc-8def-0123456789ab";

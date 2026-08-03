@@ -142,6 +142,67 @@ pub enum JpError {
         reason: String,
     },
 
+    /// 線上（JSON 等）で受け取ったタグキーが `tags.yaml` に登録されていない
+    /// （[`crate::tags::TagCatalog::parse_value`]）。
+    ///
+    /// `TagKey` の形式（snake_case）を満たさない文字列もこのバリアントになる
+    /// （どちらも「登録されたキーの綴りに直す」が次の手であり、AI から見て
+    /// 区別する意味が無い）。`CLAUDE.md` §4「TagSet はゴミ箱ではない」の
+    /// 線上側の入口であり、**黙って通さない**。
+    #[error(
+        "タグキー \"{key}\" は登録されていません（有効なキー: {valid}）。\
+         キー名を確認するか、新しいタグが必要なら tags.yaml に登録してください"
+    )]
+    UnregisteredTagKey {
+        /// 受け取ったキー（長い入力は先頭のみ）。
+        key: String,
+        /// 登録済みのタグキー一覧（`", "` 区切りに整形済み）。
+        valid: String,
+    },
+
+    /// 線上で受け取ったタグの値を、そのキーに登録された型として解釈できない
+    /// （[`crate::tags::TagCatalog::parse_value`]）。
+    #[error("タグ \"{key}\" の値 \"{input}\" を{value_type_label}として解釈できません: {reason}")]
+    InvalidTagValue {
+        /// 対象のタグキー。
+        key: String,
+        /// 期待する値の型の日本語ラベル（`kaikei_core::TagValueType::label_ja`）。
+        value_type_label: String,
+        /// 受け取った値（長い入力は先頭のみ）。
+        input: String,
+        /// 期待する書式（次に何を直せばよいか。`CLAUDE.md` §11）。
+        reason: String,
+    },
+
+    /// 線上で受け取った `tags` に同じキーが2回以上現れた
+    /// （[`crate::tags::TagCatalog::parse_tag_set`]）。
+    ///
+    /// 後勝ちで黙って上書きすると、送り手が意図した値と保存される値が
+    /// 食い違う（`tags.yaml` の重複キー検出と同じ理由。`CLAUDE.md` §4）。
+    #[error("タグキー \"{key}\" が入力に複数回現れています。1つにまとめてください")]
+    DuplicateTagKeyInInput {
+        /// 重複したタグキー。
+        key: String,
+    },
+
+    /// 取引日に適用される消費税区分マスタが1つも無い
+    /// （[`crate::tax::TaxRuleSets::require_for_date`]）。
+    ///
+    /// `TaxRuleSets::for_date` が `None` を返すこと自体は正常
+    /// （`DECISIONS.md` D-055）。「該当なしをエラーとして扱う呼び出し元」
+    /// （`docs/07-mcp-server.md` §2 の `list_tax_categories`）が、
+    /// **どの期間なら有効か**を同じ文言で答えられるようにするための入口。
+    #[error(
+        "取引日 {date} に適用される消費税区分マスタがありません\
+         （読み込まれているマスタの適用期間: {available}）。取引日を確認してください"
+    )]
+    NoApplicableTaxRuleSet {
+        /// 対象の取引日（ISO表記）。
+        date: String,
+        /// 読み込まれているマスタの適用期間一覧（表示用に整形済み）。
+        available: String,
+    },
+
     /// 税区分コードが、指定したマスタに存在しない。
     #[error(
         "税区分コード \"{code}\" は \"{table_label}\"（適用開始 {applies_from}）に存在しません\

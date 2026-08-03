@@ -278,7 +278,7 @@ async fn condition_1_exclusive_accounting_generates_tax_line_on_taxable_sale(
     let posted = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         input,
     )
@@ -358,7 +358,7 @@ async fn condition_2_reduced_rate_tax_free_and_out_of_scope_categories_are_handl
     let posted = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         input,
     )
@@ -427,7 +427,7 @@ async fn condition_3_non_qualified_transitional_measure_is_expressed_in_yaml(
     let posted_output = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         input,
     )
@@ -472,7 +472,7 @@ async fn condition_3_non_qualified_transitional_measure_is_expressed_in_yaml(
     let ctx = TaxContext {
         as_of: AccountingDate::new(2026, 4, 1).unwrap(),
         chart: &composition.chart,
-        tag_schema: &composition.tag_schema,
+        tag_schema: composition.tag_catalog.schema(),
         counterparties: &CounterpartyIndex::empty(),
     };
     let derivation = composition
@@ -526,7 +526,7 @@ async fn condition_4_household_split_produces_a_three_line_entry(
     let posted = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         input,
     )
@@ -614,7 +614,7 @@ async fn condition_5_yearly_master_switch_is_based_on_entry_date(
     let legacy_posted = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2025, 6, 15).unwrap(),
@@ -644,7 +644,7 @@ async fn condition_5_yearly_master_switch_is_based_on_entry_date(
     let current_posted = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 4, 1).unwrap(),
@@ -712,7 +712,7 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     let sales_posted = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 4, 10).unwrap(),
@@ -738,7 +738,7 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     let purchase_posted = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 5, 1).unwrap(),
@@ -776,7 +776,7 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     let split_posted = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         PostEntryInput {
             entry_date: AccountingDate::new(2026, 5, 15).unwrap(),
@@ -797,10 +797,14 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
         to: AccountingDate::new(2026, 12, 31).unwrap(),
         group_by: Vec::new(),
     };
-    let before_closing =
-        report::execute(&query, &composition.tag_schema, &settings(), period.clone())
-            .await
-            .unwrap();
+    let before_closing = report::execute(
+        &query,
+        composition.tag_catalog.schema(),
+        &settings(),
+        period.clone(),
+    )
+    .await
+    .unwrap();
     let (debit_before, credit_before) = before_closing.totals().unwrap();
     assert_eq!(
         debit_before.minor(),
@@ -823,7 +827,7 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     let tb_before_closing = TrialBalance::from_entries(
         fetched_entries.iter(),
         &composition.chart,
-        &composition.tag_schema,
+        composition.tag_catalog.schema(),
         &[],
     )
     .unwrap();
@@ -846,7 +850,7 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     let closing_posted = run_post_entry(
         &store,
         composition.tax_policy.clone(),
-        composition.tag_schema.clone(),
+        composition.tag_catalog.schema().clone(),
         ids.clone(),
         PostEntryInput {
             entry_date: proposal.entry_date,
@@ -873,9 +877,14 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     );
 
     // 7. 記帳後、report::execute（SQL集計）で収益・費用の残高が0になっていることを確認する。
-    let after_closing = report::execute(&query, &composition.tag_schema, &settings(), period)
-        .await
-        .unwrap();
+    let after_closing = report::execute(
+        &query,
+        composition.tag_catalog.schema(),
+        &settings(),
+        period,
+    )
+    .await
+    .unwrap();
     for row in after_closing.rows() {
         if matches!(
             row.account_type,
@@ -898,7 +907,7 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     let tb_after_closing = TrialBalance::from_entries(
         all_entries.iter(),
         &composition.chart,
-        &composition.tag_schema,
+        composition.tag_catalog.schema(),
         &[],
     )
     .unwrap();

@@ -2450,6 +2450,74 @@ doc コメントにも及ぶ（doc コメントが AI に読まれる文書に�
 できなくなる。`map_sqlstate` が `reason` に DB メッセージを含める設計
 （D-032 / D-038）は正しく、出口を分けるのが正解である。
 
+### 訂正注記4（PR-B 3巡目）: 「有効な期間」の文言も1箇所に持つ（`kaikei-jp` 側）
+
+`docs/07-mcp-server.md` §2 は `list_tax_categories` について「該当する年度
+マスタが存在しない日付では**空配列ではなくエラー**を返し、**有効期間を示す**」と
+定めているのに、`TaxRuleSets` の公開メソッドは `from_embedded` / `new` /
+`for_date` の3つだけで、**保持している表を列挙できなかった**
+（`TaxCategoryTable::range_display` も `pub(super)`）。消費側は
+`no method named iter found for struct TaxRuleSets` を実測した。
+
+このままだと各ツールが「2026-01-01〜…のマスタのみ…」という文言を手書きする。
+D-072 本文が潰したのと同じ、**同じ表現が複数箇所に散る**状態である。
+
+→ `kaikei-jp` に列挙用の公開 API を足した（`kaikei-core` は無変更）。
+
+| 入口 | 返すもの |
+|---|---|
+| `TaxRuleSets::iter` / `len` / `is_empty` | 保持しているマスタそのもの |
+| `TaxCategoryTable::range_display`（`pub` 化） | 1件分の適用期間（`"2026-01-01 〜 無期限"`） |
+| `TaxRuleSets::available_ranges_display` | 全件を適用開始日の昇順に並べた文字列 |
+| `TaxRuleSets::require_for_date` | 該当マスタ、無ければ `JpError::NoApplicableTaxRuleSet`（有効期間入り） |
+
+- **`for_date` は `Option` のまま残す。** 該当なしが `None` なのは正常な
+  戻り値であり（D-055）、`JpTaxPolicy` はそれを
+  `PolicyError::NoApplicableRuleSet` に写像する。`require_for_date` は
+  「該当なしをエラーとして扱う呼び出し元」（経路 (c)）専用の入口で、
+  両者は**どちらが正しいかではなく宛先が違う**。
+- `available_ranges_display` に**ラベル（YAMLのファイルパス）を含めない**。
+  線上に出るのは期間であり、読み手が直すのは取引日である。パスまで要る
+  診断は `iter()` + `label()` で組み立てる（§9「下位層の生の文字列を
+  そのまま応答に載せない」と同じ向き）。
+
+### 訂正注記5（PR-B 3巡目）: プローブが「検査できないこと」を名乗っていた
+
+`crates/kaikei-app/tests/contract_from_downstream.rs` は冒頭 doc で
+「ここでのコンパイル可否は `kaikei-mcp` / `kaikei-api` から見た可否と
+**同じになる**」と名乗り、検査項目5で「下流が `uuid` や独自の `match` を
+足さずに済むことそのものを検査する」と書いていた。**これは成り立たない。**
+
+統合テストのターゲットには、その crate の `[dependencies]` と
+`[dev-dependencies]` が**両方**リンクされる。消費側の実測:
+プローブに `Uuid::parse_str` を使う行を1行足しても**コンパイルエラーに
+ならず全テストが ok** になる。実在する下流（`kaikei-mcp`）は自分の
+`Cargo.toml` に `uuid` を書かない限りその行を書けないので、**同じ意味の
+検査ではない**。
+
+効いていない検査が「効いている」と名乗るのは、`PROGRESS.md` Phase 1 の
+教訓3（誤診を招く記述は実バグと同格）に該当する。**doc を実態に合わせて
+正す**（案 (a)）ことにし、次のように書き分けた。
+
+| | 扱い |
+|---|---|
+| 公開 API だけで下流の写像が書けること | **検査できる**（外部 crate としてリンクされるので `pub` でないものは見えない）。従来どおりプローブが担う |
+| `#[non_exhaustive]` の受け皿が下流で効くこと | **検査できる**（定義元 crate 内では検証できない性質。D-072 訂正注記1 の委譲先） |
+| 下流の `Cargo.toml` に依存が増えないこと | **検査できない。** PR-D（`kaikei-mcp` 新設）で CI に置く（`docs/07-mcp-server.md` §4 の申し送り、テストケース MC-30） |
+
+案 (b)（検査を本当に効かせる）は**この PR では採らない**。効かせるには
+`kaikei-app` だけに依存する専用 crate を新設することになるが、それは
+`kaikei-mcp` の劣化コピーであり、PR-D で本物が来た瞬間に「手で維持する
+複製」（D-047）になる。代わりに、**プローブ自身が余計な crate に手を
+伸ばしていないこと**を各プローブが自分のソースを読んで検査する
+（`the_probe_itself_does_not_reach_for_crates_outside_kaikei_*`）。
+これは自制の固定であって下流の依存の検査ではない、と doc に明記した。
+
+同じ理由で `kaikei-jp` 側にもプローブを置いた
+（`crates/kaikei-jp/tests/contract_from_downstream.rs`）。経路 (c) と
+`tags` 変換は `kaikei-app` を通らないため、app 側のプローブでは1行も
+踏めていなかった。
+
 ---
 
 ## D-073 書き込み系ユースケースの戻り値を出力構造体にし、`PolicyNote` は `post_entry` だけが持つ
@@ -2658,3 +2726,66 @@ AI は提示された赤伝を開くことすらできない。
 → `wire::fiscal_year_rule_code` / `fiscal_year_rule_from_code` を追加した
 （D-072 訂正注記2 の表を参照）。`currency_from_code` と同じく
 **未知の値は既定値へフォールバックせずエラー**にする。
+
+### 訂正注記4（PR-B 3巡目）: 線上の `tags` → `TagSet` の変換は `kaikei-jp` に置く
+
+訂正注記1〜3 と同じ「入力検証をどの層が持つか」の話が、`tags` に残っていた。
+
+`docs/07-mcp-server.md` §3 の `post_journal_entry` が受け取る `tags` は
+**文字列 → 文字列**のマップ（`{"tax_category": "SALES_10"}`）である。一方
+`kaikei_core::TagValue` は型付き（`Code` / `Text` / `Decimal` / `Date`）で、
+平文から作るにはキーごとの `TagValueType` が要る。消費側が実測した
+コンパイルエラーは2つ:
+
+- `no method named value_type found for reference &TagSchema`
+  （公開 API は `new` / `empty` / `validate` / `is_aggregatable` の4つだけで、
+  **組み立てたスキーマから型を引き戻せない**）
+- `cannot find module or crate rust_decimal`
+  （`TagValue::Decimal` を作るには小数の crate が要るが、下流は持っていない）
+
+初版の docs/07 は「これは MCP の DTO 変換であり `kaikei-app` の契約には
+現れない」としてスコープ外に置いていたが、**書き場所は `kaikei-mcp` ではなく
+`kaikei-jp` だった**。型を知っているのはタグスキーマ（`tags.yaml`）を読む層で
+あり、`kaikei-app` は `kaikei-jp` に依存できない（`CLAUDE.md` §1）。
+MCP 層に置けば `kaikei-api`（Phase 4）が同じ変換を書き直すことになり、
+D-072 本文および本決定の「呼び出し口が増えるたびに検証を書き足す運用に
+なる」がそのまま当てはまる。
+
+→ `kaikei_jp::tags::TagCatalog` を追加した（**`kaikei-core` は無変更**。
+docs/07 §3 が挙げた3案のうち (a)）。
+
+| 入口 | 役割 |
+|---|---|
+| `TagCatalog::from_embedded` / `from_path` / `from_yaml_str` | ロード（`TagSchema` + キーごとの `TagDef`） |
+| `TagCatalog::schema()` / `into_schema()` | `kaikei-core` / `kaikei-app` に渡す `&TagSchema` |
+| `TagCatalog::defs()` / `def()` / `value_type()` | キーからの逆引き |
+| `TagCatalog::parse_tag_set()` / `parse_value()` | 線上の文字列 → `TagSet` |
+| `tags::tag_value_to_string()` | 応答に載せる逆向き |
+
+**却下した選択肢**:
+
+| 候補 | 却下理由 |
+|---|---|
+| (b) `kaikei-core` に `TagSchema::value_type` を足す | **core の変更は人間の承認事項**（`CLAUDE.md` §1・§9）。同じ結果が凍結層を触らずに得られる以上、承認を求める理由が無い |
+| (c) 線上でも D-035 の `{"t":..,"v":..}` 形式を使う | 型を送り手（AI）に書かせることになる。型はスキーマが持っており、送り手が書いた `"t"` とスキーマが食い違ったらどちらを信じるかという論点が新たに増える。冗長でもある |
+| 変換を `kaikei-mcp` の DTO 層に置く（初版 docs/07） | 上記のとおり `kaikei-api` が同じ変換を再実装する。`JpError` を返す点でも経路 (c) と同型で、置き場を分ける理由が無い |
+| 未登録キーを黙って捨てる／`Text` として通す | `CLAUDE.md` §4「`TagSet` はゴミ箱ではない」。`tax_cat` のような綴り違いが**無言で消える**と、AI は「税区分を付けた」と思ったまま `tax_category` 無しの明細を作る（`required_for` の検証は通ってしまう組み合わせがある） |
+| 入力に同じキーが2回来たら後勝ちにする | `tags.yaml` の重複キーを拒否している（D-062）のと同じ理由。送り手が意図した値と保存される値が食い違う |
+| 小数を `Decimal::from_str`（`kaikei-core` の `parse_decimal` と同じ）で読む | 表現できない桁数を**黙って丸める**。`business_ratio` は税務調査時の根拠として記録するもの（`tags.yaml`）で、入口で丸めた値が保存されるのは事故。`from_str_exact` で拒否し、`CLAUDE.md` §11 に従って書式を示す |
+
+**値の文字列表現は D-035 の JSONB の `"v"` と同じ規約にする**（`Decimal` は
+`Display`/`FromStr` を経由した文字列、`Date` は ISO 8601）。線上とDBで別の
+書き方を発明しないため。number にしない理由は D-013 と同じ。
+
+**トレードオフ**: `compose::Composition` のフィールドを
+`tag_schema: TagSchema` から `tag_catalog: TagCatalog` に変えた
+（`kaikei-e2e` の呼び出しは `composition.tag_catalog.schema()` になった）。
+2つのフィールドで両方を持たせる案は、片方だけ差し替えた組み合わせが
+作れてしまうため採らない。`TagCatalog` は `Vec<(TagKey, TagDef)>` を
+保持し、`TagSchema` はその同じ `Vec` から構築時に1度だけ組み立てる
+（手で維持する2つの一覧にはしない。`PROGRESS.md` Phase 1 の教訓6）。
+
+**残る前工事**: `JpError` の新しい4バリアント
+（`UnregisteredTagKey` / `InvalidTagValue` / `DuplicateTagKeyInInput` /
+`NoApplicableTaxRuleSet`）に対する分類コードは、`JpError` 用の対応表ごと
+`kaikei-mcp` 側に置く（D-072 トレードオフの項、`docs/07-mcp-server.md` §6）。

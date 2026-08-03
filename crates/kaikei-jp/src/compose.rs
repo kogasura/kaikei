@@ -26,9 +26,9 @@
 use crate::chart;
 use crate::closing::{ClosingAccounts, JpSoleProprietorClosingPolicy};
 use crate::error::JpError;
-use crate::tags;
+use crate::tags::TagCatalog;
 use crate::tax::{JpSettings, JpSettingsOverrides, JpTaxPolicy, TaxRuleSets};
-use kaikei_core::{AccountingDate, ChartOfAccounts, TagSchema};
+use kaikei_core::{AccountingDate, ChartOfAccounts};
 
 /// [`compose`] への入力。
 #[derive(Debug, Clone)]
@@ -61,7 +61,14 @@ pub struct Composition {
     /// 勘定科目表（埋め込みテンプレート由来）。
     pub chart: ChartOfAccounts,
     /// タグスキーマ（埋め込みテンプレート由来）。
-    pub tag_schema: TagSchema,
+    ///
+    /// `kaikei_core::TagSchema` そのものではなく [`TagCatalog`] を持つ。
+    /// 検証に渡す `&TagSchema` は `tag_catalog.schema()` で取れるうえ、
+    /// 線上（JSON）の `tags` を `TagSet` にするのに必要なキーごとの
+    /// `TagValueType` も同じ値から引ける（`crate::tags` のモジュールdoc）。
+    /// `TagSchema` と定義一覧を別々のフィールドで持つと、片方だけ差し替えた
+    /// 組み合わせが作れてしまう。
+    pub tag_catalog: TagCatalog,
     /// `kaikei-policy::TaxPolicy` の実装。
     pub tax_policy: JpTaxPolicy,
     /// `kaikei-policy::ClosingPolicy` の実装。
@@ -94,7 +101,7 @@ pub enum ComposeError {
 ///
 /// 手順:
 /// 1. `chart::load_embedded` → `ChartOfAccounts`
-/// 2. `tags::load_embedded` → `TagSchema`
+/// 2. `TagCatalog::from_embedded` → タグスキーマ（+ 線上変換に使う定義一覧）
 /// 3. `options.rule_sets`（通常は `TaxRuleSets::from_embedded()` の結果）から
 ///    `options.defaults_as_of` 時点のマスタを選び、その `settings_defaults` を
 ///    既定値として `JpSettings::compose`
@@ -106,7 +113,7 @@ pub enum ComposeError {
 /// `DECISIONS.md` D-069）。
 pub fn compose(options: ComposeOptions) -> Result<Composition, ComposeError> {
     let chart = chart::load_embedded(kaikei_jp_data::CHART_SOLE_PROPRIETOR)?;
-    let tag_schema = tags::load_embedded(kaikei_jp_data::TAGS)?;
+    let tag_catalog = TagCatalog::from_embedded(kaikei_jp_data::TAGS)?;
 
     let defaults = options
         .rule_sets
@@ -120,14 +127,14 @@ pub fn compose(options: ComposeOptions) -> Result<Composition, ComposeError> {
 
     let closing_policy = JpSoleProprietorClosingPolicy::new(
         &chart,
-        &tag_schema,
+        tag_catalog.schema(),
         options.closing_accounts,
         options.closing_tax_category,
     )?;
 
     Ok(Composition {
         chart,
-        tag_schema,
+        tag_catalog,
         tax_policy,
         closing_policy,
     })
