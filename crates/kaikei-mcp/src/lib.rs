@@ -46,3 +46,4 @@
 #![warn(missing_docs)]
 
 pub mod server;
+pub mod wire;
