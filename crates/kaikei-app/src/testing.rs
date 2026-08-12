@@ -166,6 +166,31 @@ impl JournalRepo for InMemoryTx {
             .map(|e| (e.id(), e.entry_no())))
     }
 
+    async fn list_entries_in_period(
+        &mut self,
+        from: AccountingDate,
+        to: AccountingDate,
+    ) -> Result<Vec<JournalEntry>, RepoError> {
+        // このトランザクション内で追加したぶんも見えるようにする
+        // （`find_entry` と同じ可視性）。commit 前の仕訳を含めて集計できないと、
+        // 「記帳してから決算する」を1本のトランザクションで書くテストが
+        // この fake では組み立てられない。
+        let mut found: Vec<JournalEntry> = self
+            .lock_shared()
+            .entries
+            .values()
+            .cloned()
+            .chain(self.inserted_entries.iter().cloned())
+            .filter(|entry| entry.entry_date() >= from && entry.entry_date() <= to)
+            .collect();
+
+        // 実装（`PgTx`）の `ORDER BY entry_date, entry_no` と同じ並びに揃える。
+        // fake だけ並びが違うと、順序に依存するユースケース（仕訳日記帳）を
+        // fake で検証しても実装との差が出ない。
+        found.sort_by_key(|entry| (entry.entry_date(), entry.entry_no()));
+        Ok(found)
+    }
+
     async fn insert_entry(&mut self, entry: &JournalEntry) -> Result<(), RepoError> {
         // 実 DB では仕訳ID・`(fiscal_year, entry_no)` のいずれも一意制約
         // 違反として拒否される（`crates/kaikei-store/migrations/0003_journal.sql`

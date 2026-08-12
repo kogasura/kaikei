@@ -19,8 +19,9 @@ use async_trait::async_trait;
 use kaikei_app::error::RepoError;
 use kaikei_app::id::{entry_id_from_uuid, entry_id_to_uuid};
 use kaikei_app::ports::JournalRepo;
-use kaikei_core::{EntryId, EntryNumber, JournalEntry, TagValue};
+use kaikei_core::{AccountingDate, EntryId, EntryNumber, JournalEntry, TagValue};
 use row::{EntryRows, JournalEntryRow, JournalLineRow};
+use std::collections::HashMap;
 
 /// PostgreSQL の `text`/`jsonb` は U+0000（NUL）を格納できない。
 ///
@@ -40,16 +41,26 @@ fn reject_nul(s: &str) -> Result<(), RepoError> {
     Ok(())
 }
 
+/// `journal_entries` から SELECT する列。
+///
+/// 1件取得（`find_entry`）と期間取得（`list_entries_in_period`）で共有する。
+/// 列を片方にだけ足すと [`JournalEntryRow`] の `FromRow` が**実行時にしか**
+/// 落ちない（コンパイルは通る）。1箇所に置いて、その事故が起きない形にする。
+const ENTRY_COLUMNS: &str = "id, fiscal_year, entry_no, entry_date, description, \
+                             reverses, reverse_reason, recorded_at";
+
+/// `journal_lines` から SELECT する列。同上。
+const LINE_COLUMNS: &str = "entry_id, line_no, account_code, side, amount_minor, \
+                            currency, currency_minor_unit, tags, memo";
+
 #[async_trait]
 impl JournalRepo for PgTx<'_> {
     async fn find_entry(&mut self, id: EntryId) -> Result<Option<JournalEntry>, RepoError> {
         let uuid = entry_id_to_uuid(id);
 
-        let entry_row: Option<JournalEntryRow> = sqlx::query_as(
-            "SELECT id, fiscal_year, entry_no, entry_date, description, reverses, \
-                    reverse_reason, recorded_at \
-             FROM journal_entries WHERE id = $1",
-        )
+        let entry_row: Option<JournalEntryRow> = sqlx::query_as(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM journal_entries WHERE id = $1"
+        ))
         .bind(uuid)
         .fetch_optional(self.conn())
         .await
@@ -59,11 +70,9 @@ impl JournalRepo for PgTx<'_> {
             return Ok(None);
         };
 
-        let line_rows: Vec<JournalLineRow> = sqlx::query_as(
-            "SELECT line_no, account_code, side, amount_minor, currency, \
-                    currency_minor_unit, tags, memo \
-             FROM journal_lines WHERE entry_id = $1 ORDER BY line_no",
-        )
+        let line_rows: Vec<JournalLineRow> = sqlx::query_as(&format!(
+            "SELECT {LINE_COLUMNS} FROM journal_lines WHERE entry_id = $1 ORDER BY line_no"
+        ))
         .bind(uuid)
         .fetch_all(self.conn())
         .await
@@ -74,6 +83,65 @@ impl JournalRepo for PgTx<'_> {
             lines: line_rows,
         })?;
         Ok(Some(entry))
+    }
+
+    async fn list_entries_in_period(
+        &mut self,
+        from: AccountingDate,
+        to: AccountingDate,
+    ) -> Result<Vec<JournalEntry>, RepoError> {
+        let from_date = accounting_date_to_naive_date(from)?;
+        let to_date = accounting_date_to_naive_date(to)?;
+
+        // 並びは (entry_date, entry_no)。仕訳日記帳がこの順で出せる形にしておく。
+        // `entry_no` は会計年度ごとの連番なので、年度をまたぐ期間では
+        // `entry_date` が先に効く必要がある（順序を入れ替えると年度の
+        // 切り替わりで並びが崩れる）。
+        let entry_rows: Vec<JournalEntryRow> = sqlx::query_as(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM journal_entries \
+             WHERE entry_date >= $1 AND entry_date <= $2 \
+             ORDER BY entry_date, entry_no"
+        ))
+        .bind(from_date)
+        .bind(to_date)
+        .fetch_all(self.conn())
+        .await
+        .map_err(from_sqlx_error)?;
+
+        if entry_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 明細は1回のクエリでまとめて取る。仕訳ごとに引き直すと件数ぶんの
+        // 往復になる（決算では1年分＝数千件を読む）。
+        let ids: Vec<uuid::Uuid> = entry_rows.iter().map(|row| row.id).collect();
+        let line_rows: Vec<JournalLineRow> = sqlx::query_as(&format!(
+            "SELECT {LINE_COLUMNS} FROM journal_lines \
+             WHERE entry_id = ANY($1) ORDER BY entry_id, line_no"
+        ))
+        .bind(&ids)
+        .fetch_all(self.conn())
+        .await
+        .map_err(from_sqlx_error)?;
+
+        let mut lines_by_entry: HashMap<uuid::Uuid, Vec<JournalLineRow>> = HashMap::new();
+        for line in line_rows {
+            lines_by_entry.entry(line.entry_id).or_default().push(line);
+        }
+
+        let mut entries = Vec::with_capacity(entry_rows.len());
+        for entry_row in entry_rows {
+            // 明細が1行も無い仕訳は `JournalEntry::try_from` が弾く
+            // （貸借不一致として `RepoError::Corrupt`）。ここで空を
+            // 黙って通さないこと——読めた仕訳が壊れていたら、決算書の
+            // 金額が静かに狂う。
+            let lines = lines_by_entry.remove(&entry_row.id).unwrap_or_default();
+            entries.push(JournalEntry::try_from(EntryRows {
+                entry: entry_row,
+                lines,
+            })?);
+        }
+        Ok(entries)
     }
 
     async fn find_reversal_of(

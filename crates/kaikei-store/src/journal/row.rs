@@ -30,11 +30,15 @@ pub(crate) struct JournalEntryRow {
 
 /// `journal_lines` の1行の生表現。
 ///
-/// `entry_id` 列は SELECT しない。呼び出し側（`journal/mod.rs`）が
-/// どの仕訳の明細かを既に把握している（`WHERE entry_id = $1` で絞り込んで
-/// いる）ため、行ごとに保持する必要が無い。
+/// `entry_id` を行ごとに保持する。仕訳1件を引く経路
+/// （`WHERE entry_id = $1`）だけなら呼び出し側が既に把握しているので不要
+/// だったが、**期間で複数件をまとめて引く経路**
+/// （[`crate::ports`] の `JournalRepo::list_entries_in_period`）では、
+/// 取得した明細をどの仕訳に束ねるかをこの列でしか決められない。
+/// 明細を仕訳ごとに引き直すと件数ぶんのクエリになる（決算で数千件を読む）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct JournalLineRow {
+    pub entry_id: Uuid,
     pub line_no: i16,
     pub account_code: String,
     pub side: i16,
