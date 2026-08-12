@@ -22,3 +22,4 @@ pub mod post_entry;
 pub mod report;
 pub mod reverse_entry;
 pub mod search_entries;
+pub mod statements;
