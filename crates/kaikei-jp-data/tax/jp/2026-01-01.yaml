@@ -1,0 +1,116 @@
+# kaikei-jp-data/tax/jp/2026-01-01.yaml
+#
+# 消費税区分マスタ。税率も控除割合もここにだけ書く。
+# コードに税率をハードコードしないこと。
+#
+# ★ 内容は公開情報の整理であり、税務上の正しさを保証しない。
+#   経過措置の控除割合など、適用前に必ず税理士と国税庁の一次情報で確認すること。
+#
+# rate は必ず「文字列」で書く（YAML の float は誤差が出るため）
+#
+# ---- ファイル名は「暦年」ではなく「施行日」 ----
+#
+# 消費税の改正は暦年の途中に施行される。このファイルの適用期間が
+# 2026-09-30 で終わるのは、免税事業者等からの課税仕入れに係る経過措置の
+# 控除割合が 2026-10-01（令和8年10月1日）に 80% → 70% へ変わるためである
+# （令和8年度税制改正。続きは 2026-10-01.yaml）。
+#
+# 暦年でファイルを切ると、1つの暦年に2つのマスタが必要な年を表現できない。
+# 改正が来たら「施行日を名前にしたファイルを追加し、直前のファイルに
+# applies_to を入れる」（`DECISIONS.md` D-050 / D-092）。
+
+version: 1
+country: JP
+applies_from: 2026-01-01
+applies_to: 2026-09-30     # 経過措置の控除割合が 2026-10-01 に変わる
+
+settings_defaults:
+  tax_mode: exclusive      # exclusive（税抜経理） | inclusive（税込経理）
+  rounding: floor          # floor | ceil | half_up
+  rounding_unit: line      # line（明細ごと） | document（請求書単位）
+
+categories:
+  # ---- 課税売上 ----
+  - code: SALES_10
+    label: "課税売上 10%"
+    direction: sales
+    rate: "0.10"
+    tax_account: "330"       # 仮受消費税等
+
+  - code: SALES_8_REDUCED
+    label: "課税売上 8%（軽減税率）"
+    direction: sales
+    rate: "0.08"
+    tax_account: "330"
+
+  - code: SALES_EXPORT
+    label: "免税売上（輸出）"
+    direction: sales
+    rate: "0"
+    tax_account: null
+
+  # ---- 課税仕入（適格請求書あり）----
+  - code: PURCHASE_10_QUALIFIED
+    label: "課税仕入 10%（適格）"
+    direction: purchase
+    rate: "0.10"
+    deductible: true
+    deduction_ratio: "1.0"
+    requires_qualified_invoice: true
+    tax_account: "180"       # 仮払消費税等
+
+  - code: PURCHASE_8_REDUCED_QUALIFIED
+    label: "課税仕入 8%（軽減・適格）"
+    direction: purchase
+    rate: "0.08"
+    deductible: true
+    deduction_ratio: "1.0"
+    requires_qualified_invoice: true
+    tax_account: "180"
+
+  # ---- 課税仕入（非適格・経過措置）----
+  #
+  # 免税事業者等からの課税仕入れは、経過措置により仕入税額相当額の一定割合を
+  # 控除できる。割合は施行日で変わり、**課税仕入れを行った日**で判定する
+  # （国税庁インボイスQ&A 問113 / 問113-3。支払日でも請求書日付でもない）。
+  # 期間ごとの割合と出典は docs/09-tax-research.md を参照。
+  #
+  # deduction_ratio は現在**税額計算に反映していない**（rate のみで計算し、
+  # 控除できない部分の帳簿処理は `PolicyNote` で伝えるに留める。D-059）。
+  # この値は「控除割合がいくつか」をマスタとして持ち、AI・利用者に伝えるためのもの。
+  - code: PURCHASE_10_NON_QUALIFIED
+    label: "課税仕入 10%（非適格・経過措置 80%）"
+    direction: purchase
+    rate: "0.10"
+    deductible: true
+    deduction_ratio: "0.80"
+    requires_qualified_invoice: false
+    tax_account: "180"
+    note: "経過措置の控除割合は 2026-10-01 以後の課税仕入れから 70% になる（国税庁インボイスQ&A 問113）。控除できない部分の帳簿上の処理は税理士に確認（docs/08-compliance.md §9-1、docs/09-tax-research.md）"
+
+  - code: PURCHASE_8_REDUCED_NON_QUALIFIED
+    label: "課税仕入 8%（軽減・非適格・経過措置 80%）"
+    direction: purchase
+    rate: "0.08"
+    deductible: true
+    deduction_ratio: "0.80"
+    requires_qualified_invoice: false
+    tax_account: "180"
+    note: "軽減税率にも経過措置は及ぶ（国税庁インボイスQ&A 問113）。2026-10-01 以後は 70%。控除できない部分の帳簿上の処理は税理士に確認（docs/09-tax-research.md）"
+
+  # ---- 税額計算をしないもの ----
+  - code: TAX_FREE
+    label: "非課税"
+    direction: none
+    rate: null
+
+  - code: OUT_OF_SCOPE
+    label: "不課税"
+    direction: none
+    rate: null
+
+  - code: NOT_APPLICABLE
+    label: "対象外"
+    direction: none
+    rate: null
+    note: "資産・負債の振替など、消費税と無関係な取引に使う"
