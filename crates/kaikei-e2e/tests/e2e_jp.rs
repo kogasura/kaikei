@@ -36,6 +36,7 @@ mod common;
 use kaikei_app::context::{BookSettings, FiscalYearRule};
 use kaikei_app::ports::{ChartRepo, IdGenerator, JournalRepo};
 use kaikei_app::tx::{with_tx, with_tx_err};
+use kaikei_app::usecase::closing::{self, ClosingInput};
 use kaikei_app::usecase::import_chart;
 use kaikei_app::usecase::post_entry::{self, PostEntryFailure, PostEntryInput, PostEntryOutput};
 use kaikei_app::usecase::report::{self, ReportInput};
@@ -824,6 +825,45 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     );
     let proposal = proposed.into_iter().next().unwrap();
     assert_eq!(proposal.entry_date, fy_2026.end());
+
+    // 5-b. ★同じ提案が `closing::execute` からも出る★
+    //
+    // 上の 5 は「DBから仕訳を読み戻して TrialBalance を手で組み立て、policy を
+    // 直接呼ぶ」手順である。`kaikei_app::usecase::closing` はその手順を1つの
+    // ユースケースにまとめたもので、**手作業版と同じ提案が出なければ意味が無い**。
+    // 集計期間を年度ラベルから導出する（呼び出し側が日付を組み立てない）点が
+    // 唯一の違いなので、そこがずれていれば提案の中身が食い違って落ちる。
+    let via_usecase = with_tx_err(&store, |tx| {
+        let schema = composition.tag_catalog.schema().clone();
+        let policy = composition.closing_policy.clone();
+        Box::pin(async move {
+            closing::execute(tx, &policy, &schema, ClosingInput { fiscal_year: 2026 }).await
+        })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(via_usecase.period_start, fy_2026.start());
+    assert_eq!(via_usecase.period_end, fy_2026.end());
+    assert_eq!(
+        via_usecase.entry_count,
+        posted_ids.len(),
+        "この年度に記帳した仕訳がすべて集計対象に入るはず"
+    );
+    assert_eq!(via_usecase.proposals.len(), 1);
+    let from_usecase = &via_usecase.proposals[0];
+    assert_eq!(from_usecase.entry_date, proposal.entry_date);
+    assert_eq!(from_usecase.description, proposal.description);
+    assert_eq!(
+        from_usecase.lines.len(),
+        proposal.lines.len(),
+        "手作業で組み立てた提案と明細の本数が違う"
+    );
+    for (a, b) in from_usecase.lines.iter().zip(proposal.lines.iter()) {
+        assert_eq!(a.account(), b.account());
+        assert_eq!(a.side(), b.side());
+        assert_eq!(a.amount(), b.amount());
+    }
 
     // 6. ★提案された決算振替仕訳を post_entry::execute で実際に記帳する★
     //    （PR-8の最大の価値。「決算仕訳が実際に記帳できる」ことの実証）。
