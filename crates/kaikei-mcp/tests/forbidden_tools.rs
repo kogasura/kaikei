@@ -46,14 +46,15 @@ const FORBIDDEN_TOOLS: [&str; 4] = [
 
 /// MCP に登録してよいツール（`docs/07-mcp-server.md` §2）。
 ///
-/// Phase 3 の11件（D-070）に、Phase 5 で `get_statements` を足した（D-093）。
+/// Phase 3 の11件（D-070）に、Phase 5 で `get_statements`（D-093）と
+/// `propose_closing_entries`（D-094）を足した。
 /// 「Phase 4 以降」と書かれたままのツールは名前を予約しているだけで、
 /// 登録しない（登録しないツールは AI からは存在しないのと同じ）。
 ///
 /// **増やすときは設計書（§2 の表）と `DECISIONS.md` を先に更新すること。**
 /// 下の検査はこの一覧を許可リストとして使うので、ここだけ書き換えれば
 /// 通ってしまう——順序を守るのは人間の側である。
-const ALLOWED_TOOLS: [&str; 12] = [
+const ALLOWED_TOOLS: [&str; 13] = [
     "list_accounts",
     "get_entry",
     "get_trial_balance",
@@ -66,6 +67,7 @@ const ALLOWED_TOOLS: [&str; 12] = [
     "suggest_tax_category",
     "validate_invoice_number",
     "get_statements",
+    "propose_closing_entries",
 ];
 
 // MC-10 (1): `tools/list` の応答に4件のいずれも現れない。
