@@ -906,9 +906,9 @@ AI の自己修正を一段速くする効果は大きいが、
 {
   "date": "2026-04-15",
   "table": {
-    "label": "kaikei-jp-data/tax/jp/2026.yaml",
+    "label": "kaikei-jp-data/tax/jp/2026-01-01.yaml",
     "applies_from": "2026-01-01",
-    "range": "2026-01-01 〜 無期限"
+    "range": "2026-01-01 〜 2026-09-30"
   },
   "count": 9,
   "categories": [
@@ -930,7 +930,7 @@ AI の自己修正を一段速くする効果は大きいが、
 
   ```json
   { "error": "no_applicable_rule_set",
-    "message": "取引日 2000-01-01 に適用される消費税区分マスタがありません（読み込まれているマスタの適用期間: 2026-01-01 〜 無期限）。取引日を確認してください" }
+    "message": "取引日 2000-01-01 に適用される消費税区分マスタがありません（読み込まれているマスタの適用期間: 2026-01-01 〜 2026-09-30、2026-10-01 〜 無期限）。取引日を確認してください" }
   ```
 
   この文言は `TaxRuleSets::require_for_date` が組み立てる。**MCP 層で
@@ -990,8 +990,8 @@ AI の自己修正を一段速くする効果は大きいが、
 ```json
 {
   "date": "2026-04-15",
-  "table": { "label": "kaikei-jp-data/tax/jp/2026.yaml",
-             "applies_from": "2026-01-01", "range": "2026-01-01 〜 無期限" },
+  "table": { "label": "kaikei-jp-data/tax/jp/2026-01-01.yaml",
+             "applies_from": "2026-01-01", "range": "2026-01-01 〜 2026-09-30" },
   "filtered_by": { "direction": "sales", "description_used_for_filtering": false,
                    "tax_mode": "exclusive", "is_taxable_business": true,
                    "simplified_taxation": false,
@@ -1001,7 +1001,7 @@ AI の自己修正を一段速くする効果は大きいが、
   "candidates": [
     { "code": "SALES_10", "label": "課税売上 10%", "direction": "sales",
       "rate": "0.10", "requires_qualified_invoice": false, "tax_account": "330",
-      "reason": "2026-04-15 時点で有効なマスタ「kaikei-jp-data/tax/jp/2026.yaml」（2026-01-01 〜 無期限）に、売上側の区分「課税売上 10%」として登録されています。税率は 0.10 です" }
+      "reason": "2026-04-15 時点で有効なマスタ「kaikei-jp-data/tax/jp/2026-01-01.yaml」（2026-01-01 〜 2026-09-30）に、売上側の区分「課税売上 10%」として登録されています。税率は 0.10 です" }
   ],
   "disclaimer": "候補と根拠のみを返しています。どの区分を使うかの判断はこのサーバーでは行いません。候補は、指定された取引日の時点で有効な消費税区分マスタに登録されている区分です。取引内容の文面からの推論は行っていません。この帳簿の設定（filtered_by の tax_mode / is_taxable_business / simplified_taxation）でも候補を絞っていません。帳簿の設定によっては、候補の区分で記帳しても税額の行が生成されないことがあります。"
 }
