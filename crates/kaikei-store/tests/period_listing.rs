@@ -32,8 +32,8 @@ use kaikei_app::ports::JournalRepo;
 use kaikei_app::tx::with_tx;
 use kaikei_core::{
     AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, Currency, EntryId,
-    EntryNumber, FiscalYear, FixedClock, JournalEntry, JournalLine, Money, NewEntry, Side, TagSet,
-    TagSchema, Timestamp,
+    EntryNumber, FiscalYear, FixedClock, JournalEntry, JournalLine, Money, NewEntry, Side,
+    TagSchema, TagSet, Timestamp,
 };
 use kaikei_store::pool::PgStore;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -303,9 +303,7 @@ async fn each_entry_gets_exactly_its_own_lines(
     let found = list(&store, date(2026, 6, 1), date(2026, 6, 30)).await;
     let expected: Vec<JournalEntry> = seed()
         .into_iter()
-        .filter(|e| {
-            e.entry_date() >= date(2026, 6, 1) && e.entry_date() <= date(2026, 6, 30)
-        })
+        .filter(|e| e.entry_date() >= date(2026, 6, 1) && e.entry_date() <= date(2026, 6, 30))
         .collect();
 
     assert_eq!(found.len(), expected.len());
