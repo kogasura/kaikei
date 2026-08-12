@@ -243,13 +243,25 @@ mod tests {
     }
 
     // 取引日で切り替わることが応答から読める（`table` が日付で変わる）。
+    //
+    // 同梱マスタが1件だった頃、このテストは「ラベルが**同じ**」ことを見ていた。
+    // 名前が言う「切り替わる」を実際には確かめていなかったわけで、マスタが
+    // 2件以上ある今は本来の意図どおり**違う**ことを見る。2026年は経過措置の
+    // 控除割合が 10/1 に変わるため、暦年の前半と後半で別のマスタが引かれる
+    // （`DECISIONS.md` D-092）。
     #[test]
     fn the_source_table_is_selected_by_the_transaction_date() {
         let early = body_at(2026, 1, 1);
         let late = body_at(2026, 12, 31);
-        assert_eq!(early["table"]["label"], late["table"]["label"]);
+        assert_ne!(
+            early["table"]["label"], late["table"]["label"],
+            "取引日が違えば別のマスタが引かれるはず: {early} / {late}"
+        );
         assert_eq!(early["date"], json!("2026-01-01"));
         assert_eq!(late["date"], json!("2026-12-31"));
+        // 応答の適用期間も、引かれたマスタのものに揃っている。
+        assert_eq!(early["table"]["applies_to"], json!("2026-09-30"));
+        assert_eq!(late["table"]["applies_from"], json!("2026-10-01"));
     }
 
     // 説明文が `CLAUDE.md` §10 の禁止表現を含まず、断定もしない。

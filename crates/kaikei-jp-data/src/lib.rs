@@ -72,10 +72,19 @@ pub const CHART_SOLE_PROPRIETOR: EmbeddedYaml = EmbeddedYaml {
 /// 増やさないため。`DECISIONS.md` D-047 / D-050）。
 ///
 /// 並び順に意味は持たせない（適用期間で選ぶため）。
-pub const TAX_CATEGORY_SOURCES: &[EmbeddedYaml] = &[EmbeddedYaml {
-    label: "kaikei-jp-data/tax/jp/2026.yaml",
-    source: include_str!("../tax/jp/2026.yaml"),
-}];
+///
+/// ファイル名は**施行日**である（暦年ではない）。消費税の改正は暦年の途中に
+/// 施行されるため、1つの暦年に2つのマスタが並ぶ年がある（`DECISIONS.md` D-092）。
+pub const TAX_CATEGORY_SOURCES: &[EmbeddedYaml] = &[
+    EmbeddedYaml {
+        label: "kaikei-jp-data/tax/jp/2026-01-01.yaml",
+        source: include_str!("../tax/jp/2026-01-01.yaml"),
+    },
+    EmbeddedYaml {
+        label: "kaikei-jp-data/tax/jp/2026-10-01.yaml",
+        source: include_str!("../tax/jp/2026-10-01.yaml"),
+    },
+];
 
 #[cfg(test)]
 mod tests {
