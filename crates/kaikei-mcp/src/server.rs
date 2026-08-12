@@ -221,6 +221,7 @@ pub fn tool_registry() -> ToolRegistry {
     use crate::tools::get_entry::GetEntry;
     use crate::tools::get_ledger::GetLedger;
     use crate::tools::get_settings::GetSettings;
+    use crate::tools::get_statements::GetStatements;
     use crate::tools::get_trial_balance::GetTrialBalance;
     use crate::tools::list_accounts::ListAccounts;
     use crate::tools::list_tax_categories::ListTaxCategories;
@@ -238,6 +239,7 @@ pub fn tool_registry() -> ToolRegistry {
         .with::<ListAccounts>()
         .with::<GetEntry>()
         .with::<GetTrialBalance>()
+        .with::<GetStatements>()
         .with::<ListTaxCategories>()
         .with::<GetSettings>()
         // 提案系・検証系（PR-G。帳簿を変更しない）。

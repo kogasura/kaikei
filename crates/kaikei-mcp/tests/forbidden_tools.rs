@@ -44,11 +44,16 @@ const FORBIDDEN_TOOLS: [&str; 4] = [
     "reopen_period",
 ];
 
-/// Phase 3 で MCP に登録してよいツール（`docs/07-mcp-server.md` §2 の11件）。
+/// MCP に登録してよいツール（`docs/07-mcp-server.md` §2）。
 ///
-/// 「Phase 4 以降」と書かれたツールは名前を予約しているだけで、Phase 3 では
+/// Phase 3 の11件（D-070）に、Phase 5 で `get_statements` を足した（D-093）。
+/// 「Phase 4 以降」と書かれたままのツールは名前を予約しているだけで、
 /// 登録しない（登録しないツールは AI からは存在しないのと同じ）。
-const PHASE_3_TOOLS: [&str; 11] = [
+///
+/// **増やすときは設計書（§2 の表）と `DECISIONS.md` を先に更新すること。**
+/// 下の検査はこの一覧を許可リストとして使うので、ここだけ書き換えれば
+/// 通ってしまう——順序を守るのは人間の側である。
+const ALLOWED_TOOLS: [&str; 12] = [
     "list_accounts",
     "get_entry",
     "get_trial_balance",
@@ -60,6 +65,7 @@ const PHASE_3_TOOLS: [&str; 11] = [
     "reverse_journal_entry",
     "suggest_tax_category",
     "validate_invoice_number",
+    "get_statements",
 ];
 
 // MC-10 (1): `tools/list` の応答に4件のいずれも現れない。
@@ -161,15 +167,15 @@ fn the_registry_predicates_actually_observe_registered_tools() {
     assert!(!router.has_route("delete_journal_entry"));
 }
 
-// Phase 3 で登録してよいのは §2 の11件だけ。
+// 登録してよいのは §2 の許可リストにあるものだけ。
 //
 // 禁止リスト（4件）だけを見張ると、`drop_journal_entries` のような**新しい名前**の
 // 破壊的ツールが増えても緑のまま通る。許可リスト側からも閉じる。
 #[test]
-fn every_registered_tool_is_one_of_the_eleven_phase_3_tools() {
+fn every_registered_tool_is_on_the_allow_list() {
     for name in registered_tool_names() {
         assert!(
-            PHASE_3_TOOLS.contains(&name.as_str()),
+            ALLOWED_TOOLS.contains(&name.as_str()),
             "Phase 3 の11ツールに無いツールが登録されています: {name}\
              （docs/07-mcp-server.md §2。増やす場合は設計書と DECISIONS.md を先に更新すること）"
         );
@@ -181,7 +187,7 @@ fn every_registered_tool_is_one_of_the_eleven_phase_3_tools() {
 fn the_allow_list_and_the_deny_list_do_not_overlap() {
     for forbidden in FORBIDDEN_TOOLS {
         assert!(
-            !PHASE_3_TOOLS.contains(&forbidden),
+            !ALLOWED_TOOLS.contains(&forbidden),
             "許可リストに存在させないツールが混ざっています: {forbidden}"
         );
     }
