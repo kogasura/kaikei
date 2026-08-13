@@ -936,6 +936,7 @@ mod tests {
                 fiscal_year,
                 out_dir,
                 deduction,
+                yayoi,
             } => {
                 assert_eq!(fiscal_year, 2026);
                 assert_eq!(out_dir, PathBuf::from("./out"));
@@ -943,6 +944,7 @@ mod tests {
                     deduction, DEFAULT_BLUE_RETURN_DEDUCTION,
                     "--deduction 省略時は既定値"
                 );
+                assert!(!yayoi, "--yayoi 省略時は弥生向けを出さない");
             }
             other => panic!("report として解釈されるはず: {other:?}"),
         }
@@ -981,6 +983,27 @@ mod tests {
         ]))
         .expect_err("負の控除額は拒否されるはず");
         assert!(err.contains("負の値"), "{err}");
+    }
+
+    // --yayoi を指定すると弥生向けも出す。
+    #[test]
+    fn the_yayoi_output_is_opt_in() {
+        let command = parse_args(&args(&[
+            "report", "--year", "2026", "--out", "./out", "--yayoi",
+        ]))
+        .unwrap();
+        match command {
+            Command::Report { yayoi, .. } => assert!(yayoi),
+            other => panic!("report として解釈されるはず: {other:?}"),
+        }
+    }
+
+    // verify は書き出さないので --yayoi を黙って無視しない。
+    #[test]
+    fn verify_rejects_yayoi_instead_of_ignoring_it() {
+        let err = parse_args(&args(&["verify", "--year", "2026", "--yayoi"]))
+            .expect_err("verify では拒否されるはず");
+        assert!(err.contains("--yayoi"), "{err}");
     }
 
     // verify は決算書を出さないので --deduction を黙って無視しない
