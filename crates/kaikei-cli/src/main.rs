@@ -289,15 +289,31 @@ async fn write_reports(
     // 仕訳と勘定科目表を1つのトランザクションで読む。**間に記帳が入ると、
     // 仕訳日記帳と財務諸表が別の帳簿を映す。**
     let schema = catalog.schema().clone();
-    let (entries, chart, statements) = with_tx_err(&store, move |tx| {
+    let (entries, chart, statements, cumulative) = with_tx_err(&store, move |tx| {
         let schema = schema.clone();
         Box::pin(async move {
             let chart = tx.load_chart().await?;
             let entries = tx.list_entries_in_period(from, to).await?;
             let policy = JpStatementPolicy::new(chart.clone());
+            // 損益計算書は**会計年度の期間**。その期間の損益そのものである。
             let statements =
                 statements::execute(tx, &policy, &schema, StatementsInput { from, to }).await?;
-            Ok((entries, chart, statements))
+            // 貸借対照表は**帳簿の最初からの累計**。ある時点の残高であって
+            // 期間の増減ではないので、期首残高（前期末の仕訳）を含めるには
+            // 会計年度より前まで遡る必要がある。この非対称は会計の性質で
+            // あって実装の都合ではない（`usecase::statements` のモジュール
+            // doc「貸借対照表には期首残高が要る」）。
+            let cumulative = statements::execute(
+                tx,
+                &policy,
+                &schema,
+                StatementsInput {
+                    from: book_beginning(),
+                    to,
+                },
+            )
+            .await?;
+            Ok((entries, chart, statements, cumulative))
         })
     })
     .await
@@ -329,9 +345,10 @@ async fn write_reports(
     .await
     .map_err(|error| format!("試算表を集計できませんでした: {error}"))?;
 
-    // 貸借対照表が期首残高を欠いている疑いは、出力にも載せる
-    // （画面で見た人と印刷した人が違うものを見ないように）。
-    let notes = opening_balance_notes(&statements, from);
+    // 貸借対照表が何を集計したものかを出力に載せる。**会計年度の増減では
+    // なく残高である**ことが読む人に伝わらないと、期首残高の入れ忘れにも
+    // 気づけない。
+    let notes = balance_sheet_notes(&cumulative, to);
 
     std::fs::create_dir_all(&out_dir)
         .map_err(|error| format!("出力先を作れませんでした: {}（{error}）", out_dir.display()))?;
@@ -358,8 +375,12 @@ async fn write_reports(
     written.extend(write_pair(
         &out_dir,
         "balance_sheet",
-        &kaikei_report::statement::to_csv(&statements.balance_sheet),
-        &kaikei_report::statement::to_html(&statements.balance_sheet, &period_label, &notes),
+        &kaikei_report::statement::to_csv(&cumulative.balance_sheet),
+        &kaikei_report::statement::to_html(
+            &cumulative.balance_sheet,
+            &format!("{} 現在", to.to_iso_string()),
+            &notes,
+        ),
     )?);
     written.extend(write_pair(
         &out_dir,
@@ -546,27 +567,50 @@ async fn fetch_whole_ledger(
     Ok(page)
 }
 
-/// 期首残高が落ちている疑いの注記（`get_statements` と同じ判定）。
+/// 貸借対照表を集計するときの期間の下限。
 ///
-/// **同じ疑いを MCP の応答と CLI の出力の両方で伝える。** 片方にしか無いと、
-/// 画面で見た人と印刷した人が違うものを見る。
-fn opening_balance_notes(
-    output: &statements::StatementsOutput,
-    from: AccountingDate,
-) -> Vec<String> {
+/// 貸借対照表は**ある時点の残高**なので、帳簿にある仕訳をすべて含める必要が
+/// ある。期首残高は前期末の日付で記帳するため、会計年度の開始日から集計すると
+/// 落ちる（`write_reports` のコメント）。
+///
+/// 個別の帳簿の最初の仕訳日を引く経路を足す代わりに、**どんな帳簿より前**の
+/// 日付を下限に使う。範囲を広く取っても、含まれる仕訳は変わらない。
+fn book_beginning() -> AccountingDate {
+    AccountingDate::new(1900, 1, 1).expect("1900-01-01 は常に有効な日付である")
+}
+
+/// 貸借対照表が何を集計したものかの注記。
+///
+/// **「会計年度の増減」ではなく「その日現在の残高」であることを明示する。**
+/// 決算書に転記する人がこれを取り違えると、期首残高が二重に入る。
+///
+/// あわせて、帳簿の最初の仕訳が集計の終了日と同じ年度にしか無い場合は、
+/// 期首残高が帳簿に入っていない可能性を伝える。**期首残高の入れ忘れは黙って
+/// 進むと決算まで気づけない**が、実際に要るかは事業の状況によるので
+/// 「疑わしい」までしか言わない。
+fn balance_sheet_notes(output: &statements::StatementsOutput, to: AccountingDate) -> Vec<String> {
     if output.entry_count == 0 {
         return Vec::new();
     }
-    match output.first_entry_date {
-        Some(first) if first > from => vec![format!(
-            "集計対象で最も古い仕訳は {} で、会計年度の開始日（{}）から離れています。\
-             その間に取引が無かっただけであれば問題ありませんが、期首残高の仕訳が\
-             帳簿に無い場合、貸借対照表には前期から繰り越した残高が含まれません。",
-            first.to_iso_string(),
-            from.to_iso_string()
-        )],
-        _ => Vec::new(),
+
+    let mut notes = vec![format!(
+        "この貸借対照表は帳簿の最初から {} までを集計した残高です\
+         （会計年度中の増減ではありません）。",
+        to.to_iso_string()
+    )];
+
+    if let Some(first) = output.first_entry_date {
+        if first.year() == to.year() {
+            notes.push(format!(
+                "帳簿で最も古い仕訳は {} で、この会計年度の中にあります。\
+                 開業初年度であれば問題ありませんが、そうでなければ\
+                 前期から繰り越した残高（期首残高）が帳簿に入っていない\
+                 可能性があります。期首残高は前期末の日付で記帳してください。",
+                first.to_iso_string()
+            ));
+        }
     }
+    notes
 }
 
 /// CSV と HTML を1組書き出す。
@@ -656,6 +700,73 @@ mod tests {
         ]))
         .expect_err("verify では拒否されるはず");
         assert!(err.contains("--deduction"), "{err}");
+    }
+
+    fn date(year: i32, month: u8, day: u8) -> AccountingDate {
+        AccountingDate::new(year, month, day).unwrap()
+    }
+
+    fn output(entry_count: usize, first: Option<AccountingDate>) -> statements::StatementsOutput {
+        use kaikei_app::policy::Statement;
+        use kaikei_core::{Currency, Money};
+        let empty = || Statement {
+            title: String::new(),
+            sections: Vec::new(),
+            total: Money::from_minor(0, Currency::JPY),
+        };
+        statements::StatementsOutput {
+            balance_sheet: empty(),
+            income_statement: empty(),
+            entry_count,
+            first_entry_date: first,
+        }
+    }
+
+    // 貸借対照表が「残高」であることを必ず伝える。
+    //
+    // **これが無いと、会計年度の増減と読み違えて期首残高が二重に入る。**
+    #[test]
+    fn the_balance_sheet_note_says_it_is_a_balance_not_a_period_movement() {
+        let notes = balance_sheet_notes(&output(10, Some(date(2025, 12, 31))), date(2026, 12, 31));
+
+        assert!(!notes.is_empty(), "注記を出すこと");
+        assert!(notes[0].contains("残高"), "{notes:?}");
+        assert!(notes[0].contains("増減ではありません"), "{notes:?}");
+        assert!(notes[0].contains("2026-12-31"), "{notes:?}");
+    }
+
+    // 帳簿の最初の仕訳が集計年度の中にしか無ければ、期首残高の入れ忘れを疑う。
+    #[test]
+    fn a_book_that_starts_inside_the_fiscal_year_is_flagged_as_possibly_missing_its_opening() {
+        let notes = balance_sheet_notes(&output(10, Some(date(2026, 3, 1))), date(2026, 12, 31));
+
+        assert!(
+            notes.iter().any(|note| note.contains("期首残高")),
+            "期首残高の入れ忘れを疑う注記を出すこと: {notes:?}"
+        );
+    }
+
+    // 前年以前の仕訳があれば、入れ忘れの疑いは出さない（期首残高が入っている）。
+    #[test]
+    fn a_book_that_starts_before_the_fiscal_year_is_not_flagged() {
+        let notes = balance_sheet_notes(&output(10, Some(date(2025, 12, 31))), date(2026, 12, 31));
+
+        assert!(
+            !notes.iter().any(|note| note.contains("入っていない")),
+            "期首残高が入っているのに疑いを出さないこと: {notes:?}"
+        );
+    }
+
+    // 仕訳が0件なら注記は出さない（件数の警告が別に出る。二重に言わない）。
+    #[test]
+    fn an_empty_book_gets_no_balance_sheet_note() {
+        assert!(balance_sheet_notes(&output(0, None), date(2026, 12, 31)).is_empty());
+    }
+
+    // 集計の下限は、どんな帳簿の最初の仕訳よりも前であること。
+    #[test]
+    fn the_book_beginning_precedes_any_plausible_first_entry() {
+        assert!(book_beginning() < date(1970, 1, 1));
     }
 
     #[test]
