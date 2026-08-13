@@ -62,6 +62,8 @@ verify は帳簿の整合性を検査します（書き出しません）。
     trial_balance     試算表（借方合計・貸方合計・残高）
     balance_sheet     貸借対照表
     income_statement  損益計算書
+
+    export.json       帳簿の全件エクスポート（このソフトが無くても読める形）
     blue_return       青色申告決算書（損益計算書）の各欄のデータ
                       ※ 国税庁の様式そのものではありません
     blue_return_balance_sheet
@@ -440,6 +442,16 @@ async fn write_reports(
         to,
         &blue_return_fields,
     )?);
+
+    // 全件 JSON。**この出力はこのソフトが消えてもデータが残るためのもの**
+    // なので、既定で必ず出す（docs/03-database.md §8）。
+    let export_path = out_dir.join("export.json");
+    std::fs::write(
+        &export_path,
+        kaikei_report::export::to_json(&entries, &chart),
+    )
+    .map_err(|error| format!("書き出せませんでした: {}（{error}）", export_path.display()))?;
+    written.push(export_path);
 
     if yayoi {
         written.extend(write_yayoi(&out_dir, &entries, &chart)?);
