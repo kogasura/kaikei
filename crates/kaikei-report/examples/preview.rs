@@ -9,6 +9,7 @@
 //! のは値の一致までである。土台は実際の帳簿に似せてある（桁数の違う金額・
 //! 3行仕訳・長い摘要・赤伝・HTML の特殊文字）。
 
+use kaikei_app::view::{BalanceRowView, GroupKeyView, TrialBalanceView};
 use kaikei_core::{
     AccountCode, AccountDef, AccountType, AccountingDate, ChartOfAccounts, Currency, EntryId,
     EntryNumber, FiscalYear, FixedClock, JournalEntry, JournalLine, Money, NewEntry, PeriodGuard,
@@ -142,8 +143,54 @@ fn main() {
     );
     let csv = kaikei_report::journal_book::to_csv(&entries, &chart());
 
-    let html_path = format!("{out}/journal_book.html");
-    let csv_path = format!("{out}/journal_book.csv");
+    write(&out, "journal_book", &html, &csv);
+
+    // 試算表。上の仕訳から手で集計した値（この例は見た目の確認用なので、
+    // 集計そのものは read model の仕事である）。
+    let trial = TrialBalanceView::new(
+        vec![
+            balance_row("135", AccountType::Asset, 660_000, 550_000),
+            balance_row("100", AccountType::Asset, 0, 4_309),
+            balance_row("330", AccountType::Liability, 50_000, 60_000),
+            balance_row("500", AccountType::Revenue, 500_000, 600_000),
+            balance_row("604", AccountType::Expense, 4_309, 0),
+        ],
+        Currency::JPY,
+    );
+    let tb_html = kaikei_report::trial_balance::to_html(
+        &trial,
+        &chart(),
+        "2026-01-01 〜 2026-12-31",
+        &notes,
+    );
+    let tb_csv = kaikei_report::trial_balance::to_csv(&trial, &chart());
+    write(&out, "trial_balance", &tb_html, &tb_csv);
+}
+
+fn balance_row(
+    code: &str,
+    account_type: AccountType,
+    debit: i128,
+    credit: i128,
+) -> BalanceRowView {
+    let balance = if account_type.is_debit_normal() {
+        debit - credit
+    } else {
+        credit - debit
+    };
+    BalanceRowView {
+        account: AccountCode::parse(code).unwrap(),
+        account_type,
+        group: GroupKeyView::default(),
+        debit_total: Money::from_minor(debit, Currency::JPY),
+        credit_total: Money::from_minor(credit, Currency::JPY),
+        balance: Money::from_minor(balance, Currency::JPY),
+    }
+}
+
+fn write(out: &str, name: &str, html: &str, csv: &str) {
+    let html_path = format!("{out}/{name}.html");
+    let csv_path = format!("{out}/{name}.csv");
     std::fs::write(&html_path, html).expect("HTML を書き出せること");
     std::fs::write(&csv_path, csv).expect("CSV を書き出せること");
     println!("{html_path}");

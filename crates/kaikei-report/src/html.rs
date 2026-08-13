@@ -62,6 +62,12 @@ pub struct PrintableTable<'a> {
     pub notes: &'a [String],
     /// 右寄せにする列の添字（金額の列）。
     pub numeric_columns: &'a [usize],
+    /// 表の最後に置く合計行。`<tfoot>` に入れて視覚的に区別する。
+    ///
+    /// 試算表の借方合計・貸方合計のように、**明細と同じ見た目だと読み飛ばす**
+    /// 行を分ける。CSV では普通の行として続けて出す（表計算では最終行という
+    /// 位置で足りる）。
+    pub footer_rows: &'a [Vec<String>],
     /// 用紙を横向きにするか。
     ///
     /// 列が多い帳簿（仕訳日記帳は11列）は A4 縦に収まらず、**印刷すると
@@ -124,7 +130,25 @@ impl PrintableTable<'_> {
             }
             out.push_str("</tr>\n");
         }
-        out.push_str("</tbody>\n</table>\n");
+        out.push_str("</tbody>\n");
+
+        if !self.footer_rows.is_empty() {
+            out.push_str("<tfoot>\n");
+            for row in self.footer_rows {
+                out.push_str("<tr>");
+                for (index, cell) in row.iter().enumerate() {
+                    let class = if self.numeric_columns.contains(&index) {
+                        " class=\"num total\""
+                    } else {
+                        " class=\"total\""
+                    };
+                    let _ = write!(out, "<td{class}>{}</td>", escape(cell));
+                }
+                out.push_str("</tr>\n");
+            }
+            out.push_str("</tfoot>\n");
+        }
+        out.push_str("</table>\n");
 
         for note in self.notes {
             let _ = writeln!(out, "<p class=\"note\">{}</p>", escape(note));
@@ -148,18 +172,25 @@ const STYLE: &str = r#"<style>
          font-size: 10pt; margin: 16mm 12mm; color: #000; }
   h1 { font-size: 14pt; margin: 0 0 2mm; }
   .subtitle { margin: 0 0 4mm; font-size: 9pt; }
-  table { border-collapse: collapse; width: 100%; }
+  /* width:auto にすると列数の少ない帳簿（試算表は5列）で表が間延びしない。
+     max-width:100% で、列の多い帳簿（仕訳日記帳は12列）は紙幅に収める。 */
+  table { border-collapse: collapse; width: auto; max-width: 100%; }
   th, td { border: 1px solid #666; padding: 1.2mm 2mm; text-align: left;
            vertical-align: top; }
   th { background: #eee; font-weight: 600; }
+  /* width:1% は「内容に必要な幅まで縮む」指定。金額の列が均等配分で
+     広がると、科目名や摘要のほうが窮屈になる（実際に刷って気づいた）。 */
   .num { text-align: right; font-variant-numeric: tabular-nums;
-         font-family: "Consolas", "Menlo", monospace; white-space: nowrap; }
+         font-family: "Consolas", "Menlo", monospace; white-space: nowrap;
+         width: 1%; }
   .empty { text-align: center; color: #444; padding: 6mm 2mm; }
+  .total { font-weight: 700; background: #f4f4f4; border-top: 2px solid #333; }
   .note { font-size: 9pt; margin: 3mm 0 0; }
   @media print {
     body { margin: 0; }
     @page { margin: 16mm 12mm; }
     thead { display: table-header-group; }
+    tfoot { display: table-footer-group; }
     tr { page-break-inside: avoid; }
   }
 </style>
@@ -177,6 +208,7 @@ mod tests {
             rows,
             notes,
             numeric_columns: &[2],
+            footer_rows: &[],
             landscape: false,
         }
     }
@@ -263,6 +295,25 @@ mod tests {
         assert!(!t.render().contains("landscape"));
         t.landscape = true;
         assert!(t.render().contains("size: A4 landscape"));
+    }
+
+    // 合計行は tfoot に入り、明細と見た目が変わる。
+    #[test]
+    fn footer_rows_are_visually_separated_from_the_body() {
+        let rows = vec![vec!["a".to_string(), "b".to_string(), "100".to_string()]];
+        let footers = vec![vec!["合計".to_string(), String::new(), "100".to_string()]];
+        let notes: Vec<String> = Vec::new();
+        let mut t = table(&rows, &notes);
+        t.footer_rows = &footers;
+        let html = t.render();
+
+        assert!(html.contains("<tfoot>"), "{html}");
+        assert!(html.contains("<td class=\"total\">合計</td>"), "{html}");
+        assert!(html.contains("<td class=\"num total\">100</td>"), "{html}");
+        // 明細行は total クラスを持たない。
+        assert!(html.contains("<td>a</td>"));
+        // 印刷で各ページに繰り返す。
+        assert!(html.contains("display: table-footer-group"));
     }
 
     #[test]

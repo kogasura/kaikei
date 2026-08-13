@@ -100,6 +100,9 @@ pub fn to_html(
         rows: &to_rows(entries, chart),
         notes,
         numeric_columns: NUMERIC_COLUMNS,
+        // 仕訳日記帳に合計行は置かない。**貸借の合計は試算表が示すもの**で、
+        // 期間内の明細を並べるこの帳簿で足し上げても意味が無い。
+        footer_rows: &[],
         // 列が11個あるので A4 縦では右端が切れる。
         landscape: true,
     }
