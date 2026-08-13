@@ -64,6 +64,9 @@ verify は帳簿の整合性を検査します（書き出しません）。
     income_statement  損益計算書
     blue_return       青色申告決算書（損益計算書）の各欄のデータ
                       ※ 国税庁の様式そのものではありません
+    blue_return_balance_sheet
+                      青色申告決算書（貸借対照表）の各行のデータ
+                      期首・期末の2列。貸借が一致するかも確認します
 
     このほか blue_return_not_on_form.csv に、決算書のどの欄にも
     載らなかった科目を理由付きで書き出します。
@@ -289,35 +292,54 @@ async fn write_reports(
     // 仕訳と勘定科目表を1つのトランザクションで読む。**間に記帳が入ると、
     // 仕訳日記帳と財務諸表が別の帳簿を映す。**
     let schema = catalog.schema().clone();
-    let (entries, chart, statements, cumulative) = with_tx_err(&store, move |tx| {
-        let schema = schema.clone();
-        Box::pin(async move {
-            let chart = tx.load_chart().await?;
-            let entries = tx.list_entries_in_period(from, to).await?;
-            let policy = JpStatementPolicy::new(chart.clone());
-            // 損益計算書は**会計年度の期間**。その期間の損益そのものである。
-            let statements =
-                statements::execute(tx, &policy, &schema, StatementsInput { from, to }).await?;
-            // 貸借対照表は**帳簿の最初からの累計**。ある時点の残高であって
-            // 期間の増減ではないので、期首残高（前期末の仕訳）を含めるには
-            // 会計年度より前まで遡る必要がある。この非対称は会計の性質で
-            // あって実装の都合ではない（`usecase::statements` のモジュール
-            // doc「貸借対照表には期首残高が要る」）。
-            let cumulative = statements::execute(
-                tx,
-                &policy,
-                &schema,
-                StatementsInput {
-                    from: book_beginning(),
-                    to,
-                },
-            )
-            .await?;
-            Ok((entries, chart, statements, cumulative))
+    let (entries, chart, statements, cumulative, opening_balance_sheet) =
+        with_tx_err(&store, move |tx| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                let chart = tx.load_chart().await?;
+                let entries = tx.list_entries_in_period(from, to).await?;
+                let policy = JpStatementPolicy::new(chart.clone());
+                // 損益計算書は**会計年度の期間**。その期間の損益そのものである。
+                let statements =
+                    statements::execute(tx, &policy, &schema, StatementsInput { from, to }).await?;
+                // 貸借対照表は**帳簿の最初からの累計**。ある時点の残高であって
+                // 期間の増減ではないので、期首残高（前期末の仕訳）を含めるには
+                // 会計年度より前まで遡る必要がある。この非対称は会計の性質で
+                // あって実装の都合ではない（`usecase::statements` のモジュール
+                // doc「貸借対照表には期首残高が要る」）。
+                let cumulative = statements::execute(
+                    tx,
+                    &policy,
+                    &schema,
+                    StatementsInput {
+                        from: book_beginning(),
+                        to,
+                    },
+                )
+                .await?;
+                // 決算書の貸借対照表は期首列も要る。期首＝会計年度の開始日の
+                // **前日**までの累計（期首残高は前期末の日付で記帳する）。
+                let opening_balance_sheet = statements::execute(
+                    tx,
+                    &policy,
+                    &schema,
+                    StatementsInput {
+                        from: book_beginning(),
+                        to: day_before(from),
+                    },
+                )
+                .await?;
+                Ok((
+                    entries,
+                    chart,
+                    statements,
+                    cumulative,
+                    opening_balance_sheet,
+                ))
+            })
         })
-    })
-    .await
-    .map_err(|error: kaikei_app::error::AppError| format!("帳簿を読めませんでした: {error}"))?;
+        .await
+        .map_err(|error: kaikei_app::error::AppError| format!("帳簿を読めませんでした: {error}"))?;
 
     // 総勘定元帳。科目ごとに引き、ページングを辿り切る。
     let ledger_query = PgLedgerQuery::new(pool.clone());
@@ -389,11 +411,20 @@ async fn write_reports(
         &kaikei_report::statement::to_html(&statements.income_statement, &period_label, &[]),
     )?);
 
-    written.extend(write_blue_return(
+    let (blue_return_paths, blue_return_fields) = write_blue_return(
         &out_dir,
         &statements.income_statement,
         &period_label,
         deduction,
+    )?;
+    written.extend(blue_return_paths);
+
+    written.extend(write_blue_return_balance_sheet(
+        &out_dir,
+        &opening_balance_sheet.balance_sheet,
+        &cumulative.balance_sheet,
+        to,
+        &blue_return_fields,
     )?);
 
     if statements.entry_count == 0 {
@@ -418,7 +449,13 @@ fn write_blue_return(
     income_statement: &kaikei_app::policy::Statement,
     period_label: &str,
     deduction: i128,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<
+    (
+        Vec<PathBuf>,
+        std::collections::BTreeMap<u32, kaikei_core::Money>,
+    ),
+    String,
+> {
     let form = kaikei_jp::blue_return::load_embedded(kaikei_jp_data::STATEMENT_BLUE_RETURN_GENERAL)
         .map_err(|error| format!("決算書の当てはめ表を読めませんでした: {error}"))?;
 
@@ -495,7 +532,16 @@ fn write_blue_return(
         );
     }
 
-    Ok(written)
+    // 貸借対照表が転記する欄をそのまま渡す。**再計算しない**——同じ数字を
+    // 2回計算すると、片方だけ直したときに損益計算書と貸借対照表がずれる
+    // （様式の書き方が「必ず一致します」と言っている箇所である）。
+    let fields_by_no = filled
+        .fields
+        .iter()
+        .map(|field| (field.no, field.amount))
+        .collect();
+
+    Ok((written, fields_by_no))
 }
 
 /// 1科目の元帳を、ページングを辿り切って1つにまとめる。
@@ -577,6 +623,87 @@ async fn fetch_whole_ledger(
 /// 日付を下限に使う。範囲を広く取っても、含まれる仕訳は変わらない。
 fn book_beginning() -> AccountingDate {
     AccountingDate::new(1900, 1, 1).expect("1900-01-01 は常に有効な日付である")
+}
+
+/// 会計年度の開始日の前日。決算書の貸借対照表の期首列に使う。
+///
+/// 暦年のみ対応（`KAIKEI_FISCAL_YEAR_RULE` が `calendar_year` であることを
+/// 呼び出し前に確かめている）なので、開始日は必ず 1/1 であり、前日は
+/// 前年の 12/31 になる。
+fn day_before(fiscal_year_start: AccountingDate) -> AccountingDate {
+    AccountingDate::new(fiscal_year_start.year() - 1, 12, 31)
+        .expect("前年の 12/31 は常に有効な日付である")
+}
+
+/// 青色申告決算書（貸借対照表）のデータを書き出す。
+///
+/// `opening` は期首時点、`closing` は期末時点の貸借対照表。
+/// `blue_return_fields` は損益計算書の欄で、青色申告特別控除前の所得金額
+/// （㊸）の転記に使う。
+fn write_blue_return_balance_sheet(
+    out_dir: &Path,
+    opening: &kaikei_app::policy::Statement,
+    closing: &kaikei_app::policy::Statement,
+    to: AccountingDate,
+    blue_return_fields: &std::collections::BTreeMap<u32, kaikei_core::Money>,
+) -> Result<Vec<PathBuf>, String> {
+    let form =
+        kaikei_jp::blue_return_bs::load_embedded(kaikei_jp_data::STATEMENT_BLUE_RETURN_GENERAL_BS)
+            .map_err(|error| {
+                format!("決算書（貸借対照表）の当てはめ表を読めませんでした: {error}")
+            })?;
+
+    let filled = kaikei_jp::blue_return_bs::fill(&form, opening, closing, blue_return_fields)
+        .map_err(|error| format!("決算書（貸借対照表）の金額を計算できませんでした: {error}"))?;
+
+    let sections: Vec<kaikei_report::blue_return_bs::BsSection> = filled
+        .sections
+        .iter()
+        .map(|section| kaikei_report::blue_return_bs::BsSection {
+            title: section.title.clone(),
+            rows: section
+                .rows
+                .iter()
+                .map(|row| kaikei_report::blue_return_bs::BsRow {
+                    label: row.label.clone(),
+                    opening: row.opening,
+                    closing: row.closing,
+                })
+                .collect(),
+        })
+        .collect();
+
+    let imbalance = filled.imbalance();
+    let title = format!("{}（{}）", filled.form, filled.part);
+    let period = format!("{} 現在", to.to_iso_string());
+
+    let written = write_pair(
+        out_dir,
+        "blue_return_balance_sheet",
+        &kaikei_report::blue_return_bs::to_csv(&sections),
+        &kaikei_report::blue_return_bs::to_html(&title, &period, &sections, imbalance, &[]),
+    )?;
+
+    // **貸借が合わないことを画面でも伝える。** 出力ファイルを開かない人が
+    // そのまま提出するのを防ぐ。
+    match imbalance {
+        Some(diff) if !diff.is_zero() => eprintln!(
+            "注意: 決算書の貸借対照表で、資産合計と負債・資本合計が {} 円\
+             ずれています。決算書としては一致している必要があります",
+            kaikei_app::amount::money_to_plain_string(&diff)
+        ),
+        Some(_) => {}
+        None => eprintln!("注意: 決算書の貸借対照表で、貸借が一致するかを確認できませんでした"),
+    }
+
+    if !filled.not_on_form.is_empty() {
+        eprintln!(
+            "注意: 決算書の貸借対照表のどの行にも載らなかった科目が {} 件あります",
+            filled.not_on_form.len()
+        );
+    }
+
+    Ok(written)
 }
 
 /// 貸借対照表が何を集計したものかの注記。
