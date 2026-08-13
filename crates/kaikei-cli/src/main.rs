@@ -884,6 +884,17 @@ fn write_blue_return_balance_sheet(
         );
     }
 
+    // **決算振替を記帳した後に決算書を出していないか。** 様式は元入金が
+    // 期首と期末で同額であることを前提にしている（所得金額を別の行に書く
+    // ため）。動いていたら、決算書は振替前の帳簿から作り直す必要がある。
+    for (label, book_opening, book_closing) in &filled.same_column_mismatches {
+        eprintln!(
+            "注意: 決算書は「{label}」が期首と期末で同額であることを前提にしていますが、             帳簿では期首 {} / 期末 {} と動いています。             決算振替を記帳した後に決算書を出していないか確認してください             （決算書は振替前の帳簿から作ります）",
+            kaikei_app::amount::money_to_plain_string(book_opening),
+            kaikei_app::amount::money_to_plain_string(book_closing)
+        );
+    }
+
     Ok(written)
 }
 

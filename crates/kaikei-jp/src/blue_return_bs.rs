@@ -137,6 +137,17 @@ pub struct FilledBalanceSheet {
     ///
     /// **呼び出し側はこれを利用者に見せること。**
     pub not_on_form: Vec<NotOnForm>,
+    /// 「期首と期末は同額」の行で、帳簿上は同額でなかったもの
+    /// （行名・帳簿の期首・帳簿の期末）。
+    ///
+    /// 元入金がこれにあたる。様式は同額を前提にしているので、この表は期末の
+    /// 値を両列に入れる——**だからこそ、食い違いを検出して知らせないと
+    /// 黙って隠すことになる**。
+    ///
+    /// 典型は**決算振替を記帳した後に決算書を出した**場合である。損益が
+    /// 元入金へ振り替わって期末の元入金が動くが、決算書は振替前の姿を
+    /// 前提にしている（所得金額を別の行に書くため）。
+    pub same_column_mismatches: Vec<(String, Money, Money)>,
 }
 
 /// 貸借対照表に載らなかった科目1件。
@@ -308,6 +319,7 @@ pub fn fill(
     let zero = Money::from_minor(0, closing.total.currency());
 
     let mut sections = Vec::with_capacity(form.sections().len());
+    let mut same_column_mismatches = Vec::new();
     for section in form.sections() {
         // 合計は、その区分の**合計行より前の行**を足したもの。合計行を
         // 含めると二重になる。
@@ -370,6 +382,15 @@ pub fn fill(
 
             // 様式が「期首と期末は同じ金額」と指示している行。
             if row.same_in_both_columns {
+                // **食い違いを黙って揃えない。** 帳簿上で動いていたら、
+                // 決算振替を記帳した後に決算書を出した疑いがある。
+                if opening_amount != closing_amount {
+                    same_column_mismatches.push((
+                        row.label.clone().unwrap_or_else(|| "（空欄）".to_string()),
+                        opening_amount,
+                        closing_amount,
+                    ));
+                }
                 opening_amount = closing_amount;
             }
 
@@ -405,6 +426,7 @@ pub fn fill(
         part: form.part().to_string(),
         sections,
         not_on_form: collect_not_on_form(form, &closing_by_account),
+        same_column_mismatches,
     })
 }
 
@@ -700,6 +722,39 @@ mod tests {
             Some(yen(0)),
             "受取利息434を事業主借へ振り替えると貸借が合う"
         );
+    }
+
+    // BS-9b: **本命。** 「期首と期末は同額」の行が帳簿上で動いていたら
+    //        検出する。
+    //
+    //        決算振替を記帳した後に決算書を出すと、損益が元入金へ振り替わって
+    //        期末の元入金が動く。この表は期末の値を両列に入れるので、
+    //        検出しないと**食い違いを黙って隠す**ことになる。
+    #[test]
+    fn a_capital_account_that_moved_during_the_year_is_detected() {
+        // 決算振替を記帳した後の姿（元入金が当期純利益の分だけ増えた）。
+        let mut after_closing = closing();
+        after_closing.sections[2].lines[0] = line("400", "元入金", 6_554_453);
+
+        let filled = fill(&form(), &opening(), &after_closing, &pl_fields(8_368_714)).unwrap();
+
+        assert_eq!(
+            filled.same_column_mismatches.len(),
+            1,
+            "元入金が動いていることを検出すること"
+        );
+        let (label, book_opening, book_closing) = &filled.same_column_mismatches[0];
+        assert_eq!(label, "元入金");
+        assert_eq!(*book_opening, yen(-1_814_261));
+        assert_eq!(*book_closing, yen(6_554_453));
+    }
+
+    // BS-9c: 動いていなければ検出しない。
+    #[test]
+    fn a_capital_account_that_did_not_move_is_not_flagged() {
+        let filled = fill(&form(), &opening(), &closing(), &pl_fields(8_368_714)).unwrap();
+
+        assert!(filled.same_column_mismatches.is_empty());
     }
 
     // BS-10: 同じ科目を2つの行に当てはめたら拒否する（二重計上になる）。
