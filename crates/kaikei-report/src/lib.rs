@@ -23,6 +23,7 @@
 #![warn(missing_docs)]
 
 pub mod blue_return;
+pub mod blue_return_bs;
 pub mod csv;
 pub mod html;
 pub mod journal_book;
