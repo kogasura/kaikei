@@ -200,6 +200,11 @@ mod tests {
 
     fn line_row(line_no: i16, side: i16, amount_minor: i64, currency: &str) -> JournalLineRow {
         JournalLineRow {
+            // この mapper は `entry_id` を読まない。どの仕訳の明細かは
+            // `EntryRows` に束ねた時点で決まっているためで、この列は
+            // 期間取得の経路が明細を仕訳へ振り分けるために使う
+            // （`journal/row.rs` のモジュール doc を参照）。
+            entry_id: uuid::Uuid::from_u128(1),
             line_no,
             account_code: "100".to_string(),
             side,

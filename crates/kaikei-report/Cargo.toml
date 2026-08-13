@@ -1,0 +1,20 @@
+# crates/kaikei-report/Cargo.toml
+#
+# ★ 帳簿の出力（CSV / 印刷用 HTML）。I/O を持たない ★
+# 入力は既に手元にあるデータ、出力は String。DB から取ってくるのは呼び出し側
+# （CLI バイナリ・kaikei-mcp）の仕事である（docs/10-report.md §3）。
+# CI (architecture.yml) が sqlx / tokio への依存を検出したら失敗する。
+# そのおかげでこの crate のテストは DB を要らない。
+
+[package]
+name = "kaikei-report"
+version = "0.0.1"
+description = "帳簿の出力（CSV / 印刷用 HTML）。データ → 文字列 の変換に徹する"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+kaikei-policy = { path = "../kaikei-policy", version = "0.0.1" }
+kaikei-app = { path = "../kaikei-app", version = "0.0.1" }

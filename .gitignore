@@ -1,5 +1,11 @@
 /target
 .env
+# `.env` の派生（`.env.bak` / `.env.local` 等）も同じ扱いにする。
+# 素の `.env` だけを無視していると、退避コピーを1つ作った瞬間に
+# **DB パスワードが `git add -A` の射程に入る**（実際に `.env.bak` を
+# 作って踏みかけた）。`.env.example` は配布物なので除外しない。
+.env.*
+!.env.example
 
 # MCP クライアント（Claude Code 等）の設定。README「5分で動かす」の手順4が
 # リポジトリ直下に作らせる。DB パスワードが平文で入るファイルであり、

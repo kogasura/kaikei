@@ -457,6 +457,97 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
         .expect("訂正理由")
         .contains("桁誤り"));
 
+    // -----------------------------------------------------------------
+    // 9-b. 決算書（B/S・P/L）を同じ帳簿から組み立てる（D-093）
+    // -----------------------------------------------------------------
+    //
+    // 試算表（read model の SQL 集計）と決算書（帳簿のドメインモデルから
+    // 組み立て直したもの）は経路が完全に別である。**同じ帳簿から同じ数字が
+    // 出ることをここで確かめる**——食い違えばどちらかにバグがある。
+    let statements = server
+        .call_tool(
+            "get_statements",
+            json!({ "from": "2026-01-01", "to": "2026-12-31" }),
+        )
+        .await;
+    assert!(!is_error(&statements), "{statements}");
+    let st = body(&statements);
+
+    // 記帳した4件すべてが集計対象に入っている。
+    assert_eq!(st["entry_count"], json!(4), "{st}");
+    assert_eq!(st["first_entry_date"], json!("2026-04-15"), "{st}");
+
+    // 損益計算書の収益が試算表の売上高と一致する（別経路・同じ数字）。
+    let revenue = st["income_statement"]["sections"]
+        .as_array()
+        .expect("区分の配列")
+        .iter()
+        .find(|section| section["title"] == json!("収益"))
+        .unwrap_or_else(|| panic!("収益の区分が無い: {st}"));
+    assert_eq!(
+        revenue["subtotal"],
+        json!("150000"),
+        "試算表の売上高（150000）と食い違っています: {st}"
+    );
+
+    // 期首残高の注記が出る。この帳簿には 1/1 付けの開始仕訳が無く、
+    // 最初の仕訳は 4/10 なので、貸借対照表は前期繰越を含んでいない
+    // （実装の誤りではない。呼び出し側が気づけるように伝えている）。
+    let note = st["balance_sheet_note"]
+        .as_str()
+        .unwrap_or_else(|| panic!("期首残高の注記が出ていない: {st}"));
+    assert!(note.contains("2026-04-15"), "{note}");
+    assert!(note.contains("期首残高"), "{note}");
+
+    // -----------------------------------------------------------------
+    // 9-c. 決算振替仕訳を提案させる（D-094）
+    // -----------------------------------------------------------------
+    //
+    // 提案するだけで記帳はしない。**提案が返っただけで決算が済んだと
+    // 読み違えられるのが最も危険**なので、応答がそう読めない形になっている
+    // ことをここで確かめる。
+    let closing = server
+        .call_tool("propose_closing_entries", json!({ "fiscal_year": 2026 }))
+        .await;
+    assert!(!is_error(&closing), "{closing}");
+    let cl = body(&closing);
+
+    assert_eq!(
+        cl["posted"],
+        json!(false),
+        "記帳していないことを必ず言う: {cl}"
+    );
+    assert_eq!(cl["period_start"], json!("2026-01-01"), "{cl}");
+    assert_eq!(cl["period_end"], json!("2026-12-31"), "{cl}");
+    assert_eq!(cl["entry_count"], json!(4), "{cl}");
+
+    // 収益（売上高 150,000）が残っているので提案が1本出る。
+    let proposals = cl["proposals"].as_array().expect("提案の配列");
+    assert_eq!(proposals.len(), 1, "{cl}");
+    assert_eq!(proposals[0]["entry_date"], json!("2026-12-31"), "{cl}");
+
+    // 明細は post_journal_entry にそのまま渡せる形（呼び出し側が組み替えると
+    // 写し間違いが起きる）。売上高 500 を借方に落とす明細が含まれる。
+    let lines = proposals[0]["lines"].as_array().expect("明細の配列");
+    let sales_line = lines
+        .iter()
+        .find(|line| line["account"] == json!("500"))
+        .unwrap_or_else(|| panic!("売上高をゼロ化する明細が無い: {cl}"));
+    assert_eq!(sales_line["side"], json!("debit"), "{cl}");
+    assert_eq!(sales_line["amount"], json!("150000"), "{cl}");
+
+    // 次の手が示されている（`CLAUDE.md` §11）。
+    assert!(
+        cl["next_step"]
+            .as_str()
+            .expect("next_step")
+            .contains("post_journal_entry"),
+        "{cl}"
+    );
+
+    // 帳簿はまだ4件のまま（提案では増えない）。
+    assert_eq!(journal_entry_count(&app).await, 4);
+
     server.shutdown().await;
 
     // -----------------------------------------------------------------
@@ -489,6 +580,8 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
             ("post_journal_entry".to_string(), "ok".to_string()),
             ("get_trial_balance".to_string(), "ok".to_string()),
             ("get_ledger".to_string(), "ok".to_string()),
+            ("get_statements".to_string(), "ok".to_string()),
+            ("propose_closing_entries".to_string(), "ok".to_string()),
         ],
         "呼び出した順に「開始・結果の2行」が並ぶこと（読み取り系も同じ経路）"
     );

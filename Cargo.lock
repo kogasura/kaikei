@@ -754,6 +754,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaikei-cli"
+version = "0.0.1"
+dependencies = [
+ "kaikei-app",
+ "kaikei-core",
+ "kaikei-jp",
+ "kaikei-jp-data",
+ "kaikei-report",
+ "kaikei-store",
+ "tokio",
+]
+
+[[package]]
 name = "kaikei-core"
 version = "0.0.1"
 dependencies = [
@@ -772,6 +785,7 @@ dependencies = [
  "kaikei-jp-data",
  "kaikei-mcp",
  "kaikei-policy",
+ "kaikei-report",
  "kaikei-store",
  "serde_json",
  "sqlx",
@@ -819,6 +833,15 @@ dependencies = [
  "kaikei-core",
  "proptest",
  "thiserror",
+]
+
+[[package]]
+name = "kaikei-report"
+version = "0.0.1"
+dependencies = [
+ "kaikei-app",
+ "kaikei-core",
+ "kaikei-policy",
 ]
 
 [[package]]

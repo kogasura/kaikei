@@ -125,6 +125,48 @@ pub trait JournalRepo: Send {
     /// 行うため通常は起こらないが、実装（`PgTx` 等）は DB の一意制約
     /// 違反として検出できる必要がある）。
     async fn insert_entry(&mut self, entry: &JournalEntry) -> Result<(), RepoError>;
+
+    /// 取引日が `from` 〜 `to`（両端を含む）の仕訳を**ドメインモデルとして**
+    /// すべて返す。`(entry_date, entry_no)` の昇順。
+    ///
+    /// # なぜ read model ではなくドメインモデルなのか
+    ///
+    /// [`kaikei_core::TrialBalance::from_entries`] が `&JournalEntry` の
+    /// イテレータを要求するためである。決算振替（`ClosingPolicy`）も
+    /// 財務諸表（`StatementPolicy`）も `kaikei_core::TrialBalance` を入力に
+    /// 取るので、read model の DTO（[`crate::view::TrialBalanceView`]。
+    /// `DECISIONS.md` D-031）では代わりにならない。
+    /// 画面に出すための試算表は read model、**帳簿から計算し直すもの**は
+    /// この経路、という住み分けになる。
+    ///
+    /// # 取り消された仕訳も返す
+    ///
+    /// 赤伝で訂正された仕訳も、赤伝そのものも隠さない（`DECISIONS.md` D-088）。
+    /// 試算表は両者を含めて集計することで相殺されるので、これが正しい。
+    /// 隠すと決算書の金額が狂う。
+    ///
+    /// # 全件をメモリに載せる
+    ///
+    /// 上限もページングも設けない。**決算書の計算で件数を切ったら、
+    /// 出てくるのは「途中まで正しい決算書」ではなく単に誤った決算書**で
+    /// あり、切ったことを応答で伝える（D-089）という解決が使えない。
+    /// 個人事業主の帳簿1年分（数千件）を前提とした割り切りであり、
+    /// 試算表 read model の全件走査（D-046）と同じ性質の判断である。
+    /// 体感できる遅さとして顕在化したら、その時点で分割を設計する。
+    ///
+    /// # 入力の妥当性検証はユースケース側の責務
+    ///
+    /// [`SearchEntriesQuery`] / [`LedgerQuery`] と同じ分担で、この実装は
+    /// SQL に徹する。**`from > to` の拒否はユースケース側で済んでいる**
+    /// （[`crate::usecase::ledger`] と同じ形。期間を逆に指定したときに
+    /// 「貸借一致した空の決算書」が成功で返るのは、`PROGRESS.md` Phase 1 の
+    /// 教訓3 が名指しした「誤診を招くエラー」そのものなので、**呼び出し側で
+    /// 必ず弾いてから渡すこと**）。
+    async fn list_entries_in_period(
+        &mut self,
+        from: AccountingDate,
+        to: AccountingDate,
+    ) -> Result<Vec<JournalEntry>, RepoError>;
 }
 
 /// 勘定科目表と取引先索引の読み込み。
@@ -435,6 +477,14 @@ mod dyn_safety {
 
         async fn insert_entry(&mut self, _entry: &JournalEntry) -> Result<(), RepoError> {
             Ok(())
+        }
+
+        async fn list_entries_in_period(
+            &mut self,
+            _from: AccountingDate,
+            _to: AccountingDate,
+        ) -> Result<Vec<JournalEntry>, RepoError> {
+            Ok(Vec::new())
         }
     }
 

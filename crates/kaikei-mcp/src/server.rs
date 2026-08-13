@@ -221,10 +221,12 @@ pub fn tool_registry() -> ToolRegistry {
     use crate::tools::get_entry::GetEntry;
     use crate::tools::get_ledger::GetLedger;
     use crate::tools::get_settings::GetSettings;
+    use crate::tools::get_statements::GetStatements;
     use crate::tools::get_trial_balance::GetTrialBalance;
     use crate::tools::list_accounts::ListAccounts;
     use crate::tools::list_tax_categories::ListTaxCategories;
     use crate::tools::post_journal_entry::PostJournalEntry;
+    use crate::tools::propose_closing_entries::ProposeClosingEntries;
     use crate::tools::reverse_journal_entry::ReverseJournalEntry;
     use crate::tools::search_entries::SearchEntries;
     use crate::tools::suggest_tax_category::SuggestTaxCategory;
@@ -238,6 +240,8 @@ pub fn tool_registry() -> ToolRegistry {
         .with::<ListAccounts>()
         .with::<GetEntry>()
         .with::<GetTrialBalance>()
+        .with::<GetStatements>()
+        .with::<ProposeClosingEntries>()
         .with::<ListTaxCategories>()
         .with::<GetSettings>()
         // 提案系・検証系（PR-G。帳簿を変更しない）。

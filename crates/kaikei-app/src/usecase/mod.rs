@@ -16,9 +16,12 @@
 //! `Tx: ChartRepo + ChartWriteRepo` を要求する——記帳の経路にマスタ書き込みの
 //! 能力を持ち込まないため（[`crate::ports::ChartWriteRepo`] の doc を参照）。
 
+pub mod closing;
 pub mod import_chart;
 pub mod ledger;
 pub mod post_entry;
 pub mod report;
 pub mod reverse_entry;
 pub mod search_entries;
+pub mod statements;
+pub mod verify;

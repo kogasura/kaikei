@@ -36,6 +36,7 @@ mod common;
 use kaikei_app::context::{BookSettings, FiscalYearRule};
 use kaikei_app::ports::{ChartRepo, IdGenerator, JournalRepo};
 use kaikei_app::tx::{with_tx, with_tx_err};
+use kaikei_app::usecase::closing::{self, ClosingInput};
 use kaikei_app::usecase::import_chart;
 use kaikei_app::usecase::post_entry::{self, PostEntryFailure, PostEntryInput, PostEntryOutput};
 use kaikei_app::usecase::report::{self, ReportInput};
@@ -825,6 +826,45 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
     let proposal = proposed.into_iter().next().unwrap();
     assert_eq!(proposal.entry_date, fy_2026.end());
 
+    // 5-b. ★同じ提案が `closing::execute` からも出る★
+    //
+    // 上の 5 は「DBから仕訳を読み戻して TrialBalance を手で組み立て、policy を
+    // 直接呼ぶ」手順である。`kaikei_app::usecase::closing` はその手順を1つの
+    // ユースケースにまとめたもので、**手作業版と同じ提案が出なければ意味が無い**。
+    // 集計期間を年度ラベルから導出する（呼び出し側が日付を組み立てない）点が
+    // 唯一の違いなので、そこがずれていれば提案の中身が食い違って落ちる。
+    let via_usecase = with_tx_err(&store, |tx| {
+        let schema = composition.tag_catalog.schema().clone();
+        let policy = composition.closing_policy.clone();
+        Box::pin(async move {
+            closing::execute(tx, &policy, &schema, ClosingInput { fiscal_year: 2026 }).await
+        })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(via_usecase.period_start, fy_2026.start());
+    assert_eq!(via_usecase.period_end, fy_2026.end());
+    assert_eq!(
+        via_usecase.entry_count,
+        posted_ids.len(),
+        "この年度に記帳した仕訳がすべて集計対象に入るはず"
+    );
+    assert_eq!(via_usecase.proposals.len(), 1);
+    let from_usecase = &via_usecase.proposals[0];
+    assert_eq!(from_usecase.entry_date, proposal.entry_date);
+    assert_eq!(from_usecase.description, proposal.description);
+    assert_eq!(
+        from_usecase.lines.len(),
+        proposal.lines.len(),
+        "手作業で組み立てた提案と明細の本数が違う"
+    );
+    for (a, b) in from_usecase.lines.iter().zip(proposal.lines.iter()) {
+        assert_eq!(a.account(), b.account());
+        assert_eq!(a.side(), b.side());
+        assert_eq!(a.amount(), b.amount());
+    }
+
     // 6. ★提案された決算振替仕訳を post_entry::execute で実際に記帳する★
     //    （PR-8の最大の価値。「決算仕訳が実際に記帳できる」ことの実証）。
     let closing_posted = run_post_entry(
@@ -909,6 +949,68 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
         "決算振替後の当期純利益は0になっているはず: {:?}",
         income_statement.total
     );
+
+    // 9. ★実 DB から取ったものが、そのまま帳簿として出力できる★（Phase 5）
+    //
+    // `kaikei-report` 自身のテストは DB を持たない（I/O を持たない層なので）。
+    // **実際の帳簿が本当に出力に流れるか**は、ここでしか確かめられない——
+    // 型が合うことと、実データが通ることは別である。
+    let period_label = "2026-01-01 〜 2026-12-31";
+
+    // 9-a. 仕訳日記帳（決算振替仕訳を含む全件）。
+    let journal_csv = kaikei_report::journal_book::to_csv(&all_entries, &composition.chart);
+    let journal_html =
+        kaikei_report::journal_book::to_html(&all_entries, &composition.chart, period_label, &[]);
+
+    // 明細の総数ぶんの行が出る（1行1明細）。ヘッダを除いて数える。
+    let line_count: usize = all_entries.iter().map(|entry| entry.lines().len()).sum();
+    let data_rows = journal_csv.lines().count() - 1;
+    assert_eq!(
+        data_rows, line_count,
+        "仕訳日記帳の行数が明細の総数と合わない"
+    );
+    // 決算振替仕訳が帳簿に載っている（記帳したものが出力に現れる）。
+    assert!(
+        journal_csv.contains("決算振替") || journal_html.contains("決算振替"),
+        "決算振替仕訳が仕訳日記帳に出ていない"
+    );
+
+    // 9-b. 試算表（read model の結果をそのまま出力に流す）。
+    let tb_view = report::execute(
+        &query,
+        composition.tag_catalog.schema(),
+        &settings(),
+        ReportInput {
+            from: AccountingDate::new(2026, 1, 1).unwrap(),
+            to: AccountingDate::new(2026, 12, 31).unwrap(),
+            group_by: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let tb_csv = kaikei_report::trial_balance::to_csv(&tb_view, &composition.chart);
+
+    // 借方合計と貸方合計が一致する（試算表が試算表である条件）。
+    let (debit, credit) = tb_view.totals().unwrap();
+    assert_eq!(debit, credit);
+    assert!(
+        tb_csv.contains(&format!(
+            "合計,{},{}",
+            kaikei_app::amount::money_to_plain_string(&debit),
+            kaikei_app::amount::money_to_plain_string(&credit)
+        )),
+        "試算表の合計行が出力に現れていない: {tb_csv}"
+    );
+
+    // 9-c. 財務諸表。
+    let bs_csv = kaikei_report::statement::to_csv(&balance_sheet);
+    let pl_html = kaikei_report::statement::to_html(&income_statement, period_label, &[]);
+
+    assert!(bs_csv.contains("資産"), "{bs_csv}");
+    assert!(pl_html.contains("<h1>損益計算書</h1>"), "{pl_html}");
+    // 決算振替後なので損益計算書の合計は 0。**出力にもその 0 が出る**
+    // （帳簿の数字が出力で書き換わらないことの確認）。
+    assert!(pl_html.contains(">0<"), "当期純利益 0 が出力に現れていない");
 }
 
 // ---- Phase 3 PR-E: 勘定科目マスタの投入経路 ----
