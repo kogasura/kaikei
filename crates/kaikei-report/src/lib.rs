@@ -23,4 +23,5 @@
 #![warn(missing_docs)]
 
 pub mod csv;
+pub mod html;
 pub mod journal_book;

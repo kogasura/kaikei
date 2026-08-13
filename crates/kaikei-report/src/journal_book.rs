@@ -19,9 +19,106 @@
 //! どちらであるかは `reverses` / `reverse_reason` の列で読める。
 
 use crate::csv::CsvBuilder;
+use crate::html::PrintableTable;
 use kaikei_app::amount::money_to_plain_string;
 use kaikei_app::wire::side_code;
-use kaikei_core::JournalEntry;
+use kaikei_core::{ChartOfAccounts, JournalEntry};
+
+/// 表の見出し。CSV と HTML で同じものを使う。
+///
+/// **2箇所に書かない。** 列を片方にだけ足すと、同じ帳簿を CSV で見た人と
+/// 印刷して見た人が違うものを見ることになる。
+const HEADERS: &[&str] = &[
+    "取引日",
+    "仕訳番号",
+    "行番号",
+    "摘要",
+    "科目コード",
+    "勘定科目",
+    "貸借",
+    "金額",
+    "通貨",
+    "備考",
+    "訂正元",
+    "訂正理由",
+];
+
+/// 右寄せにする列（金額）。`HEADERS` の添字。
+const NUMERIC_COLUMNS: &[usize] = &[7];
+
+/// 仕訳を1行1明細の表に開く。
+///
+/// CSV と HTML はこの結果を共有する。**フォーマットごとに組み立て直さない**
+/// ——同じ帳簿が形式によって違う中身になるのを、構造で防ぐ。
+fn to_rows(entries: &[JournalEntry], chart: &ChartOfAccounts) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for entry in entries {
+        // 訂正元は「この仕訳が訂正している相手」。仕訳IDではなく**仕訳番号**を
+        // 出したいが、集約が持っているのは相手の EntryId だけである
+        // （番号を引くには相手を読み直す必要がある）。ここは I/O を持たない
+        // 層なので、ID をそのまま出す。
+        let reverses = entry
+            .reverses()
+            .map(|id| id.as_u128().to_string())
+            .unwrap_or_default();
+        let reverse_reason = entry.reverse_reason().unwrap_or_default().to_string();
+
+        for (index, line) in entry.lines().iter().enumerate() {
+            rows.push(vec![
+                entry.entry_date().to_iso_string(),
+                entry.entry_no().as_u32().to_string(),
+                (index + 1).to_string(),
+                entry.description().to_string(),
+                line.account().as_str().to_string(),
+                account_name(chart, line.account()),
+                side_code(line.side()).to_string(),
+                money_to_plain_string(line.amount()),
+                line.amount().currency().code().to_string(),
+                line.memo().unwrap_or_default().to_string(),
+                reverses.clone(),
+                reverse_reason.clone(),
+            ]);
+        }
+    }
+    rows
+}
+
+/// 印刷用 HTML。
+///
+/// `period` は表題の下に出す期間（例: 「2026-01-01 〜 2026-12-31」）。
+/// `notes` は表の下に出す注記。
+pub fn to_html(
+    entries: &[JournalEntry],
+    chart: &ChartOfAccounts,
+    period: &str,
+    notes: &[String],
+) -> String {
+    PrintableTable {
+        title: "仕訳日記帳",
+        subtitle: period,
+        headers: HEADERS,
+        rows: &to_rows(entries, chart),
+        notes,
+        numeric_columns: NUMERIC_COLUMNS,
+        // 列が11個あるので A4 縦では右端が切れる。
+        landscape: true,
+    }
+    .render()
+}
+
+/// 科目コードから科目名を引く。
+///
+/// **帳簿に無いコードでも空文字にせず、コードをそのまま返す。** 仕訳は
+/// 記帳時に勘定科目表で検証されているので通常は引けるが、科目を削除した
+/// 帳簿を後から出力する場合などに引けないことがありうる。そのとき名前欄が
+/// 空だと「名前の無い科目」に見えてしまう——**引けなかったことが分かる形**
+/// にしておく。
+fn account_name(chart: &ChartOfAccounts, code: &kaikei_core::AccountCode) -> String {
+    chart
+        .get(code)
+        .map(|def| def.name.clone())
+        .unwrap_or_else(|| format!("（{}：勘定科目表にありません）", code.as_str()))
+}
 
 /// 仕訳日記帳の CSV。
 ///
@@ -44,48 +141,11 @@ use kaikei_core::JournalEntry;
 ///   MCP の応答にも前例が無い（`get_entry` も返していない）
 ///
 /// `docs/10-report.md` §7 の判断待ちに含めてある。
-pub fn to_csv(entries: &[JournalEntry]) -> String {
+pub fn to_csv(entries: &[JournalEntry], chart: &ChartOfAccounts) -> String {
     let mut csv = CsvBuilder::new();
-    csv.push_row([
-        "取引日",
-        "仕訳番号",
-        "行番号",
-        "摘要",
-        "勘定科目",
-        "貸借",
-        "金額",
-        "通貨",
-        "備考",
-        "訂正元",
-        "訂正理由",
-    ]);
-
-    for entry in entries {
-        // 訂正元は「この仕訳が訂正している相手」。仕訳IDではなく**仕訳番号**を
-        // 出したいが、集約が持っているのは相手の EntryId だけである
-        // （番号を引くには相手を読み直す必要がある）。ここは I/O を持たない
-        // 層なので、ID をそのまま出す。
-        let reverses = entry
-            .reverses()
-            .map(|id| id.as_u128().to_string())
-            .unwrap_or_default();
-        let reverse_reason = entry.reverse_reason().unwrap_or_default().to_string();
-
-        for (index, line) in entry.lines().iter().enumerate() {
-            csv.push_row([
-                entry.entry_date().to_iso_string(),
-                entry.entry_no().as_u32().to_string(),
-                (index + 1).to_string(),
-                entry.description().to_string(),
-                line.account().as_str().to_string(),
-                side_code(line.side()).to_string(),
-                money_to_plain_string(line.amount()),
-                line.amount().currency().code().to_string(),
-                line.memo().unwrap_or_default().to_string(),
-                reverses.clone(),
-                reverse_reason.clone(),
-            ]);
-        }
+    csv.push_row(HEADERS);
+    for row in to_rows(entries, chart) {
+        csv.push_row(row);
     }
     csv.finish()
 }
@@ -178,7 +238,7 @@ mod tests {
             ],
         )];
 
-        let rows = data_rows(&to_csv(&entries));
+        let rows = data_rows(&to_csv(&entries, &chart()));
 
         assert_eq!(rows.len(), 3);
         // 同じ仕訳の行には同じ取引日・仕訳番号・摘要が繰り返される。
@@ -203,7 +263,7 @@ mod tests {
             ],
         )];
 
-        let csv = to_csv(&entries);
+        let csv = to_csv(&entries, &chart());
 
         assert!(csv.contains(",1234567,"), "桁区切りが入っている: {csv}");
         assert!(!csv.contains("1,234,567"));
@@ -223,7 +283,7 @@ mod tests {
             ],
         )];
 
-        let csv = to_csv(&entries);
+        let csv = to_csv(&entries, &chart());
 
         assert!(csv.contains("\"A社, B社 合算\""), "{csv}");
     }
@@ -231,11 +291,76 @@ mod tests {
     // ヘッダだけの CSV も成立する（仕訳0件は正常）。
     #[test]
     fn an_empty_book_still_has_a_header() {
-        let csv = to_csv(&[]);
+        let csv = to_csv(&[], &chart());
 
         assert!(csv.starts_with(crate::csv::UTF8_BOM));
         assert!(csv.contains("取引日,仕訳番号,行番号"));
         assert!(data_rows(&csv).is_empty());
+    }
+
+    // ★CSV と HTML が同じ中身を出す★
+    //
+    // 両者は `to_rows` を共有しているが、**共有していることをテストで縛る**。
+    // 片方だけ列を足す・値を変える変更が入ったら、ここが落ちる。
+    // 同じ帳簿が形式によって違う中身になるのが、この検査が防ぎたい事故である。
+    #[test]
+    fn the_csv_and_the_html_carry_the_same_values() {
+        let entries = vec![entry(
+            1,
+            "A社 <重要> 請求",
+            vec![
+                line("100", Side::Debit, 110_000, Some("備考あり")),
+                line("500", Side::Credit, 110_000, None),
+            ],
+        )];
+
+        let csv = to_csv(&entries, &chart());
+        let html = to_html(&entries, &chart(), "2026-01-01 〜 2026-12-31", &[]);
+
+        // 見出しは同じ集合。
+        for header in HEADERS {
+            assert!(csv.contains(header), "CSV に見出しが無い: {header}");
+            assert!(html.contains(header), "HTML に見出しが無い: {header}");
+        }
+
+        // 値も同じ。HTML 側はエスケープされるので、素の値で比べられるものを見る。
+        for value in ["2026-04-15", "110000", "debit", "credit", "JPY", "備考あり"] {
+            assert!(csv.contains(value), "CSV に値が無い: {value}");
+            assert!(html.contains(value), "HTML に値が無い: {value}");
+        }
+
+        // 行数が一致する（明細2本なので2行）。
+        let csv_rows = data_rows(&csv).len();
+        let html_rows = html.matches("<tr>").count() - 1; // ヘッダ行を除く
+        assert_eq!(csv_rows, html_rows, "CSV と HTML で行数が違う");
+    }
+
+    // HTML では摘要がエスケープされる（CSV は生のまま）。
+    #[test]
+    fn the_html_escapes_what_the_csv_leaves_raw() {
+        let entries = vec![entry(
+            1,
+            "A社 <重要>",
+            vec![
+                line("100", Side::Debit, 1_000, None),
+                line("500", Side::Credit, 1_000, None),
+            ],
+        )];
+
+        assert!(to_csv(&entries, &chart()).contains("A社 <重要>"));
+        assert!(to_html(&entries, &chart(), "", &[]).contains("A社 &lt;重要&gt;"));
+    }
+
+    // 印刷用 HTML には期間と注記が載る。
+    #[test]
+    fn the_html_carries_the_period_and_notes() {
+        let notes = vec!["期首残高の仕訳が帳簿にありません".to_string()];
+        let html = to_html(&[], &chart(), "2026-01-01 〜 2026-12-31", &notes);
+
+        assert!(html.contains("<h1>仕訳日記帳</h1>"));
+        assert!(html.contains("2026-01-01 〜 2026-12-31"));
+        assert!(html.contains("期首残高の仕訳が帳簿にありません"));
+        assert!(html.contains("この期間に該当する記録はありません"));
     }
 
     // 赤伝は訂正元と理由が読める形で出る（隠さない。D-088）。
@@ -263,7 +388,7 @@ mod tests {
             )
             .unwrap();
 
-        let rows = data_rows(&to_csv(&[original, reversal]));
+        let rows = data_rows(&to_csv(&[original, reversal], &chart()));
 
         // 原仕訳も残る（隠さない）。
         assert_eq!(rows.len(), 4);
