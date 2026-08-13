@@ -32,6 +32,13 @@ use kaikei_store::pool::{connect_app, PgStore};
 use kaikei_store::query::{PgLedgerQuery, PgTrialBalanceQuery};
 use std::path::{Path, PathBuf};
 
+/// `--deduction` を省略したときの青色申告特別控除額（円）。
+///
+/// 複式簿記に加えて e-Tax申告または優良な電子帳簿保存の要件を満たす場合の額。
+/// **このソフトは要件を判定しない**ので、既定値を使ったときも実行時に
+/// 「何円を適用したか」と「要件は判定していない」ことを画面に出す。
+const DEFAULT_BLUE_RETURN_DEDUCTION: i128 = 650_000;
+
 const USAGE: &str = "\
 kaikei — 帳簿を CSV と印刷用 HTML で書き出します
 
@@ -43,8 +50,11 @@ report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
 
 引数:
-    --year <西暦>    会計年度（暦年）。例: 2026
-    --out <パス>     出力先のディレクトリ。無ければ作ります（report のみ）
+    --year <西暦>       会計年度（暦年）。例: 2026
+    --out <パス>        出力先のディレクトリ。無ければ作ります（report のみ）
+    --deduction <円>    青色申告特別控除額。省略時は 650000（report のみ）
+                        要件（複式簿記・e-Tax申告・優良な電子帳簿保存）を
+                        満たすかどうかは、このソフトでは判定しません
 
 書き出すもの（それぞれ .csv と .html）:
     journal_book      仕訳日記帳（1行1明細。取り消された仕訳も含みます）
@@ -52,6 +62,11 @@ verify は帳簿の整合性を検査します（書き出しません）。
     trial_balance     試算表（借方合計・貸方合計・残高）
     balance_sheet     貸借対照表
     income_statement  損益計算書
+    blue_return       青色申告決算書（損益計算書）の各欄のデータ
+                      ※ 国税庁の様式そのものではありません
+
+    このほか blue_return_not_on_form.csv に、決算書のどの欄にも
+    載らなかった科目を理由付きで書き出します。
 
 環境変数:
     APP_DATABASE_URL          帳簿の接続先（kaikei_app ロール）
@@ -93,7 +108,8 @@ fn run() -> Result<Vec<PathBuf>, String> {
         Command::Report {
             fiscal_year,
             out_dir,
-        } => runtime.block_on(write_reports(fiscal_year, out_dir)),
+            deduction,
+        } => runtime.block_on(write_reports(fiscal_year, out_dir, deduction)),
         Command::Verify { fiscal_year } => runtime.block_on(run_verify(fiscal_year)),
     }
 }
@@ -102,7 +118,12 @@ fn run() -> Result<Vec<PathBuf>, String> {
 #[derive(Debug)]
 enum Command {
     /// 帳簿をファイルに書き出す。
-    Report { fiscal_year: i32, out_dir: PathBuf },
+    Report {
+        fiscal_year: i32,
+        out_dir: PathBuf,
+        /// 青色申告特別控除額（円）。**帳簿からは決まらない**ので受け取る。
+        deduction: i128,
+    },
     /// 帳簿の整合性を検査する（書き出さない）。
     Verify { fiscal_year: i32 },
 }
@@ -123,6 +144,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 
     let mut fiscal_year: Option<i32> = None;
     let mut out_dir: Option<PathBuf> = None;
+    let mut deduction: Option<i128> = None;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -140,6 +162,21 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     .ok_or("--out の後に出力先ディレクトリを指定してください（例: --out ./out）")?;
                 out_dir = Some(PathBuf::from(value));
             }
+            "--deduction" => {
+                let value = rest.next().ok_or(
+                    "--deduction の後に青色申告特別控除額を円で指定してください（例: --deduction 650000）",
+                )?;
+                let parsed = value.parse::<i128>().map_err(|_| {
+                    format!("--deduction は円の数字で指定してください（受け取った値: {value}）")
+                })?;
+                // **負の控除額は受け取らない。** 所得金額が過大になる。
+                if parsed < 0 {
+                    return Err(format!(
+                        "--deduction に負の値は指定できません（受け取った値: {value}）"
+                    ));
+                }
+                deduction = Some(parsed);
+            }
             other => {
                 return Err(format!("不明な引数です: {other}\n\n{USAGE}"));
             }
@@ -151,12 +188,19 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "report" => Ok(Command::Report {
             fiscal_year,
             out_dir: out_dir.ok_or("--out を指定してください（例: --out ./out）")?,
+            // 省略時は 65 万円（複式簿記 + e-Tax申告 または優良な電子帳簿保存）。
+            // **要件を満たすかはソフトが判定しない**ので、適用した額は実行時に
+            // 必ず画面へ出す（`write_blue_return` を参照）。
+            deduction: deduction.unwrap_or(DEFAULT_BLUE_RETURN_DEDUCTION),
         }),
         // verify は書き出さないので --out を受け取らない。**黙って無視しない**
         // ——「出力先を指定したのに何も出なかった」と読まれる。
-        _ => match out_dir {
-            Some(_) => Err("verify は書き出さないので --out は指定できません".to_string()),
-            None => Ok(Command::Verify { fiscal_year }),
+        _ => match (out_dir, deduction) {
+            (Some(_), _) => Err("verify は書き出さないので --out は指定できません".to_string()),
+            (_, Some(_)) => {
+                Err("verify は決算書を出さないので --deduction は指定できません".to_string())
+            }
+            (None, None) => Ok(Command::Verify { fiscal_year }),
         },
     }
 }
@@ -207,7 +251,11 @@ fn env_var(name: &str) -> Result<String, String> {
         .map_err(|_| format!("環境変数 {name} が未設定です（.env.example を参照してください）"))
 }
 
-async fn write_reports(fiscal_year_label: i32, out_dir: PathBuf) -> Result<Vec<PathBuf>, String> {
+async fn write_reports(
+    fiscal_year_label: i32,
+    out_dir: PathBuf,
+    deduction: i128,
+) -> Result<Vec<PathBuf>, String> {
     let database_url = env_var("APP_DATABASE_URL")?;
     let currency_code = env_var("KAIKEI_BOOK_CURRENCY")?;
     let fiscal_year_rule = env_var("KAIKEI_FISCAL_YEAR_RULE")?;
@@ -320,6 +368,13 @@ async fn write_reports(fiscal_year_label: i32, out_dir: PathBuf) -> Result<Vec<P
         &kaikei_report::statement::to_html(&statements.income_statement, &period_label, &[]),
     )?);
 
+    written.extend(write_blue_return(
+        &out_dir,
+        &statements.income_statement,
+        &period_label,
+        deduction,
+    )?);
+
     if statements.entry_count == 0 {
         eprintln!(
             "注意: {} にはこの会計年度の仕訳が1件もありません。\
@@ -327,6 +382,98 @@ async fn write_reports(fiscal_year_label: i32, out_dir: PathBuf) -> Result<Vec<P
             period_label
         );
     }
+    Ok(written)
+}
+
+/// 青色申告決算書（損益計算書）のデータを書き出す。
+///
+/// **控除額はソフトが決めない。** 65万・55万・10万のどれになるかは複式簿記・
+/// e-Tax申告・優良な電子帳簿保存といった要件で決まり、帳簿からは判定できない
+/// （`docs/10-report.md` §5）。呼び出し側が渡した額をそのまま使い、**何円を
+/// 適用したかを必ず画面に出す**——黙って既定値が入ると、要件を満たさない
+/// 控除額のまま決算書が出る。
+fn write_blue_return(
+    out_dir: &Path,
+    income_statement: &kaikei_app::policy::Statement,
+    period_label: &str,
+    deduction: i128,
+) -> Result<Vec<PathBuf>, String> {
+    let form = kaikei_jp::blue_return::load_embedded(kaikei_jp_data::STATEMENT_BLUE_RETURN_GENERAL)
+        .map_err(|error| format!("決算書の当てはめ表を読めませんでした: {error}"))?;
+
+    let mut inputs = std::collections::BTreeMap::new();
+    inputs.insert(
+        "blue_return_deduction".to_string(),
+        kaikei_core::Money::from_minor(deduction, income_statement.total.currency()),
+    );
+
+    let filled = kaikei_jp::blue_return_fill::fill(&form, income_statement, &inputs)
+        .map_err(|error| format!("決算書の金額を計算できませんでした: {error}"))?;
+
+    let fields: Vec<kaikei_report::blue_return::FormRow> = filled
+        .fields
+        .iter()
+        .map(|field| kaikei_report::blue_return::FormRow {
+            no: field.no,
+            label: field.label.clone(),
+            amount: field.amount,
+        })
+        .collect();
+
+    let not_on_form: Vec<kaikei_report::blue_return::NotOnFormRow> = filled
+        .not_on_form
+        .iter()
+        .map(|entry| kaikei_report::blue_return::NotOnFormRow {
+            account: entry.account.as_str().to_string(),
+            label: entry.label.clone(),
+            amount: entry.amount,
+            reason: match &entry.reason {
+                kaikei_jp::blue_return_fill::NotOnFormReason::Excluded(reason) => reason.clone(),
+                kaikei_jp::blue_return_fill::NotOnFormReason::Unmapped => {
+                    "当てはめ表にこの科目がありません。決算書のどの欄に入れるかを\
+                     決めてください（黙って雑費には入れません）"
+                        .to_string()
+                }
+            },
+        })
+        .collect();
+
+    let title = format!("{}（{}）", filled.form, filled.part);
+    let notes = vec![format!(
+        "青色申告特別控除額として {} 円を適用しています。\
+         控除額の要件（複式簿記・e-Tax申告・優良な電子帳簿保存）を\
+         満たすかどうかは、このソフトでは判定していません。",
+        deduction
+    )];
+
+    let mut written = write_pair(
+        out_dir,
+        "blue_return",
+        &kaikei_report::blue_return::to_csv(&fields),
+        &kaikei_report::blue_return::to_html(&title, period_label, &fields, &not_on_form, &notes),
+    )?;
+
+    // 載らなかった科目は本表と別の CSV にする（1つの CSV に2つの表を
+    // 入れると表計算で読めなくなる）。0 件でも見出しだけのファイルを書く。
+    let aside = out_dir.join("blue_return_not_on_form.csv");
+    std::fs::write(
+        &aside,
+        kaikei_report::blue_return::not_on_form_to_csv(&not_on_form),
+    )
+    .map_err(|error| format!("書き出せませんでした: {}（{error}）", aside.display()))?;
+    written.push(aside);
+
+    // **適用した控除額を必ず出す。** 出力ファイルを見ない人にも伝わるように。
+    println!("青色申告特別控除額 {deduction} 円を適用しました（要件の判定はしていません）");
+
+    if !not_on_form.is_empty() {
+        eprintln!(
+            "注意: 決算書のどの欄にも載らなかった科目が {} 件あります。\
+             blue_return_not_on_form.csv を確認してください",
+            not_on_form.len()
+        );
+    }
+
     Ok(written)
 }
 
@@ -448,12 +595,67 @@ mod tests {
             Command::Report {
                 fiscal_year,
                 out_dir,
+                deduction,
             } => {
                 assert_eq!(fiscal_year, 2026);
                 assert_eq!(out_dir, PathBuf::from("./out"));
+                assert_eq!(
+                    deduction, DEFAULT_BLUE_RETURN_DEDUCTION,
+                    "--deduction 省略時は既定値"
+                );
             }
             other => panic!("report として解釈されるはず: {other:?}"),
         }
+    }
+
+    // 控除額は指定できる（65万の要件を満たさない場合に 55万・10万を選べる）。
+    #[test]
+    fn the_deduction_can_be_given_explicitly() {
+        let command = parse_args(&args(&[
+            "report",
+            "--year",
+            "2026",
+            "--out",
+            "./out",
+            "--deduction",
+            "100000",
+        ]))
+        .unwrap();
+        match command {
+            Command::Report { deduction, .. } => assert_eq!(deduction, 100_000),
+            other => panic!("report として解釈されるはず: {other:?}"),
+        }
+    }
+
+    // **負の控除額は拒否する。** 通すと所得金額が過大になる。
+    #[test]
+    fn a_negative_deduction_is_rejected() {
+        let err = parse_args(&args(&[
+            "report",
+            "--year",
+            "2026",
+            "--out",
+            "./out",
+            "--deduction",
+            "-1",
+        ]))
+        .expect_err("負の控除額は拒否されるはず");
+        assert!(err.contains("負の値"), "{err}");
+    }
+
+    // verify は決算書を出さないので --deduction を黙って無視しない
+    // （「指定したのに効かなかった」と読まれる）。
+    #[test]
+    fn verify_rejects_a_deduction_instead_of_ignoring_it() {
+        let err = parse_args(&args(&[
+            "verify",
+            "--year",
+            "2026",
+            "--deduction",
+            "650000",
+        ]))
+        .expect_err("verify では拒否されるはず");
+        assert!(err.contains("--deduction"), "{err}");
     }
 
     #[test]
