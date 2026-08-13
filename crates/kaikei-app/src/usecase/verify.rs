@@ -32,7 +32,7 @@
 use crate::error::AppError;
 use crate::ports::{ChartRepo, JournalRepo, TrialBalanceQuery};
 use crate::view::TrialBalanceView;
-use kaikei_core::{AccountCode, EntryId, FiscalYear, Money, TagSchema, TrialBalance};
+use kaikei_core::{AccountCode, FiscalYear, Money, TagSchema, TrialBalance};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// [`execute`] への入力。
@@ -270,7 +270,8 @@ mod tests {
     use super::*;
     use crate::test_support::{fixed_clock, sample_chart_with_tax_account, AllOpen};
     use kaikei_core::{
-        AccountingDate, Currency, EntryNumber, JournalEntry, JournalLine, NewEntry, Side, TagSet,
+        AccountingDate, Currency, EntryId, EntryNumber, JournalEntry, JournalLine, NewEntry, Side,
+        TagSet,
     };
 
     fn yen(amount: i128) -> Money {
