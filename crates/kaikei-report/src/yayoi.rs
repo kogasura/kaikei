@@ -64,6 +64,11 @@ pub struct Conversion {
     pub skipped: Vec<Skipped>,
     /// 摘要が上限を超えていた仕訳の番号（インポート時に切り捨てられる）。
     pub truncated_descriptions: Vec<u32>,
+    /// Shift-JIS で表せない文字を含む仕訳（番号と、その文字）。
+    ///
+    /// **どの仕訳かを言えないと直しようがない。** 「化けました」とだけ
+    /// 知らせても、687 行の中から探すことになる。
+    pub unmappable_characters: Vec<(u32, String)>,
 }
 
 impl Conversion {
@@ -219,6 +224,18 @@ pub fn convert(
                 if half_width_len(&description) > DESCRIPTION_LIMIT_HALF_WIDTH {
                     out.truncated_descriptions.push(entry_no);
                 }
+                // Shift-JIS に無い文字は置換文字に化ける。**どの仕訳かを
+                // 記録する**——化けたことだけ知らせても直しようがない。
+                let unmappable: String = rows
+                    .iter()
+                    .flat_map(|row| row.iter())
+                    .flat_map(|cell| unmappable_chars(cell).into_iter())
+                    .collect::<std::collections::BTreeSet<char>>()
+                    .into_iter()
+                    .collect();
+                if !unmappable.is_empty() {
+                    out.unmappable_characters.push((entry_no, unmappable));
+                }
                 out.rows.extend(rows);
             }
         }
@@ -274,6 +291,17 @@ fn flag_for(index: usize, total: usize) -> &'static str {
 /// スラッシュ区切りにしている（`docs/10-report.md` §6-3b）。
 fn to_yayoi_date(iso: &str) -> String {
     iso.replace('-', "/")
+}
+
+/// Shift-JIS で表せない文字を拾う。
+fn unmappable_chars(text: &str) -> Vec<char> {
+    text.chars()
+        .filter(|ch| {
+            let mut buffer = [0u8; 4];
+            let (_, _, had_errors) = SHIFT_JIS.encode(ch.encode_utf8(&mut buffer));
+            had_errors
+        })
+        .collect()
 }
 
 /// 半角換算の桁数。全角は2桁として数える。
@@ -552,6 +580,47 @@ mod tests {
         let result = convert(&entries, &chart(), &tax_map());
 
         assert_eq!(result.truncated_descriptions, vec![6]);
+    }
+
+    // YA-6b: **本命。** 化けた仕訳がどれかを言えること。
+    //
+    //        「化けました」とだけ知らせても、687 行の中から探すことになる。
+    #[test]
+    fn an_entry_with_characters_shift_jis_cannot_represent_is_identified() {
+        let entries = vec![entry(
+            7,
+            "打合せ🙂",
+            vec![
+                line("604", Side::Debit, 1_000, Some("PURCHASE_10_QUALIFIED")),
+                line("110", Side::Credit, 1_000, None),
+            ],
+        )];
+
+        let result = convert(&entries, &chart(), &tax_map());
+
+        assert_eq!(result.unmappable_characters.len(), 1);
+        assert_eq!(result.unmappable_characters[0].0, 7, "仕訳番号を言うこと");
+        assert_eq!(
+            result.unmappable_characters[0].1, "🙂",
+            "どの文字かも言うこと"
+        );
+    }
+
+    // YA-6c: 通常の日本語だけの仕訳は報告に出ない。
+    #[test]
+    fn an_ordinary_entry_is_not_reported_as_unmappable() {
+        let entries = vec![entry(
+            8,
+            "通信費の支払",
+            vec![
+                line("604", Side::Debit, 1_000, Some("PURCHASE_10_QUALIFIED")),
+                line("110", Side::Credit, 1_000, None),
+            ],
+        )];
+
+        let result = convert(&entries, &chart(), &tax_map());
+
+        assert!(result.unmappable_characters.is_empty());
     }
 
     // YA-7: Shift-JIS で表せない文字があったら知らせる。

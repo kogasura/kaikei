@@ -112,7 +112,8 @@ fn run() -> Result<Vec<PathBuf>, String> {
             fiscal_year,
             out_dir,
             deduction,
-        } => runtime.block_on(write_reports(fiscal_year, out_dir, deduction)),
+            yayoi,
+        } => runtime.block_on(write_reports(fiscal_year, out_dir, deduction, yayoi)),
         Command::Verify { fiscal_year } => runtime.block_on(run_verify(fiscal_year)),
     }
 }
@@ -126,6 +127,12 @@ enum Command {
         out_dir: PathBuf,
         /// 青色申告特別控除額（円）。**帳簿からは決まらない**ので受け取る。
         deduction: i128,
+        /// 弥生インポート形式の CSV も書き出すか。
+        ///
+        /// **既定では出さない。** 税込経理を前提にした出力なので、経理方式の
+        /// 設定（`KAIKEI_TAX_MODE`）を確かめる必要があり、読む設定が増える。
+        /// 必要な人だけが指定する。
+        yayoi: bool,
     },
     /// 帳簿の整合性を検査する（書き出さない）。
     Verify { fiscal_year: i32 },
@@ -148,6 +155,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut fiscal_year: Option<i32> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut deduction: Option<i128> = None;
+    let mut yayoi = false;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -180,6 +188,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 }
                 deduction = Some(parsed);
             }
+            "--yayoi" => {
+                yayoi = true;
+            }
             other => {
                 return Err(format!("不明な引数です: {other}\n\n{USAGE}"));
             }
@@ -195,15 +206,17 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             // **要件を満たすかはソフトが判定しない**ので、適用した額は実行時に
             // 必ず画面へ出す（`write_blue_return` を参照）。
             deduction: deduction.unwrap_or(DEFAULT_BLUE_RETURN_DEDUCTION),
+            yayoi,
         }),
         // verify は書き出さないので --out を受け取らない。**黙って無視しない**
         // ——「出力先を指定したのに何も出なかった」と読まれる。
-        _ => match (out_dir, deduction) {
-            (Some(_), _) => Err("verify は書き出さないので --out は指定できません".to_string()),
-            (_, Some(_)) => {
+        _ => match (out_dir, deduction, yayoi) {
+            (Some(_), _, _) => Err("verify は書き出さないので --out は指定できません".to_string()),
+            (_, Some(_), _) => {
                 Err("verify は決算書を出さないので --deduction は指定できません".to_string())
             }
-            (None, None) => Ok(Command::Verify { fiscal_year }),
+            (_, _, true) => Err("verify は書き出さないので --yayoi は指定できません".to_string()),
+            (None, None, false) => Ok(Command::Verify { fiscal_year }),
         },
     }
 }
@@ -258,6 +271,7 @@ async fn write_reports(
     fiscal_year_label: i32,
     out_dir: PathBuf,
     deduction: i128,
+    yayoi: bool,
 ) -> Result<Vec<PathBuf>, String> {
     let database_url = env_var("APP_DATABASE_URL")?;
     let currency_code = env_var("KAIKEI_BOOK_CURRENCY")?;
@@ -426,6 +440,10 @@ async fn write_reports(
         to,
         &blue_return_fields,
     )?);
+
+    if yayoi {
+        written.extend(write_yayoi(&out_dir, &entries, &chart)?);
+    }
 
     if statements.entry_count == 0 {
         eprintln!(
@@ -623,6 +641,157 @@ async fn fetch_whole_ledger(
 /// 日付を下限に使う。範囲を広く取っても、含まれる仕訳は変わらない。
 fn book_beginning() -> AccountingDate {
     AccountingDate::new(1900, 1, 1).expect("1900-01-01 は常に有効な日付である")
+}
+
+/// 弥生インポート形式の CSV を書き出す。
+///
+/// **税込経理を前提にしている。** 同梱の税区分の写像は税込（「込」）の名称
+/// なので、税抜経理の帳簿に使うと税額の扱いがずれる。`KAIKEI_TAX_MODE` を
+/// 確かめ、一致しなければ書き出さない——黙って出すと、消費税の扱いが違う
+/// データが税理士に渡る。
+///
+/// 変換できなかった仕訳は別の CSV（UTF-8）に理由付きで書き出す。**弥生に
+/// 渡すファイルに混ぜない**——取り込む側が読むファイルではない。
+fn write_yayoi(
+    out_dir: &Path,
+    entries: &[kaikei_core::JournalEntry],
+    chart: &kaikei_core::ChartOfAccounts,
+) -> Result<Vec<PathBuf>, String> {
+    let map = kaikei_jp::yayoi::load_embedded(kaikei_jp_data::YAYOI_TAX_CATEGORIES)
+        .map_err(|error| format!("弥生の税区分の写像を読めませんでした: {error}"))?;
+
+    let tax_mode = env_var("KAIKEI_TAX_MODE")?;
+    if tax_mode != map.tax_mode() {
+        return Err(format!(
+            "弥生向けの出力は{}（KAIKEI_TAX_MODE={}）の帳簿を前提にしていますが、\
+             この帳簿は {} です。税額の扱いがずれるため書き出しません",
+            map.taxation_method(),
+            map.tax_mode(),
+            tax_mode
+        ));
+    }
+
+    let tax_map = build_tax_map(&map);
+
+    let conversion = kaikei_report::yayoi::convert(entries, chart, &tax_map);
+    let (bytes, had_encoding_errors) = kaikei_report::yayoi::to_shift_jis_csv(&conversion.rows);
+
+    let mut written = Vec::new();
+    let csv_path = out_dir.join("yayoi_journal.csv");
+    std::fs::write(&csv_path, &bytes)
+        .map_err(|error| format!("書き出せませんでした: {}（{error}）", csv_path.display()))?;
+    written.push(csv_path);
+
+    // 変換できなかった仕訳。**0 件でも見出しだけのファイルを書く**
+    // （消すと「無かった」のか「出し忘れた」のかが読めない）。
+    let skipped_path = out_dir.join("yayoi_skipped.csv");
+    let mut skipped_csv = String::from("\u{feff}仕訳番号,取引日,摘要,変換できなかった理由\r\n");
+    for item in &conversion.skipped {
+        skipped_csv.push_str(&format!(
+            "{},{},\"{}\",\"{}\"\r\n",
+            item.entry_no,
+            item.date,
+            item.description.replace('"', "\"\""),
+            item.reason.replace('"', "\"\"")
+        ));
+    }
+    std::fs::write(&skipped_path, skipped_csv).map_err(|error| {
+        format!(
+            "書き出せませんでした: {}（{error}）",
+            skipped_path.display()
+        )
+    })?;
+    written.push(skipped_path);
+
+    println!(
+        "弥生形式: {} 行を書き出しました（Shift-JIS）",
+        conversion.rows.len()
+    );
+
+    // **写像が未確認であることを必ず伝える。** ある区分を別の区分として
+    // 出力することは、その取引の税務上の扱いを変える。
+    if !map.all_verified() {
+        eprintln!(
+            "注意: 弥生の税区分の写像は実機で確認していません（未確認 {} 件）。\
+             取り込む前に税理士に確認してください",
+            map.unverified_count()
+        );
+    }
+    if !conversion.skipped.is_empty() {
+        eprintln!(
+            "注意: 弥生形式に変換できなかった仕訳が {} 件あります。\
+             yayoi_skipped.csv を確認してください",
+            conversion.skipped.len()
+        );
+    }
+    if !conversion.truncated_descriptions.is_empty() {
+        eprintln!(
+            "注意: 摘要が弥生の上限（半角64桁）を超える仕訳が {} 件あります。\
+             インポート時に切り捨てられます",
+            conversion.truncated_descriptions.len()
+        );
+    }
+    if had_encoding_errors {
+        eprintln!(
+            "注意: Shift-JIS で表せない文字があり、置換されました（{} 件の仕訳）。\
+             該当する仕訳を直してから出し直してください:",
+            conversion.unmappable_characters.len()
+        );
+        // **どの仕訳かを言う。** 化けたことだけ知らせても直しようがない。
+        for (entry_no, chars) in conversion.unmappable_characters.iter().take(20) {
+            eprintln!("  仕訳 {entry_no}: {chars}");
+        }
+        if conversion.unmappable_characters.len() > 20 {
+            eprintln!(
+                "  （ほか {} 件）",
+                conversion.unmappable_characters.len() - 20
+            );
+        }
+    }
+    if conversion.exceeds_online_row_limit() {
+        eprintln!(
+            "注意: {} 行あります。弥生会計 オンラインは {} 行を超えるファイルを\
+             取り込めません（デスクトップ版には制限の記載がありません）。\
+             期間を分けて出し直してください",
+            conversion.rows.len(),
+            kaikei_report::yayoi::ONLINE_MAX_ROWS
+        );
+    }
+    if bytes.len() > kaikei_report::yayoi::ONLINE_MAX_BYTES {
+        eprintln!(
+            "注意: {} バイトあります。弥生会計 オンラインは 1.0MB を超える\
+             ファイルを取り込めません",
+            bytes.len()
+        );
+    }
+
+    Ok(written)
+}
+
+/// 税区分の写像を、出力側が使う素の対応表にする。
+fn build_tax_map(
+    map: &kaikei_jp::yayoi::YayoiTaxMap,
+) -> std::collections::BTreeMap<String, String> {
+    // `kaikei-report` は `kaikei-jp` を知らない（層を保つ）ので、
+    // ここで素の文字列の対応表に落とす。
+    let mut out = std::collections::BTreeMap::new();
+    for code in [
+        "SALES_10",
+        "SALES_8_REDUCED",
+        "SALES_EXPORT",
+        "PURCHASE_10_QUALIFIED",
+        "PURCHASE_8_REDUCED_QUALIFIED",
+        "PURCHASE_10_NON_QUALIFIED",
+        "PURCHASE_8_REDUCED_NON_QUALIFIED",
+        "TAX_FREE",
+        "OUT_OF_SCOPE",
+        "NOT_APPLICABLE",
+    ] {
+        if let Some(mapping) = map.get(code) {
+            out.insert(code.to_string(), mapping.yayoi.clone());
+        }
+    }
+    out
 }
 
 /// 会計年度の開始日の前日。決算書の貸借対照表の期首列に使う。
