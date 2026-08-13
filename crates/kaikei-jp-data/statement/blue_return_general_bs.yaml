@@ -1,0 +1,166 @@
+# 青色申告決算書（一般用）への当てはめ — 貸借対照表（決算書4ページ）
+#
+# 出典: 国税庁「令和7年分 青色申告決算書（一般用）の書き方」
+#   https://www.nta.go.jp/taxes/shiraberu/shinkoku/tebiki/2025/pdf/037.pdf
+#   （2026-08-13 に様式を確認。行の並び・空欄の行数・期首欄の斜線は印字どおり）
+#
+# ■ 損益計算書と構造が違う
+#
+# 損益計算書には丸番号の欄があるが、貸借対照表には**番号が無い**。代わりに
+# 「1月1日（期首）」と「12月31日（期末）」の**2列**がある。並びが意味を
+# 持つので、この表の行順は様式の印字順そのものである。
+#
+# ■ 期首欄に斜線が引かれている行がある
+#
+# 事業主貸・事業主借・青色申告特別控除前の所得金額は、様式で期首欄に斜線が
+# 引かれており記入しない（`omit_opening: true`）。事業主貸・事業主借は毎期
+# 元入金へ振り替えられて期首残高を持たないためであり、所得金額は当期の
+# 結果だからである（docs/09-tax-research.md 項目18）。
+#
+# ■ 元入金は期首と期末が同額
+#
+# 様式の書き方が「期首の金額と期末の金額は同じ金額を記入します」と明記して
+# いる（`same_in_both_columns: true`）。期中に元入金が動かないことの表れ
+# なので、帳簿側で動いていたらそれは検出したい——この表は期末の残高を
+# 両列に入れる。
+#
+# ■ 普通預金は「その他の預金」に入れる
+#
+# 様式の預金欄は 当座預金・定期預金・その他の預金 の3つで、**普通預金の欄が
+# 無い**。同梱の科目表の `110 普通預金` は「その他の預金」に当てはめる。
+
+version: 1
+form: "青色申告決算書（一般用）"
+part: "貸借対照表（資産負債調）"
+source: "令和7年分 青色申告決算書（一般用）の書き方（国税庁）"
+
+sections:
+  # 様式の左半分。空欄は7行（土地の下、事業主貸の上）。
+  - title: "資産の部"
+    rows:
+      - label: "現金"
+        accounts: ["100"]
+      - label: "当座預金"
+        accounts: []
+      - label: "定期預金"
+        accounts: ["120"]
+      # 様式に普通預金の欄が無いため、ここに入れる。
+      - label: "その他の預金"
+        accounts: ["110"]
+      - label: "受取手形"
+        accounts: ["130"]
+      - label: "売掛金"
+        accounts: ["135"]
+      - label: "有価証券"
+        accounts: ["140"]
+      - label: "棚卸資産"
+        accounts: ["150"]
+      - label: "前払金"
+        accounts: ["160"]
+      - label: "貸付金"
+        accounts: ["165"]
+      - label: "建物"
+        accounts: ["200"]
+      - label: "建物附属設備"
+        accounts: []
+      - label: "機械装置"
+        accounts: ["205"]
+      - label: "車両運搬具"
+        accounts: ["220"]
+      - label: "工具器具備品"
+        accounts: ["210"]
+      - label: "土地"
+        accounts: []
+      # ---- 空欄7行（利用者が科目名を書き込む）----
+      - label: null
+        accounts: ["170"] # 立替金
+      - label: null
+        accounts: ["180"] # 仮払消費税等（税抜経理のときに出る）
+      - label: null
+        accounts: ["230"] # ソフトウェア
+      - label: null
+        accounts: ["240"] # 減価償却累計額
+      - label: null
+        accounts: ["250"] # 敷金・保証金
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      # 期首欄は様式で斜線。
+      # 事業主貸は同梱の科目表では純資産（貸方が自然な向き）だが、様式では
+      # **資産の部**に置かれる。試算表は科目の自然な向きで残高を返すので、
+      # ここで符号を反転しないと資産合計が狂う（借方残が負の値で入る）。
+      - label: "事業主貸"
+        accounts: ["410"]
+        omit_opening: true
+        negate: true
+      - label: "合計"
+        total: true
+
+  # 様式の右半分。空欄は 預り金の下に7行、貸倒引当金の下に7行。
+  - title: "負債・資本の部"
+    rows:
+      - label: "支払手形"
+        accounts: ["300"]
+      - label: "買掛金"
+        accounts: ["310"]
+      - label: "借入金"
+        accounts: ["320"]
+      - label: "未払金"
+        accounts: ["325"]
+      - label: "前受金"
+        accounts: ["328"]
+      - label: "預り金"
+        accounts: ["335"]
+      # ---- 空欄7行 ----
+      - label: null
+        accounts: ["330"] # 仮受消費税等（税抜経理のときに出る）
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: "貸倒引当金"
+        accounts: []
+      # ---- 空欄7行 ----
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      - label: null
+        accounts: []
+      # 期首欄は様式で斜線。
+      - label: "事業主借"
+        accounts: ["420"]
+        omit_opening: true
+      # 様式の書き方が「期首と期末は同じ金額」と明記している。
+      - label: "元入金"
+        accounts: ["400"]
+        same_in_both_columns: true
+      # 損益計算書の㊸をそのまま転記する。期首欄は様式で斜線。
+      - label: "青色申告特別控除前の所得金額"
+        from_income_statement: 43
+        omit_opening: true
+      - label: "合計"
+        total: true
+
+# この表に出てこない科目のうち、意図して載せていないもの。
+# 損益科目は貸借対照表に載らないが、それは当たり前なので挙げない
+# （挙げると本当に見てほしいものが埋もれる）。この表が対象にするのは
+# 資産・負債・純資産の科目だけである。
+excluded: []
