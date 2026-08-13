@@ -23,6 +23,7 @@ accounts:
   - { code: "170", name: "立替金",       type: Asset, sort: 170 }
   - { code: "180", name: "仮払消費税等", type: Asset, sort: 180 }
   - { code: "200", name: "建物",         type: Asset, sort: 200 }
+  - { code: "205", name: "機械装置",     type: Asset, sort: 205 }
   - { code: "210", name: "工具器具備品", type: Asset, sort: 210 }
   - { code: "220", name: "車両運搬具",   type: Asset, sort: 220 }
   - { code: "230", name: "ソフトウェア", type: Asset, sort: 230 }
