@@ -20,13 +20,15 @@
 use kaikei_app::context::{BookSettings, FiscalYearRule};
 use kaikei_app::ports::{ChartRepo, JournalRepo};
 use kaikei_app::tx::with_tx_err;
+use kaikei_app::usecase::ledger::{self, LedgerInput, MAX_LIMIT};
 use kaikei_app::usecase::report::{self, ReportInput};
 use kaikei_app::usecase::statements::{self, StatementsInput};
+use kaikei_app::view::LedgerPageView;
 use kaikei_core::{AccountingDate, FiscalYear};
 use kaikei_jp::statement::JpStatementPolicy;
 use kaikei_jp::tags::TagCatalog;
 use kaikei_store::pool::{connect_app, PgStore};
-use kaikei_store::query::PgTrialBalanceQuery;
+use kaikei_store::query::{PgLedgerQuery, PgTrialBalanceQuery};
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "\
@@ -41,6 +43,7 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
 
 書き出すもの（それぞれ .csv と .html）:
     journal_book      仕訳日記帳（1行1明細。取り消された仕訳も含みます）
+    general_ledger    総勘定元帳（科目ごとの明細と残高の推移）
     trial_balance     試算表（借方合計・貸方合計・残高）
     balance_sheet     貸借対照表
     income_statement  損益計算書
@@ -184,6 +187,16 @@ async fn write_reports(options: Options) -> Result<Vec<PathBuf>, String> {
     .await
     .map_err(|error: kaikei_app::error::AppError| format!("帳簿を読めませんでした: {error}"))?;
 
+    // 総勘定元帳。科目ごとに引き、ページングを辿り切る。
+    let ledger_query = PgLedgerQuery::new(pool.clone());
+    let mut ledger_pages = Vec::new();
+    for account in chart.iter() {
+        let page = fetch_whole_ledger(&ledger_query, &account.code, from, to, &settings).await?;
+        if kaikei_report::ledger::is_worth_printing(&page) {
+            ledger_pages.push(page);
+        }
+    }
+
     // 試算表は read model（SQL 集計）から取る。財務諸表とは経路が違う
     // （`DECISIONS.md` D-093 の住み分け）。
     let query = PgTrialBalanceQuery::new(pool);
@@ -220,6 +233,12 @@ async fn write_reports(options: Options) -> Result<Vec<PathBuf>, String> {
     )?);
     written.extend(write_pair(
         &options.out_dir,
+        "general_ledger",
+        &kaikei_report::ledger::to_csv(&ledger_pages),
+        &kaikei_report::ledger::to_html(&ledger_pages, &period_label, &[]),
+    )?);
+    written.extend(write_pair(
+        &options.out_dir,
         "trial_balance",
         &kaikei_report::trial_balance::to_csv(&trial_balance, &chart),
         &kaikei_report::trial_balance::to_html(&trial_balance, &chart, &period_label, &[]),
@@ -245,6 +264,75 @@ async fn write_reports(options: Options) -> Result<Vec<PathBuf>, String> {
         );
     }
     Ok(written)
+}
+
+/// 1科目の元帳を、ページングを辿り切って1つにまとめる。
+///
+/// **ここで取りこぼすと帳簿が静かに欠ける。** `get_ledger`（MCP）は1回で
+/// 返せる上限を超えたら `next_cursor` を添えて切るが、帳簿として書き出す
+/// ときに切ってよい理由は無い——読み手は「これで全部だ」と思って印刷する。
+///
+/// 集計値（期首・期末残高、借方・貸方合計、総行数）は**期間全体の値**なので
+/// 1ページ目のものをそのまま使う（`LedgerPageView` の doc）。ページごとに
+/// 足し直さないこと。
+async fn fetch_whole_ledger(
+    query: &PgLedgerQuery,
+    account: &kaikei_core::AccountCode,
+    from: AccountingDate,
+    to: AccountingDate,
+    settings: &BookSettings,
+) -> Result<LedgerPageView, String> {
+    let mut cursor = None;
+    let mut merged: Option<LedgerPageView> = None;
+
+    loop {
+        let page = ledger::execute(
+            query,
+            settings,
+            LedgerInput {
+                account: account.clone(),
+                from,
+                to,
+                cursor,
+                limit: MAX_LIMIT,
+            },
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "元帳を読めませんでした（科目 {}）: {error}",
+                account.as_str()
+            )
+        })?;
+
+        cursor = page.next_cursor;
+        match merged.as_mut() {
+            // 2ページ目以降は行だけを継ぎ足す。集計値は期間全体の値なので
+            // 1ページ目のものが正しい。
+            Some(acc) => acc.rows.extend(page.rows),
+            None => merged = Some(page),
+        }
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    let mut page = merged.expect("最低1ページは返る");
+    // 全ページを辿り終えたので、切れ残りは無い。
+    page.next_cursor = None;
+
+    // 読み終えた行数が、read model が数えた総行数と一致すること。
+    // **ページングの辿り漏れをここで検出する**——黙って短い元帳が出ると、
+    // 印刷した人は気づけない。
+    let collected = page.rows.len() as u64;
+    if collected != page.total_lines {
+        return Err(format!(
+            "元帳の行を取りこぼしました（科目 {}）: 読めたのは {collected} 行ですが、             この期間の明細は {} 行あります",
+            account.as_str(),
+            page.total_lines
+        ));
+    }
+    Ok(page)
 }
 
 /// 期首残高が落ちている疑いの注記（`get_statements` と同じ判定）。
