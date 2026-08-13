@@ -39,6 +39,11 @@ use std::path::{Path, PathBuf};
 /// 「何円を適用したか」と「要件は判定していない」ことを画面に出す。
 const DEFAULT_BLUE_RETURN_DEDUCTION: i128 = 650_000;
 
+/// 検査の「疑い」を画面に出す件数の上限。
+///
+/// 正当な重複は普通にあるので、全部並べると本当の不整合が埋もれる。
+const SUSPICIONS_TO_SHOW: usize = 5;
+
 const USAGE: &str = "\
 kaikei — 帳簿を CSV と印刷用 HTML で書き出します
 
@@ -251,13 +256,32 @@ async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
     .map_err(|error: kaikei_app::error::AppError| format!("検査できませんでした: {error}"))?;
 
     println!("検査した仕訳: {} 件", output.entry_count);
+
+    // 疑いは不整合と分けて出す。**混ぜると本当の不整合が埋もれる。**
+    // 正当な重複（同じ日に同額の交通費など）は普通にあるので、疑いの件数は
+    // 多くなりうる。全部並べず、件数と先頭だけ出す。
+    let suspicions: Vec<_> = output.suspicions().collect();
+    if !suspicions.is_empty() {
+        println!("確認する価値のある点が {} 件あります:", suspicions.len());
+        for finding in suspicions.iter().take(SUSPICIONS_TO_SHOW) {
+            println!("  [{}] {}", finding.kind.as_code(), finding.detail);
+        }
+        if suspicions.len() > SUSPICIONS_TO_SHOW {
+            println!(
+                "  （ほか {} 件。いずれも誤りとは限りません）",
+                suspicions.len() - SUSPICIONS_TO_SHOW
+            );
+        }
+    }
+
     if output.is_clean() {
         println!("不整合は見つかりませんでした");
         return Ok(Vec::new());
     }
 
-    eprintln!("不整合が {} 件見つかりました:", output.findings.len());
-    for finding in &output.findings {
+    let inconsistencies: Vec<_> = output.inconsistencies().collect();
+    eprintln!("不整合が {} 件見つかりました:", inconsistencies.len());
+    for finding in inconsistencies {
         eprintln!("  [{}] {}", finding.kind.as_code(), finding.detail);
     }
     Err(String::new())

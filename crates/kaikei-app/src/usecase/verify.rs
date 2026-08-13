@@ -64,6 +64,12 @@ pub enum FindingKind {
     DanglingReversal,
     /// 同じ仕訳番号が複数の仕訳に付いている。
     DuplicateEntryNumber,
+    /// 取引日・摘要・明細がまったく同じ仕訳が複数ある（二重計上の疑い）。
+    ///
+    /// **誤りとは言わない。** 同じ日に同額の交通費が2件ある、といった正当な
+    /// 重複は普通にある。一方で、同じ取引を2回取り込むと帳簿が静かに膨らみ、
+    /// 決算まで気づけない。疑いとして知らせ、判断は人間に返す。
+    SuspectedDuplicate,
 }
 
 impl FindingKind {
@@ -74,7 +80,18 @@ impl FindingKind {
             FindingKind::AccountSetMismatch => "account_set_mismatch",
             FindingKind::DanglingReversal => "dangling_reversal",
             FindingKind::DuplicateEntryNumber => "duplicate_entry_number",
+            FindingKind::SuspectedDuplicate => "suspected_duplicate",
         }
+    }
+
+    /// 「誤り」ではなく「確認する価値がある」だけの種別か。
+    ///
+    /// **この区別が無いと検査が使い物にならない。** 正当な重複（同じ日に
+    /// 同額の交通費が2件、など）は普通にあるので、疑いを不整合と同じ扱いに
+    /// すると、正しい帳簿でも検査が失敗する。失敗が当たり前になると、
+    /// 本当の不整合を見落とす。
+    pub fn is_suspicion(&self) -> bool {
+        matches!(self, FindingKind::SuspectedDuplicate)
     }
 }
 
@@ -93,7 +110,23 @@ pub struct VerifyOutput {
 impl VerifyOutput {
     /// 不整合が1件も無いか。
     pub fn is_clean(&self) -> bool {
-        self.findings.is_empty()
+        self.findings
+            .iter()
+            .all(|finding| finding.kind.is_suspicion())
+    }
+
+    /// 定かな不整合（帳簿が内部で食い違っているもの）。
+    pub fn inconsistencies(&self) -> impl Iterator<Item = &Finding> {
+        self.findings
+            .iter()
+            .filter(|finding| !finding.kind.is_suspicion())
+    }
+
+    /// 疑い（誤りとは限らないが、確認する価値があるもの）。
+    pub fn suspicions(&self) -> impl Iterator<Item = &Finding> {
+        self.findings
+            .iter()
+            .filter(|finding| finding.kind.is_suspicion())
     }
 }
 
@@ -126,6 +159,7 @@ where
     // 1. 赤伝の参照先と仕訳番号の重複（帳簿の内部で閉じた検査）。
     findings.extend(check_reversals(&entries));
     findings.extend(check_entry_numbers(&entries));
+    findings.extend(check_suspected_duplicates(&entries));
 
     // 2. ★2つの経路で計算した試算表を突き合わせる★
     let domain = TrialBalance::from_entries(entries.iter(), &chart, tag_schema, &[])?;
@@ -198,6 +232,81 @@ fn check_entry_numbers(entries: &[kaikei_core::JournalEntry]) -> Vec<Finding> {
                 "仕訳番号 {number} が {count} 件の仕訳に付いています。\
                  会計年度ごとに一意であるべき番号です"
             ),
+        })
+        .collect()
+}
+
+/// 二重計上の疑いを拾う。
+///
+/// 取引日・摘要・明細（科目・貸借・金額）がまったく同じ仕訳が複数あれば、
+/// 同じ取引を2回入れた疑いがある。**外部データを繰り返し取り込む運用では
+/// 実際に起きる**（この帳簿でも一度起きた）。
+///
+/// # 誤りとは言わない
+///
+/// 同じ日に同額の交通費が2件、といった正当な重複はある。**断定すると、
+/// 正しい帳簿に「誤り」と言うことになる。** 疑いとして件数と内容を出し、
+/// 判断は人間に返す。
+///
+/// # 赤伝とその原仕訳は重複ではない
+///
+/// 逆仕訳は貸借が逆なので明細の並びが一致せず、この検査には引っかからない。
+/// 念のため、訂正（`is_reversal`）は比較から外す。
+fn check_suspected_duplicates(entries: &[kaikei_core::JournalEntry]) -> Vec<Finding> {
+    // 明細は並び順が違っても同じ仕訳なので、揃えてから比べる。
+    let fingerprint = |entry: &kaikei_core::JournalEntry| {
+        let mut lines: Vec<String> = entry
+            .lines()
+            .iter()
+            .map(|line| {
+                format!(
+                    "{}/{:?}/{}",
+                    line.account().as_str(),
+                    line.side(),
+                    line.amount().minor()
+                )
+            })
+            .collect();
+        lines.sort_unstable();
+        format!(
+            "{}|{}|{}",
+            entry.entry_date().to_iso_string(),
+            entry.description(),
+            lines.join(",")
+        )
+    };
+
+    let mut seen: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for entry in entries.iter().filter(|entry| !entry.is_reversal()) {
+        seen.entry(fingerprint(entry))
+            .or_default()
+            .push(entry.entry_no().as_u32());
+    }
+
+    seen.into_iter()
+        .filter(|(_, numbers)| numbers.len() > 1)
+        .map(|(key, numbers)| {
+            let date = key.split('|').next().unwrap_or("");
+            let description = key.split('|').nth(1).unwrap_or("");
+            Finding {
+                kind: FindingKind::SuspectedDuplicate,
+                detail: format!(
+                    concat!(
+                        "取引日・摘要・明細が同じ仕訳が {} 件あります",
+                        "（{}「{}」/ 仕訳番号 {}）。",
+                        "同じ取引を2回入れていないか確認してください。",
+                        "正当な重複であればそのままで構いません"
+                    ),
+                    numbers.len(),
+                    date,
+                    description,
+                    numbers
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
         })
         .collect()
 }
@@ -486,15 +595,178 @@ mod tests {
     }
 
     // 種別の機械可読名が重複しない（応答で使う語彙）。
+    /// 摘要と日付を指定して仕訳を作る（重複の検査に使う）。
+    fn entry_on(
+        id: u128,
+        no: u32,
+        day: u8,
+        description: &str,
+        lines: Vec<JournalLine>,
+    ) -> JournalEntry {
+        JournalEntry::new(
+            NewEntry {
+                id: EntryId::new(id),
+                entry_no: EntryNumber::new(no),
+                entry_date: AccountingDate::new(2026, 6, day).unwrap(),
+                description: description.to_string(),
+                lines,
+                document_refs: Vec::new(),
+            },
+            &FiscalYear::calendar_year(2026),
+            &sample_chart_with_tax_account(),
+            &TagSchema::empty(),
+            &AllOpen,
+            &fixed_clock(),
+        )
+        .unwrap()
+    }
+
+    fn pair(amount: i128) -> Vec<JournalLine> {
+        vec![
+            line("100", Side::Debit, amount),
+            line("500", Side::Credit, amount),
+        ]
+    }
+
+    // **本命。** 同じ取引を2回入れたら疑いとして知らせる。
+    //
+    // この帳簿で実際に起きた（外部データを取り込む前に手で入れた仕訳が、
+    // 取り込んだ分と重複した）。金額も貸借も正しいので、残高の突き合わせ
+    // では見つからない。
+    #[test]
+    fn the_same_transaction_entered_twice_is_reported_as_suspected() {
+        let entries = vec![
+            entry_on(1, 1, 15, "ビーテック 5月分 請求", pair(550_000)),
+            entry_on(2, 2, 15, "ビーテック 5月分 請求", pair(550_000)),
+        ];
+
+        let findings = check_suspected_duplicates(&entries);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, FindingKind::SuspectedDuplicate);
+        assert!(
+            findings[0].detail.contains("2 件"),
+            "{}",
+            findings[0].detail
+        );
+        assert!(
+            findings[0].detail.contains("1, 2"),
+            "どの仕訳かを言うこと: {}",
+            findings[0].detail
+        );
+        // **誤りと断定しない。** 正当な重複もある。
+        assert!(
+            findings[0]
+                .detail
+                .contains("正当な重複であればそのままで構いません"),
+            "{}",
+            findings[0].detail
+        );
+    }
+
+    // 日付・摘要・金額のどれかが違えば疑わない。
+    #[test]
+    fn entries_that_differ_are_not_suspected() {
+        let entries = vec![
+            entry_on(1, 1, 15, "A", pair(1_000)),
+            entry_on(2, 2, 16, "A", pair(1_000)), // 日付が違う
+            entry_on(3, 3, 15, "B", pair(1_000)), // 摘要が違う
+            entry_on(4, 4, 15, "A", pair(2_000)), // 金額が違う
+        ];
+
+        assert!(check_suspected_duplicates(&entries).is_empty());
+    }
+
+    // 明細の並び順が違うだけなら同じ仕訳として扱う（並べてから比べる）。
+    #[test]
+    fn the_order_of_lines_does_not_hide_a_duplicate() {
+        let entries = vec![
+            entry_on(
+                1,
+                1,
+                15,
+                "A",
+                vec![
+                    line("100", Side::Debit, 1_000),
+                    line("500", Side::Credit, 1_000),
+                ],
+            ),
+            entry_on(
+                2,
+                2,
+                15,
+                "A",
+                vec![
+                    line("500", Side::Credit, 1_000),
+                    line("100", Side::Debit, 1_000),
+                ],
+            ),
+        ];
+
+        assert_eq!(check_suspected_duplicates(&entries).len(), 1);
+    }
+
+    // **疑いだけなら検査は失敗しない。** 正当な重複がある帳簿で検査が
+    // 落ちるようになると、失敗が当たり前になって本当の不整合を見落とす。
+    #[test]
+    fn suspicions_alone_do_not_make_the_check_fail() {
+        let output = VerifyOutput {
+            entry_count: 2,
+            findings: vec![Finding {
+                kind: FindingKind::SuspectedDuplicate,
+                detail: "同じ日に同額の交通費".to_string(),
+            }],
+        };
+
+        assert!(output.is_clean(), "疑いだけなら不整合とはしない");
+        assert_eq!(output.suspicions().count(), 1);
+        assert_eq!(output.inconsistencies().count(), 0);
+    }
+
+    // 定かな不整合が1件でもあれば失敗する。
+    #[test]
+    fn a_real_inconsistency_makes_the_check_fail() {
+        let output = VerifyOutput {
+            entry_count: 2,
+            findings: vec![
+                Finding {
+                    kind: FindingKind::SuspectedDuplicate,
+                    detail: "疑い".to_string(),
+                },
+                Finding {
+                    kind: FindingKind::DuplicateEntryNumber,
+                    detail: "仕訳番号の重複".to_string(),
+                },
+            ],
+        };
+
+        assert!(!output.is_clean());
+        assert_eq!(output.inconsistencies().count(), 1);
+    }
+
     #[test]
     fn finding_kinds_have_distinct_codes() {
+        // **種別を足したらここにも足す。** この一覧が網羅されていないと、
+        // 新しい種別のコードが他と重複していても気づけない。
         let kinds = [
             FindingKind::BalanceMismatch,
             FindingKind::AccountSetMismatch,
             FindingKind::DanglingReversal,
             FindingKind::DuplicateEntryNumber,
+            FindingKind::SuspectedDuplicate,
         ];
         let codes: BTreeSet<&str> = kinds.iter().map(FindingKind::as_code).collect();
-        assert_eq!(codes.len(), kinds.len());
+        assert_eq!(codes.len(), kinds.len(), "コードが重複している");
+
+        // 一覧が網羅されていることを、変換の全分岐で確かめる。**足し忘れると
+        // 上の重複検査がすり抜ける。**
+        for kind in &kinds {
+            assert!(!kind.as_code().is_empty());
+        }
+        assert_eq!(
+            kinds.len(),
+            5,
+            "FindingKind に種別を足したら、この一覧と件数も更新すること"
+        );
     }
 }
