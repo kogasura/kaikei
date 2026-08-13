@@ -1128,7 +1128,7 @@ Phase 2 の E2E が手作業で組み立てている提案と一致すること�
 | 弥生インポート形式 CSV | 未着手（`ROADMAP.md` で優先度最高） |
 | 全件 JSON エクスポート / `export_for_audit` | 未着手 |
 | `kaikei verify` | 未着手。canonical JSON の定義が `close_period` と共通 |
-| `kaikei-report` crate | 未作成。出力形式と出力の口（MCP / CLI）の選択が先 |
+| `kaikei-report` crate | 未作成。**設計案は `docs/10-report.md`**（2026-08-13）。実装前に人間のレビューを受ける。判断が要る点は同 §7 に6件 |
 
 ### 税理士に確認すべき事項
 
