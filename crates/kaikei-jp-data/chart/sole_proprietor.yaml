@@ -47,6 +47,9 @@ accounts:
   - { code: "500", name: "売上高",       type: Revenue, sort: 500 }
   - { code: "510", name: "家事消費等",   type: Revenue, sort: 510 }
   - { code: "520", name: "雑収入",       type: Revenue, sort: 520 }
+  # 預金利息は事業用口座でも発生する。雑収入に混ぜると、利子所得との
+  # 区別（源泉徴収済みかどうか）が帳簿から読めなくなる。
+  - { code: "530", name: "受取利息",     type: Revenue, sort: 530 }
 
   # ===== 売上原価 =====
   - { code: "550", name: "期首商品棚卸高", type: Expense, sort: 550 }
@@ -76,4 +79,7 @@ accounts:
   - { code: "622", name: "研修費",       type: Expense, sort: 622 }
   - { code: "623", name: "会議費",       type: Expense, sort: 623 }
   - { code: "624", name: "車両費",       type: Expense, sort: 624 }
+  # 同業者団体・商工会などの会費。雑費に入れると、決算書で内訳が
+  # 見えなくなる（金額が続くと税務調査で内訳を問われる科目である）。
+  - { code: "625", name: "諸会費",       type: Expense, sort: 625 }
   - { code: "690", name: "雑費",         type: Expense, sort: 690 }
