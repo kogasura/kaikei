@@ -153,6 +153,20 @@ jobs:
           fi
           echo "OK"
 
+      - name: kaikei-cli は kaikei-mcp に依存しない
+        run: |
+          set -euo pipefail
+          DEPS=$(cargo tree -p kaikei-cli --edges normal --prefix none                  | sed 's/ v[0-9].*//'                  | sort -u)
+          if echo "$DEPS" | grep -qx "kaikei-mcp"; then
+            echo "::error::kaikei-cli が kaikei-mcp に依存しています"
+            echo ""
+            echo "どちらも合成ルートであり、並列に置く層です（docs/10-report.md §3）。"
+            echo "片方がもう片方を知ると、CLI を動かすのに MCP サーバーの"
+            echo "設定（税区分・決算科目）まで要求されることになります。"
+            exit 1
+          fi
+          echo "OK"
+
       - name: kaikei-jp-data は依存ゼロを保つ
         run: |
           set -euo pipefail

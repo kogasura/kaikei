@@ -754,6 +754,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaikei-cli"
+version = "0.0.1"
+dependencies = [
+ "kaikei-app",
+ "kaikei-core",
+ "kaikei-jp",
+ "kaikei-jp-data",
+ "kaikei-report",
+ "kaikei-store",
+ "tokio",
+]
+
+[[package]]
 name = "kaikei-core"
 version = "0.0.1"
 dependencies = [

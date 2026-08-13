@@ -1,0 +1,32 @@
+# crates/kaikei-cli/Cargo.toml
+#
+# 帳簿をファイルとして書き出す CLI（Phase 5。docs/10-report.md §4）。
+#
+# ★ この crate は合成ルートである ★
+# kaikei-store（DB）と kaikei-jp（様式）の両方を知ってよい唯一の層が
+# kaikei-mcp とここである。逆に kaikei-report は I/O を持たず、
+# 「データ → 文字列」に徹する（architecture.yml が検査する）。
+#
+# 引数のパースにライブラリを使わない。サブコマンド1つと引数2つで足り、
+# エラー文言は CLAUDE.md §11（次の手が分かる）に合わせて自分で書きたい。
+
+[package]
+name = "kaikei-cli"
+version = "0.0.1"
+description = "帳簿を CSV / 印刷用 HTML として書き出す CLI"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kaikei"
+path = "src/main.rs"
+
+[dependencies]
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
+kaikei-store = { path = "../kaikei-store", version = "0.0.1" }
+kaikei-jp = { path = "../kaikei-jp", version = "0.0.1" }
+kaikei-jp-data = { path = "../kaikei-jp-data", version = "0.0.1" }
+kaikei-report = { path = "../kaikei-report", version = "0.0.1" }
+tokio = { workspace = true }
