@@ -30,3 +30,4 @@ pub mod journal_book;
 pub mod ledger;
 pub mod statement;
 pub mod trial_balance;
+pub mod yayoi;
