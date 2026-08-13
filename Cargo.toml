@@ -18,11 +18,13 @@ members = [
     # rust-version だけは workspace 既定（1.80）を継承せず個別宣言している
     # （rmcp の MSRV。DECISIONS.md D-071 / D-078）。
     "crates/kaikei-mcp",
+    # Phase 5: 帳簿の出力（CSV / 印刷用 HTML）。I/O を持たない
+    # （docs/10-report.md §3。architecture.yml が sqlx/tokio 非依存を検査する）。
+    "crates/kaikei-report",
     # Phase 1 以降で追加
     # "crates/kaikei-blob",
     # "crates/kaikei-import",
     # "crates/kaikei-import-data",
-    # "crates/kaikei-report",
     # "crates/kaikei-api",
 ]
 

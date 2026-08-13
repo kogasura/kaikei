@@ -822,6 +822,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaikei-report"
+version = "0.0.1"
+dependencies = [
+ "kaikei-app",
+ "kaikei-core",
+ "kaikei-policy",
+]
+
+[[package]]
 name = "kaikei-store"
 version = "0.0.1"
 dependencies = [

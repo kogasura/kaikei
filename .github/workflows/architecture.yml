@@ -131,6 +131,28 @@ jobs:
           fi
           echo "OK"
 
+      - name: kaikei-report は I/O を持たない
+        run: |
+          set -euo pipefail
+          FORBIDDEN="sqlx tokio kaikei-store kaikei-import kaikei-mcp"
+          DEPS=$(cargo tree -p kaikei-report --edges normal --prefix none                  | sed 's/ v[0-9].*//'                  | sort -u)
+          FAIL=0
+          for f in $FORBIDDEN; do
+            if echo "$DEPS" | grep -qx "$f"; then
+              echo "::error::kaikei-report が I/O 層に依存しています: $f"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo ""
+            echo "kaikei-report は「データ → 文字列」の変換に徹する層です"
+            echo "（docs/10-report.md §3）。DB から取ってくるのは呼び出し側"
+            echo "（CLI バイナリ・kaikei-mcp）の仕事であり、この crate が"
+            echo "I/O を知ると、出力のテストに DB が要るようになります。"
+            exit 1
+          fi
+          echo "OK"
+
       - name: kaikei-jp-data は依存ゼロを保つ
         run: |
           set -euo pipefail

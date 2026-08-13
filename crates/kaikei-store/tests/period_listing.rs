@@ -394,7 +394,7 @@ async fn ordering_across_fiscal_years_is_by_date_first(
     // 2026年の末尾に大きい番号、2027年の先頭に小さい番号を置く。
     // 日付順なら 2026-12-31(no=99) → 2027-01-01(no=1)。
     // 番号順に並べると逆転する。
-    let entries = vec![
+    let entries = [
         build_entry(
             101,
             99,
