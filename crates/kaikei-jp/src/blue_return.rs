@@ -366,18 +366,43 @@ mod tests {
         assert!(!unmapped.iter().any(|code| code.as_str() == "530"));
     }
 
-    // BR-4: 空欄は様式どおり6行ある（一般用の経費 ㉕〜㉚）。
+    // BR-4: 空欄の位置が様式どおりであること。
+    //
+    // 経費の空欄は ㉕〜㉚ の6行（利用者が科目名を書き込む行）。各種引当金・
+    // 準備金等にも空欄があり（㉟㊱ と ㊵㊶）、こちらは繰戻額等・繰入額等の
+    // 計が参照するため欄として実在させている。
     #[test]
-    fn the_form_has_the_six_blank_expense_rows_of_the_official_layout() {
+    fn the_blank_rows_are_where_the_official_layout_puts_them() {
         let form = embedded_form();
 
         let blanks: Vec<u32> = form.blank_fields().map(|field| field.no).collect();
 
         assert_eq!(
             blanks,
-            vec![25, 26, 27, 28, 29, 30],
-            "様式（令和7年分・一般用）の空欄は ㉕〜㉚ の6行"
+            vec![25, 26, 27, 28, 29, 30, 35, 36, 40, 41],
+            "様式（令和7年分・一般用）の空欄は 経費 ㉕〜㉚ と 引当金 ㉟㊱・㊵㊶"
         );
+    }
+
+    // BR-4b: 計の欄が参照する欄はすべて実在すること。
+    //
+    // ㊲ は sum(34..36)、㊷ は sum(38..41) を集計する。参照先の欄を YAML に
+    // 書き忘れると、**欠けた欄が黙って 0 として集計される**。金額が合わない
+    // ことに決算まで気づけないので、参照の範囲が埋まっていることを固定する。
+    #[test]
+    fn every_field_referenced_by_a_total_actually_exists() {
+        let form = embedded_form();
+        let present: BTreeSet<u32> = form.fields().iter().map(|field| field.no).collect();
+
+        for range in [34..=36, 38..=41, 8..=31] {
+            for no in range {
+                assert!(
+                    present.contains(&no),
+                    "計が参照する欄 {no} が当てはめ表にありません。\
+                     欄が無いと、その欄は集計で黙って 0 になります"
+                );
+            }
+        }
     }
 
     // BR-5: 欄番号の重複は拒否する（どちらの金額が載るか決められない）。
