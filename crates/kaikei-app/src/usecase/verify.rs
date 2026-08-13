@@ -322,7 +322,7 @@ mod tests {
     // VF-1: 同じ仕訳番号が2件あれば報告する。
     #[test]
     fn duplicate_entry_numbers_are_reported() {
-        let entries = vec![balanced(1, 7, 1_000), balanced(2, 7, 2_000)];
+        let entries = [balanced(1, 7, 1_000), balanced(2, 7, 2_000)];
 
         let findings = check_entry_numbers(&entries);
 
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn distinct_entry_numbers_are_clean() {
-        let entries = vec![balanced(1, 1, 1_000), balanced(2, 2, 2_000)];
+        let entries = [balanced(1, 1, 1_000), balanced(2, 2, 2_000)];
         assert!(check_entry_numbers(&entries).is_empty());
     }
 
@@ -357,7 +357,7 @@ mod tests {
             .unwrap();
 
         // 原仕訳を含めなければ、赤伝の参照先が見つからない。
-        let findings = check_reversals(&[reversal.clone()]);
+        let findings = check_reversals(std::slice::from_ref(&reversal));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, FindingKind::DanglingReversal);
         assert!(
@@ -373,7 +373,7 @@ mod tests {
     // VF-3: ★本命★ 2つの経路の残高が食い違えば報告する。
     #[test]
     fn a_balance_mismatch_between_the_two_paths_is_reported_with_both_values() {
-        let entries = vec![balanced(1, 1, 110_000)];
+        let entries = [balanced(1, 1, 110_000)];
         let chart = sample_chart_with_tax_account();
         let domain =
             TrialBalance::from_entries(entries.iter(), &chart, &TagSchema::empty(), &[]).unwrap();
@@ -422,7 +422,7 @@ mod tests {
     // VF-4: 片方にしか現れない科目も報告する。
     #[test]
     fn an_account_present_in_only_one_path_is_reported() {
-        let entries = vec![balanced(1, 1, 1_000)];
+        let entries = [balanced(1, 1, 1_000)];
         let chart = sample_chart_with_tax_account();
         let domain =
             TrialBalance::from_entries(entries.iter(), &chart, &TagSchema::empty(), &[]).unwrap();
@@ -455,7 +455,7 @@ mod tests {
     // 一致していれば何も報告しない。
     #[test]
     fn matching_paths_produce_no_findings() {
-        let entries = vec![balanced(1, 1, 1_000)];
+        let entries = [balanced(1, 1, 1_000)];
         let chart = sample_chart_with_tax_account();
         let domain =
             TrialBalance::from_entries(entries.iter(), &chart, &TagSchema::empty(), &[]).unwrap();
