@@ -63,6 +63,16 @@ pub const CHART_SOLE_PROPRIETOR: EmbeddedYaml = EmbeddedYaml {
     source: include_str!("../chart/sole_proprietor.yaml"),
 };
 
+/// 青色申告決算書（一般用）への当てはめ表（損益計算書）。
+///
+/// **どの勘定科目をどの欄に足すか**だけを定める。決算書の帳票そのものは
+/// 作らない（`docs/10-report.md` §5）。この表に出てこない科目は、どの欄にも
+/// 足さず一覧して知らせる——黙って雑費へ寄せると決算書の内訳が変わる。
+pub const STATEMENT_BLUE_RETURN_GENERAL: EmbeddedYaml = EmbeddedYaml {
+    label: "kaikei-jp-data/statement/blue_return_general.yaml",
+    source: include_str!("../statement/blue_return_general.yaml"),
+};
+
 /// 埋め込み済みの消費税区分マスタ**全件**。
 ///
 /// 適用期間（各 YAML の `applies_from` / `applies_to`）による選択は

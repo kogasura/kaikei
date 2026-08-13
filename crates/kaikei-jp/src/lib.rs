@@ -99,6 +99,7 @@
 // 読み手向けの解説順（土台 → その上に乗るもの）は上の「モジュール構成」に譲り、
 // ここでは fmt に任せる。
 mod account_type;
+pub mod blue_return;
 pub mod chart;
 pub mod closing;
 pub mod compose;
