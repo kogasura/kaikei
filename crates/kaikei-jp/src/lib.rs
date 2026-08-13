@@ -114,3 +114,4 @@ pub mod tax;
 #[cfg(test)]
 mod test_support;
 pub mod yaml;
+pub mod yayoi;
