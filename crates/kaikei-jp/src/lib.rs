@@ -100,6 +100,7 @@
 // ここでは fmt に任せる。
 mod account_type;
 pub mod blue_return;
+pub mod blue_return_bs;
 pub mod blue_return_fill;
 pub mod chart;
 pub mod closing;

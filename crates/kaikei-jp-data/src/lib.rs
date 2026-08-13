@@ -73,6 +73,16 @@ pub const STATEMENT_BLUE_RETURN_GENERAL: EmbeddedYaml = EmbeddedYaml {
     source: include_str!("../statement/blue_return_general.yaml"),
 };
 
+/// 青色申告決算書（一般用）への当てはめ表（貸借対照表）。
+///
+/// 損益計算書側（[`STATEMENT_BLUE_RETURN_GENERAL`]）と違い、様式に丸番号が
+/// 無く「期首」「期末」の2列を持つ。行の並びが意味を持つので、印字順を
+/// そのまま保つ。
+pub const STATEMENT_BLUE_RETURN_GENERAL_BS: EmbeddedYaml = EmbeddedYaml {
+    label: "kaikei-jp-data/statement/blue_return_general_bs.yaml",
+    source: include_str!("../statement/blue_return_general_bs.yaml"),
+};
+
 /// 埋め込み済みの消費税区分マスタ**全件**。
 ///
 /// 適用期間（各 YAML の `applies_from` / `applies_to`）による選択は
