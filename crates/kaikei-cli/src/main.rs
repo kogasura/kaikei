@@ -23,6 +23,7 @@ use kaikei_app::tx::with_tx_err;
 use kaikei_app::usecase::ledger::{self, LedgerInput, MAX_LIMIT};
 use kaikei_app::usecase::report::{self, ReportInput};
 use kaikei_app::usecase::statements::{self, StatementsInput};
+use kaikei_app::usecase::verify::{self, VerifyInput};
 use kaikei_app::view::LedgerPageView;
 use kaikei_core::{AccountingDate, FiscalYear};
 use kaikei_jp::statement::JpStatementPolicy;
@@ -36,10 +37,14 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
 
 使い方:
     kaikei report --year <西暦> --out <出力先ディレクトリ>
+    kaikei verify --year <西暦>
+
+report は帳簿をファイルに書き出します。
+verify は帳簿の整合性を検査します（書き出しません）。
 
 引数:
     --year <西暦>    会計年度（暦年）。例: 2026
-    --out <パス>     出力先のディレクトリ。無ければ作ります
+    --out <パス>     出力先のディレクトリ。無ければ作ります（report のみ）
 
 書き出すもの（それぞれ .csv と .html）:
     journal_book      仕訳日記帳（1行1明細。取り消された仕訳も含みます）
@@ -53,7 +58,12 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     KAIKEI_BOOK_CURRENCY      帳簿通貨（例: JPY）
     KAIKEI_FISCAL_YEAR_RULE   会計年度の区切り（現在は calendar_year のみ）
 
-記帳はしません。読み取りだけなので、税区分や決算科目の設定は要りません。
+verify が見るもの:
+    同じ帳簿を2つの経路（仕訳からの集計と SQL 集計）で計算し、
+    残高が一致するかを突き合わせます。あわせて赤伝の訂正元と
+    仕訳番号の重複を確認します。
+
+どちらも記帳はしません。読み取りだけなので、税区分や決算科目の設定は要りません。
 ";
 
 fn main() -> std::process::ExitCode {
@@ -73,20 +83,28 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<Vec<PathBuf>, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let options = parse_args(&args)?;
+    let command = parse_args(&args)?;
 
     // 同期の `main` から非同期の本体を回す。CLI は1回走って終わるので、
     // ランタイムをここで作って捨てる。
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| format!("非同期ランタイムを作れませんでした: {error}"))?;
-    runtime.block_on(write_reports(options))
+    match command {
+        Command::Report {
+            fiscal_year,
+            out_dir,
+        } => runtime.block_on(write_reports(fiscal_year, out_dir)),
+        Command::Verify { fiscal_year } => runtime.block_on(run_verify(fiscal_year)),
+    }
 }
 
 /// 解析済みの引数。
 #[derive(Debug)]
-struct Options {
-    fiscal_year: i32,
-    out_dir: PathBuf,
+enum Command {
+    /// 帳簿をファイルに書き出す。
+    Report { fiscal_year: i32, out_dir: PathBuf },
+    /// 帳簿の整合性を検査する（書き出さない）。
+    Verify { fiscal_year: i32 },
 }
 
 /// 引数を解析する。
@@ -94,12 +112,13 @@ struct Options {
 /// **未知の引数を黙って無視しない。** `--yea 2026` のような打ち間違いを
 /// 受理すると、既定の年度で出力が作られて「なぜか去年の帳簿が出た」に
 /// なる（`CLAUDE.md` §11）。
-fn parse_args(args: &[String]) -> Result<Options, String> {
+fn parse_args(args: &[String]) -> Result<Command, String> {
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         return Err(USAGE.to_string());
     }
-    if args[0] != "report" {
-        return Err(format!("不明なサブコマンドです: {}\n\n{USAGE}", args[0]));
+    let subcommand = args[0].as_str();
+    if subcommand != "report" && subcommand != "verify" {
+        return Err(format!("不明なサブコマンドです: {subcommand}\n\n{USAGE}"));
     }
 
     let mut fiscal_year: Option<i32> = None;
@@ -127,10 +146,59 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         }
     }
 
-    Ok(Options {
-        fiscal_year: fiscal_year.ok_or("--year を指定してください（例: --year 2026）")?,
-        out_dir: out_dir.ok_or("--out を指定してください（例: --out ./out）")?,
+    let fiscal_year = fiscal_year.ok_or("--year を指定してください（例: --year 2026）")?;
+    match subcommand {
+        "report" => Ok(Command::Report {
+            fiscal_year,
+            out_dir: out_dir.ok_or("--out を指定してください（例: --out ./out）")?,
+        }),
+        // verify は書き出さないので --out を受け取らない。**黙って無視しない**
+        // ——「出力先を指定したのに何も出なかった」と読まれる。
+        _ => match out_dir {
+            Some(_) => Err("verify は書き出さないので --out は指定できません".to_string()),
+            None => Ok(Command::Verify { fiscal_year }),
+        },
+    }
+}
+
+/// 帳簿を検査して結果を表示する。
+///
+/// **不整合が見つかったら終了コードを 1 にする。** 「検査が走った」ことと
+/// 「異常が無かった」ことは別で、シェルから使うときに区別できる必要がある。
+async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let catalog = TagCatalog::from_embedded(kaikei_jp_data::TAGS)
+        .map_err(|error| format!("同梱のタグ定義を読めませんでした: {error}"))?;
+
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool.clone());
+
+    let schema = catalog.schema().clone();
+    let output = with_tx_err(&store, move |tx| {
+        let schema = schema.clone();
+        // read model のクエリはクロージャの中で作る。外で作った参照を
+        // 持ち込むと、`with_tx_err` が要求する 'static を満たせない。
+        let query = PgTrialBalanceQuery::new(pool.clone());
+        Box::pin(
+            async move { verify::execute(tx, &query, &schema, VerifyInput { fiscal_year }).await },
+        )
     })
+    .await
+    .map_err(|error: kaikei_app::error::AppError| format!("検査できませんでした: {error}"))?;
+
+    println!("検査した仕訳: {} 件", output.entry_count);
+    if output.is_clean() {
+        println!("不整合は見つかりませんでした");
+        return Ok(Vec::new());
+    }
+
+    eprintln!("不整合が {} 件見つかりました:", output.findings.len());
+    for finding in &output.findings {
+        eprintln!("  [{}] {}", finding.kind.as_code(), finding.detail);
+    }
+    Err(String::new())
 }
 
 /// 環境変数を1つ読む。**未設定は既定値で埋めない。**
@@ -139,7 +207,7 @@ fn env_var(name: &str) -> Result<String, String> {
         .map_err(|_| format!("環境変数 {name} が未設定です（.env.example を参照してください）"))
 }
 
-async fn write_reports(options: Options) -> Result<Vec<PathBuf>, String> {
+async fn write_reports(fiscal_year_label: i32, out_dir: PathBuf) -> Result<Vec<PathBuf>, String> {
     let database_url = env_var("APP_DATABASE_URL")?;
     let currency_code = env_var("KAIKEI_BOOK_CURRENCY")?;
     let fiscal_year_rule = env_var("KAIKEI_FISCAL_YEAR_RULE")?;
@@ -157,7 +225,7 @@ async fn write_reports(options: Options) -> Result<Vec<PathBuf>, String> {
         book_currency,
     };
 
-    let fiscal_year = FiscalYear::calendar_year(options.fiscal_year);
+    let fiscal_year = FiscalYear::calendar_year(fiscal_year_label);
     let from = fiscal_year.start();
     let to = fiscal_year.end();
     let period_label = format!("{} 〜 {}", from.to_iso_string(), to.to_iso_string());
@@ -217,40 +285,36 @@ async fn write_reports(options: Options) -> Result<Vec<PathBuf>, String> {
     // （画面で見た人と印刷した人が違うものを見ないように）。
     let notes = opening_balance_notes(&statements, from);
 
-    std::fs::create_dir_all(&options.out_dir).map_err(|error| {
-        format!(
-            "出力先を作れませんでした: {}（{error}）",
-            options.out_dir.display()
-        )
-    })?;
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|error| format!("出力先を作れませんでした: {}（{error}）", out_dir.display()))?;
 
     let mut written = Vec::new();
     written.extend(write_pair(
-        &options.out_dir,
+        &out_dir,
         "journal_book",
         &kaikei_report::journal_book::to_csv(&entries, &chart),
         &kaikei_report::journal_book::to_html(&entries, &chart, &period_label, &[]),
     )?);
     written.extend(write_pair(
-        &options.out_dir,
+        &out_dir,
         "general_ledger",
         &kaikei_report::ledger::to_csv(&ledger_pages),
         &kaikei_report::ledger::to_html(&ledger_pages, &period_label, &[]),
     )?);
     written.extend(write_pair(
-        &options.out_dir,
+        &out_dir,
         "trial_balance",
         &kaikei_report::trial_balance::to_csv(&trial_balance, &chart),
         &kaikei_report::trial_balance::to_html(&trial_balance, &chart, &period_label, &[]),
     )?);
     written.extend(write_pair(
-        &options.out_dir,
+        &out_dir,
         "balance_sheet",
         &kaikei_report::statement::to_csv(&statements.balance_sheet),
         &kaikei_report::statement::to_html(&statements.balance_sheet, &period_label, &notes),
     )?);
     written.extend(write_pair(
-        &options.out_dir,
+        &out_dir,
         "income_statement",
         &kaikei_report::statement::to_csv(&statements.income_statement),
         &kaikei_report::statement::to_html(&statements.income_statement, &period_label, &[]),
@@ -378,10 +442,35 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_complete_command() {
-        let options = parse_args(&args(&["report", "--year", "2026", "--out", "./out"])).unwrap();
-        assert_eq!(options.fiscal_year, 2026);
-        assert_eq!(options.out_dir, PathBuf::from("./out"));
+    fn parses_a_complete_report_command() {
+        let command = parse_args(&args(&["report", "--year", "2026", "--out", "./out"])).unwrap();
+        match command {
+            Command::Report {
+                fiscal_year,
+                out_dir,
+            } => {
+                assert_eq!(fiscal_year, 2026);
+                assert_eq!(out_dir, PathBuf::from("./out"));
+            }
+            other => panic!("report として解釈されるはず: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_verify_command() {
+        let command = parse_args(&args(&["verify", "--year", "2026"])).unwrap();
+        match command {
+            Command::Verify { fiscal_year } => assert_eq!(fiscal_year, 2026),
+            other => panic!("verify として解釈されるはず: {other:?}"),
+        }
+    }
+
+    // verify は書き出さないので --out を受け取らない。**黙って無視しない**
+    // ——「出力先を指定したのに何も出なかった」と読まれる。
+    #[test]
+    fn verify_rejects_an_out_directory_instead_of_ignoring_it() {
+        let error = parse_args(&args(&["verify", "--year", "2026", "--out", "./out"])).unwrap_err();
+        assert!(error.contains("--out"), "{error}");
     }
 
     // 打ち間違いを黙って無視しない。既定値で埋めると「なぜか違う年度の
