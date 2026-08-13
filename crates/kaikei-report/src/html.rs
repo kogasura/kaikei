@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 /// 摘要も勘定科目名も**利用者が自由に書く**欄で、`<` `>` `&` が入りうる。
 /// エスケープしないと表示が壊れる（帳簿としては「金額の隣の文字が消える」
 /// という形で現れ、印刷するまで気づかないことがある）。
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
