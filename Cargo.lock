@@ -772,6 +772,7 @@ dependencies = [
  "kaikei-jp-data",
  "kaikei-mcp",
  "kaikei-policy",
+ "kaikei-report",
  "kaikei-store",
  "serde_json",
  "sqlx",

@@ -157,22 +157,13 @@ fn main() {
         ],
         Currency::JPY,
     );
-    let tb_html = kaikei_report::trial_balance::to_html(
-        &trial,
-        &chart(),
-        "2026-01-01 〜 2026-12-31",
-        &notes,
-    );
+    let tb_html =
+        kaikei_report::trial_balance::to_html(&trial, &chart(), "2026-01-01 〜 2026-12-31", &notes);
     let tb_csv = kaikei_report::trial_balance::to_csv(&trial, &chart());
     write(&out, "trial_balance", &tb_html, &tb_csv);
 }
 
-fn balance_row(
-    code: &str,
-    account_type: AccountType,
-    debit: i128,
-    credit: i128,
-) -> BalanceRowView {
+fn balance_row(code: &str, account_type: AccountType, debit: i128, credit: i128) -> BalanceRowView {
     let balance = if account_type.is_debit_normal() {
         debit - credit
     } else {

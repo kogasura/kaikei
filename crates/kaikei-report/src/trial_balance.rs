@@ -186,7 +186,10 @@ mod tests {
         assert!(csv.contains("合計,110000,110000"), "{csv}");
         assert!(html.contains("<tfoot>"), "{html}");
         assert!(html.contains("<td class=\"total\">合計</td>"), "{html}");
-        assert!(html.contains("<td class=\"num total\">110000</td>"), "{html}");
+        assert!(
+            html.contains("<td class=\"num total\">110000</td>"),
+            "{html}"
+        );
     }
 
     // 帳簿に無い科目コードでも、名前欄を空にせず引けなかったことを示す。
@@ -211,7 +214,10 @@ mod tests {
         let html = to_html(&empty, &chart(), "2026-01-01 〜 2026-01-31", &[]);
 
         assert!(csv.contains("合計,0,0"), "{csv}");
-        assert!(html.contains("この期間に該当する記録はありません"), "{html}");
+        assert!(
+            html.contains("この期間に該当する記録はありません"),
+            "{html}"
+        );
         // 0 件でも合計行は出す（「合計が無い」と「合計が0」は違う）。
         assert!(html.contains("<tfoot>"), "{html}");
     }

@@ -25,4 +25,5 @@
 pub mod csv;
 pub mod html;
 pub mod journal_book;
+pub mod statement;
 pub mod trial_balance;

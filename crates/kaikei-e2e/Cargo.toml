@@ -19,6 +19,9 @@ publish = false
 kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
 kaikei-policy = { path = "../kaikei-policy", version = "0.0.1" }
 kaikei-jp = { path = "../kaikei-jp", version = "0.0.1" }
+# Phase 5: 帳簿の出力。実 DB から取ったデータが実際に CSV / HTML に
+# なるところまでを1本で確かめる（kaikei-report 自身のテストは DB を持たない）。
+kaikei-report = { path = "../kaikei-report", version = "0.0.1" }
 kaikei-jp-data = { path = "../kaikei-jp-data", version = "0.0.1" }
 kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
 kaikei-store = { path = "../kaikei-store", version = "0.0.1" }

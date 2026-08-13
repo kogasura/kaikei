@@ -949,6 +949,68 @@ async fn phase2_end_to_end_scenario_posts_and_closes_the_books(
         "決算振替後の当期純利益は0になっているはず: {:?}",
         income_statement.total
     );
+
+    // 9. ★実 DB から取ったものが、そのまま帳簿として出力できる★（Phase 5）
+    //
+    // `kaikei-report` 自身のテストは DB を持たない（I/O を持たない層なので）。
+    // **実際の帳簿が本当に出力に流れるか**は、ここでしか確かめられない——
+    // 型が合うことと、実データが通ることは別である。
+    let period_label = "2026-01-01 〜 2026-12-31";
+
+    // 9-a. 仕訳日記帳（決算振替仕訳を含む全件）。
+    let journal_csv = kaikei_report::journal_book::to_csv(&all_entries, &composition.chart);
+    let journal_html =
+        kaikei_report::journal_book::to_html(&all_entries, &composition.chart, period_label, &[]);
+
+    // 明細の総数ぶんの行が出る（1行1明細）。ヘッダを除いて数える。
+    let line_count: usize = all_entries.iter().map(|entry| entry.lines().len()).sum();
+    let data_rows = journal_csv.lines().count() - 1;
+    assert_eq!(
+        data_rows, line_count,
+        "仕訳日記帳の行数が明細の総数と合わない"
+    );
+    // 決算振替仕訳が帳簿に載っている（記帳したものが出力に現れる）。
+    assert!(
+        journal_csv.contains("決算振替") || journal_html.contains("決算振替"),
+        "決算振替仕訳が仕訳日記帳に出ていない"
+    );
+
+    // 9-b. 試算表（read model の結果をそのまま出力に流す）。
+    let tb_view = report::execute(
+        &query,
+        composition.tag_catalog.schema(),
+        &settings(),
+        ReportInput {
+            from: AccountingDate::new(2026, 1, 1).unwrap(),
+            to: AccountingDate::new(2026, 12, 31).unwrap(),
+            group_by: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let tb_csv = kaikei_report::trial_balance::to_csv(&tb_view, &composition.chart);
+
+    // 借方合計と貸方合計が一致する（試算表が試算表である条件）。
+    let (debit, credit) = tb_view.totals().unwrap();
+    assert_eq!(debit, credit);
+    assert!(
+        tb_csv.contains(&format!(
+            "合計,{},{}",
+            kaikei_app::amount::money_to_plain_string(&debit),
+            kaikei_app::amount::money_to_plain_string(&credit)
+        )),
+        "試算表の合計行が出力に現れていない: {tb_csv}"
+    );
+
+    // 9-c. 財務諸表。
+    let bs_csv = kaikei_report::statement::to_csv(&balance_sheet);
+    let pl_html = kaikei_report::statement::to_html(&income_statement, period_label, &[]);
+
+    assert!(bs_csv.contains("資産"), "{bs_csv}");
+    assert!(pl_html.contains("<h1>損益計算書</h1>"), "{pl_html}");
+    // 決算振替後なので損益計算書の合計は 0。**出力にもその 0 が出る**
+    // （帳簿の数字が出力で書き換わらないことの確認）。
+    assert!(pl_html.contains(">0<"), "当期純利益 0 が出力に現れていない");
 }
 
 // ---- Phase 3 PR-E: 勘定科目マスタの投入経路 ----
