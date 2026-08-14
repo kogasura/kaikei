@@ -27,7 +27,9 @@ members = [
     # ファイルシステムを触るが DB は知らない（docs/06-documents.md）。
     "crates/kaikei-blob",
     # Phase 1 以降で追加
-    # "crates/kaikei-import",
+    # Phase 4: 明細の取込。**kaikei-core に依存しない**
+    # （docs/05-csv-import.md §1。architecture.yml が検査する）。
+    "crates/kaikei-import",
     # "crates/kaikei-import-data",
     # "crates/kaikei-api",
 ]
