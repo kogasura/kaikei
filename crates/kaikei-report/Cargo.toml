@@ -18,3 +18,9 @@ license.workspace = true
 kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
 kaikei-policy = { path = "../kaikei-policy", version = "0.0.1" }
 kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
+# 弥生向けの出力は Shift-JIS でなければ取り込めない（docs/10-report.md §6-3）。
+# I/O ではなく文字コード変換なので、この層に置いてよい。
+encoding_rs = { workspace = true }
+# 全件 JSON エクスポート（docs/03-database.md §8）。手で JSON を組み立てると
+# 文字のエスケープを間違える。
+serde_json = { workspace = true }

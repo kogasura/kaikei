@@ -389,6 +389,34 @@ mod tests {
         assert_eq!(amount_of(&filled, 45), yen(7_718_714));
     }
 
+    // FL-1b: **年度末に手で入れる決算整理仕訳が決算書に載ること。**
+    //
+    //         減価償却費は固定資産台帳を持たない方針なので、利用者が年度末に
+    //         仕訳を1本入れる（額は取得日・耐用年数・償却方法で決まる税務
+    //         判断）。**入れたのに⑱に載らなければ気づけない**ので、経路を
+    //         固定しておく。
+    #[test]
+    fn a_year_end_depreciation_entry_lands_in_its_field() {
+        let mut statement = income_statement();
+        statement.sections[1]
+            .lines
+            .push(line("610", "減価償却費", 129_572));
+
+        let filled = fill(&form(), &statement, &inputs(650_000)).unwrap();
+
+        // ⑱ 減価償却費。
+        assert_eq!(amount_of(&filled, 18), yen(129_572));
+        // ㉜ 経費の計にも入る（3,066,666 + 129,572）。
+        assert_eq!(amount_of(&filled, 32), yen(3_196_238));
+        // ㊺ 所得金額はその分だけ減る（7,718,714 − 129,572）。
+        assert_eq!(amount_of(&filled, 45), yen(7_589_142));
+        // 未マッピングには出ない（当てはめ済みの科目）。
+        assert!(!filled
+            .not_on_form
+            .iter()
+            .any(|entry| entry.account.as_str() == "610"));
+    }
+
     // FL-2: 空欄の行には、当てはめた科目の名前が入る。
     #[test]
     fn a_blank_row_takes_its_label_from_the_account_mapped_to_it() {
