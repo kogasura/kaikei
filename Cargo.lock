@@ -798,9 +798,11 @@ dependencies = [
 name = "kaikei-cli"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "kaikei-app",
  "kaikei-blob",
  "kaikei-core",
+ "kaikei-import",
  "kaikei-jp",
  "kaikei-jp-data",
  "kaikei-report",

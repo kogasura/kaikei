@@ -31,6 +31,11 @@ kaikei-jp-data = { path = "../kaikei-jp-data", version = "0.0.1" }
 kaikei-report = { path = "../kaikei-report", version = "0.0.1" }
 # 証憑の中身が変わっていないかを verify で確かめる（docs/06-documents.md §6）。
 kaikei-blob = { path = "../kaikei-blob", version = "0.0.1" }
+# 明細 CSV の読み取り（docs/05-csv-import.md）。**帳簿とは別の文脈**なので、
+# 取込の型から帳簿の型への翻訳はこの端（CLI）が行う。
+kaikei-import = { path = "../kaikei-import", version = "0.0.1" }
+# 取り込んだ日付を帳簿の日付に直すために使う。
+chrono = { workspace = true }
 # 証憑IDの採番（attach）。時刻順に並ぶ v7 を使う。
 uuid = { workspace = true }
 tokio = { workspace = true }

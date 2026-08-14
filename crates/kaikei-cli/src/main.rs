@@ -52,9 +52,11 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei report --year <西暦> --out <出力先ディレクトリ>
     kaikei verify --year <西暦>
     kaikei attach --file <ファイル> --date <取引年月日> --type <種別> --via <経路>
+    kaikei import --profile <プロファイル.yaml> --file <明細.csv> [--commit]
 
 report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
+import は銀行・カードの明細 CSV を取り込みます。
 
 引数:
     --year <西暦>       会計年度（暦年）。例: 2026
@@ -113,6 +115,22 @@ attach の引数:
     証憑は内容の SHA-256 で保存します。同じ内容を2回入れてもファイルは1つです。
     KAIKEI_BLOB_ROOT の指定が要ります。
 
+import の引数:
+    --profile <パス>     CSV プロファイル（YAML。列の対応を書いたもの。必須）
+    --file <パス>        取り込む明細 CSV（必須）
+    --profile-id <ID>    プロファイルが複数書かれている YAML から1つ選ぶ
+    --source <ID>        取込元の名前。省略時はプロファイルのIDを使います
+    --commit             実際に取り込みます
+
+    **既定は下見です。** 引数に --commit が無ければ、読み取った内容を表示
+    するだけで保存しません。取り込んだ明細は消せない（何を取り込んだかが
+    追えなくなるため）ので、列の対応が合っているかを先に目で確かめます。
+
+    同じ明細を2回取り込んでも重複しません。追記された行だけを取り込む
+    使い方ができます。
+
+    取り込んだだけでは帳簿に入りません。仕訳にするのは別の操作です。
+
 report と verify は記帳しません。読み取りだけなので、税区分や決算科目の設定は
 要りません。
 ";
@@ -149,6 +167,7 @@ fn run() -> Result<Vec<PathBuf>, String> {
         } => runtime.block_on(write_reports(fiscal_year, out_dir, deduction, yayoi)),
         Command::Verify { fiscal_year } => runtime.block_on(run_verify(fiscal_year)),
         Command::Attach(args) => runtime.block_on(run_attach(args)),
+        Command::Import(args) => runtime.block_on(run_import(args)),
     }
 }
 
@@ -172,6 +191,26 @@ enum Command {
     Verify { fiscal_year: i32 },
     /// 証憑を保存して帳簿に登録する。
     Attach(AttachArgs),
+    /// 銀行・カードの明細 CSV を取り込む。
+    Import(ImportArgs),
+}
+
+/// `kaikei import` の引数。
+#[derive(Debug)]
+struct ImportArgs {
+    /// CSV プロファイル（YAML）。
+    profile: PathBuf,
+    /// 取り込む明細 CSV。
+    file: PathBuf,
+    /// プロファイルが複数あるとき、どれを使うか。
+    profile_id: Option<String>,
+    /// 取込元の名前。省略時はプロファイルのID。
+    source: Option<String>,
+    /// 実際に保存するか。
+    ///
+    /// **既定は false（下見）。** 取り込んだ明細は消せないので、列の対応が
+    /// 合っているかを先に目で確かめられるようにする。
+    commit: bool,
 }
 
 /// `kaikei attach` の引数。
@@ -209,6 +248,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let subcommand = args[0].as_str();
     if subcommand == "attach" {
         return parse_attach(&args[1..]);
+    }
+    if subcommand == "import" {
+        return parse_import(&args[1..]);
     }
     if subcommand != "report" && subcommand != "verify" {
         return Err(format!("不明なサブコマンドです: {subcommand}\n\n{USAGE}"));
@@ -671,6 +713,243 @@ async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
         println!("  仕訳に紐付けました");
     }
     Ok(Vec::new())
+}
+
+/// `kaikei import` の引数を解析する。
+fn parse_import(args: &[String]) -> Result<Command, String> {
+    let mut profile = None;
+    let mut file = None;
+    let mut profile_id = None;
+    let mut source = None;
+    let mut commit = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index].as_str();
+        // 値を取る引数と、取らない引数を混ぜない。`--commit` の次を値として
+        // 食べてしまうと、`--commit --file x` が黙って通る。
+        if key == "--commit" {
+            commit = true;
+            index += 1;
+            continue;
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?
+            .clone();
+        match key {
+            "--profile" => profile = Some(PathBuf::from(value)),
+            "--file" => file = Some(PathBuf::from(value)),
+            "--profile-id" => profile_id = Some(value),
+            "--source" => source = Some(value),
+            other => return Err(format!("不明な引数です: {other}\n\n{USAGE}")),
+        }
+        index += 2;
+    }
+
+    Ok(Command::Import(ImportArgs {
+        profile: profile.ok_or("--profile を指定してください（列の対応を書いた YAML）")?,
+        file: file.ok_or("--file を指定してください（取り込む明細 CSV）")?,
+        profile_id,
+        source,
+        commit,
+    }))
+}
+
+/// 下見で並べて見せる明細の件数。
+///
+/// 全部出すと画面が流れて、肝心の先頭（列がずれていれば真っ先に分かる）が
+/// 見えなくなる。
+const IMPORT_PREVIEW_ROWS: usize = 10;
+
+/// 銀行・カードの明細 CSV を取り込む。
+///
+/// # 既定では保存しない
+///
+/// 取り込んだ明細は消せない（何を取り込んだかが追えなくなるため、
+/// `imported_transactions` の DELETE は与えていない）。プロファイルの列指定を
+/// 間違えたまま保存すると、桁の狂った明細が残り続ける。**`--commit` が無ければ
+/// 読んで見せるだけにする。**
+async fn run_import(args: ImportArgs) -> Result<Vec<PathBuf>, String> {
+    use kaikei_app::ports::{
+        ImportDirection, ImportOutcome, ImportedTxRepo, NewImportedTransaction,
+    };
+
+    let yaml = std::fs::read_to_string(&args.profile).map_err(|error| {
+        format!(
+            "プロファイルを読めませんでした: {}（{error}）",
+            args.profile.display()
+        )
+    })?;
+    let profiles = kaikei_import::profile::CsvProfile::load_all(&yaml)
+        .map_err(|error| format!("プロファイルを読めませんでした: {error}"))?;
+    let profile = choose_profile(profiles, args.profile_id.as_deref())?;
+
+    // **文字コードを推測で決めない。** 邦銀の明細は Shift-JIS が多いが、
+    // 読めないものを置換文字で埋めると摘要が壊れたまま帳簿に入る。
+    let bytes = std::fs::read(&args.file)
+        .map_err(|error| format!("読めませんでした: {}（{error}）", args.file.display()))?;
+    let text = kaikei_import::decode_csv(&bytes)
+        .map_err(|error| format!("{}: {error}", args.file.display()))?;
+
+    let source_id = args.source.clone().unwrap_or_else(|| profile.id.clone());
+    let source = kaikei_import::SourceId::parse(&source_id)
+        .map_err(|error| format!("--source が不正です: {error}"))?;
+
+    let parsed = kaikei_import::reader::parse_csv(&profile, &source, &text)
+        .map_err(|error| format!("{}: {error}", args.file.display()))?;
+
+    println!(
+        "読み取り: {}件（エラー {}件）  プロファイル: {}",
+        parsed.transactions.len(),
+        parsed.errors.len(),
+        profile.name
+    );
+    for row in parsed.transactions.iter().take(IMPORT_PREVIEW_ROWS) {
+        println!(
+            "  {}  {}  {:>12}  {}",
+            row.occurred_on,
+            match row.direction {
+                kaikei_import::Direction::In => "入金",
+                kaikei_import::Direction::Out => "出金",
+            },
+            group_digits(row.amount_minor),
+            row.raw_description
+        );
+    }
+    if parsed.transactions.len() > IMPORT_PREVIEW_ROWS {
+        println!(
+            "  ...（残り {}件）",
+            parsed.transactions.len() - IMPORT_PREVIEW_ROWS
+        );
+    }
+    // **読めなかった行は必ず全部出す。** 件数だけ出して中身を隠すと、
+    // 「エラー3件」を見なかったことにして先へ進んでしまう。
+    for error in &parsed.errors {
+        eprintln!("  {}行目: {}", error.line, error.reason);
+    }
+
+    if !args.commit {
+        println!("※ 下見です。取り込むには --commit を付けてください");
+        return Ok(Vec::new());
+    }
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool);
+
+    let imported_at = kaikei_core::Timestamp::from_unix_nanos(now_unix_nanos()?);
+    let rows: Vec<NewImportedTransaction> = parsed
+        .transactions
+        .iter()
+        .map(|row| {
+            Ok(NewImportedTransaction {
+                id: uuid::Uuid::now_v7().to_string(),
+                source: row.source.as_str().to_string(),
+                external_key: row.external_key.clone(),
+                occurred_on: to_accounting_date(row.occurred_on)?,
+                amount_minor: row.amount_minor,
+                direction: match row.direction {
+                    kaikei_import::Direction::In => ImportDirection::In,
+                    kaikei_import::Direction::Out => ImportDirection::Out,
+                },
+                raw_description: row.raw_description.clone(),
+                balance_after: row.balance_after,
+                raw_row: row.raw_row.to_string(),
+                imported_at,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+
+    // **1つのトランザクションで入れる。** 途中で落ちたときに半分だけ入ると、
+    // どこまで取り込んだかを人が数え直すことになる（消せないので余計に困る）。
+    let outcomes = with_tx_err(&store, move |tx| {
+        let rows = rows.clone();
+        Box::pin(async move {
+            let mut inserted = 0usize;
+            let mut skipped = 0usize;
+            for row in &rows {
+                match tx.insert_imported(row).await? {
+                    ImportOutcome::Inserted => inserted += 1,
+                    ImportOutcome::SkippedDuplicate => skipped += 1,
+                }
+            }
+            Ok::<(usize, usize), kaikei_app::error::AppError>((inserted, skipped))
+        })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::AppError| format!("取り込めませんでした: {error}"))?;
+
+    println!(
+        "取り込みました: 新規 {}件 / 重複 {}件",
+        outcomes.0, outcomes.1
+    );
+    println!("※ まだ仕訳ではありません。帳簿に入れるには仕訳化が要ります");
+    Ok(Vec::new())
+}
+
+/// 使うプロファイルを1つ選ぶ。
+///
+/// **どれを使ったか分からないまま進めない。** 複数あるのに指定が無ければ、
+/// 候補を並べて止める。勝手に先頭を使うと、別の銀行の列の対応で読んで
+/// 桁が狂う。
+fn choose_profile(
+    profiles: Vec<kaikei_import::profile::CsvProfile>,
+    wanted: Option<&str>,
+) -> Result<kaikei_import::profile::CsvProfile, String> {
+    let available = || {
+        profiles
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>()
+            .join("・")
+    };
+    match wanted {
+        Some(id) => profiles
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "プロファイル {id} がありません（あるのは: {}）",
+                    available()
+                )
+            }),
+        None if profiles.len() == 1 => Ok(profiles.into_iter().next().expect("1件ある")),
+        None if profiles.is_empty() => Err("プロファイルが1つも書かれていません".to_string()),
+        None => Err(format!(
+            "プロファイルが複数あります。--profile-id で選んでください（{}）",
+            available()
+        )),
+    }
+}
+
+/// `chrono` の日付を帳簿の日付に直す。
+fn to_accounting_date(date: chrono::NaiveDate) -> Result<AccountingDate, String> {
+    use chrono::Datelike;
+    let month = u8::try_from(date.month()).map_err(|_| format!("月が範囲外です: {date}"))?;
+    let day = u8::try_from(date.day()).map_err(|_| format!("日が範囲外です: {date}"))?;
+    AccountingDate::new(date.year(), month, day)
+        .map_err(|error| format!("取り込めない日付です（{date}）: {error}"))
+}
+
+/// 3桁ごとに区切る。
+fn group_digits(amount: i64) -> String {
+    let digits = amount.abs().to_string();
+    let mut out = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if amount < 0 {
+        format!("-{out}")
+    } else {
+        out
+    }
 }
 
 /// 仕訳IDを解釈する。
@@ -1757,6 +2036,154 @@ mod tests {
     fn an_unknown_subcommand_is_rejected() {
         let error = parse_args(&args(&["export", "--year", "2026"])).unwrap_err();
         assert!(error.contains("export"), "{error}");
+    }
+
+    // ─── import ─────────────────────────────────────────
+
+    fn profile(id: &str) -> kaikei_import::profile::CsvProfile {
+        let yaml = format!(
+            "id: {id}\nname: テスト\nkind: bank\n\
+             date:\n  column: 0\n  format: \"%Y/%m/%d\"\n\
+             amount:\n  mode: separate_columns\n  debit_column: 1\n  credit_column: 2\n\
+             description:\n  columns: [3]\n"
+        );
+        kaikei_import::profile::CsvProfile::load_all(&yaml)
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    /// **本命。** 既定では保存しない。
+    ///
+    /// 取り込んだ明細は消せない（DELETE を与えていない）。列の対応を
+    /// 間違えたまま保存すると、桁の狂った明細が残り続ける。
+    #[test]
+    fn import_does_not_write_unless_commit_is_given() {
+        let command = parse_import(&args(&["--profile", "p.yaml", "--file", "m.csv"])).unwrap();
+        match command {
+            Command::Import(args) => assert!(!args.commit, "既定は下見であること"),
+            other => panic!("import が返らない: {other:?}"),
+        }
+
+        let command = parse_import(&args(&[
+            "--profile",
+            "p.yaml",
+            "--file",
+            "m.csv",
+            "--commit",
+        ]))
+        .unwrap();
+        match command {
+            Command::Import(args) => assert!(args.commit),
+            other => panic!("import が返らない: {other:?}"),
+        }
+    }
+
+    /// `--commit` の次の引数を値として食べない。
+    ///
+    /// 食べると `--commit --file x` が黙って通り、`--file` を指定したつもりで
+    /// 「--file を指定してください」と言われる（あるいは通ってしまう）。
+    #[test]
+    fn commit_does_not_swallow_the_next_argument() {
+        let command = parse_import(&args(&[
+            "--profile",
+            "p.yaml",
+            "--commit",
+            "--file",
+            "m.csv",
+        ]))
+        .unwrap();
+        match command {
+            Command::Import(args) => {
+                assert!(args.commit);
+                assert_eq!(args.file, PathBuf::from("m.csv"));
+            }
+            other => panic!("import が返らない: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_needs_a_profile_and_a_file() {
+        let error = parse_import(&args(&["--file", "m.csv"])).unwrap_err();
+        assert!(error.contains("--profile"), "{error}");
+
+        let error = parse_import(&args(&["--profile", "p.yaml"])).unwrap_err();
+        assert!(error.contains("--file"), "{error}");
+    }
+
+    /// 打ち間違いを黙って無視しない。
+    #[test]
+    fn an_unknown_import_argument_is_rejected() {
+        let error = parse_import(&args(&[
+            "--profile",
+            "p.yaml",
+            "--file",
+            "m.csv",
+            "--fiel",
+            "x",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("--fiel"), "{error}");
+    }
+
+    /// **本命。** プロファイルが複数あるのに指定が無ければ止める。
+    ///
+    /// 勝手に先頭を使うと、別の銀行の列の対応で読んで桁が狂う。
+    #[test]
+    fn several_profiles_without_a_choice_stops_instead_of_guessing() {
+        let error = choose_profile(vec![profile("mizuho"), profile("mufg")], None).unwrap_err();
+
+        assert!(error.contains("--profile-id"), "{error}");
+        // どれが選べるかを出す（利用者が次に何をすればよいか分かるように）。
+        assert!(error.contains("mizuho"), "{error}");
+        assert!(error.contains("mufg"), "{error}");
+    }
+
+    #[test]
+    fn a_single_profile_needs_no_choice() {
+        let chosen = choose_profile(vec![profile("mizuho")], None).unwrap();
+        assert_eq!(chosen.id, "mizuho");
+    }
+
+    #[test]
+    fn a_named_profile_is_picked_out_of_several() {
+        let chosen =
+            choose_profile(vec![profile("mizuho"), profile("mufg")], Some("mufg")).unwrap();
+        assert_eq!(chosen.id, "mufg");
+    }
+
+    #[test]
+    fn an_unknown_profile_id_lists_what_is_available() {
+        let error = choose_profile(vec![profile("mizuho")], Some("rakuten")).unwrap_err();
+        assert!(error.contains("rakuten"), "{error}");
+        assert!(error.contains("mizuho"), "{error}");
+    }
+
+    #[test]
+    fn digits_are_grouped_in_threes() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1_000), "1,000");
+        assert_eq!(group_digits(550_000), "550,000");
+        assert_eq!(group_digits(1_234_567), "1,234,567");
+        assert_eq!(group_digits(-1_000), "-1,000");
+    }
+
+    #[test]
+    fn a_chrono_date_becomes_an_accounting_date() {
+        let date = to_accounting_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap())
+            .expect("普通の日付");
+        assert_eq!(date, AccountingDate::new(2026, 6, 15).unwrap());
+    }
+
+    // 使い方に import の要点が載っている。
+    //
+    // 「既定では保存しない」は、読まないと事故る側の情報である。
+    #[test]
+    fn the_usage_explains_that_import_is_a_preview_by_default() {
+        assert!(USAGE.contains("--commit"), "{USAGE}");
+        assert!(USAGE.contains("既定は下見"), "{USAGE}");
+        assert!(USAGE.contains("--profile"), "{USAGE}");
     }
 
     // 使い方に、書き出すファイル名と要る環境変数が載っている
