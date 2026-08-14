@@ -116,6 +116,66 @@ fn default_postable() -> bool {
     true
 }
 
+/// 減価償却の計上漏れを見つけるための対応。
+///
+/// # 税額の計算には使わない
+///
+/// このソフトは固定資産台帳を持たない（償却方法・耐用年数・事業専用割合を
+/// 知らない）。ここにあるのは**「固定資産があるのに減価償却費が1円も
+/// 計上されていない」という抜けを指摘する**ための科目コードだけである。
+/// いくら償却するかは、このソフトでは決められない。
+///
+/// # なぜ指摘する価値があるか
+///
+/// 減価償却の計上漏れは**決算書を見ても分からない**。貸借は一致したままで、
+/// 所得だけが過大になる。翌年に気づいても、その年分は申告済みである。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepreciationHint {
+    /// 減価償却費の科目。
+    pub expense_account: AccountCode,
+    /// 減価償却の対象になりうる科目。土地のように償却しない資産は含まない。
+    pub depreciable_accounts: Vec<AccountCode>,
+}
+
+/// 科目表から減価償却の対応を読む。
+///
+/// **省略されていれば `None`。** 利用者が自分の科目表に差し替えたときに、
+/// この節を書かなければ指摘は行われない。
+///
+/// # Errors
+///
+/// YAML を読めない場合、または科目コードが不正な場合は [`JpError`]。
+pub fn load_depreciation_hint(embedded: EmbeddedYaml) -> Result<Option<DepreciationHint>, JpError> {
+    let raw: ChartRaw = crate::yaml::load_embedded(embedded)?;
+    depreciation_from_raw(embedded.label, raw.depreciation)
+}
+
+fn depreciation_from_raw(
+    label: &str,
+    raw: Option<DepreciationRaw>,
+) -> Result<Option<DepreciationHint>, JpError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let expense_account = parse_code(label, &raw.expense_account)?;
+    let depreciable_accounts = raw
+        .depreciable_accounts
+        .iter()
+        .map(|code| parse_code(label, code))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(DepreciationHint {
+        expense_account,
+        depreciable_accounts,
+    }))
+}
+
+fn parse_code(label: &str, code: &str) -> Result<AccountCode, JpError> {
+    AccountCode::parse(code).map_err(|source| JpError::InvalidChart {
+        label: label.to_string(),
+        reason: format!("depreciation の科目コードが不正です（{code}）: {source}"),
+    })
+}
+
 /// [`ChartOfAccounts`] の YAML 上の生の形。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -127,6 +187,21 @@ struct ChartRaw {
     #[allow(dead_code)]
     name: String,
     accounts: Vec<AccountRaw>,
+    /// 減価償却の計上漏れを見つけるための対応（[`DepreciationHint`]）。
+    ///
+    /// **省略できる。** 利用者が自分の科目表に差し替えたときに、この節を
+    /// 書かなければ指摘は行われない（書かせるために読み込みを失敗させる
+    /// ほどのものではない）。
+    #[serde(default)]
+    depreciation: Option<DepreciationRaw>,
+}
+
+/// [`DepreciationHint`] の YAML 上の生の形。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DepreciationRaw {
+    expense_account: String,
+    depreciable_accounts: Vec<String>,
 }
 
 /// 科目1件分の YAML 上の生の形。
@@ -154,6 +229,74 @@ struct AccountRaw {
     /// 書き忘れると YAML 全体がパースエラーになる、という非対称を避ける）。
     #[serde(default)]
     sort: Option<i64>,
+}
+
+#[cfg(test)]
+mod depreciation_tests {
+    use super::*;
+
+    /// **本命。** 同梱の科目表に減価償却の対応が入っている。
+    ///
+    /// 入っていなければ、計上漏れの指摘が黙って行われなくなる。
+    #[test]
+    fn the_bundled_chart_knows_which_accounts_are_depreciable() {
+        let hint = load_depreciation_hint(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+            .expect("読めること")
+            .expect("同梱の科目表には入っていること");
+
+        assert_eq!(hint.expense_account.as_str(), "610", "減価償却費");
+        let codes: Vec<&str> = hint
+            .depreciable_accounts
+            .iter()
+            .map(|code| code.as_str())
+            .collect();
+        assert!(codes.contains(&"205"), "機械装置: {codes:?}");
+        assert!(codes.contains(&"210"), "工具器具備品: {codes:?}");
+        assert!(codes.contains(&"220"), "車両運搬具: {codes:?}");
+    }
+
+    /// **本命。** 償却しない資産を対象に入れない。
+    ///
+    /// 土地や現金を入れると、正しい帳簿でも毎年指摘が出る。指摘が当たり前に
+    /// なると、本当の計上漏れを見落とす。
+    #[test]
+    fn assets_that_are_never_depreciated_are_not_listed() {
+        let hint = load_depreciation_hint(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+            .unwrap()
+            .unwrap();
+        let codes: Vec<&str> = hint
+            .depreciable_accounts
+            .iter()
+            .map(|code| code.as_str())
+            .collect();
+
+        // 現金・普通預金・売掛金は償却しない。
+        for never in ["100", "110", "135"] {
+            assert!(!codes.contains(&never), "{never} が入っている: {codes:?}");
+        }
+        // 減価償却累計額そのものも対象ではない。
+        assert!(!codes.contains(&"240"), "{codes:?}");
+    }
+
+    /// 節が無くても読み込みは通る。
+    ///
+    /// 利用者が自分の科目表に差し替えたときに、この節を書かせるために
+    /// 読み込みを失敗させるほどのものではない。
+    #[test]
+    fn a_chart_without_the_section_is_still_valid() {
+        assert_eq!(depreciation_from_raw("テスト", None).unwrap(), None);
+    }
+
+    /// 科目コードが不正なら、どの節の問題かが分かる。
+    #[test]
+    fn a_bad_code_says_which_section_it_came_from() {
+        let raw = DepreciationRaw {
+            expense_account: String::new(),
+            depreciable_accounts: Vec::new(),
+        };
+        let error = depreciation_from_raw("テスト", Some(raw)).expect_err("拒否されること");
+        assert!(error.to_string().contains("depreciation"), "{error}");
+    }
 }
 
 #[cfg(test)]
