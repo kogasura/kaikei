@@ -115,6 +115,7 @@ async fn runtime_with(app: &PgPool, options: ComposeOptions) -> Runtime {
         // read model は書き込み側（`PgStore`）を経由しない
         // （`CLAUDE.md` §6。本番の `assemble` と同じ形）。
         trial_balance: Arc::new(PgTrialBalanceQuery::new(app.clone())),
+        documents: Arc::new(kaikei_store::documents::PgDocumentQuery::new(app.clone())),
         // 帳簿と**同じプール**から別の接続を acquire する（本番と同じ形。
         // 分離の実体は「別プール」ではなく「トランザクションを経由しない」
         // ことである。`docs/07-mcp-server.md` §9）。

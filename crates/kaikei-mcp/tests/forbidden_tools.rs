@@ -54,7 +54,7 @@ const FORBIDDEN_TOOLS: [&str; 4] = [
 /// **増やすときは設計書（§2 の表）と `DECISIONS.md` を先に更新すること。**
 /// 下の検査はこの一覧を許可リストとして使うので、ここだけ書き換えれば
 /// 通ってしまう——順序を守るのは人間の側である。
-const ALLOWED_TOOLS: [&str; 13] = [
+const ALLOWED_TOOLS: [&str; 14] = [
     "list_accounts",
     "get_entry",
     "get_trial_balance",
@@ -68,6 +68,8 @@ const ALLOWED_TOOLS: [&str; 13] = [
     "validate_invoice_number",
     "get_statements",
     "propose_closing_entries",
+    // Phase 4: 証憑検索（docs/07-mcp-server.md §2）。
+    "search_documents",
 ];
 
 // MC-10 (1): `tools/list` の応答に4件のいずれも現れない。
@@ -178,7 +180,7 @@ fn every_registered_tool_is_on_the_allow_list() {
     for name in registered_tool_names() {
         assert!(
             ALLOWED_TOOLS.contains(&name.as_str()),
-            "Phase 3 の11ツールに無いツールが登録されています: {name}\
+            "設計書の許可リストに無いツールが登録されています: {name}\
              （docs/07-mcp-server.md §2。増やす場合は設計書と DECISIONS.md を先に更新すること）"
         );
     }
