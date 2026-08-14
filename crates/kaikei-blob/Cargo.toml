@@ -1,0 +1,21 @@
+# crates/kaikei-blob/Cargo.toml
+#
+# ★ 証憑ファイルの保存（Content-Addressed Storage）★
+# 内容の SHA-256 で管理する（docs/06-documents.md §1）。ファイルシステムを
+# 触るのでインフラ層だが、DB は知らない——保存と取り出しに徹する。
+# 帳簿との紐付け（documents テーブル）は kaikei-store の仕事。
+
+[package]
+name = "kaikei-blob"
+version = "0.0.1"
+description = "証憑ファイルの保存（内容の SHA-256 で管理する Content-Addressed Storage）"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

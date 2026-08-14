@@ -23,8 +23,10 @@ members = [
     "crates/kaikei-report",
     # Phase 5: 帳簿を書き出す CLI。合成ルートなので store と jp の両方を知る。
     "crates/kaikei-cli",
+    # Phase 4: 証憑ファイルの保存（内容の SHA-256 で管理）。
+    # ファイルシステムを触るが DB は知らない（docs/06-documents.md）。
+    "crates/kaikei-blob",
     # Phase 1 以降で追加
-    # "crates/kaikei-blob",
     # "crates/kaikei-import",
     # "crates/kaikei-import-data",
     # "crates/kaikei-api",
