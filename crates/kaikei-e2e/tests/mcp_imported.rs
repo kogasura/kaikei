@@ -33,6 +33,7 @@ use kaikei_jp::closing::ClosingAccounts;
 use kaikei_jp::tax::{JpSettingsOverrides, TaxRuleSets};
 use kaikei_mcp::dispatch::{self, McpTool};
 use kaikei_mcp::startup::Runtime;
+use kaikei_mcp::tools::journalize_transaction::JournalizeTransaction;
 use kaikei_mcp::tools::list_pending_transactions::ListPendingTransactions;
 use kaikei_store::audit::PgAuditSink;
 use kaikei_store::pool::PgStore;
@@ -326,4 +327,251 @@ async fn a_reversed_date_range_is_an_error(pool_opts: PgPoolOptions, conn_opts: 
     .await;
 
     assert!(is_error(&response), "拒否されること: {response}");
+}
+
+// ─── 仕訳にする（journalize_transaction）──────────────
+
+/// 未処理の明細を1件入れて、そのIDを返す。
+async fn a_pending_line(app: &PgPool, amount: i64, is_money_in: bool) -> String {
+    insert_imported(app, "k1", 15, amount, is_money_in, "pending").await;
+    sqlx::query_scalar("SELECT id::text FROM imported_transactions LIMIT 1")
+        .fetch_one(app)
+        .await
+        .expect("IDを引けること")
+}
+
+async fn journal_entry_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM journal_entries")
+        .fetch_one(pool)
+        .await
+        .expect("件数を数えられること")
+}
+
+async fn status_of(pool: &PgPool, id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM imported_transactions WHERE id = $1::uuid")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("状態を引けること")
+}
+
+/// **本命。** 記帳と状態遷移が1つのまとまりとして起きる。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn journalizing_records_the_entry_and_advances_the_line(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+    let id = a_pending_line(&app, 1_980, false).await;
+
+    let response = call::<JournalizeTransaction>(
+        &runtime,
+        json!({
+            "imported_tx_id": id,
+            "lines": [
+                { "account": "609", "side": "debit", "amount": "1980",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "110", "side": "credit", "amount": "1980" },
+            ],
+        }),
+    )
+    .await;
+
+    assert!(!is_error(&response), "{response}");
+    let posted = body(&response);
+    // 取引日と摘要は明細から採る。
+    assert_eq!(posted["entry_date"], json!("2026-06-15"), "{posted}");
+    assert_eq!(posted["description"], json!("ｶ)ｱﾏｿﾞﾝ"), "{posted}");
+    assert_eq!(posted["imported_tx_id"], json!(id), "{posted}");
+
+    assert_eq!(journal_entry_count(&app).await, 1, "帳簿に1件入ること");
+    assert_eq!(
+        status_of(&app, &id).await,
+        "journalized",
+        "明細が仕訳済みになること"
+    );
+}
+
+/// **本命。** 記帳が失敗したら、明細も進まない。
+///
+/// 片方だけ残ると、帳簿に仕訳だけがあって明細は未処理のまま——
+/// つまり二重計上の入口——になる。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_failed_posting_leaves_the_line_untouched(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+    let id = a_pending_line(&app, 1_980, false).await;
+
+    // 貸借が一致しない仕訳は記帳されない。
+    let response = call::<JournalizeTransaction>(
+        &runtime,
+        json!({
+            "imported_tx_id": id,
+            "lines": [
+                { "account": "609", "side": "debit", "amount": "1980",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "110", "side": "credit", "amount": "999" },
+            ],
+        }),
+    )
+    .await;
+
+    assert!(is_error(&response), "{response}");
+    assert_eq!(journal_entry_count(&app).await, 0, "帳簿に何も入らないこと");
+    assert_eq!(
+        status_of(&app, &id).await,
+        "pending",
+        "明細は未処理のままであること"
+    );
+}
+
+/// **本命。** 桁を落とした仕訳を止め、そのとき明細も進まない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_dropped_digit_is_rejected_and_nothing_is_left_behind(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+    // 明細は 19,800 円。
+    let id = a_pending_line(&app, 19_800, false).await;
+
+    // 貸借は一致しているが、桁が1つ落ちている。
+    let response = call::<JournalizeTransaction>(
+        &runtime,
+        json!({
+            "imported_tx_id": id,
+            "lines": [
+                { "account": "609", "side": "debit", "amount": "1980",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "110", "side": "credit", "amount": "1980" },
+            ],
+        }),
+    )
+    .await;
+
+    assert!(is_error(&response), "止めること: {response}");
+    assert_eq!(journal_entry_count(&app).await, 0, "帳簿に何も入らないこと");
+    assert_eq!(status_of(&app, &id).await, "pending", "明細も進まないこと");
+}
+
+/// 意図して一致しない仕訳は、明示すれば通る。
+///
+/// 振込手数料が差し引かれた入金（入金 100,000 ＋ 手数料 10,000 ＝ 売上 110,000）。
+/// **合計で見ていたらこの普通の記帳ができない。**
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_deposit_net_of_a_fee_goes_through_without_the_escape_hatch(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+    let id = a_pending_line(&app, 100_000, true).await;
+
+    let response = call::<JournalizeTransaction>(
+        &runtime,
+        json!({
+            "imported_tx_id": id,
+            "lines": [
+                { "account": "110", "side": "debit", "amount": "100000" },
+                { "account": "620", "side": "debit", "amount": "10000",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "500", "side": "credit", "amount": "110000",
+                  "tags": { "tax_category": "SALES_10" } },
+            ],
+        }),
+    )
+    .await;
+
+    assert!(!is_error(&response), "逃げ道なしで通ること: {response}");
+    assert_eq!(status_of(&app, &id).await, "journalized");
+}
+
+/// **本命。** 同じ明細を2回仕訳にできない。
+///
+/// 塗り替えると、先に作った仕訳が帳簿に残ったまま誰からも参照されなくなる。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_same_line_cannot_be_journalized_twice(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+    let id = a_pending_line(&app, 1_980, false).await;
+    let arguments = json!({
+        "imported_tx_id": id,
+        "lines": [
+            { "account": "609", "side": "debit", "amount": "1980",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+            { "account": "110", "side": "credit", "amount": "1980" },
+        ],
+    });
+
+    let first = call::<JournalizeTransaction>(&runtime, arguments.clone()).await;
+    assert!(!is_error(&first), "1回目は通ること: {first}");
+
+    let second = call::<JournalizeTransaction>(&runtime, arguments).await;
+
+    assert!(is_error(&second), "2回目は拒否されること: {second}");
+    assert_eq!(journal_entry_count(&app).await, 1, "仕訳は増えないこと");
+}
+
+/// 取引日を上書きできる（カードの引落日と購入日は違う）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_entry_date_can_be_overridden(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+    let id = a_pending_line(&app, 1_980, false).await;
+
+    let response = call::<JournalizeTransaction>(
+        &runtime,
+        json!({
+            "imported_tx_id": id,
+            "entry_date": "2026-05-20",
+            "description": "5月に買ったもの",
+            "lines": [
+                { "account": "609", "side": "debit", "amount": "1980",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "110", "side": "credit", "amount": "1980" },
+            ],
+        }),
+    )
+    .await;
+
+    assert!(!is_error(&response), "{response}");
+    assert_eq!(body(&response)["entry_date"], json!("2026-05-20"));
+    assert_eq!(body(&response)["description"], json!("5月に買ったもの"));
+}
+
+/// 知らないIDは「見つからない」と言う。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_unknown_id_says_not_found(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+
+    let response = call::<JournalizeTransaction>(
+        &runtime,
+        json!({
+            "imported_tx_id": "00000000-0000-0000-0000-000000000000",
+            "lines": [
+                { "account": "609", "side": "debit", "amount": "1980",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "110", "side": "credit", "amount": "1980" },
+            ],
+        }),
+    )
+    .await;
+
+    assert!(is_error(&response), "{response}");
 }

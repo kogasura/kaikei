@@ -59,6 +59,19 @@ const FORBIDDEN_TOOLS: [&str; 4] = [
     "reopen_period",
 ];
 
+/// 取り込んだ明細を1件仕込む。
+///
+/// 取込の経路（`kaikei import`）は CLI にあり、ここから呼べない。**読む側と
+/// 仕訳にする側は本番と同じ経路**（MCP のツール）を通す。
+async fn seed_imported_line(pool: &sqlx::PgPool) -> String {
+    sqlx::query_scalar(
+        "INSERT INTO imported_transactions          (id, source, external_key, occurred_on, amount_minor, direction,           raw_description, balance_after, raw_row, status, imported_at)          VALUES (gen_random_uuid(), 'mizuho', 'k1', DATE '2026-06-15', 19800, 2,                  'ｶ)ｱﾏｿﾞﾝ', 500000, '[]', 'pending', now())          RETURNING id::text",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("取込明細を入れられること")
+}
+
 fn entry_id_of(result: &Value) -> String {
     body(result)["entry_id"]
         .as_str()
@@ -595,14 +608,71 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
         .await;
     assert!(is_error(&near_miss), "拒否されること: {near_miss}");
 
+    // ── 明細を仕訳にする（Phase 4）──────────────────────
+    //
+    // 取り込んだ明細を1件用意し、仕訳にする。**記帳と状態遷移が1つの
+    // まとまりとして起きる**ことを、実バイナリの経路で確かめる。
+    let imported_id = seed_imported_line(&app).await;
+
+    // 桁を落とした仕訳は止まる。貸借は合っているので、ここで止めなければ
+    // 帳簿に入ってしまい、決算書を見ても分からない。
+    let dropped_digit = server
+        .call_tool(
+            "journalize_transaction",
+            json!({
+                "imported_tx_id": imported_id,
+                "lines": [
+                    { "account": "609", "side": "debit", "amount": "1980",
+                      "tags": { "tax_category": "PURCHASE_10_NON_QUALIFIED" } },
+                    { "account": "110", "side": "credit", "amount": "1980" }
+                ]
+            }),
+        )
+        .await;
+    assert!(
+        is_error(&dropped_digit),
+        "桁落ちは止めること: {dropped_digit}"
+    );
+    // 止めたのだから、帳簿も明細も動いていない。
+    assert_eq!(journal_entry_count(&app).await, 4);
+
+    let journalized = server
+        .call_tool(
+            "journalize_transaction",
+            json!({
+                "imported_tx_id": imported_id,
+                "lines": [
+                    { "account": "609", "side": "debit", "amount": "19800",
+                      "tags": { "tax_category": "PURCHASE_10_NON_QUALIFIED" } },
+                    { "account": "110", "side": "credit", "amount": "19800" }
+                ]
+            }),
+        )
+        .await;
+    assert!(!is_error(&journalized), "{journalized}");
+    let posted = body(&journalized);
+    // 取引日と摘要は明細から採る（AI に組み立てさせない）。
+    assert_eq!(posted["entry_date"], json!("2026-06-15"), "{posted}");
+    assert_eq!(posted["imported_tx_id"], json!(imported_id), "{posted}");
+    assert_eq!(journal_entry_count(&app).await, 5, "帳簿が1件増えること");
+
+    // 明細は仕訳済みになり、未処理からは消える。
+    let after = server
+        .call_tool("list_pending_transactions", json!({}))
+        .await;
+    let after = body(&after);
+    assert_eq!(after["count"], json!(0), "{after}");
+    assert_eq!(after["counts"]["journalized"], json!(1), "{after}");
+
     server.shutdown().await;
 
     // -----------------------------------------------------------------
     // 10. ★全操作が audit_log に記録されている★
     // -----------------------------------------------------------------
     //
-    // 帳簿に残るのは4件（原仕訳も誤記帳も消えない。`CLAUDE.md` §2）。
-    assert_eq!(journal_entry_count(&app).await, 4);
+    // 帳簿に残るのは5件（原仕訳も誤記帳も消えない。`CLAUDE.md` §2）。
+    // 4件はこの通しで AI が起こしたもの、1件は取り込んだ明細から起こしたもの。
+    assert_eq!(journal_entry_count(&app).await, 5);
 
     let calls = audited_calls(&audit_rows(&app).await);
     assert_eq!(
@@ -632,6 +702,9 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
             ("search_documents".to_string(), "ok".to_string()),
             ("list_pending_transactions".to_string(), "ok".to_string()),
             ("list_pending_transactions".to_string(), "error".to_string()),
+            ("journalize_transaction".to_string(), "error".to_string()),
+            ("journalize_transaction".to_string(), "ok".to_string()),
+            ("list_pending_transactions".to_string(), "ok".to_string()),
         ],
         "呼び出した順に「開始・結果の2行」が並ぶこと（読み取り系も同じ経路）"
     );
