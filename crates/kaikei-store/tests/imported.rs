@@ -493,3 +493,89 @@ async fn the_direction_survives_a_round_trip(
     assert!(flag_of(&on("1", 3, 15).id), "入金であること");
     assert!(!flag_of(&on("2", 6, 30).id), "出金であること");
 }
+
+// ─── IDで1件引く ──────────────────────────────────────
+
+// IMP-14: **本命。** 一覧の上限を超えていても、IDで引ける。
+//
+// 一覧から絞る形だと、上限を超えた分の明細が「見つかりません」になる。
+// IDを持っているのに引けないのは、帳簿が育つほど起きやすくなる失敗である。
+#[sqlx::test]
+async fn a_line_past_the_list_limit_can_still_be_found_by_id(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let store = PgStore::new(pool.clone());
+
+    // 上限（200件）を超える数を入れる。狙いの1件は最後（＝一覧では
+    // 古い順に切られて外れる位置）に置く。
+    for i in 1..=201 {
+        let mut tx = imported(&i.to_string(), &format!("key-{i}"));
+        tx.occurred_on = AccountingDate::new(2026, 12, 31).unwrap();
+        insert(&store, tx).await;
+    }
+    let target = imported("201", "key-201").id;
+
+    let query = PgImportedTxQuery::new(pool);
+
+    // 一覧では届かない。
+    let listed = query
+        .list_imported(&ImportedTxQuerySpec::default(), 200)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 200, "上限で切られること");
+    assert!(
+        !listed.iter().any(|tx| tx.id == target),
+        "この明細は一覧に含まれないこと（前提の確認）"
+    );
+
+    // IDでは引ける。
+    let found = query
+        .find_imported(&target)
+        .await
+        .unwrap()
+        .expect("IDで引けること");
+    assert_eq!(found.id, target);
+    assert_eq!(found.amount_minor, 1_980);
+}
+
+// IMP-15: 知らないIDは見つからない（エラーではない）。
+#[sqlx::test]
+async fn an_unknown_id_is_not_found_rather_than_an_error(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let query = PgImportedTxQuery::new(pool);
+
+    let found = query
+        .find_imported("00000000-0000-0000-0000-000000000000")
+        .await
+        .expect("エラーにしないこと");
+
+    assert!(found.is_none());
+}
+
+// IMP-16: **本命。** UUID でない文字列は「見つからない」。
+//
+// ここを Corrupt にすると、打ち間違いが「保存データが壊れている」という
+// 誤診になる。壊れているのは入力であって帳簿ではない。
+#[sqlx::test]
+async fn a_malformed_id_is_not_found_rather_than_corrupt(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let query = PgImportedTxQuery::new(pool);
+
+    let found = query
+        .find_imported("これはUUIDではない")
+        .await
+        .expect("保存データの異常として扱わないこと");
+
+    assert!(found.is_none());
+}

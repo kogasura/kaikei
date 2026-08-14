@@ -37,7 +37,6 @@ use kaikei_app::error::AppError;
 use kaikei_app::ports::{ImportedTxQuery, ImportedTxRepo};
 use kaikei_app::tx::with_tx_err;
 use kaikei_app::usecase::post_entry::{self, PostEntryInput};
-use kaikei_app::view::ImportedTxQuerySpec;
 use kaikei_core::{JournalLine, Side};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -47,11 +46,6 @@ use crate::dispatch::{McpTool, ToolContext, ToolFailure, ToolSuccess};
 use crate::error::ToolError;
 use crate::tools::parse_date;
 use crate::tools::post_journal_entry::{build_lines, entry_body, PostJournalEntryLine};
-
-/// 明細を1件引くための上限。
-///
-/// IDで引くので1件しか返らないが、read model には「IDで1件引く」口が無い。
-const LOOKUP_LIMIT: u32 = 200;
 
 /// `journalize_transaction`。
 pub struct JournalizeTransaction;
@@ -195,13 +189,14 @@ async fn find_pending(
     ctx: &ToolContext<'_>,
     imported_tx_id: &str,
 ) -> Result<kaikei_app::view::ImportedTxView, ToolFailure> {
-    let query = ctx.imported_tx_query();
-    let all = query
-        .list_imported(&ImportedTxQuerySpec::default(), LOOKUP_LIMIT)
+    // **IDで直接引く。** 一覧から絞る形にすると、上限を超えた分の明細が
+    // 「見つかりません」になる（帳簿が育つほど起きやすくなる）。
+    let found = ctx
+        .imported_tx_query()
+        .find_imported(imported_tx_id)
         .await
         .map_err(|error| ToolFailure::from(ToolError::from_app_error(&error.into())))?;
 
-    let found = all.into_iter().find(|tx| tx.id == imported_tx_id);
     match found {
         Some(tx) if tx.status == "pending" => Ok(tx),
         Some(tx) => Err(ToolError::new(

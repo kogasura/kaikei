@@ -26,7 +26,7 @@
 //! 過去の記帳が間違っていれば、同じ間違いを繰り返す提案になる。
 
 use kaikei_app::ports::{ImportedTxQuery, SearchEntriesParams, SearchEntriesQuery};
-use kaikei_app::view::{EntrySummaryView, ImportedTxQuerySpec, ImportedTxView};
+use kaikei_app::view::{EntrySummaryView, ImportedTxView};
 use kaikei_app::wire::side_code;
 use kaikei_core::ChartOfAccounts;
 use schemars::JsonSchema;
@@ -36,9 +36,6 @@ use std::collections::BTreeMap;
 
 use crate::dispatch::{McpTool, ToolContext, ToolFailure, ToolSuccess};
 use crate::error::ToolError;
-
-/// 明細を引くための上限（`journalize_transaction` と同じ制約）。
-const LOOKUP_LIMIT: u32 = 200;
 
 /// 過去の仕訳を何件まで見るか。
 ///
@@ -129,14 +126,12 @@ async fn find_transaction(
     ctx: &ToolContext<'_>,
     imported_tx_id: &str,
 ) -> Result<ImportedTxView, ToolFailure> {
-    let all = ctx
-        .imported_tx_query()
-        .list_imported(&ImportedTxQuerySpec::default(), LOOKUP_LIMIT)
+    // **IDで直接引く。** 一覧から絞る形にすると、上限を超えた分の明細が
+    // 「見つかりません」になる。
+    ctx.imported_tx_query()
+        .find_imported(imported_tx_id)
         .await
-        .map_err(|error| ToolFailure::from(ToolError::from_app_error(&error.into())))?;
-
-    all.into_iter()
-        .find(|tx| tx.id == imported_tx_id)
+        .map_err(|error| ToolFailure::from(ToolError::from_app_error(&error.into())))?
         .ok_or_else(|| {
             ToolError::new(
                 kaikei_app::error::codes::NOT_FOUND,
