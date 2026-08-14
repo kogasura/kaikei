@@ -57,6 +57,8 @@ async fn applied_migrations_match_the_expected_list(
         (8, "distinct error codes"),
         // Phase 3 PR-C: 監査ログ（docs/07-mcp-server.md §9・D-075）。
         (9, "audit log"),
+        // Phase 4: 証憑（docs/06-documents.md §3）。
+        (10, "documents"),
     ]
     .into_iter()
     .map(|(version, description)| (version, description.to_string()))
@@ -70,10 +72,7 @@ async fn applied_migrations_match_the_expected_list(
 }
 
 #[sqlx::test]
-async fn expected_tables_exist_and_documents_tables_do_not(
-    pool_opts: PgPoolOptions,
-    conn_opts: PgConnectOptions,
-) {
+async fn expected_tables_exist(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
     let roles = common::roles(pool_opts, conn_opts).await;
 
     let tables: Vec<String> = sqlx::query_scalar(
@@ -91,17 +90,17 @@ async fn expected_tables_exist_and_documents_tables_do_not(
         // Phase 3 PR-C: 監査ログ（docs/07-mcp-server.md §9・D-075）。
         "audit_log".to_string(),
         "counterparties".to_string(),
+        // Phase 4: 証憑と、帳簿との紐付け（docs/06-documents.md §3）。
+        // F-1（人間承認済み）で「Phase 1 では作らない。Phase 4 の kaikei-blob と
+        // 同時に作る」としていたもの。0010 で追加した。
+        "documents".to_string(),
         "entry_counters".to_string(),
+        "entry_documents".to_string(),
         "journal_entries".to_string(),
         "journal_lines".to_string(),
         "period_snapshots".to_string(),
     ];
     assert_eq!(tables, expected);
-
-    // F-1（人間承認済み）: documents / entry_documents は Phase 1 では作らない
-    // （Phase 4 の kaikei-blob と同時に作る）。
-    assert!(!tables.iter().any(|t| t == "documents"));
-    assert!(!tables.iter().any(|t| t == "entry_documents"));
 }
 
 #[sqlx::test]
