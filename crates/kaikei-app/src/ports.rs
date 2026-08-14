@@ -526,6 +526,24 @@ pub trait ImportedTxQuery: Send + Sync {
         limit: u32,
     ) -> Result<Vec<crate::view::ImportedTxView>, RepoError>;
 
+    /// 明細を1件、IDで引く。
+    ///
+    /// # なぜ一覧と別に用意するか
+    ///
+    /// [`Self::list_imported`] で引いてから絞ると、**上限を超えた分の明細が
+    /// 「見つかりません」になる**。IDを持っているのに引けないのは、
+    /// 帳簿が育つほど起きやすくなる種類の失敗である。
+    ///
+    /// # Errors
+    ///
+    /// 問い合わせに失敗した場合、または保存されている値を復元できない場合は
+    /// [`RepoError`]。**見つからないことはエラーにしない**（`None` を返す）
+    /// ——IDの打ち間違いは呼び出し側が文脈に応じて説明する。
+    async fn find_imported(
+        &self,
+        imported_id: &str,
+    ) -> Result<Option<crate::view::ImportedTxView>, RepoError>;
+
     /// 状態ごとの件数を返す。
     ///
     /// **一覧が空でも、取り込み済みかどうかが分かるようにする**

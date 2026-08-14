@@ -213,6 +213,24 @@ impl ImportedTxQuery for PgImportedTxQuery {
         rows.into_iter().map(ImportedRow::into_view).collect()
     }
 
+    async fn find_imported(&self, imported_id: &str) -> Result<Option<ImportedTxView>, RepoError> {
+        // **UUID でない文字列は「見つからない」。** ここで Corrupt にすると、
+        // 打ち間違いが「保存データが壊れている」という誤診になる
+        // （壊れているのは入力であって帳簿ではない）。
+        let Ok(id) = imported_id.parse::<uuid::Uuid>() else {
+            return Ok(None);
+        };
+        let row = sqlx::query_as::<_, ImportedRow>(
+            "SELECT id::text, source, occurred_on, amount_minor, direction,                     raw_description, balance_after, status, entry_id::text, ignore_reason              FROM imported_transactions              WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(crate::error::from_sqlx_error)?;
+
+        row.map(ImportedRow::into_view).transpose()
+    }
+
     async fn import_status_counts(
         &self,
         source: Option<&str>,
