@@ -383,6 +383,127 @@ pub trait DocumentQueryPort: Send + Sync {
     async fn all_blob_hashes(&self) -> Result<Vec<String>, RepoError>;
 }
 
+/// 取り込んだ明細の向き（`docs/05-csv-import.md` §2）。
+///
+/// **借方/貸方ではない。** 口座から見た入金か出金かでしかなく、どちらの側に
+/// どの科目が立つかは仕訳化のときに決まる（入金が必ず貸方とは限らない
+/// ——返金の入金は費用の取消であり、貸方に費用が立つ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportDirection {
+    /// 口座への入金。
+    In,
+    /// 口座からの出金。
+    Out,
+}
+
+/// 取り込む明細（`docs/05-csv-import.md` §3）。
+///
+/// # なぜ `kaikei_import` の型をそのまま使わないか
+///
+/// `kaikei-app` は `kaikei-import` に依存しない（`ARCHITECTURE.md` §3。CI が
+/// 検査する）。取込は帳簿とは別の文脈であり、繋ぐと「入金/出金」と
+/// 「借方/貸方」が混ざる。**CSV の型からこの型への翻訳は、両方を知ってよい
+/// 端（CLI / MCP）が行う。**
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewImportedTransaction {
+    /// 明細ID（呼び出し側が採番する）。
+    pub id: String,
+    /// どの口座・カードから取り込んだか。
+    pub source: String,
+    /// 同じ明細を二度取り込まないための鍵（`docs/05-csv-import.md` §4）。
+    pub external_key: String,
+    /// 取引年月日。
+    pub occurred_on: AccountingDate,
+    /// 金額。**常に正**——向きは [`Self::direction`] が表す。
+    pub amount_minor: i64,
+    /// 入金か出金か。
+    pub direction: ImportDirection,
+    /// CSV の摘要（正規化後）。
+    pub raw_description: String,
+    /// 取引後残高。CSV に残高列が無ければ `None`。
+    pub balance_after: Option<i64>,
+    /// 元の CSV 行（JSON）。**捨てない**——解釈を間違えたと後で分かったとき、
+    /// 元が無ければ直せない。
+    pub raw_row: String,
+    /// 取り込んだ日時。
+    pub imported_at: Timestamp,
+}
+
+/// 明細を取り込んだ結果（`docs/05-csv-import.md` §4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// 新しく取り込んだ。
+    Inserted,
+    /// 同じ明細が既にあったので何もしなかった。
+    SkippedDuplicate,
+}
+
+/// 取り込んだ明細の登録と状態遷移（Phase 4。`docs/05-csv-import.md` §3・§6）。
+///
+/// # このテーブルだけ append-only ではない
+///
+/// 帳簿・監査ログ・証憑は追記のみだが、取込明細は「未処理 → 仕訳済み」と
+/// 状態が変わる。分けることで両立する——取込を追記のみにすると状態が変わる
+/// たび行が増えて「今どうなっているか」が読めなくなり、逆に帳簿を更新可に
+/// すれば訂正の履歴が消える。
+///
+/// **`Tx` を通す。** 仕訳を作って明細を仕訳済みにするまでが一続きでないと、
+/// 帳簿に仕訳だけが残って明細が未処理のまま——つまり二重計上の入口——になる。
+#[async_trait]
+pub trait ImportedTxRepo: Send {
+    /// 明細を1件取り込む。
+    ///
+    /// **同じ `(source, external_key)` が既にあれば
+    /// [`ImportOutcome::SkippedDuplicate`] を返し、エラーにしない。**
+    /// 同じ CSV を2回流しても同じ結果になることが取込の要件である
+    /// （`docs/05-csv-import.md` §4）。既存の行は書き換えない——取り込んだ後に
+    /// 仕訳済みにした明細を、再取込が未処理へ巻き戻すと二重計上になる。
+    ///
+    /// # Errors
+    ///
+    /// 保存に失敗した場合は [`RepoError`]。
+    async fn insert_imported(
+        &mut self,
+        imported: &NewImportedTransaction,
+    ) -> Result<ImportOutcome, RepoError>;
+
+    /// 明細を仕訳済みにする。
+    ///
+    /// **未処理の明細だけを移せる。** 既に仕訳済みの行を別の仕訳で塗り替える
+    /// と、先に作った仕訳が帳簿に残ったまま誰からも指されなくなる（帳簿は
+    /// 追記のみなので消せない）。取消は逆仕訳を起こしてから
+    /// [`Self::revert_to_pending`] を使う。
+    ///
+    /// # Errors
+    ///
+    /// 明細が無い、または未処理でない場合は [`RepoError::NotFound`]。
+    async fn mark_journalized(
+        &mut self,
+        imported_id: &str,
+        entry_id: EntryId,
+    ) -> Result<(), RepoError>;
+
+    /// 明細を「仕訳しない」ものとして片付ける。
+    ///
+    /// 理由は必ず要る——理由の無い無視は、取りこぼしと見分けが付かない。
+    ///
+    /// # Errors
+    ///
+    /// 明細が無い、または未処理でない場合は [`RepoError::NotFound`]。
+    async fn mark_ignored(&mut self, imported_id: &str, reason: &str) -> Result<(), RepoError>;
+
+    /// 仕訳済みの明細を未処理へ戻す（`docs/05-csv-import.md` §6「状態遷移」）。
+    ///
+    /// **帳簿側の取消は呼び出し側の責任である。** この関数は明細の状態しか
+    /// 戻さない。逆仕訳を起こさずにこれを呼ぶと、帳簿に仕訳が残ったまま明細が
+    /// 未処理に戻り、もう一度仕訳化すると二重計上になる。
+    ///
+    /// # Errors
+    ///
+    /// 明細が無い、または仕訳済みでない場合は [`RepoError::NotFound`]。
+    async fn revert_to_pending(&mut self, imported_id: &str) -> Result<(), RepoError>;
+}
+
 /// 仕訳検索の read model クエリ（Phase 3 PR-H）。
 ///
 /// [`TrialBalanceQuery`] と同じく `Tx` を通さない
