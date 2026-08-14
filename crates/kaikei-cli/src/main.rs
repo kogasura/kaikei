@@ -51,6 +51,7 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
 使い方:
     kaikei report --year <西暦> --out <出力先ディレクトリ>
     kaikei verify --year <西暦>
+    kaikei attach --file <ファイル> --date <取引年月日> --type <種別> --via <経路>
 
 report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
@@ -93,7 +94,22 @@ verify が見るもの:
     証憑が登録されていれば、保存されているファイルの中身が
     帳簿の記録と一致するかも確かめます。
 
-どちらも記帳はしません。読み取りだけなので、税区分や決算科目の設定は要りません。
+attach の引数:
+    --file <パス>        取り込むファイル（必須）
+    --date <YYYY-MM-DD>  取引年月日（必須。検索要件の1つ）
+    --type <種別>        invoice / receipt / contract / other（必須）
+    --via <経路>         email / download / scan / manual（必須）
+    --amount <円>        取引金額（検索要件。無い証憑もあるので任意）
+    --counterparty <名>  取引先（検索要件）
+    --entry <UUID>       紐付ける仕訳のID
+    --mime <型>          MIME タイプ（省略時は拡張子から決める）
+    --note <文>          備考
+
+    証憑は内容の SHA-256 で保存します。同じ内容を2回入れてもファイルは1つです。
+    KAIKEI_BLOB_ROOT の指定が要ります。
+
+report と verify は記帳しません。読み取りだけなので、税区分や決算科目の設定は
+要りません。
 ";
 
 fn main() -> std::process::ExitCode {
@@ -127,6 +143,7 @@ fn run() -> Result<Vec<PathBuf>, String> {
             yayoi,
         } => runtime.block_on(write_reports(fiscal_year, out_dir, deduction, yayoi)),
         Command::Verify { fiscal_year } => runtime.block_on(run_verify(fiscal_year)),
+        Command::Attach(args) => runtime.block_on(run_attach(args)),
     }
 }
 
@@ -148,6 +165,31 @@ enum Command {
     },
     /// 帳簿の整合性を検査する（書き出さない）。
     Verify { fiscal_year: i32 },
+    /// 証憑を保存して帳簿に登録する。
+    Attach(AttachArgs),
+}
+
+/// `kaikei attach` の引数。
+#[derive(Debug)]
+struct AttachArgs {
+    /// 取り込むファイル。
+    file: PathBuf,
+    /// 取引年月日（検索要件）。
+    doc_date: AccountingDate,
+    /// 取引金額（検索要件）。**無い証憑があるので Option**。
+    amount_minor: Option<i64>,
+    /// 取引先（検索要件）。
+    counterparty: Option<String>,
+    /// 種別（invoice / receipt / contract / other）。
+    doc_type: String,
+    /// 授受の経路（email / download / scan / manual）。
+    received_via: String,
+    /// MIME タイプ。省略時は拡張子から決める。
+    mime_type: Option<String>,
+    /// 紐付ける仕訳のID。
+    entry_id: Option<String>,
+    /// 備考。
+    note: Option<String>,
 }
 
 /// 引数を解析する。
@@ -160,6 +202,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         return Err(USAGE.to_string());
     }
     let subcommand = args[0].as_str();
+    if subcommand == "attach" {
+        return parse_attach(&args[1..]);
+    }
     if subcommand != "report" && subcommand != "verify" {
         return Err(format!("不明なサブコマンドです: {subcommand}\n\n{USAGE}"));
     }
@@ -302,6 +347,211 @@ async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
         eprintln!("  [{}] {}", finding.kind.as_code(), finding.detail);
     }
     Err(String::new())
+}
+
+/// `kaikei attach` の引数を解析する。
+///
+/// **必須のものを既定値で埋めない。** 取引年月日・種別・授受の経路は後から
+/// 復元できない情報なので、指定が無ければ止める。
+fn parse_attach(args: &[String]) -> Result<Command, String> {
+    let mut file: Option<PathBuf> = None;
+    let mut doc_date: Option<AccountingDate> = None;
+    let mut amount_minor: Option<i64> = None;
+    let mut counterparty: Option<String> = None;
+    let mut doc_type: Option<String> = None;
+    let mut received_via: Option<String> = None;
+    let mut mime_type: Option<String> = None;
+    let mut entry_id: Option<String> = None;
+    let mut note: Option<String> = None;
+
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let key = arg.as_str();
+        let mut take = || {
+            rest.next()
+                .cloned()
+                .ok_or_else(|| format!("{key} の後に値を指定してください"))
+        };
+        match key {
+            "--file" => file = Some(PathBuf::from(take()?)),
+            "--date" => {
+                let text = take()?;
+                doc_date = Some(AccountingDate::parse(&text).map_err(|error| {
+                    format!("--date は YYYY-MM-DD で指定してください（{text}: {error}）")
+                })?);
+            }
+            "--amount" => {
+                let text = take()?;
+                amount_minor = Some(text.parse::<i64>().map_err(|_| {
+                    format!("--amount は円の数字で指定してください（受け取った値: {text}）")
+                })?);
+            }
+            "--counterparty" => counterparty = Some(take()?),
+            "--type" => doc_type = Some(take()?),
+            "--via" => received_via = Some(take()?),
+            "--mime" => mime_type = Some(take()?),
+            "--entry" => entry_id = Some(take()?),
+            "--note" => note = Some(take()?),
+            other => return Err(format!("不明な引数です: {other}")),
+        }
+    }
+
+    Ok(Command::Attach(AttachArgs {
+        file: file.ok_or("--file を指定してください")?,
+        doc_date: doc_date.ok_or("--date を指定してください（例: --date 2026-06-15）")?,
+        amount_minor,
+        counterparty,
+        doc_type: doc_type
+            .ok_or("--type を指定してください（invoice / receipt / contract / other）")?,
+        received_via: received_via
+            .ok_or("--via を指定してください（email / download / scan / manual）")?,
+        mime_type,
+        entry_id,
+        note,
+    }))
+}
+
+/// 拡張子から MIME タイプを決める。
+///
+/// **分からなければ推測しない。** 誤った型で保存すると、後から中身が何かを
+/// 判別できなくなる。`--mime` で明示してもらう。
+fn mime_from_extension(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "csv" => "text/csv",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "xml" => "application/xml",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        _ => return None,
+    })
+}
+
+/// 証憑を保存して帳簿に登録する。
+///
+/// **保存と登録を必ず両方行う。** ファイルだけ保存して帳簿に登録しないと、
+/// 中身はあるのに誰も辿れない証憑が残る。
+async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
+    use kaikei_app::ports::{DocumentQueryPort, DocumentRepo, NewDocument};
+    use kaikei_blob::BlobStore;
+
+    let mime_type = match &args.mime_type {
+        Some(mime) => mime.clone(),
+        None => mime_from_extension(&args.file)
+            .ok_or_else(|| {
+                format!(
+                    "{} の MIME タイプを拡張子から決められません。--mime で指定してください",
+                    args.file.display()
+                )
+            })?
+            .to_string(),
+    };
+
+    let bytes = std::fs::read(&args.file)
+        .map_err(|error| format!("読めませんでした: {}（{error}）", args.file.display()))?;
+    let original_name = args
+        .file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("ファイル名を取れません: {}", args.file.display()))?
+        .to_string();
+
+    let blob_root = env_var("KAIKEI_BLOB_ROOT")?;
+    let store = kaikei_blob::LocalBlobStore::new(blob_root);
+    store
+        .prepare()
+        .await
+        .map_err(|error| format!("証憑の保存先を用意できませんでした: {error}"))?;
+    let hash = store
+        .put(&bytes)
+        .await
+        .map_err(|error| format!("証憑を保存できませんでした: {error}"))?;
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+
+    // **同じ内容が既に登録されていれば知らせる。** 同じ請求書を別の取引の
+    // 証憑にすることはあるので止めはしないが、二重登録に気づけるようにする。
+    let query = PgDocumentQuery::new(pool.clone());
+    let existing = query
+        .search_documents(&kaikei_app::view::DocumentQuery::default(), 200)
+        .await
+        .map_err(|error| format!("既存の証憑を調べられませんでした: {error}"))?;
+    let same: Vec<&str> = existing
+        .iter()
+        .filter(|doc| doc.blob_hash == hash.to_hex())
+        .map(|doc| doc.original_name.as_str())
+        .collect();
+    if !same.is_empty() {
+        eprintln!(
+            "注意: 同じ内容の証憑が既に {} 件登録されています（{}）。別の取引の証憑にするなら問題ありません",
+            same.len(),
+            same.join("・")
+        );
+    }
+
+    let document = NewDocument {
+        id: uuid::Uuid::now_v7().to_string(),
+        blob_hash: hash.to_hex(),
+        original_name,
+        mime_type,
+        byte_size: bytes.len() as i64,
+        doc_date: args.doc_date,
+        amount_minor: args.amount_minor,
+        counterparty: args.counterparty,
+        doc_type: args.doc_type,
+        received_via: args.received_via,
+        received_at: kaikei_core::Timestamp::from_unix_nanos(now_unix_nanos()?),
+        note: args.note,
+    };
+    let document_id = document.id.clone();
+    let entry = args.entry_id.as_deref().map(parse_entry_id).transpose()?;
+
+    let store_pg = PgStore::new(pool);
+    with_tx_err(&store_pg, move |tx| {
+        let document = document.clone();
+        let document_id = document_id.clone();
+        Box::pin(async move {
+            tx.insert_document(&document).await?;
+            // **登録と紐付けを同じトランザクションで行う。** 片方だけ残ると
+            // 帳簿から証憑への道筋が壊れる。
+            if let Some(entry) = entry {
+                tx.link_document(entry, &document_id).await?;
+            }
+            Ok::<(), kaikei_app::error::AppError>(())
+        })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::AppError| format!("証憑を登録できませんでした: {error}"))?;
+
+    println!("証憑を登録しました: {}", hash.to_hex());
+    if entry.is_some() {
+        println!("  仕訳に紐付けました");
+    }
+    Ok(Vec::new())
+}
+
+/// 仕訳IDを解釈する。
+fn parse_entry_id(text: &str) -> Result<kaikei_core::EntryId, String> {
+    let uuid = uuid::Uuid::parse_str(text)
+        .map_err(|error| format!("--entry は UUID で指定してください（{text}: {error}）"))?;
+    Ok(kaikei_core::EntryId::new(uuid.as_u128()))
+}
+
+/// 現在時刻（UNIX ナノ秒）。
+fn now_unix_nanos() -> Result<i128, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as i128)
+        .map_err(|error| format!("現在時刻を取れませんでした: {error}"))
 }
 
 /// 証憑の中身が保存時から変わっていないかを確かめる。
@@ -1209,6 +1459,102 @@ mod tests {
     #[test]
     fn an_empty_book_gets_no_balance_sheet_note() {
         assert!(balance_sheet_notes(&output(0, None), date(2026, 12, 31)).is_empty());
+    }
+
+    // attach は必須の指定を既定値で埋めない。
+    //
+    // **取引年月日・種別・授受の経路は後から復元できない。** 既定値で埋めると、
+    // 誤った値の証憑が黙って帳簿に入る。
+    #[test]
+    fn attach_requires_what_cannot_be_recovered_later() {
+        for (missing, args_without) in [
+            (
+                "--file",
+                vec![
+                    "attach",
+                    "--date",
+                    "2026-06-15",
+                    "--type",
+                    "invoice",
+                    "--via",
+                    "email",
+                ],
+            ),
+            (
+                "--date",
+                vec![
+                    "attach", "--file", "x.pdf", "--type", "invoice", "--via", "email",
+                ],
+            ),
+            (
+                "--type",
+                vec![
+                    "attach",
+                    "--file",
+                    "x.pdf",
+                    "--date",
+                    "2026-06-15",
+                    "--via",
+                    "email",
+                ],
+            ),
+            (
+                "--via",
+                vec![
+                    "attach",
+                    "--file",
+                    "x.pdf",
+                    "--date",
+                    "2026-06-15",
+                    "--type",
+                    "invoice",
+                ],
+            ),
+        ] {
+            let err =
+                parse_args(&args(&args_without)).expect_err("{missing} が無ければ拒否されるはず");
+            assert!(err.contains(missing), "{missing} を求めること: {err}");
+        }
+    }
+
+    // 金額と取引先は任意（契約書のように金額の無い証憑がある）。
+    #[test]
+    fn attach_allows_a_document_without_an_amount() {
+        let command = parse_args(&args(&[
+            "attach",
+            "--file",
+            "契約書.pdf",
+            "--date",
+            "2026-04-01",
+            "--type",
+            "contract",
+            "--via",
+            "manual",
+        ]))
+        .unwrap();
+        match command {
+            Command::Attach(attach) => {
+                assert_eq!(attach.amount_minor, None, "0 で埋めないこと");
+                assert_eq!(attach.counterparty, None);
+                assert_eq!(attach.doc_type, "contract");
+            }
+            other => panic!("attach として解釈されるはず: {other:?}"),
+        }
+    }
+
+    // 拡張子から MIME が決まらなければ、推測せずに指定を求める。
+    #[test]
+    fn an_unknown_extension_does_not_get_a_guessed_mime_type() {
+        assert_eq!(
+            mime_from_extension(Path::new("請求書.pdf")),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            mime_from_extension(Path::new("領収書.PDF")),
+            Some("application/pdf")
+        );
+        assert_eq!(mime_from_extension(Path::new("なぞ.xyz")), None);
+        assert_eq!(mime_from_extension(Path::new("拡張子なし")), None);
     }
 
     // 集計の下限は、どんな帳簿の最初の仕訳よりも前であること。
