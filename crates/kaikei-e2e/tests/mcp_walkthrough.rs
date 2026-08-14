@@ -636,6 +636,21 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
     // 止めたのだから、帳簿も明細も動いていない。
     assert_eq!(journal_entry_count(&app).await, 4);
 
+    // 過去の記帳を根拠に候補を出す。**記帳はしない。**
+    // この帳簿には同じ摘要の記帳がまだ無いので候補は空になる——0件は
+    // 異常ではなく、「似た取引が無い」と読めることが要る。
+    let suggested = server
+        .call_tool(
+            "suggest_journal_entry",
+            json!({ "imported_tx_id": imported_id }),
+        )
+        .await;
+    assert!(!is_error(&suggested), "0件はエラーにしない: {suggested}");
+    let suggestion = body(&suggested);
+    assert_eq!(suggestion["has_suggestion"], json!(false), "{suggestion}");
+    // 提案では帳簿が動かない。
+    assert_eq!(journal_entry_count(&app).await, 4);
+
     let journalized = server
         .call_tool(
             "journalize_transaction",
@@ -703,6 +718,7 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
             ("list_pending_transactions".to_string(), "ok".to_string()),
             ("list_pending_transactions".to_string(), "error".to_string()),
             ("journalize_transaction".to_string(), "error".to_string()),
+            ("suggest_journal_entry".to_string(), "ok".to_string()),
             ("journalize_transaction".to_string(), "ok".to_string()),
             ("list_pending_transactions".to_string(), "ok".to_string()),
         ],

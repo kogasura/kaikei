@@ -32,6 +32,7 @@ pub mod propose_closing_entries;
 pub mod reverse_journal_entry;
 pub mod search_documents;
 pub mod search_entries;
+pub mod suggest_journal_entry;
 pub mod suggest_tax_category;
 pub mod validate_invoice_number;
 

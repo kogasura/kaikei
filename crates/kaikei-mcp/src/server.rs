@@ -232,6 +232,7 @@ pub fn tool_registry() -> ToolRegistry {
     use crate::tools::reverse_journal_entry::ReverseJournalEntry;
     use crate::tools::search_documents::SearchDocuments;
     use crate::tools::search_entries::SearchEntries;
+    use crate::tools::suggest_journal_entry::SuggestJournalEntry;
     use crate::tools::suggest_tax_category::SuggestTaxCategory;
     use crate::tools::validate_invoice_number::ValidateInvoiceNumber;
 
@@ -255,6 +256,8 @@ pub fn tool_registry() -> ToolRegistry {
         .with::<GetSettings>()
         // 提案系・検証系（PR-G。帳簿を変更しない）。
         .with::<SuggestTaxCategory>()
+        // 明細から仕訳を提案する（Phase 4）。**記帳はしない**。
+        .with::<SuggestJournalEntry>()
         .with::<ValidateInvoiceNumber>()
         // 読み取り系（PR-H。read model の新設が要ったぶん）。
         .with::<SearchEntries>()
