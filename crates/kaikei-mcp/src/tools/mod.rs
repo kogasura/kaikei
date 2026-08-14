@@ -23,6 +23,7 @@ pub mod get_ledger;
 pub mod get_settings;
 pub mod get_statements;
 pub mod get_trial_balance;
+pub mod journalize_transaction;
 pub mod list_accounts;
 pub mod list_pending_transactions;
 pub mod list_tax_categories;

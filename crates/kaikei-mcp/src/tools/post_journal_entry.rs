@@ -220,7 +220,20 @@ auto_tax_lines を true にすると消費税額の行の生成を試みます�
 /// **確定後の明細を必ず返す**（AI が「何が記録されたか」を確認できるように
 /// するため）。`policy_notes` は `kaikei-policy` が組み立てた文言をそのまま
 /// 素通しする（`CLAUDE.md` §10）。
-fn success(output: &PostEntryOutput) -> ToolSuccess {
+/// 記帳の結果を応答にする。
+///
+/// **`journalize_transaction` と共有する**（D-096 の後続）。同じ仕訳を2つの
+/// ツールが別々の形で返すと、AI から見て別物に見える。
+pub(crate) fn success(output: &PostEntryOutput) -> ToolSuccess {
+    ToolSuccess::new(entry_body(output)).with_entry_id(output.entry.id())
+}
+
+/// 記帳した仕訳を応答の本文にする。
+///
+/// **`journalize_transaction` と共有する**。同じ仕訳を2つのツールが別々の形で
+/// 返すと、AI から見て別物に見える。あちらは項目を1つ足すので、
+/// [`ToolSuccess`] ではなく組み立て途中の本文を返す。
+pub(crate) fn entry_body(output: &PostEntryOutput) -> Map<String, Value> {
     let entry = &output.entry;
     let mut body = Map::new();
     body.insert(
@@ -249,14 +262,14 @@ fn success(output: &PostEntryOutput) -> ToolSuccess {
         policy_notes_to_json(&output.notes),
     );
 
-    ToolSuccess::new(body).with_entry_id(entry.id())
+    body
 }
 
 /// 線上の明細を [`JournalLine`] にする。
 ///
 /// エラーには**何行目か**を添える（`CLAUDE.md` §11。下位層の文言は
 /// 言い換えず、位置情報だけを足す）。
-fn build_lines(
+pub(crate) fn build_lines(
     composition: &Composition,
     settings: &BookSettings,
     lines: &[PostJournalEntryLine],

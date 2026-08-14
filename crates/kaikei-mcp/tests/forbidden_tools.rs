@@ -48,14 +48,15 @@ const FORBIDDEN_TOOLS: [&str; 4] = [
 ///
 /// Phase 3 の11件（D-070）に、Phase 5 で `get_statements`（D-093）と
 /// `propose_closing_entries`（D-094）を、Phase 4 で `search_documents`（D-095）と
-/// `list_pending_transactions`（D-096）を足した。
+/// `list_pending_transactions`（D-096）と `journalize_transaction`（D-097）を
+/// 足した。
 /// 「Phase 4 以降」と書かれたままのツールは名前を予約しているだけで、
 /// 登録しない（登録しないツールは AI からは存在しないのと同じ）。
 ///
 /// **増やすときは設計書（§2 の表）と `DECISIONS.md` を先に更新すること。**
 /// 下の検査はこの一覧を許可リストとして使うので、ここだけ書き換えれば
 /// 通ってしまう——順序を守るのは人間の側である。
-const ALLOWED_TOOLS: [&str; 15] = [
+const ALLOWED_TOOLS: [&str; 16] = [
     "list_accounts",
     "get_entry",
     "get_trial_balance",
@@ -73,6 +74,8 @@ const ALLOWED_TOOLS: [&str; 15] = [
     "search_documents",
     // Phase 4: 取り込んだ明細の一覧（D-096）。**仕訳ではない**。
     "list_pending_transactions",
+    // Phase 4: 明細を仕訳にする（D-097）。記帳と状態遷移を1つのまとまりで行う。
+    "journalize_transaction",
 ];
 
 // MC-10 (1): `tools/list` の応答に4件のいずれも現れない。
