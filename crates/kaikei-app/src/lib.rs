@@ -79,6 +79,7 @@ pub mod context;
 pub mod currency;
 pub mod error;
 pub mod id;
+pub mod journalize;
 pub mod period_guard;
 pub mod ports;
 #[cfg(test)]
