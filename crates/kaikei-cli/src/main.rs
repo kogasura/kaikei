@@ -28,6 +28,7 @@ use kaikei_app::view::LedgerPageView;
 use kaikei_core::{AccountingDate, FiscalYear};
 use kaikei_jp::statement::JpStatementPolicy;
 use kaikei_jp::tags::TagCatalog;
+use kaikei_store::documents::PgDocumentQuery;
 use kaikei_store::pool::{connect_app, PgStore};
 use kaikei_store::query::{PgLedgerQuery, PgTrialBalanceQuery};
 use std::path::{Path, PathBuf};
@@ -82,11 +83,15 @@ verify は帳簿の整合性を検査します（書き出しません）。
     APP_DATABASE_URL          帳簿の接続先（kaikei_app ロール）
     KAIKEI_BOOK_CURRENCY      帳簿通貨（例: JPY）
     KAIKEI_FISCAL_YEAR_RULE   会計年度の区切り（現在は calendar_year のみ）
+    KAIKEI_BLOB_ROOT          証憑ファイルの保存先（verify で中身を検証する
+                              ときに使う。未設定なら検証を行わず、その旨を出す）
 
 verify が見るもの:
     同じ帳簿を2つの経路（仕訳からの集計と SQL 集計）で計算し、
     残高が一致するかを突き合わせます。あわせて赤伝の訂正元と
     仕訳番号の重複を確認します。
+    証憑が登録されていれば、保存されているファイルの中身が
+    帳簿の記録と一致するかも確かめます。
 
 どちらも記帳はしません。読み取りだけなので、税区分や決算科目の設定は要りません。
 ";
@@ -242,6 +247,9 @@ async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
         .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
     let store = PgStore::new(pool.clone());
 
+    // 証憑の検査に使う。**クロージャへ移す前に取っておく。**
+    let documents = PgDocumentQuery::new(pool.clone());
+
     let schema = catalog.schema().clone();
     let output = with_tx_err(&store, move |tx| {
         let schema = schema.clone();
@@ -274,17 +282,91 @@ async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
         }
     }
 
-    if output.is_clean() {
+    // 証憑の検証。**保存先が設定されていなければ、検証したふりをしない。**
+    let document_findings = verify_documents(&documents).await?;
+    for message in &document_findings {
+        eprintln!("  [document] {message}");
+    }
+
+    if output.is_clean() && document_findings.is_empty() {
         println!("不整合は見つかりませんでした");
         return Ok(Vec::new());
     }
 
     let inconsistencies: Vec<_> = output.inconsistencies().collect();
-    eprintln!("不整合が {} 件見つかりました:", inconsistencies.len());
+    eprintln!(
+        "不整合が {} 件見つかりました:",
+        inconsistencies.len() + document_findings.len()
+    );
     for finding in inconsistencies {
         eprintln!("  [{}] {}", finding.kind.as_code(), finding.detail);
     }
     Err(String::new())
+}
+
+/// 証憑の中身が保存時から変わっていないかを確かめる。
+///
+/// `docs/06-documents.md` §6。**この検査が「改変されていないことを証明できる」
+/// という価値の実体**である。
+///
+/// # 保存先が無いときに「検証済み」と言わない
+///
+/// `KAIKEI_BLOB_ROOT` が未設定なら、証憑の検証は**行っていない**ことを画面に
+/// 出して素通りする。黙って通すと、一度も検証していない帳簿が「不整合は
+/// 見つかりませんでした」と表示されることになる。
+///
+/// 帳簿に証憑が1件も登録されていなければ、設定が無くても何も言わない
+/// （証憑を使っていない人に設定を求めない）。
+async fn verify_documents(query: &PgDocumentQuery) -> Result<Vec<String>, String> {
+    use kaikei_app::ports::DocumentQueryPort;
+    use kaikei_blob::BlobStore;
+
+    let hashes = query
+        .all_blob_hashes()
+        .await
+        .map_err(|error| format!("証憑の一覧を読めませんでした: {error}"))?;
+
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Ok(root) = std::env::var("KAIKEI_BLOB_ROOT") else {
+        println!(
+            concat!(
+                "注意: 証憑が {} 件ありますが、KAIKEI_BLOB_ROOT が未設定のため",
+                "中身の検証は行っていません"
+            ),
+            hashes.len()
+        );
+        return Ok(Vec::new());
+    };
+
+    let store = kaikei_blob::LocalBlobStore::new(root);
+    let mut findings = Vec::new();
+    let mut verified = 0usize;
+    for hex in &hashes {
+        let hash = match kaikei_core::BlobHash::parse_hex(hex) {
+            Ok(hash) => hash,
+            Err(error) => {
+                findings.push(format!("証憑のハッシュが不正です: {hex}（{error}）"));
+                continue;
+            }
+        };
+        match store.verify(&hash).await {
+            // **中身が変わっている。** 最も知りたいのがこれ。
+            Ok(false) => findings.push(format!(
+                "証憑の中身が保存時から変わっています: {hex}。帳簿の記録と一致しません"
+            )),
+            Ok(true) => verified += 1,
+            // 「無い」と「変わっている」を分けて言う。
+            Err(kaikei_blob::BlobError::NotFound { hash }) => {
+                findings.push(format!("証憑のファイルが保存先に見つかりません: {hash}"))
+            }
+            Err(error) => findings.push(format!("証憑を検証できませんでした: {error}")),
+        }
+    }
+    println!("検証した証憑: {verified} 件（全 {} 件）", hashes.len());
+    Ok(findings)
 }
 
 /// 環境変数を1つ読む。**未設定は既定値で埋めない。**
