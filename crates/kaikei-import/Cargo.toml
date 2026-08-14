@@ -1,0 +1,24 @@
+# crates/kaikei-import/Cargo.toml
+#
+# ★ 取込データは仕訳ではない ★
+# 銀行明細 CSV の1行は「未処理の取引記録」であって仕訳ではない
+# （docs/05-csv-import.md §1）。別集約・別コンテキストとして分離する。
+#
+# **kaikei-core に依存しない。** ここを繋ぐと「入金/出金」と「借方/貸方」が
+# 混ざり、設計全体が汚染される。翻訳は kaikei-app の journalize が担う。
+
+[package]
+name = "kaikei-import"
+version = "0.0.1"
+description = "銀行・カード明細の取込（取込データは仕訳ではない。帳簿とは別の集約）"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+encoding_rs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
