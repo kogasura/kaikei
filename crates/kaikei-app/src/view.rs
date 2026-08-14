@@ -392,3 +392,54 @@ mod tests {
         ));
     }
 }
+
+/// 証憑1件（`docs/06-documents.md` §3）。
+///
+/// ファイルの中身は持たない（内容は `kaikei-blob` が SHA-256 で管理する）。
+/// **メタデータだけを運ぶ**ので、一覧を返しても量が跳ねない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentView {
+    /// 証憑ID。
+    pub id: String,
+    /// 内容の SHA-256（16進64文字・小文字）。
+    pub blob_hash: String,
+    /// 元のファイル名。
+    pub original_name: String,
+    /// MIME タイプ。
+    pub mime_type: String,
+    /// バイト数。
+    pub byte_size: i64,
+    /// 取引年月日（検索要件）。
+    pub doc_date: AccountingDate,
+    /// 取引金額（検索要件）。**契約書のように金額が無い証憑があるので
+    /// `None` を許す。0 で埋めない。**
+    pub amount_minor: Option<i64>,
+    /// 取引先（検索要件）。
+    pub counterparty: Option<String>,
+    /// 種別（invoice / receipt / contract / other）。
+    pub doc_type: String,
+    /// 授受の経路（email / download / scan / manual）。
+    pub received_via: String,
+    /// 備考。
+    pub note: Option<String>,
+}
+
+/// 証憑の検索条件（`docs/06-documents.md` §4）。
+///
+/// **取引年月日・取引金額・取引先の3項目**の組み合わせと範囲指定に対応する。
+/// これが電子取引データの検索要件の内容である。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocumentQuery {
+    /// 取引年月日の下限（この日を含む）。
+    pub date_from: Option<AccountingDate>,
+    /// 取引年月日の上限（この日を含む）。
+    pub date_to: Option<AccountingDate>,
+    /// 取引金額の下限（この額を含む）。
+    pub amount_min: Option<i64>,
+    /// 取引金額の上限（この額を含む）。
+    pub amount_max: Option<i64>,
+    /// 取引先（完全一致）。
+    pub counterparty: Option<String>,
+    /// 種別。
+    pub doc_type: Option<String>,
+}

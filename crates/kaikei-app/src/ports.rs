@@ -42,7 +42,7 @@ use crate::view::{BalanceRowView, EntryCursor, EntrySearchPageView, LedgerCursor
 use async_trait::async_trait;
 use kaikei_core::{
     AccountCode, AccountDef, AccountingDate, ChartOfAccounts, Clock, Currency, EntryId,
-    EntryNumber, JournalEntry, Money, TagKey,
+    EntryNumber, JournalEntry, Money, TagKey, Timestamp,
 };
 use kaikei_policy::CounterpartyIndex;
 
@@ -287,6 +287,93 @@ pub trait TrialBalanceQuery: Send + Sync {
         to: AccountingDate,
         group_by: &[TagKey],
     ) -> Result<Vec<BalanceRowView>, RepoError>;
+}
+
+/// 登録する証憑（`docs/06-documents.md` §3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDocument {
+    /// 証憑ID（呼び出し側が採番する）。
+    pub id: String,
+    /// 内容の SHA-256（16進64文字・小文字）。
+    pub blob_hash: String,
+    /// 元のファイル名。
+    pub original_name: String,
+    /// MIME タイプ。
+    pub mime_type: String,
+    /// バイト数。
+    pub byte_size: i64,
+    /// 取引年月日。
+    pub doc_date: AccountingDate,
+    /// 取引金額。金額の無い証憑（契約書など）は `None`。
+    pub amount_minor: Option<i64>,
+    /// 取引先。
+    pub counterparty: Option<String>,
+    /// 種別（invoice / receipt / contract / other）。
+    pub doc_type: String,
+    /// 授受の経路（email / download / scan / manual）。
+    pub received_via: String,
+    /// 授受した日時。
+    pub received_at: Timestamp,
+    /// 備考。
+    pub note: Option<String>,
+}
+
+/// 証憑の登録（Phase 4）。
+///
+/// **`Tx` を通す。** 仕訳と証憑の紐付けが半分だけ残ると、帳簿から証憑への
+/// 道筋が壊れる。登録と紐付けは同じトランザクションで行う。
+#[async_trait]
+pub trait DocumentRepo: Send {
+    /// 証憑を登録する。
+    ///
+    /// # Errors
+    ///
+    /// 同じIDが既にある場合は [`RepoError::Conflict`]、それ以外の失敗は
+    /// [`RepoError`]。
+    async fn insert_document(&mut self, document: &NewDocument) -> Result<(), RepoError>;
+
+    /// 仕訳と証憑を紐付ける。
+    ///
+    /// **同じ組み合わせを2回登録しても失敗しない**（何度取り込んでも同じ結果に
+    /// なるようにする）。
+    async fn link_document(
+        &mut self,
+        entry_id: EntryId,
+        document_id: &str,
+    ) -> Result<(), RepoError>;
+}
+
+/// 証憑の read model クエリ（Phase 4。`docs/06-documents.md` §4）。
+///
+/// [`TrialBalanceQuery`] と同じく `Tx` を通さない
+/// （`CLAUDE.md` §6「read model は物理的に分離する」）。
+///
+/// 書き込み側（証憑の登録）を分けているのは、**登録は帳簿と同じ
+/// トランザクションで行う**ためである（仕訳と証憑の紐付けが半分だけ残ると、
+/// 帳簿から証憑への道筋が壊れる）。
+#[async_trait]
+pub trait DocumentQueryPort: Send + Sync {
+    /// 条件に一致する証憑を返す。
+    ///
+    /// 並びは取引年月日の降順、同じ日ならIDの昇順（決定的にする）。
+    ///
+    /// # Errors
+    ///
+    /// 問い合わせに失敗した場合、または保存されている値を復元できない場合は
+    /// [`RepoError`]。
+    async fn search_documents(
+        &self,
+        query: &crate::view::DocumentQuery,
+        limit: u32,
+    ) -> Result<Vec<crate::view::DocumentView>, RepoError>;
+
+    /// 1つの仕訳に紐付いた証憑を返す。
+    ///
+    /// **帳簿から証憑へ辿れること**が電子帳簿保存法の相互関連性の要件である。
+    async fn documents_of_entry(
+        &self,
+        entry_id: EntryId,
+    ) -> Result<Vec<crate::view::DocumentView>, RepoError>;
 }
 
 /// 仕訳検索の read model クエリ（Phase 3 PR-H）。
