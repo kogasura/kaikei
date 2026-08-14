@@ -321,3 +321,104 @@ async fn documents_reject_values_that_would_break_search(
         assert!(result.is_err(), "{label} は拒否されるはず");
     }
 }
+
+// ─── 取込明細（0011_imported_transactions.sql）──────────────
+
+/// 取込明細を1件入れる。
+async fn insert_imported(pool: &sqlx::PgPool, key: &str, status: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO imported_transactions          (id, source, external_key, occurred_on, amount_minor, direction,           raw_description, raw_row, status, imported_at)          VALUES (gen_random_uuid(), 'bank', $1, DATE '2026-06-15', 1000, 2,                  'ｺﾝﾋﾞﾆ', '{}', $2, now())",
+    )
+    .bind(key)
+    .bind(status)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// **本命。** 取込明細は UPDATE できる（帳簿と違う）。
+///
+/// 取り込んだ明細は「未処理 → 仕訳済み」と状態が変わるものであり、訂正を
+/// 逆仕訳で表す帳簿とは性質が違う（docs/05-csv-import.md §2）。
+/// **この分離があるから帳簿の不変性を守れる。**
+#[sqlx::test]
+async fn imported_transactions_can_be_updated_unlike_the_journal(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    insert_imported(&roles.app, "k1", "pending").await.unwrap();
+
+    // 取込は状態を変えられる。
+    sqlx::query("UPDATE imported_transactions SET status='ignored', ignore_reason='事業外'")
+        .execute(&roles.app)
+        .await
+        .expect("取込明細は UPDATE できること");
+
+    // 帳簿は変えられないまま。
+    let err = sqlx::query("UPDATE journal_entries SET description='x'")
+        .execute(&roles.app)
+        .await
+        .expect_err("帳簿の UPDATE は拒否されること");
+    assert_eq!(sqlstate(&err).as_deref(), Some("42501"));
+}
+
+/// 取り込んだ記録は消せない。
+///
+/// 消せると「何を取り込んだか」が追えなくなる。
+#[sqlx::test]
+async fn an_imported_transaction_cannot_be_deleted(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    insert_imported(&roles.app, "k1", "pending").await.unwrap();
+
+    let err = sqlx::query("DELETE FROM imported_transactions")
+        .execute(&roles.app)
+        .await
+        .expect_err("DELETE は拒否されること");
+
+    assert_eq!(sqlstate(&err).as_deref(), Some("42501"));
+}
+
+/// **本命。** 同じ明細を2回取り込めない（冪等性）。
+#[sqlx::test]
+async fn the_same_statement_line_cannot_be_imported_twice(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+    insert_imported(&roles.app, "same-key", "pending")
+        .await
+        .unwrap();
+
+    let err = insert_imported(&roles.app, "same-key", "pending")
+        .await
+        .expect_err("同じ source+external_key は1行だけ");
+
+    assert_eq!(sqlstate(&err).as_deref(), Some("23505"), "一意制約違反");
+}
+
+/// 状態と付随する値が食い違う行を通さない。
+///
+/// 「仕訳済みなのに仕訳IDが無い」行があると、帳簿へ辿れないまま
+/// 「処理済み」として一覧から消える。
+#[sqlx::test]
+async fn a_status_that_contradicts_its_fields_is_rejected(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let roles = common::roles(pool_opts, conn_opts).await;
+
+    // 仕訳済みなのに仕訳IDが無い。
+    assert!(insert_imported(&roles.app, "k1", "journalized")
+        .await
+        .is_err());
+    // 無視なのに理由が無い。
+    assert!(insert_imported(&roles.app, "k2", "ignored").await.is_err());
+    // 知らない状態。
+    assert!(insert_imported(&roles.app, "k3", "なんとなく")
+        .await
+        .is_err());
+}
