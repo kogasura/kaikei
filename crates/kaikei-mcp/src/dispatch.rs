@@ -263,6 +263,11 @@ impl<'a> ToolContext<'a> {
         self.runtime.documents.as_ref()
     }
 
+    /// 取り込んだ明細の read model（`Store` / `Tx` を経由しない。`CLAUDE.md` §6）。
+    pub fn imported_tx_query(&self) -> &'a kaikei_store::imported::PgImportedTxQuery {
+        self.runtime.imported_tx.as_ref()
+    }
+
     /// 起動時にテンプレートと定義が食い違い、**既存を残した**科目
     /// （`DECISIONS.md` D-081 / D-086）。
     ///

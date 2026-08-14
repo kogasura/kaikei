@@ -569,6 +569,32 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
     );
     assert_eq!(docs["documents"], json!([]), "{docs}");
 
+    // ── 取り込んだ明細を見る（Phase 4）────────────────────
+    //
+    // この帳簿には明細を1件も取り込んでいない。**0件は成功**である。
+    // ただし「全部片付いた」のか「まだ1件も取り込んでいない」のかで、
+    // 次にやることが正反対になる。counts の合計がそれを分ける。
+    let pending = server
+        .call_tool("list_pending_transactions", json!({}))
+        .await;
+    assert!(!is_error(&pending), "0件はエラーにしない: {pending}");
+    let txs = body(&pending);
+    assert_eq!(txs["count"], json!(0), "{txs}");
+    assert_eq!(
+        txs["counts"]["total"],
+        json!(0),
+        "まだ取り込んでいないことが読み取れること: {txs}"
+    );
+    assert_eq!(txs["transactions"], json!([]), "{txs}");
+    assert_eq!(txs["status"], json!("pending"), "既定は未処理: {txs}");
+
+    // **惜しい指定を黙って0件にしない。** `Pending` が通ると、条件に
+    // 合わないだけなのに「未処理は無い」と読み違える。
+    let near_miss = server
+        .call_tool("list_pending_transactions", json!({ "status": "Pending" }))
+        .await;
+    assert!(is_error(&near_miss), "拒否されること: {near_miss}");
+
     server.shutdown().await;
 
     // -----------------------------------------------------------------
@@ -604,6 +630,8 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
             ("get_statements".to_string(), "ok".to_string()),
             ("propose_closing_entries".to_string(), "ok".to_string()),
             ("search_documents".to_string(), "ok".to_string()),
+            ("list_pending_transactions".to_string(), "ok".to_string()),
+            ("list_pending_transactions".to_string(), "error".to_string()),
         ],
         "呼び出した順に「開始・結果の2行」が並ぶこと（読み取り系も同じ経路）"
     );
