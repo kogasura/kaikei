@@ -26,6 +26,7 @@
 //! 残高の無い明細では、同じ内容の何件目かを添えて区別する。
 
 pub mod profile;
+pub mod reader;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
