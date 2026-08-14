@@ -80,6 +80,11 @@ verify は帳簿の整合性を検査します（書き出しません）。
     このほか blue_return_not_on_form.csv に、決算書のどの欄にも
     載らなかった科目を理由付きで書き出します。
 
+    証憑が登録されていれば documents/ にも書き出します（KAIKEI_BLOB_ROOT が
+    要ります）。保存はハッシュ、閲覧は「日付_取引先_金額_種別」の名前です。
+    index.csv に元のファイル名とハッシュ、checksums.txt に各ファイルの
+    SHA-256 が入ります。中身が変わっている証憑は書き出さず、理由を出します。
+
 環境変数:
     APP_DATABASE_URL          帳簿の接続先（kaikei_app ロール）
     KAIKEI_BOOK_CURRENCY      帳簿通貨（例: JPY）
@@ -347,6 +352,135 @@ async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
         eprintln!("  [{}] {}", finding.kind.as_code(), finding.detail);
     }
     Err(String::new())
+}
+
+/// 証憑を人間が読める名前で書き出す（`docs/06-documents.md` §5）。
+///
+/// 税務調査の「ダウンロードの求め」に応じられる形にする。保存はハッシュ、
+/// 閲覧は人間が読める名前、という分担の閲覧側にあたる。
+///
+/// # 保存先が無いときに黙って飛ばさない
+///
+/// `KAIKEI_BLOB_ROOT` が未設定なら、証憑を書き出していないことを画面に出す
+/// （`verify` と同じ方針）。証憑が1件も無ければ何も言わない。
+///
+/// # 書けなかったものを黙って落とさない
+///
+/// ファイルが保存先に無い、中身が変わっている、といった証憑は**書き出さずに
+/// 知らせる**。欠けたまま「これで全部です」と提出されるのが最も困る。
+async fn write_document_export(
+    out_dir: &Path,
+    query: &PgDocumentQuery,
+    from: AccountingDate,
+    to: AccountingDate,
+) -> Result<Vec<PathBuf>, String> {
+    use kaikei_app::ports::DocumentQueryPort;
+    use kaikei_blob::BlobStore;
+
+    let documents = query
+        .search_documents(
+            &kaikei_app::view::DocumentQuery {
+                date_from: Some(from),
+                date_to: Some(to),
+                ..Default::default()
+            },
+            u32::MAX,
+        )
+        .await
+        .map_err(|error| format!("証憑を読めませんでした: {error}"))?;
+
+    if documents.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Ok(blob_root) = std::env::var("KAIKEI_BLOB_ROOT") else {
+        eprintln!(
+            "注意: この期間の証憑が {} 件ありますが、KAIKEI_BLOB_ROOT が未設定のため書き出していません",
+            documents.len()
+        );
+        return Ok(Vec::new());
+    };
+
+    let store = kaikei_blob::LocalBlobStore::new(blob_root);
+    let planned = kaikei_report::documents::plan_export(&documents);
+
+    let dir = out_dir.join("documents");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("作れませんでした: {}（{error}）", dir.display()))?;
+
+    let mut written = Vec::new();
+    let mut checksums = String::new();
+    let mut failed: Vec<String> = Vec::new();
+
+    for entry in &planned {
+        let hash = match kaikei_core::BlobHash::parse_hex(&entry.document.blob_hash) {
+            Ok(hash) => hash,
+            Err(error) => {
+                failed.push(format!(
+                    "{}: ハッシュが不正です（{error}）",
+                    entry.document.original_name
+                ));
+                continue;
+            }
+        };
+        let bytes = match store.get(&hash).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                failed.push(format!("{}: {error}", entry.document.original_name));
+                continue;
+            }
+        };
+        // **書き出す前に中身を確かめる。** 変わっているものをそのまま提出用の
+        // フォルダへ入れると、改変に気づかないまま提出することになる。
+        if kaikei_blob::hash_of(&bytes) != hash {
+            failed.push(format!(
+                "{}: 中身が保存時から変わっています",
+                entry.document.original_name
+            ));
+            continue;
+        }
+
+        let path = dir.join(&entry.file_name);
+        std::fs::write(&path, &bytes)
+            .map_err(|error| format!("書き出せませんでした: {}（{error}）", path.display()))?;
+        checksums.push_str(&format!(
+            "{}  {}\n",
+            entry.document.blob_hash, entry.file_name
+        ));
+        written.push(path);
+    }
+
+    // 一覧は**書き出せたかどうかに関わらず全件**載せる。載っていない証憑が
+    // あることを、受け取った側が index から気づけるようにする。
+    let index_path = dir.join("index.csv");
+    std::fs::write(
+        &index_path,
+        kaikei_report::documents::index_to_csv(&planned),
+    )
+    .map_err(|error| format!("書き出せませんでした: {}（{error}）", index_path.display()))?;
+    written.push(index_path);
+
+    let checksums_path = dir.join("checksums.txt");
+    std::fs::write(&checksums_path, checksums).map_err(|error| {
+        format!(
+            "書き出せませんでした: {}（{error}）",
+            checksums_path.display()
+        )
+    })?;
+    written.push(checksums_path);
+
+    println!(
+        "証憑を書き出しました: {} 件（全 {} 件）",
+        written.len() - 2,
+        planned.len()
+    );
+    if !failed.is_empty() {
+        eprintln!("注意: 書き出せなかった証憑が {} 件あります:", failed.len());
+        for message in &failed {
+            eprintln!("  {message}");
+        }
+    }
+    Ok(written)
 }
 
 /// `kaikei attach` の引数を解析する。
@@ -660,6 +794,8 @@ async fn write_reports(
         .await
         .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
     let store = PgStore::new(pool.clone());
+    // 証憑のエクスポートに使う。**クロージャへ移す前に取っておく。**
+    let pool_for_documents = PgDocumentQuery::new(pool.clone());
 
     // 仕訳と勘定科目表を1つのトランザクションで読む。**間に記帳が入ると、
     // 仕訳日記帳と財務諸表が別の帳簿を映す。**
@@ -812,6 +948,8 @@ async fn write_reports(
     if yayoi {
         written.extend(write_yayoi(&out_dir, &entries, &chart)?);
     }
+
+    written.extend(write_document_export(&out_dir, &pool_for_documents, from, to).await?);
 
     if statements.entry_count == 0 {
         eprintln!(
