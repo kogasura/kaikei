@@ -1,0 +1,19 @@
+# マイグレーションの改行コードを LF に固定する。
+#
+# ★ これが揺れると、正式なマイグレーション実行が止まる ★
+#
+# sqlx は適用済みマイグレーションのチェックサムを**ファイルのバイト列**から
+# 計算し、記録と違えば VersionMismatch で拒否する（改ざん検知のため正しい
+# 振る舞い）。Windows で core.autocrlf=true のままチェックアウトすると
+# CRLF になり、LF で適用した DB に対して migrate が動かなくなる。
+#
+# 実際に踏んだ（2026-08-14。kaikei-migrate が VersionMismatch(9) で止まった）。
+*.sql text eol=lf
+
+# Rust と設定ファイルも揃えておく。改行だけの差分でレビューが埋まるのを防ぐ。
+*.rs text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.json text eol=lf

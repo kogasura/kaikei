@@ -160,6 +160,14 @@ SQLX_OFFLINE=true cargo run -p kaikei-store --bin kaikei-migrate
 
 最後に `マイグレーションを適用しました` と出れば成功です。
 
+> **Windows で `VersionMismatch` が出たら改行コードを疑ってください。**
+> sqlx は適用済みマイグレーションのチェックサムを**ファイルのバイト列**から
+> 計算し、記録と違えば拒否します（改ざん検知としては正しい振る舞いです）。
+> `core.autocrlf=true` のまま古いチェックアウトを使っていると、`.sql` が CRLF に
+> なって LF で適用した DB と一致しません。`.gitattributes` が `*.sql text eol=lf`
+> を強制しているので、**作業ツリーを取り直す**（`git rm --cached -r . && git reset --hard`）
+> と揃います。
+
 > **`SQLX_OFFLINE=true` を外さないでください（この手順では必須です）。**
 > `kaikei-store` は `sqlx` の `query!` マクロを使っており、**コンパイル時に
 > `DATABASE_URL` の DB へ問い合わせて SQL を検証します**。ところがこの時点の DB は
