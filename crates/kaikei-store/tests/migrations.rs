@@ -59,6 +59,7 @@ async fn applied_migrations_match_the_expected_list(
         (9, "audit log"),
         // Phase 4: 証憑（docs/06-documents.md §3）。
         (10, "documents"),
+        (11, "imported transactions"),
     ]
     .into_iter()
     .map(|(version, description)| (version, description.to_string()))
@@ -96,6 +97,8 @@ async fn expected_tables_exist(pool_opts: PgPoolOptions, conn_opts: PgConnectOpt
         "documents".to_string(),
         "entry_counters".to_string(),
         "entry_documents".to_string(),
+        // Phase 4: 明細の取込（docs/05-csv-import.md §3）。
+        "imported_transactions".to_string(),
         "journal_entries".to_string(),
         "journal_lines".to_string(),
         "period_snapshots".to_string(),
