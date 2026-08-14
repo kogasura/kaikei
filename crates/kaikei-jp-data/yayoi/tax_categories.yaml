@@ -1,0 +1,75 @@
+# 弥生の仕訳データインポート用 税区分の写像（原則課税・税込経理）
+#
+# 出典: 弥生株式会社サポート情報
+#   「仕訳データの項目と記述形式」
+#   https://support.yayoi-kk.co.jp/subcontents.html?page_id=18545
+#   「課税方式別税区分・税計算区分一覧」
+#   https://support.yayoi-kk.co.jp/faq_Subcontents.html?page_id=18111
+#   （2026-08-13 に参照）
+#
+# ■ この表は税理士の確認を受けていない
+#
+# **ある区分を別の区分として出力することは、その取引の税務上の扱いを変える
+# ことになる**（docs/10-report.md §6-4）。名称は上記ページから拾ったもので、
+# 弥生の実機で取り込めることを確かめていない。
+#
+# そのため各行に `verified: false` を持たせ、出力時に「この写像は未確認である」
+# ことを利用者へ知らせる。確認が取れた行から `verified: true` にしていく。
+#
+# ■ 対応しない区分は変換せずエラーにする
+#
+# この表に無い区分は**黙って近い区分に丸めない**。丸めると、消費税の申告額が
+# 変わったことに誰も気づけない。
+#
+# ■ 税込経理を前提にしている
+#
+# 弥生の税区分は税込（「込」）と税抜（「内」）で名称が分かれる。この表は
+# 税込経理（KAIKEI_TAX_MODE=inclusive）用である。税抜経理の帳簿に使うと
+# 税額の扱いがずれるので、出力側が経理方式を確かめること。
+
+version: 1
+tax_mode: inclusive
+taxation_method: "原則課税"
+source: "弥生サポート情報 課税方式別税区分・税計算区分一覧（2026-08-13 参照）"
+
+categories:
+  - kaikei: SALES_10
+    yayoi: "課税売上込10%"
+    verified: false
+
+  - kaikei: SALES_8_REDUCED
+    yayoi: "課税売上込軽減8%"
+    verified: false
+
+  - kaikei: SALES_EXPORT
+    yayoi: "輸出売上"
+    verified: false
+
+  - kaikei: PURCHASE_10_QUALIFIED
+    yayoi: "課対仕入込10%適格"
+    verified: false
+
+  - kaikei: PURCHASE_8_REDUCED_QUALIFIED
+    yayoi: "課対仕入込軽減8%適格"
+    verified: false
+
+  # 経過措置。控除割合は施行日で変わる（80% → 70% → 50% → 30% → 0%）が、
+  # **弥生側の名称は割合を含む**（「区分80%」等）。kaikei の区分は割合を
+  # 持たない（税区分マスタの deduction_ratio が施行日で決まる）ため、
+  # ここで割合を決め打ちにすると施行日をまたいだときに誤る。
+  #
+  # そのため経過措置の区分は**写像を用意しない**。変換しようとすると
+  # エラーになり、利用者が施行日に応じた区分を指定することになる。
+  # 黙って 80% として出すと、控除できない額が変わったことに気づけない。
+
+  - kaikei: TAX_FREE
+    yayoi: "非課売上"
+    verified: false
+
+  - kaikei: OUT_OF_SCOPE
+    yayoi: "対象外"
+    verified: false
+
+  - kaikei: NOT_APPLICABLE
+    yayoi: "対象外"
+    verified: false

@@ -83,6 +83,15 @@ pub const STATEMENT_BLUE_RETURN_GENERAL_BS: EmbeddedYaml = EmbeddedYaml {
     source: include_str!("../statement/blue_return_general_bs.yaml"),
 };
 
+/// 弥生の仕訳データインポート用 税区分の写像（原則課税・税込経理）。
+///
+/// **税理士の確認を受けていない。** ある区分を別の区分として出力することは
+/// その取引の税務上の扱いを変えるため、各行が確認済みかどうかを持つ。
+pub const YAYOI_TAX_CATEGORIES: EmbeddedYaml = EmbeddedYaml {
+    label: "kaikei-jp-data/yayoi/tax_categories.yaml",
+    source: include_str!("../yayoi/tax_categories.yaml"),
+};
+
 /// 埋め込み済みの消費税区分マスタ**全件**。
 ///
 /// 適用期間（各 YAML の `applies_from` / `applies_to`）による選択は
