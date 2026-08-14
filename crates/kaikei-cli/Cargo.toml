@@ -31,4 +31,6 @@ kaikei-jp-data = { path = "../kaikei-jp-data", version = "0.0.1" }
 kaikei-report = { path = "../kaikei-report", version = "0.0.1" }
 # 証憑の中身が変わっていないかを verify で確かめる（docs/06-documents.md §6）。
 kaikei-blob = { path = "../kaikei-blob", version = "0.0.1" }
+# 証憑IDの採番（attach）。時刻順に並ぶ v7 を使う。
+uuid = { workspace = true }
 tokio = { workspace = true }
