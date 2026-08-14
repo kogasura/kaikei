@@ -17,6 +17,9 @@ license.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
+# 引用符付きフィールドの解釈を任せる。摘要にカンマが入った明細で列がずれる
+# （金額の列が摘要の一部を読む）事故を、自前の分割では防げない。
+csv = { workspace = true }
 encoding_rs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
