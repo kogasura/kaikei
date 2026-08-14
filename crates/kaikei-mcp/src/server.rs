@@ -224,6 +224,7 @@ pub fn tool_registry() -> ToolRegistry {
     use crate::tools::get_statements::GetStatements;
     use crate::tools::get_trial_balance::GetTrialBalance;
     use crate::tools::list_accounts::ListAccounts;
+    use crate::tools::list_pending_transactions::ListPendingTransactions;
     use crate::tools::list_tax_categories::ListTaxCategories;
     use crate::tools::post_journal_entry::PostJournalEntry;
     use crate::tools::propose_closing_entries::ProposeClosingEntries;
@@ -246,6 +247,8 @@ pub fn tool_registry() -> ToolRegistry {
         .with::<ListTaxCategories>()
         // 証憑（Phase 4）。
         .with::<SearchDocuments>()
+        // 取り込んだ明細（Phase 4）。**仕訳ではない**（docs/05-csv-import.md §1）。
+        .with::<ListPendingTransactions>()
         .with::<GetSettings>()
         // 提案系・検証系（PR-G。帳簿を変更しない）。
         .with::<SuggestTaxCategory>()
