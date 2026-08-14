@@ -356,7 +356,7 @@ async fn imported_transactions_can_be_updated_unlike_the_journal(
         .expect("取込明細は UPDATE できること");
 
     // 帳簿は変えられないまま。
-    let err = sqlx::query("UPDATE journal_entries SET description='x'")
+    let err = sqlx::query("UPDATE journal_entries SET description='x'") // ci-allow: append-only-probe
         .execute(&roles.app)
         .await
         .expect_err("帳簿の UPDATE は拒否されること");
