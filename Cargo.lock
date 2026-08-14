@@ -807,6 +807,8 @@ dependencies = [
  "kaikei-jp-data",
  "kaikei-report",
  "kaikei-store",
+ "serde",
+ "serde_norway",
  "tokio",
  "uuid",
 ]

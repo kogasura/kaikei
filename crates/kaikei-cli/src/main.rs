@@ -17,6 +17,8 @@
 //! 使わない設定を要求すると、帳簿を出したいだけの人が12項目を埋めることに
 //! なる。記帳する経路（`kaikei-mcp`）は従来どおり全項目を要求する（D-082）。
 
+mod rules;
+
 use kaikei_app::context::{BookSettings, FiscalYearRule};
 use kaikei_app::ports::{ChartRepo, JournalRepo};
 use kaikei_app::tx::with_tx_err;
@@ -29,6 +31,7 @@ use kaikei_core::{AccountingDate, FiscalYear};
 use kaikei_jp::statement::JpStatementPolicy;
 use kaikei_jp::tags::TagCatalog;
 use kaikei_store::documents::PgDocumentQuery;
+use kaikei_store::imported::PgImportedTxQuery;
 use kaikei_store::pool::{connect_app, PgStore};
 use kaikei_store::query::{PgLedgerQuery, PgTrialBalanceQuery};
 use std::path::{Path, PathBuf};
@@ -53,10 +56,12 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei verify --year <西暦>
     kaikei attach --file <ファイル> --date <取引年月日> --type <種別> --via <経路>
     kaikei import --profile <プロファイル.yaml> --file <明細.csv> [--commit]
+    kaikei journalize --rules <ルール.yaml> [--year <西暦>]
 
 report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
 import は銀行・カードの明細 CSV を取り込みます。
+journalize は取り込んだ明細にルールを当てて、仕訳の案を見せます。
 
 引数:
     --year <西暦>       会計年度（暦年）。例: 2026
@@ -131,6 +136,15 @@ import の引数:
 
     取り込んだだけでは帳簿に入りません。仕訳にするのは別の操作です。
 
+journalize の引数:
+    --rules <パス>       仕訳化ルール（YAML。必須）
+    --year <西暦>        この年の明細だけを見ます
+    --source <ID>        この取り込み元の明細だけを見ます
+
+    **見せるだけで、まだ記帳しません。** どの明細にどのルールが当たるかと、
+    ルールが無い明細を出します。ルールを書く手がかりにしてください。
+    記帳するには MCP の post_journal_entry を使います。
+
 report と verify は記帳しません。読み取りだけなので、税区分や決算科目の設定は
 要りません。
 ";
@@ -168,6 +182,7 @@ fn run() -> Result<Vec<PathBuf>, String> {
         Command::Verify { fiscal_year } => runtime.block_on(run_verify(fiscal_year)),
         Command::Attach(args) => runtime.block_on(run_attach(args)),
         Command::Import(args) => runtime.block_on(run_import(args)),
+        Command::Journalize(args) => runtime.block_on(run_journalize(args)),
     }
 }
 
@@ -193,6 +208,19 @@ enum Command {
     Attach(AttachArgs),
     /// 銀行・カードの明細 CSV を取り込む。
     Import(ImportArgs),
+    /// 取り込んだ明細にルールを当てて、仕訳の案を見せる。
+    Journalize(JournalizeArgs),
+}
+
+/// `kaikei journalize` の引数。
+#[derive(Debug)]
+struct JournalizeArgs {
+    /// 仕訳化ルール（YAML）。
+    rules: PathBuf,
+    /// この年の明細だけを見る。
+    fiscal_year: Option<i32>,
+    /// この取り込み元の明細だけを見る。
+    source: Option<String>,
 }
 
 /// `kaikei import` の引数。
@@ -251,6 +279,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     if subcommand == "import" {
         return parse_import(&args[1..]);
+    }
+    if subcommand == "journalize" {
+        return parse_journalize(&args[1..]);
     }
     if subcommand != "report" && subcommand != "verify" {
         return Err(format!("不明なサブコマンドです: {subcommand}\n\n{USAGE}"));
@@ -950,6 +981,232 @@ fn group_digits(amount: i64) -> String {
     } else {
         out
     }
+}
+
+/// `kaikei journalize` の引数を解析する。
+fn parse_journalize(args: &[String]) -> Result<Command, String> {
+    let mut rules = None;
+    let mut fiscal_year = None;
+    let mut source = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?
+            .clone();
+        match key {
+            "--rules" => rules = Some(PathBuf::from(value)),
+            "--year" => {
+                fiscal_year = Some(
+                    value
+                        .parse::<i32>()
+                        .map_err(|_| format!("--year は西暦で指定してください: {value}"))?,
+                )
+            }
+            "--source" => source = Some(value),
+            other => return Err(format!("不明な引数です: {other}\n\n{USAGE}")),
+        }
+        index += 2;
+    }
+
+    Ok(Command::Journalize(JournalizeArgs {
+        rules: rules.ok_or("--rules を指定してください（仕訳化ルールの YAML）")?,
+        fiscal_year,
+        source,
+    }))
+}
+
+/// 一度に見る明細の上限。
+const JOURNALIZE_LIMIT: u32 = 200;
+
+/// ルールが当たった明細を、いくつまで並べて見せるか。
+const JOURNALIZE_PREVIEW: usize = 10;
+
+/// ルールが無い摘要を、いくつまで並べて見せるか。
+///
+/// 多い順に出す。**次にどのルールを書けば一番効くか**が分かるようにするため。
+const UNMATCHED_TO_SHOW: usize = 15;
+
+/// 取り込んだ明細にルールを当てて、仕訳の案を見せる。
+///
+/// # まだ記帳しない
+///
+/// 帳簿は追記のみで、入れた仕訳は消せない（訂正は逆仕訳）。ルールが正しいか
+/// 分からないうちに自動で記帳すると、逆仕訳の山を作ることになる。**まずは
+/// 当たり方を見せる**ことに徹する。
+async fn run_journalize(args: JournalizeArgs) -> Result<Vec<PathBuf>, String> {
+    use kaikei_app::journalize::{self, MatchTarget};
+    use kaikei_app::ports::ImportedTxQuery;
+    use kaikei_app::view::ImportedTxQuerySpec;
+
+    let yaml = std::fs::read_to_string(&args.rules).map_err(|error| {
+        format!(
+            "ルールを読めませんでした: {}（{error}）",
+            args.rules.display()
+        )
+    })?;
+    let rules = rules::load_rules(&yaml)?;
+    let active = rules.iter().filter(|rule| rule.active).count();
+    println!("ルール: {}件（うち有効 {}件）", rules.len(), active);
+
+    let currency_code = env_var("KAIKEI_BOOK_CURRENCY")?;
+    let currency = kaikei_app::currency::currency_from_code(&currency_code)
+        .map_err(|error| format!("KAIKEI_BOOK_CURRENCY が不正です: {error}"))?;
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+
+    let (date_from, date_to) = match args.fiscal_year {
+        Some(year) => {
+            let fiscal_year = FiscalYear::calendar_year(year);
+            (Some(fiscal_year.start()), Some(fiscal_year.end()))
+        }
+        None => (None, None),
+    };
+
+    let query = PgImportedTxQuery::new(pool.clone());
+    let pending = query
+        .list_imported(
+            &ImportedTxQuerySpec {
+                source: args.source.clone(),
+                status: Some("pending".to_string()),
+                date_from,
+                date_to,
+            },
+            JOURNALIZE_LIMIT,
+        )
+        .await
+        .map_err(|error| format!("未処理の明細を読めませんでした: {error}"))?;
+
+    // **0件の意味を取り違えさせない。** 全部片付いたのか、そもそも取り込んで
+    // いないのかで、次にやることが正反対になる。
+    let counts = query
+        .import_status_counts(args.source.as_deref())
+        .await
+        .map_err(|error| format!("取込の状況を読めませんでした: {error}"))?;
+    println!(
+        "取込: 全{}件（未処理 {} / 仕訳済み {} / 無視 {}）",
+        counts.total(),
+        counts.pending,
+        counts.journalized,
+        counts.ignored
+    );
+    if counts.total() == 0 {
+        println!("※ まだ1件も取り込んでいません。kaikei import で取り込んでください");
+        return Ok(Vec::new());
+    }
+    if pending.is_empty() {
+        println!("※ 未処理の明細はありません");
+        return Ok(Vec::new());
+    }
+
+    // 科目名を出すために勘定科目表を読む。コードだけだと、500 と 501 を
+    // 取り違えたルールに気づけない。
+    let store = PgStore::new(pool);
+    let chart = with_tx_err(&store, |tx| Box::pin(async move { tx.load_chart().await }))
+        .await
+        .map_err(|error: kaikei_app::error::RepoError| {
+            format!("勘定科目表を読めませんでした: {error}")
+        })?;
+
+    let mut matched = Vec::new();
+    let mut unmatched: Vec<&kaikei_app::view::ImportedTxView> = Vec::new();
+    for row in &pending {
+        let target = MatchTarget {
+            source: &row.source,
+            occurred_on: row.occurred_on,
+            amount_minor: row.amount_minor,
+            direction: if row.is_money_in {
+                kaikei_app::ports::ImportDirection::In
+            } else {
+                kaikei_app::ports::ImportDirection::Out
+            },
+            raw_description: &row.raw_description,
+        };
+        match journalize::first_matching(&rules, &target) {
+            Some(rule) => {
+                let built = journalize::build_entry(rule, &target, currency)
+                    .map_err(|error| format!("ルール {} で仕訳を作れません: {error}", rule.id))?;
+                matched.push((row, built));
+            }
+            None => unmatched.push(row),
+        }
+    }
+
+    println!(
+        "\n未処理 {}件のうち、ルールが当たったのは {}件（当たらなかったのは {}件）",
+        pending.len(),
+        matched.len(),
+        unmatched.len()
+    );
+
+    for (row, built) in matched.iter().take(JOURNALIZE_PREVIEW) {
+        println!(
+            "\n  {}  {}",
+            row.occurred_on.to_iso_string(),
+            row.raw_description
+        );
+        for line in &built.entry.lines {
+            let name = chart
+                .get(line.account())
+                .map(|def| def.name.as_str())
+                // **知らない科目を黙って通さない。** 勘定科目表に無いコードを
+                // 書いたルールは、記帳の段で必ず落ちる。ここで見えるようにする。
+                .unwrap_or("※この科目は勘定科目表にありません");
+            println!(
+                "    {} {} {}  {:>12}",
+                match line.side() {
+                    kaikei_core::Side::Debit => "借",
+                    kaikei_core::Side::Credit => "貸",
+                },
+                line.account().as_str(),
+                name,
+                group_digits(i64::try_from(line.amount().minor()).unwrap_or(i64::MAX))
+            );
+        }
+        println!("    ルール: {}", built.rule_id);
+    }
+    if matched.len() > JOURNALIZE_PREVIEW {
+        println!("\n  ...（ほか {}件）", matched.len() - JOURNALIZE_PREVIEW);
+    }
+
+    if !unmatched.is_empty() {
+        println!("\nルールが無い明細（多い順）:");
+        for (description, count, total) in summarize_unmatched(&unmatched) {
+            println!(
+                "  {count:>3}件  {:>12}円  {description}",
+                group_digits(total)
+            );
+        }
+    }
+
+    println!("\n※ 見せただけで、まだ記帳していません");
+    Ok(Vec::new())
+}
+
+/// ルールが無い明細を、摘要ごとにまとめる。
+///
+/// **多い順に返す。** 次にどのルールを書けば一番効くかが分かるようにする。
+/// 同数のときは摘要の順で決める（並びが実行のたびに変わらないように）。
+fn summarize_unmatched(rows: &[&kaikei_app::view::ImportedTxView]) -> Vec<(String, usize, i64)> {
+    let mut groups: std::collections::BTreeMap<String, (usize, i64)> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let entry = groups.entry(row.raw_description.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = entry.1.saturating_add(row.amount_minor);
+    }
+    let mut summary: Vec<(String, usize, i64)> = groups
+        .into_iter()
+        .map(|(description, (count, total))| (description, count, total))
+        .collect();
+    summary.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    summary.truncate(UNMATCHED_TO_SHOW);
+    summary
 }
 
 /// 仕訳IDを解釈する。
@@ -2184,6 +2441,99 @@ mod tests {
         assert!(USAGE.contains("--commit"), "{USAGE}");
         assert!(USAGE.contains("既定は下見"), "{USAGE}");
         assert!(USAGE.contains("--profile"), "{USAGE}");
+    }
+
+    // ─── journalize ─────────────────────────────────────
+
+    #[test]
+    fn journalize_needs_rules() {
+        let error = parse_journalize(&args(&[])).unwrap_err();
+        assert!(error.contains("--rules"), "{error}");
+    }
+
+    #[test]
+    fn journalize_takes_a_year_and_a_source() {
+        let command = parse_journalize(&args(&[
+            "--rules", "r.yaml", "--year", "2026", "--source", "mizuho",
+        ]))
+        .unwrap();
+        match command {
+            Command::Journalize(args) => {
+                assert_eq!(args.rules, PathBuf::from("r.yaml"));
+                assert_eq!(args.fiscal_year, Some(2026));
+                assert_eq!(args.source.as_deref(), Some("mizuho"));
+            }
+            other => panic!("journalize が返らない: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_journalize_argument_is_rejected() {
+        let error = parse_journalize(&args(&["--rules", "r.yaml", "--yaer", "2026"])).unwrap_err();
+        assert!(error.contains("--yaer"), "{error}");
+    }
+
+    fn unmatched(description: &str, amount: i64) -> kaikei_app::view::ImportedTxView {
+        kaikei_app::view::ImportedTxView {
+            id: format!("id-{description}-{amount}"),
+            source: "mizuho".to_string(),
+            occurred_on: AccountingDate::new(2026, 6, 15).unwrap(),
+            amount_minor: amount,
+            is_money_in: false,
+            raw_description: description.to_string(),
+            balance_after: None,
+            status: "pending".to_string(),
+            entry_id: None,
+            ignore_reason: None,
+        }
+    }
+
+    /// **本命。** ルールが無い明細は多い順に出る。
+    ///
+    /// 次にどのルールを書けば一番効くかが分かるようにするため。
+    #[test]
+    fn unmatched_lines_come_out_most_frequent_first() {
+        let rows = [
+            unmatched("ｾﾌﾞﾝ", 500),
+            unmatched("ｽｰﾊﾟｰ", 3_000),
+            unmatched("ｾﾌﾞﾝ", 700),
+            unmatched("ｾﾌﾞﾝ", 300),
+            unmatched("ﾔﾏﾄﾞ", 100),
+            unmatched("ｽｰﾊﾟｰ", 2_000),
+        ];
+        let borrowed: Vec<&kaikei_app::view::ImportedTxView> = rows.iter().collect();
+
+        let summary = summarize_unmatched(&borrowed);
+
+        assert_eq!(summary[0].0, "ｾﾌﾞﾝ");
+        assert_eq!(summary[0].1, 3, "件数");
+        assert_eq!(summary[0].2, 1_500, "金額の合計");
+        assert_eq!(summary[1].0, "ｽｰﾊﾟｰ");
+        assert_eq!(summary[2].0, "ﾔﾏﾄﾞ");
+    }
+
+    /// 同数なら摘要の順で決まる。
+    ///
+    /// 決めておかないと、実行のたびに並びが変わって差分が読めない。
+    #[test]
+    fn a_tie_among_unmatched_lines_is_broken_by_description() {
+        let rows = [unmatched("ｾﾞﾌﾞﾗ", 100), unmatched("ｱﾙﾌｧ", 100)];
+        let borrowed: Vec<&kaikei_app::view::ImportedTxView> = rows.iter().collect();
+
+        let summary = summarize_unmatched(&borrowed);
+
+        assert_eq!(summary[0].0, "ｱﾙﾌｧ");
+        assert_eq!(summary[1].0, "ｾﾞﾌﾞﾗ");
+    }
+
+    // 使い方に、記帳しないことが書いてある。
+    //
+    // 「当たったのが見えた＝記帳された」と取り違えると、帳簿に何も入って
+    // いないまま確定申告を迎える。
+    #[test]
+    fn the_usage_says_journalize_does_not_record_yet() {
+        assert!(USAGE.contains("journalize"), "{USAGE}");
+        assert!(USAGE.contains("まだ記帳しません"), "{USAGE}");
     }
 
     // 使い方に、書き出すファイル名と要る環境変数が載っている
