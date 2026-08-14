@@ -11,9 +11,12 @@
 mod common;
 
 use kaikei_app::error::{AppError, RepoError};
+use kaikei_app::ports::ImportedTxQuery;
 use kaikei_app::ports::{ImportDirection, ImportOutcome, ImportedTxRepo, NewImportedTransaction};
 use kaikei_app::tx::with_tx;
+use kaikei_app::view::{ImportStatusCounts, ImportedTxQuerySpec};
 use kaikei_core::{AccountingDate, EntryId, Timestamp};
+use kaikei_store::imported::PgImportedTxQuery;
 use kaikei_store::pool::PgStore;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
@@ -276,4 +279,217 @@ async fn the_original_csv_row_is_kept(pool_opts: PgPoolOptions, conn_opts: PgCon
 
     assert_eq!(raw["date"], "2026/06/15");
     assert_eq!(raw["amount"], "1,980");
+}
+
+// ─── 一覧（read model）────────────────────────────────
+
+/// 日付だけ変えた明細を作る。
+fn on(id: &str, month: u8, day: u8) -> NewImportedTransaction {
+    let mut tx = imported(id, &format!("key-{id}"));
+    tx.occurred_on = AccountingDate::new(2026, month, day).unwrap();
+    tx
+}
+
+// IMP-9: 一覧は古い順に返る。
+//
+// 未処理の明細は古いものから順に片付けるものであり、新しい方から見せても
+// 手が付かない（証憑の検索が新しい順なのと逆）。
+#[sqlx::test]
+async fn the_list_comes_back_oldest_first(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let pool = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let store = PgStore::new(pool.clone());
+    for tx in [on("3", 9, 1), on("1", 3, 15), on("2", 6, 30)] {
+        insert(&store, tx).await;
+    }
+
+    let query = PgImportedTxQuery::new(pool);
+    let found = query
+        .list_imported(&ImportedTxQuerySpec::default(), 100)
+        .await
+        .unwrap();
+
+    let dates: Vec<_> = found.iter().map(|t| t.occurred_on).collect();
+    assert_eq!(
+        dates,
+        vec![
+            AccountingDate::new(2026, 3, 15).unwrap(),
+            AccountingDate::new(2026, 6, 30).unwrap(),
+            AccountingDate::new(2026, 9, 1).unwrap(),
+        ]
+    );
+}
+
+// IMP-10: 状態・期間・取り込み元で絞れる。
+#[sqlx::test]
+async fn the_list_can_be_narrowed(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let pool = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let store = PgStore::new(pool.clone());
+    let entry = an_entry(&pool).await;
+    for tx in [on("1", 3, 15), on("2", 6, 30), on("3", 9, 1)] {
+        insert(&store, tx).await;
+    }
+    // 1件だけ仕訳済みにする。
+    let done = on("1", 3, 15).id;
+    with_tx(&store, |t| {
+        let done = done.clone();
+        Box::pin(async move { Ok::<_, AppError>(t.mark_journalized(&done, entry).await?) })
+    })
+    .await
+    .unwrap();
+
+    let query = PgImportedTxQuery::new(pool);
+
+    let pending = query
+        .list_imported(
+            &ImportedTxQuerySpec {
+                status: Some("pending".to_string()),
+                ..Default::default()
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 2, "仕訳済みの1件が外れること");
+
+    let first_half = query
+        .list_imported(
+            &ImportedTxQuerySpec {
+                date_to: Some(AccountingDate::new(2026, 6, 30).unwrap()),
+                ..Default::default()
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_half.len(), 2, "期間の端を含むこと");
+
+    let other_bank = query
+        .list_imported(
+            &ImportedTxQuerySpec {
+                source: Some("rakuten".to_string()),
+                ..Default::default()
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    assert!(other_bank.is_empty(), "別の口座は返らないこと");
+}
+
+// IMP-11: **本命。** 一覧が空でも、取り込み済みかどうかが分かる。
+//
+// 「未処理が0件」には2つの意味がある——全部片付いたのか、そもそも1件も
+// 取り込んでいないのか。確定申告の直前にこれを取り違えると、帳簿に丸ごと
+// 抜けができる。
+#[sqlx::test]
+async fn an_empty_list_can_still_tell_imported_from_never_imported(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let store = PgStore::new(pool.clone());
+    let query = PgImportedTxQuery::new(pool.clone());
+
+    // まだ1件も取り込んでいない。
+    assert_eq!(
+        query.import_status_counts(None).await.unwrap(),
+        ImportStatusCounts::default(),
+        "取り込んでいなければ全て0"
+    );
+
+    // 取り込んで、全部片付ける。
+    let entry = an_entry(&pool).await;
+    insert(&store, on("1", 3, 15)).await;
+    insert(&store, on("2", 6, 30)).await;
+    let (a, b) = (on("1", 3, 15).id, on("2", 6, 30).id);
+    with_tx(&store, |t| {
+        let (a, b) = (a.clone(), b.clone());
+        Box::pin(async move {
+            t.mark_journalized(&a, entry).await?;
+            Ok::<_, AppError>(t.mark_ignored(&b, "個人の買い物").await?)
+        })
+    })
+    .await
+    .unwrap();
+
+    let pending = query
+        .list_imported(
+            &ImportedTxQuerySpec {
+                status: Some("pending".to_string()),
+                ..Default::default()
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    let counts = query.import_status_counts(None).await.unwrap();
+
+    // 一覧はどちらの場合も空。合計だけが両者を分ける。
+    assert!(pending.is_empty());
+    assert_eq!(counts.pending, 0);
+    assert_eq!(counts.journalized, 1);
+    assert_eq!(counts.ignored, 1);
+    assert_eq!(counts.total(), 2, "取り込み済みだと分かること");
+}
+
+// IMP-12: 上限を超える件数を頼まれても落ちない。
+//
+// 上限を素通しすると、LIMIT へ渡す型変換で溢れる。
+#[sqlx::test]
+async fn asking_for_more_than_the_cap_does_not_break(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let store = PgStore::new(pool.clone());
+    for i in 1..=5 {
+        insert(&store, imported(&i.to_string(), &format!("key-{i}"))).await;
+    }
+
+    let query = PgImportedTxQuery::new(pool);
+    let found = query
+        .list_imported(&ImportedTxQuerySpec::default(), u32::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(found.len(), 5);
+}
+
+// IMP-13: 向きが読み戻せる。
+//
+// 入金と出金が入れ替わると、収入と経費が丸ごと逆になる。
+#[sqlx::test]
+async fn the_direction_survives_a_round_trip(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let store = PgStore::new(pool.clone());
+    let mut money_in = on("1", 3, 15);
+    money_in.direction = ImportDirection::In;
+    insert(&store, money_in).await;
+    insert(&store, on("2", 6, 30)).await; // Out
+
+    let query = PgImportedTxQuery::new(pool);
+    let found = query
+        .list_imported(&ImportedTxQuerySpec::default(), 100)
+        .await
+        .unwrap();
+
+    // **IDで引き当てる。** 並び順に頼ると、並びを変える誤りでもこの検査が
+    // 落ちてしまい、「向きを見ている」と言えなくなる。
+    let flag_of = |id: &str| {
+        found
+            .iter()
+            .find(|t| t.id == id)
+            .unwrap_or_else(|| panic!("明細が見つかりません: {id}"))
+            .is_money_in
+    };
+    assert!(flag_of(&on("1", 3, 15).id), "入金であること");
+    assert!(!flag_of(&on("2", 6, 30).id), "出金であること");
 }
