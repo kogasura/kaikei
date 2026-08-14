@@ -1209,6 +1209,80 @@ fn summarize_unmatched(rows: &[&kaikei_app::view::ImportedTxView]) -> Vec<(Strin
     summary
 }
 
+/// 固定資産があるのに減価償却費が計上されていなければ知らせる。
+///
+/// # なぜ黙って出さないか
+///
+/// **減価償却の計上漏れは決算書を見ても分からない。** 貸借は一致したままで、
+/// 所得だけが過大になる。翌年に気づいても、その年分は申告済みである。
+///
+/// # 何を言い、何を言わないか
+///
+/// 言うのは「固定資産があるのに減価償却費が0である」という**帳簿の事実**
+/// だけである。いくら償却すべきかは言わない——このソフトは固定資産台帳を
+/// 持たず、取得年月日も耐用年数も事業専用割合も知らない（`CLAUDE.md` §10。
+/// 税務判断を断定しない）。
+///
+/// 科目表に `depreciation` 節が無ければ何もしない（利用者が自分の科目表に
+/// 差し替えた場合）。
+fn warn_if_depreciation_is_missing(
+    income_statement: &kaikei_app::policy::Statement,
+    balance_sheet: &kaikei_app::policy::Statement,
+) -> Result<(), String> {
+    let hint = kaikei_jp::chart::load_depreciation_hint(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+        .map_err(|error| format!("科目表の depreciation 節を読めませんでした: {error}"))?;
+    let Some(hint) = hint else {
+        return Ok(());
+    };
+
+    let expense = amount_of(income_statement, &hint.expense_account);
+    if !expense.is_zero() {
+        return Ok(());
+    }
+
+    let assets: Vec<(&kaikei_core::AccountCode, kaikei_core::Money)> = hint
+        .depreciable_accounts
+        .iter()
+        .map(|code| (code, amount_of(balance_sheet, code)))
+        .filter(|(_, amount)| !amount.is_zero())
+        .collect();
+    if assets.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "注意: 減価償却の対象になりうる資産がありますが、減価償却費（{}）が\
+         1円も計上されていません。",
+        hint.expense_account.as_str()
+    );
+    for (code, amount) in &assets {
+        eprintln!("  {} {}", code.as_str(), amount.to_display_string());
+    }
+    eprintln!(
+        "  計上漏れであれば、所得がその分だけ過大になります（貸借は一致した\
+         ままなので決算書を見ても分かりません）。"
+    );
+    eprintln!(
+        "  いくら償却するかはこのソフトでは決められません（取得年月日・\
+         耐用年数・事業専用割合を持っていません）。"
+    );
+    Ok(())
+}
+
+/// 財務諸表から1科目の金額を取る。**無ければ0。**
+fn amount_of(
+    statement: &kaikei_app::policy::Statement,
+    account: &kaikei_core::AccountCode,
+) -> kaikei_core::Money {
+    statement
+        .sections
+        .iter()
+        .flat_map(|section| section.lines.iter())
+        .find(|line| &line.account == account)
+        .map(|line| line.amount)
+        .unwrap_or_else(|| kaikei_core::Money::from_minor(0, statement.total.currency()))
+}
+
 /// 仕訳IDを解釈する。
 fn parse_entry_id(text: &str) -> Result<kaikei_core::EntryId, String> {
     let uuid = uuid::Uuid::parse_str(text)
@@ -1462,6 +1536,10 @@ async fn write_reports(
         deduction,
     )?;
     written.extend(blue_return_paths);
+
+    // **減価償却の計上漏れを指摘する。** 貸借は一致したままで所得だけが
+    // 過大になる誤りで、決算書を見ても分からない。
+    warn_if_depreciation_is_missing(&statements.income_statement, &cumulative.balance_sheet)?;
 
     written.extend(write_blue_return_balance_sheet(
         &out_dir,
@@ -2534,6 +2612,85 @@ mod tests {
     fn the_usage_says_journalize_does_not_record_yet() {
         assert!(USAGE.contains("journalize"), "{USAGE}");
         assert!(USAGE.contains("まだ記帳しません"), "{USAGE}");
+    }
+
+    // ─── 減価償却の計上漏れ ─────────────────────────────
+
+    fn statement(title: &str, lines: Vec<(&str, i128)>) -> kaikei_app::policy::Statement {
+        use kaikei_core::{Currency, Money};
+        let lines: Vec<kaikei_app::policy::StatementLine> = lines
+            .into_iter()
+            .map(|(code, amount)| kaikei_app::policy::StatementLine {
+                account: kaikei_core::AccountCode::parse(code).unwrap(),
+                label: code.to_string(),
+                amount: Money::from_minor(amount, Currency::JPY),
+            })
+            .collect();
+        kaikei_app::policy::Statement {
+            title: title.to_string(),
+            sections: vec![kaikei_app::policy::StatementSection {
+                title: "区分".to_string(),
+                lines,
+                subtotal: Money::from_minor(0, Currency::JPY),
+            }],
+            total: Money::from_minor(0, Currency::JPY),
+        }
+    }
+
+    /// 財務諸表に無い科目は 0 として扱う。
+    ///
+    /// 無いことを「読めない」にすると、科目を1つも使っていない年度で
+    /// 出力そのものが止まる。
+    #[test]
+    fn an_account_absent_from_the_statement_counts_as_zero() {
+        let empty = statement("損益計算書", vec![]);
+        let code = kaikei_core::AccountCode::parse("610").unwrap();
+        assert!(amount_of(&empty, &code).is_zero());
+    }
+
+    #[test]
+    fn an_account_present_in_the_statement_is_found() {
+        let pl = statement("損益計算書", vec![("610", 50_000)]);
+        let code = kaikei_core::AccountCode::parse("610").unwrap();
+        assert_eq!(amount_of(&pl, &code).minor(), 50_000);
+    }
+
+    /// **本命。** 減価償却費が計上されていれば指摘しない。
+    ///
+    /// 正しい帳簿で毎年出る指摘は、当たり前になって本当の漏れを覆い隠す。
+    #[test]
+    fn a_book_with_depreciation_is_not_warned_about() {
+        let pl = statement("損益計算書", vec![("610", 50_000)]);
+        let bs = statement("貸借対照表", vec![("210", 161_917)]);
+
+        // 指摘は stderr に出るので、ここで見るのは「落ちないこと」と
+        // 「呼び出しが成功すること」である。中身の判定は下の2つが持つ。
+        assert!(warn_if_depreciation_is_missing(&pl, &bs).is_ok());
+    }
+
+    /// **本命。** 対象になる資産が無ければ指摘しない。
+    #[test]
+    fn a_book_without_depreciable_assets_is_not_warned_about() {
+        let pl = statement("損益計算書", vec![]);
+        // 現金しかない帳簿。
+        let bs = statement("貸借対照表", vec![("100", 552_542)]);
+
+        assert!(warn_if_depreciation_is_missing(&pl, &bs).is_ok());
+    }
+
+    /// 指摘の対象になる帳簿でも、出力そのものは止めない。
+    ///
+    /// **止めると決算書が出せなくなる。** 償却額が決まるまで帳簿を見られない
+    /// のでは、判断のしようがない。
+    #[test]
+    fn a_book_that_should_be_warned_about_still_produces_output() {
+        let pl = statement("損益計算書", vec![]);
+        let bs = statement("貸借対照表", vec![("210", 161_917)]);
+
+        assert!(
+            warn_if_depreciation_is_missing(&pl, &bs).is_ok(),
+            "指摘しても出力は続けること"
+        );
     }
 
     // 使い方に、書き出すファイル名と要る環境変数が載っている
