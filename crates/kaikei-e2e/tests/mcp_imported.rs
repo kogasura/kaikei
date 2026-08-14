@@ -35,6 +35,7 @@ use kaikei_mcp::dispatch::{self, McpTool};
 use kaikei_mcp::startup::Runtime;
 use kaikei_mcp::tools::journalize_transaction::JournalizeTransaction;
 use kaikei_mcp::tools::list_pending_transactions::ListPendingTransactions;
+use kaikei_mcp::tools::suggest_journal_entry::SuggestJournalEntry;
 use kaikei_store::audit::PgAuditSink;
 use kaikei_store::pool::PgStore;
 use kaikei_store::query::{PgLedgerQuery, PgSearchEntriesQuery, PgTrialBalanceQuery};
@@ -570,6 +571,176 @@ async fn an_unknown_id_says_not_found(pool_opts: PgPoolOptions, conn_opts: PgCon
                 { "account": "110", "side": "credit", "amount": "1980" },
             ],
         }),
+    )
+    .await;
+
+    assert!(is_error(&response), "{response}");
+}
+
+// ─── 仕訳を提案する（suggest_journal_entry）────────────
+
+/// 明細を1件入れて仕訳にする（提案の材料になる過去の記帳を作る）。
+async fn journalize_once(runtime: &Runtime, app: &PgPool, key: &str, day: u32) {
+    insert_imported(app, key, day, 1_980, false, "pending").await;
+    let id: String =
+        sqlx::query_scalar("SELECT id::text FROM imported_transactions WHERE external_key = $1")
+            .bind(key)
+            .fetch_one(app)
+            .await
+            .expect("IDを引けること");
+    let response = call::<JournalizeTransaction>(
+        runtime,
+        json!({
+            "imported_tx_id": id,
+            "lines": [
+                { "account": "609", "side": "debit", "amount": "1980",
+                  "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
+                { "account": "110", "side": "credit", "amount": "1980" },
+            ],
+        }),
+    )
+    .await;
+    assert!(!is_error(&response), "{response}");
+}
+
+/// **本命。** 提案に根拠が付く。
+///
+/// 既存の会計ソフトも学習型の自動仕訳を持つが、なぜその科目にしたかを
+/// 説明できない。根拠が見えれば、提案が外れているときに人が気づける。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_suggestion_comes_with_its_basis(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+    // 同じ摘要で3回記帳しておく。
+    for (index, day) in [(1u32, 1u32), (2, 2), (3, 3)] {
+        journalize_once(&runtime, &app, &format!("past{index}"), day).await;
+    }
+    // 4件目は未処理のまま。
+    insert_imported(&app, "new", 10, 5_000, false, "pending").await;
+    let target: String =
+        sqlx::query_scalar("SELECT id::text FROM imported_transactions WHERE external_key = 'new'")
+            .fetch_one(&app)
+            .await
+            .unwrap();
+
+    let response = call::<SuggestJournalEntry>(&runtime, json!({ "imported_tx_id": target })).await;
+
+    assert!(!is_error(&response), "{response}");
+    let found = body(&response);
+    assert_eq!(found["has_suggestion"], json!(true), "{found}");
+
+    let first = &found["suggestions"][0];
+    assert_eq!(first["occurrences"], json!(3), "{first}");
+    assert_eq!(first["confidence"], json!("high"), "{first}");
+    // 根拠として過去の仕訳が挙がる。
+    assert!(
+        first["examples"].as_array().is_some_and(|a| !a.is_empty()),
+        "根拠が空: {first}"
+    );
+    assert!(first["examples"][0]["entry_id"].is_string(), "{first}");
+    // どの摘要で探したかが分かる。
+    assert!(found["searched"]["matched_by"].is_string(), "{found}");
+
+    // 候補は仕訳の形になっており、科目名も付く。
+    let lines = first["lines"].as_array().expect("明細の配列");
+    assert_eq!(lines.len(), 2, "{first}");
+    assert!(
+        lines.iter().any(|line| line["account"] == json!("609")
+            && line["account_name"] == json!("消耗品費")
+            && line["tax_category"] == json!("PURCHASE_10_QUALIFIED")),
+        "{first}"
+    );
+    // **金額は候補に含めない。** 按分するかどうかは人が決める。
+    assert!(
+        lines.iter().all(|line| line.get("amount").is_none()),
+        "{first}"
+    );
+}
+
+/// **本命。** 過去に似た取引が無ければ、候補は空で返る。
+///
+/// 0件は異常ではない。ただし「候補が無い」ことが読み取れる必要がある。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn no_similar_past_entry_gives_an_empty_suggestion(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+    insert_imported(&app, "k1", 15, 1_980, false, "pending").await;
+    let id: String = sqlx::query_scalar("SELECT id::text FROM imported_transactions LIMIT 1")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+
+    let response = call::<SuggestJournalEntry>(&runtime, json!({ "imported_tx_id": id })).await;
+
+    assert!(!is_error(&response), "0件はエラーにしない: {response}");
+    let found = body(&response);
+    assert_eq!(found["has_suggestion"], json!(false), "{found}");
+    assert_eq!(found["suggestions"], json!([]), "{found}");
+    assert_eq!(found["searched"]["entries_found"], json!(0), "{found}");
+}
+
+/// **本命。** 取り消された仕訳は根拠にしない。
+///
+/// 取り消したということはその記帳が誤りだったということで、繰り返す理由が無い。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_reversed_entry_is_not_used_as_a_basis(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+    journalize_once(&runtime, &app, "past1", 1).await;
+
+    // 起こした仕訳を取り消す。
+    let entry_id: String = sqlx::query_scalar(
+        "SELECT entry_id::text FROM imported_transactions WHERE external_key = 'past1'",
+    )
+    .fetch_one(&app)
+    .await
+    .unwrap();
+    let reversed = call::<kaikei_mcp::tools::reverse_journal_entry::ReverseJournalEntry>(
+        &runtime,
+        json!({ "original_id": entry_id, "reverse_date": "2026-06-20", "reason": "誤記帳のため" }),
+    )
+    .await;
+    assert!(!is_error(&reversed), "{reversed}");
+
+    insert_imported(&app, "new", 10, 5_000, false, "pending").await;
+    let target: String =
+        sqlx::query_scalar("SELECT id::text FROM imported_transactions WHERE external_key = 'new'")
+            .fetch_one(&app)
+            .await
+            .unwrap();
+
+    let response = call::<SuggestJournalEntry>(&runtime, json!({ "imported_tx_id": target })).await;
+
+    let found = body(&response);
+    assert_eq!(
+        found["has_suggestion"],
+        json!(false),
+        "取り消した記帳を勧めないこと: {found}"
+    );
+}
+
+/// 知らないIDは「見つからない」と言う。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn suggesting_for_an_unknown_id_says_not_found(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let runtime = runtime(&app).await;
+
+    let response = call::<SuggestJournalEntry>(
+        &runtime,
+        json!({ "imported_tx_id": "00000000-0000-0000-0000-000000000000" }),
     )
     .await;
 
