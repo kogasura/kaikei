@@ -29,4 +29,6 @@ kaikei-store = { path = "../kaikei-store", version = "0.0.1" }
 kaikei-jp = { path = "../kaikei-jp", version = "0.0.1" }
 kaikei-jp-data = { path = "../kaikei-jp-data", version = "0.0.1" }
 kaikei-report = { path = "../kaikei-report", version = "0.0.1" }
+# 証憑の中身が変わっていないかを verify で確かめる（docs/06-documents.md §6）。
+kaikei-blob = { path = "../kaikei-blob", version = "0.0.1" }
 tokio = { workspace = true }

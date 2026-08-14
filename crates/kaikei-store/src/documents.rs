@@ -152,6 +152,13 @@ impl DocumentQueryPort for PgDocumentQuery {
 
         rows.into_iter().map(DocumentRow::into_view).collect()
     }
+
+    async fn all_blob_hashes(&self) -> Result<Vec<String>, RepoError> {
+        sqlx::query_scalar("SELECT DISTINCT blob_hash FROM documents ORDER BY blob_hash")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::error::from_sqlx_error)
+    }
 }
 
 #[derive(sqlx::FromRow)]

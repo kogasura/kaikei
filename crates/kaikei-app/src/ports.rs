@@ -374,6 +374,13 @@ pub trait DocumentQueryPort: Send + Sync {
         &self,
         entry_id: EntryId,
     ) -> Result<Vec<crate::view::DocumentView>, RepoError>;
+
+    /// 帳簿に登録されている証憑の内容ハッシュを重複なく返す。
+    ///
+    /// 整合性検査（`docs/06-documents.md` §6）で、保存されているファイルの
+    /// 中身が変わっていないかを確かめるために使う。**メタデータは返さない**
+    /// ——検査に要るのはハッシュだけで、件数が多くても軽く済ませたい。
+    async fn all_blob_hashes(&self) -> Result<Vec<String>, RepoError>;
 }
 
 /// 仕訳検索の read model クエリ（Phase 3 PR-H）。
