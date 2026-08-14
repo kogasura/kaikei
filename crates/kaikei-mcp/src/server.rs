@@ -228,6 +228,7 @@ pub fn tool_registry() -> ToolRegistry {
     use crate::tools::post_journal_entry::PostJournalEntry;
     use crate::tools::propose_closing_entries::ProposeClosingEntries;
     use crate::tools::reverse_journal_entry::ReverseJournalEntry;
+    use crate::tools::search_documents::SearchDocuments;
     use crate::tools::search_entries::SearchEntries;
     use crate::tools::suggest_tax_category::SuggestTaxCategory;
     use crate::tools::validate_invoice_number::ValidateInvoiceNumber;
@@ -243,6 +244,8 @@ pub fn tool_registry() -> ToolRegistry {
         .with::<GetStatements>()
         .with::<ProposeClosingEntries>()
         .with::<ListTaxCategories>()
+        // 証憑（Phase 4）。
+        .with::<SearchDocuments>()
         .with::<GetSettings>()
         // 提案系・検証系（PR-G。帳簿を変更しない）。
         .with::<SuggestTaxCategory>()

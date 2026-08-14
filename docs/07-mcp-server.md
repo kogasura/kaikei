@@ -169,7 +169,7 @@ MCP サーバーに登録しない（登録しないツールは AI からは存
 | `get_statements` | **Phase 5** | B/S・P/L。**D-031 の延期理由は解けた**（D-093）。read model の DTO では `StatementPolicy` の入力にならないが、`JournalRepo::list_entries_in_period` でドメインモデルの仕訳を引き、`TrialBalance::from_entries` で組み立て直す。集計対象は指定期間の仕訳だけなので、**貸借対照表は期首残高の有無に左右される**——年度途中から始まる期間では `balance_sheet_note` を添えて呼び出し側に伝える |
 | `propose_closing_entries` | **Phase 5** | 決算振替仕訳の**提案**（収益・費用のゼロ化と元入金への振替）。**記帳はしない**（応答の `posted` は常に `false`）。`suggest_tax_category` と同じ「候補と根拠まで、確定は人間に残す」形（D-087 / D-094）。集計期間は会計年度ラベルから導出し、日付では指定できない——年度と1日ずれた期間で提案できると、ゼロ化しきれなかった残高が翌年度に残り、**その誤りは決算書を見ても分からない**（貸借は一致したまま）。**`close_period`（締め）とは別物**で、こちらは期間を締めない |
 | `list_pending_transactions` | Phase 4 以降 | 未仕訳の取込明細。**延期理由: `kaikei-import` 未着手**（crate もテーブルも存在しない） |
-| `search_documents` | Phase 4 以降 | 証憑検索（日付・金額・取引先）。**延期理由: `kaikei-blob` 未着手**（`documents` / `entry_documents` は Phase 4 で設計する。`docs/03-database.md` §1 の注記） |
+| `search_documents` | **Phase 4** | 証憑検索（取引年月日・取引金額・取引先の組み合わせと範囲指定。電子取引データの検索要件そのもの）。**延期理由は解けた**——`kaikei-blob` と `documents` / `entry_documents` を実装した。**ファイルの中身は返さない**（実体を応答に載せると量がファイルの大きさに比例し、append-only の `audit_log` に毎回残る。§9）。返すのは内容の SHA-256 とメタデータだけで、実体の取り出しは `kaikei report` が `documents/` へ書き出す。**0件は成功**（空配列）。ただし「1件も登録されていない」と「条件に合わなかった」を区別できるよう `total_registered` を添える。`date_from > date_to` は空ではなく**エラー**（`get_trial_balance` と同じ規律）。金額は文字列で返し、金額の無い証憑（契約書など）は `null`（0 で埋めない） |
 
 **`search_entries` / `get_ledger` の read model は PR-H で新設した**
 （`crates/kaikei-store/src/query/search.rs` / `ledger.rs`。対応するポートは

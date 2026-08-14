@@ -97,6 +97,7 @@ async fn runtime(app: &PgPool) -> Runtime {
         clock: SystemClock,
         // read model は書き込み側を経由しない（`CLAUDE.md` §6）。
         trial_balance: Arc::new(PgTrialBalanceQuery::new(app.clone())),
+        documents: Arc::new(kaikei_store::documents::PgDocumentQuery::new(app.clone())),
         search_query: Arc::new(PgSearchEntriesQuery::new(app.clone())),
         ledger_query: Arc::new(PgLedgerQuery::new(app.clone())),
         // テンプレートと同じ定義を投入するので食い違いは出ない（D-086）。

@@ -548,6 +548,27 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
     // 帳簿はまだ4件のまま（提案では増えない）。
     assert_eq!(journal_entry_count(&app).await, 4);
 
+    // ── 証憑を探す（Phase 4）──────────────────────────────
+    //
+    // この帳簿には証憑を1件も登録していない。**0件は成功**であり、
+    // エラーにしない。ただし「1件も登録されていない」のか「条件に合わなかった」
+    // のかを AI が区別できるよう、total_registered を添える。
+    let documents = server
+        .call_tool(
+            "search_documents",
+            json!({ "date_from": "2026-01-01", "date_to": "2026-12-31" }),
+        )
+        .await;
+    assert!(!is_error(&documents), "0件はエラーにしない: {documents}");
+    let docs = body(&documents);
+    assert_eq!(docs["count"], json!(0), "{docs}");
+    assert_eq!(
+        docs["total_registered"],
+        json!(0),
+        "1件も登録されていないことが読み取れること: {docs}"
+    );
+    assert_eq!(docs["documents"], json!([]), "{docs}");
+
     server.shutdown().await;
 
     // -----------------------------------------------------------------
@@ -582,6 +603,7 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
             ("get_ledger".to_string(), "ok".to_string()),
             ("get_statements".to_string(), "ok".to_string()),
             ("propose_closing_entries".to_string(), "ok".to_string()),
+            ("search_documents".to_string(), "ok".to_string()),
         ],
         "呼び出した順に「開始・結果の2行」が並ぶこと（読み取り系も同じ経路）"
     );

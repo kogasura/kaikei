@@ -78,6 +78,11 @@ pub struct Runtime {
     /// 別の入口としてここに置く（PR-G。`DECISIONS.md` D-086）。
     pub trial_balance: Arc<PgTrialBalanceQuery>,
 
+    /// 証憑の read model（**`Store` / `Tx` を経由しない**）。
+    ///
+    /// [`Runtime::trial_balance`] と同じ扱い（`CLAUDE.md` §6）。
+    pub documents: Arc<kaikei_store::documents::PgDocumentQuery>,
+
     /// 監査ログの記録先。**帳簿とは別のコネクション**で書く
     /// （`DECISIONS.md` D-070 / D-075）。
     pub audit_sink: Arc<PgAuditSink>,
@@ -223,6 +228,7 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
     // read model は書き込み側（`PgStore`/`PgTx`）を経由せず、自前で同じ
     // プールから引く（`CLAUDE.md` §6）。プールは共有するが、経路は別である。
     let trial_balance = Arc::new(PgTrialBalanceQuery::new(pool.clone()));
+    let documents = Arc::new(kaikei_store::documents::PgDocumentQuery::new(pool.clone()));
     let search_query = Arc::new(PgSearchEntriesQuery::new(pool.clone()));
     let ledger_query = Arc::new(PgLedgerQuery::new(pool));
 
@@ -261,6 +267,7 @@ pub async fn assemble(config: &ServerConfig) -> Result<Startup, StartupError> {
         runtime: Arc::new(Runtime {
             store,
             trial_balance,
+            documents,
             audit_sink,
             composition: Arc::new(composition),
             book_settings: config.book_settings,

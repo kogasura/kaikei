@@ -258,6 +258,11 @@ impl<'a> ToolContext<'a> {
         self.runtime.trial_balance.as_ref()
     }
 
+    /// 証憑の read model（**`Store` / `Tx` を経由しない**）。
+    pub fn document_query(&self) -> &'a kaikei_store::documents::PgDocumentQuery {
+        self.runtime.documents.as_ref()
+    }
+
     /// 起動時にテンプレートと定義が食い違い、**既存を残した**科目
     /// （`DECISIONS.md` D-081 / D-086）。
     ///
