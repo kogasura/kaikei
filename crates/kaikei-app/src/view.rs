@@ -424,6 +424,72 @@ pub struct DocumentView {
     pub note: Option<String>,
 }
 
+/// 取り込んだ明細（`docs/05-csv-import.md` §3）。
+///
+/// **仕訳ではない。** 借方も貸方も勘定科目も無い——口座から見た入出金の記録
+/// でしかなく、科目が決まるのは仕訳化のときである。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedTxView {
+    /// 明細ID。
+    pub id: String,
+    /// どの口座・カードから取り込んだか。
+    pub source: String,
+    /// 取引年月日。
+    pub occurred_on: AccountingDate,
+    /// 金額。**常に正**——向きは [`Self::is_money_in`] が表す。
+    pub amount_minor: i64,
+    /// 入金なら `true`、出金なら `false`。
+    pub is_money_in: bool,
+    /// CSV の摘要。
+    pub raw_description: String,
+    /// 取引後残高。CSV に残高列が無ければ `None`。
+    pub balance_after: Option<i64>,
+    /// 状態（pending / journalized / ignored）。
+    pub status: String,
+    /// 仕訳済みなら、その仕訳ID。
+    pub entry_id: Option<String>,
+    /// 無視したなら、その理由。
+    pub ignore_reason: Option<String>,
+}
+
+/// 取り込んだ明細の検索条件。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportedTxQuerySpec {
+    /// 取り込み元で絞る。`None` なら全ての口座・カード。
+    pub source: Option<String>,
+    /// 状態で絞る。`None` なら全ての状態。
+    pub status: Option<String>,
+    /// この日以降。
+    pub date_from: Option<AccountingDate>,
+    /// この日以前。
+    pub date_to: Option<AccountingDate>,
+}
+
+/// 取り込んだ明細の状態ごとの件数。
+///
+/// # なぜ一覧と別に数えるか
+///
+/// **「未処理が0件」には2つの意味がある。** 全部片付いたのか、そもそも
+/// 1件も取り込んでいないのか。前者は喜ぶところだが、後者は CSV を流し忘れて
+/// いるということで、確定申告の直前にこれを取り違えると帳簿に丸ごと抜けが
+/// できる。一覧が空でも合計が読めれば区別が付く。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImportStatusCounts {
+    /// 未処理。
+    pub pending: i64,
+    /// 仕訳済み。
+    pub journalized: i64,
+    /// 仕訳しないものとして片付けた。
+    pub ignored: i64,
+}
+
+impl ImportStatusCounts {
+    /// 取り込んだ明細の総数。
+    pub fn total(&self) -> i64 {
+        self.pending + self.journalized + self.ignored
+    }
+}
+
 /// 証憑の検索条件（`docs/06-documents.md` §4）。
 ///
 /// **取引年月日・取引金額・取引先の3項目**の組み合わせと範囲指定に対応する。

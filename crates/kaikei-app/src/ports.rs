@@ -504,6 +504,42 @@ pub trait ImportedTxRepo: Send {
     async fn revert_to_pending(&mut self, imported_id: &str) -> Result<(), RepoError>;
 }
 
+/// 取り込んだ明細の read model クエリ（Phase 4。`docs/05-csv-import.md` §3）。
+///
+/// [`ImportedTxRepo`] と分けているのは `CLAUDE.md` §6「read model は物理的に
+/// 分離する」による。書き込みは `Tx` を通すが、こちらは通さない。
+#[async_trait]
+pub trait ImportedTxQuery: Send + Sync {
+    /// 条件に一致する明細を返す。
+    ///
+    /// 並びは**取引年月日の昇順**、同じ日ならIDの昇順（決定的にする）。
+    /// 証憑の検索が降順なのと逆なのは、用途が違うためである——未処理の明細は
+    /// 古いものから順に片付けるものであり、新しい方から見せても手が付かない。
+    ///
+    /// # Errors
+    ///
+    /// 問い合わせに失敗した場合、または保存されている値を復元できない場合は
+    /// [`RepoError`]。
+    async fn list_imported(
+        &self,
+        query: &crate::view::ImportedTxQuerySpec,
+        limit: u32,
+    ) -> Result<Vec<crate::view::ImportedTxView>, RepoError>;
+
+    /// 状態ごとの件数を返す。
+    ///
+    /// **一覧が空でも、取り込み済みかどうかが分かるようにする**
+    /// （[`crate::view::ImportStatusCounts`] を参照）。
+    ///
+    /// # Errors
+    ///
+    /// 問い合わせに失敗した場合は [`RepoError`]。
+    async fn import_status_counts(
+        &self,
+        source: Option<&str>,
+    ) -> Result<crate::view::ImportStatusCounts, RepoError>;
+}
+
 /// 仕訳検索の read model クエリ（Phase 3 PR-H）。
 ///
 /// [`TrialBalanceQuery`] と同じく `Tx` を通さない

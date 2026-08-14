@@ -19,11 +19,23 @@
 
 use async_trait::async_trait;
 use kaikei_app::error::RepoError;
-use kaikei_app::ports::{ImportDirection, ImportOutcome, ImportedTxRepo, NewImportedTransaction};
+use kaikei_app::ports::{
+    ImportDirection, ImportOutcome, ImportedTxQuery, ImportedTxRepo, NewImportedTransaction,
+};
+use kaikei_app::view::{ImportStatusCounts, ImportedTxQuerySpec, ImportedTxView};
 use kaikei_core::EntryId;
+use sqlx::PgPool;
 
-use crate::convert::{accounting_date_to_naive_date, timestamp_to_datetime};
+use crate::convert::{
+    accounting_date_to_naive_date, naive_date_to_accounting_date, timestamp_to_datetime,
+};
 use crate::store::PgTx;
+
+/// 一覧で一度に返す上限。
+///
+/// **呼び出し側が上限を渡すが、それでも上限の上限を持つ。** 条件を付け忘れた
+/// 一覧が取込全体を返すと、応答が明細の量に比例して膨らむ。
+pub const MAX_LIST_LIMIT: u32 = 200;
 
 /// 0011 の `direction` 列の値。
 ///
@@ -154,6 +166,121 @@ fn parse_uuid(value: &str) -> Result<uuid::Uuid, RepoError> {
     })
 }
 
+/// 取り込んだ明細の一覧（read model）。
+#[derive(Debug, Clone)]
+pub struct PgImportedTxQuery {
+    pool: PgPool,
+}
+
+impl PgImportedTxQuery {
+    /// プールから作る。
+    pub fn new(pool: PgPool) -> Self {
+        PgImportedTxQuery { pool }
+    }
+}
+
+#[async_trait]
+impl ImportedTxQuery for PgImportedTxQuery {
+    async fn list_imported(
+        &self,
+        query: &ImportedTxQuerySpec,
+        limit: u32,
+    ) -> Result<Vec<ImportedTxView>, RepoError> {
+        let limit = limit.min(MAX_LIST_LIMIT) as i64;
+
+        // **SQL は固定にする。** 条件の有無で文字列を組み立てず、NULL のときは
+        // その条件を素通りさせる（`$n IS NULL OR ...`）。組み立てをやめれば
+        // 注入の余地が構造的に無くなる（`documents.rs` と同じ方針）。
+        //
+        // 並びは取引年月日の昇順——未処理は古いものから片付ける。
+        let rows = sqlx::query_as::<_, ImportedRow>(
+            "SELECT id::text, source, occurred_on, amount_minor, direction,                     raw_description, balance_after, status, entry_id::text, ignore_reason              FROM imported_transactions              WHERE ($1::text IS NULL OR source = $1)                AND ($2::text IS NULL OR status = $2)                AND ($3::date IS NULL OR occurred_on >= $3)                AND ($4::date IS NULL OR occurred_on <= $4)              ORDER BY occurred_on ASC, id ASC              LIMIT $5",
+        )
+        .bind(query.source.as_deref())
+        .bind(query.status.as_deref())
+        .bind(
+            query
+                .date_from
+                .map(accounting_date_to_naive_date)
+                .transpose()?,
+        )
+        .bind(query.date_to.map(accounting_date_to_naive_date).transpose()?)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::error::from_sqlx_error)?;
+
+        rows.into_iter().map(ImportedRow::into_view).collect()
+    }
+
+    async fn import_status_counts(
+        &self,
+        source: Option<&str>,
+    ) -> Result<ImportStatusCounts, RepoError> {
+        // 3状態を1往復で数える。状態ごとに問い合わせると、その間に取込が
+        // 進んで合計が合わなくなる。
+        let row: (i64, i64, i64) = sqlx::query_as(
+            "SELECT                count(*) FILTER (WHERE status = 'pending'),                count(*) FILTER (WHERE status = 'journalized'),                count(*) FILTER (WHERE status = 'ignored')              FROM imported_transactions              WHERE ($1::text IS NULL OR source = $1)",
+        )
+        .bind(source)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(crate::error::from_sqlx_error)?;
+
+        Ok(ImportStatusCounts {
+            pending: row.0,
+            journalized: row.1,
+            ignored: row.2,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ImportedRow {
+    id: String,
+    source: String,
+    occurred_on: chrono::NaiveDate,
+    amount_minor: i64,
+    direction: i16,
+    raw_description: String,
+    balance_after: Option<i64>,
+    status: String,
+    entry_id: Option<String>,
+    ignore_reason: Option<String>,
+}
+
+impl ImportedRow {
+    fn into_view(self) -> Result<ImportedTxView, RepoError> {
+        Ok(ImportedTxView {
+            id: self.id,
+            source: self.source,
+            occurred_on: naive_date_to_accounting_date(self.occurred_on)?,
+            amount_minor: self.amount_minor,
+            is_money_in: direction_from_i16(self.direction)?,
+            raw_description: self.raw_description,
+            balance_after: self.balance_after,
+            status: self.status,
+            entry_id: self.entry_id,
+            ignore_reason: self.ignore_reason,
+        })
+    }
+}
+
+/// `direction` 列を「入金かどうか」に直す。
+///
+/// **知らない値は panic させず [`RepoError::Corrupt`] にする。** 0011 の
+/// CHECK 制約が 1/2 以外を弾いているので通常は起きないが、制約を落とした
+/// 別経路の書き込みがあったときに落ちるより、読めなかったと言う方が良い。
+fn direction_from_i16(value: i16) -> Result<bool, RepoError> {
+    match value {
+        1 => Ok(true),
+        2 => Ok(false),
+        other => Err(RepoError::Corrupt {
+            reason: format!("取込明細の direction が 1/2 ではありません: {other}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +306,28 @@ mod tests {
     #[test]
     fn updating_one_row_is_success() {
         assert!(require_one_row(1, "abc", "未処理").is_ok());
+    }
+
+    #[test]
+    fn the_direction_column_reads_back_as_money_in_or_out() {
+        assert!(direction_from_i16(1).unwrap(), "1 は入金");
+        assert!(!direction_from_i16(2).unwrap(), "2 は出金");
+    }
+
+    /// 知らない向きは panic ではなく `Corrupt`。
+    ///
+    /// 0011 の CHECK 制約が弾いているので通常は起きないが、落ちるより
+    /// 「読めなかった」と言う方が良い。
+    #[test]
+    fn an_unknown_direction_is_corrupt_not_a_panic() {
+        assert!(matches!(
+            direction_from_i16(3),
+            Err(RepoError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            direction_from_i16(0),
+            Err(RepoError::Corrupt { .. })
+        ));
     }
 
     #[test]
