@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 mod account;
+mod blob;
 mod clock;
 mod error;
 mod journal;
@@ -13,6 +14,7 @@ mod tag;
 mod trial_balance;
 
 pub use account::*;
+pub use blob::*;
 pub use clock::*;
 pub use error::*;
 pub use journal::*;
