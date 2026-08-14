@@ -33,6 +33,7 @@
 pub mod audit;
 mod chart;
 pub mod convert;
+pub mod documents;
 pub mod error;
 mod journal;
 mod numbering;
