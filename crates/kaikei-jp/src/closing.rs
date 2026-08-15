@@ -308,11 +308,41 @@ fn tax_category_key() -> &'static TagKey {
 /// 検証の前提**であり、片方だけを変更すると検証が実際の生成結果と
 /// 食い違ってしまう。
 fn build_zeroing_tags(tax_category: Option<&str>) -> TagSet {
-    let mut tags = TagSet::new();
+    let mut tags = closing_tags();
     if let Some(code) = tax_category {
         tags.insert(tax_category_key().clone(), TagValue::Code(code.to_string()));
     }
     tags
+}
+
+/// 決算振替であることを示すタグ。
+///
+/// # なぜ印が要るのか
+///
+/// 決算振替は収益・費用をゼロにする。**記帳した瞬間から、その年度の決算書は
+/// 売上0・所得0になる。** 帳簿は追記型なので取り消せず、逆仕訳を切るしか
+/// 戻す手がない。決算書が最も要る時期（申告直前）にこれが起きる。
+///
+/// 摘要の文字列で見分けることもできるが、摘要は人が書き換えられるうえ、
+/// 手で切った決算振替には当てはまらない。**構造的な印**を付けて、
+/// 決算書の集計から外せるようにする（`StatementsInput::exclude_closing`）。
+fn closing_tags() -> TagSet {
+    let mut tags = TagSet::new();
+    tags.insert(
+        entry_kind_key().clone(),
+        TagValue::Code(CLOSING_ENTRY_KIND.to_string()),
+    );
+    tags
+}
+
+/// `entry_kind` タグの値のうち、決算振替を表すもの。
+pub const CLOSING_ENTRY_KIND: &str = "closing";
+
+fn entry_kind_key() -> &'static TagKey {
+    static KEY: OnceLock<TagKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        TagKey::parse("entry_kind").expect("\"entry_kind\" は tags.yaml に登録された既知のタグキー")
+    })
 }
 
 impl ClosingPolicy for JpSoleProprietorClosingPolicy {
@@ -367,7 +397,9 @@ impl ClosingPolicy for JpSoleProprietorClosingPolicy {
                 self.capital_account.clone(),
                 side,
                 income.abs(),
-                TagSet::new(),
+                // 元入金の明細にも印を付ける。**1行でも印が漏れると、
+                // 決算書から外したときに貸借が合わなくなる。**
+                closing_tags(),
                 None,
             )?);
         }
@@ -481,11 +513,27 @@ mod tests {
         FiscalYear::calendar_year(2026)
     }
 
+    /// `entry_kind` だけを登録したタグ定義。
+    ///
+    /// `closing_entries` は決算振替の印として `entry_kind` を必ず付けるので、
+    /// **空のスキーマでは構築できない**（未登録のタグキーとして弾かれる。
+    /// これは意図した動作で、印が黙って落ちるより良い）。
+    fn entry_kind_def() -> (TagKey, kaikei_core::TagDef) {
+        (
+            TagKey::parse("entry_kind").unwrap(),
+            kaikei_core::TagDef {
+                value_type: kaikei_core::TagValueType::Code,
+                aggregatable: false,
+                required_for: vec![],
+            },
+        )
+    }
+
     fn schema() -> TagSchema {
         // `tax_category` を含め何も必須にしないスキーマ。closing_entries
         // 自体のロジック（貸借計算）を実運用のタグ要件から切り離してテストする
         // （`tax_category` の要件そのものを検証するテストは別に用意する）。
-        TagSchema::empty()
+        TagSchema::new(vec![entry_kind_def()])
     }
 
     fn policy(chart: &ChartOfAccounts) -> JpSoleProprietorClosingPolicy {
@@ -830,14 +878,17 @@ mod tests {
 
     /// `tax_category` を `Revenue`/`Expense` に必須とするスキーマ。
     fn schema_requiring_tax_category_for_revenue_and_expense() -> TagSchema {
-        TagSchema::new(vec![(
-            TagKey::parse("tax_category").unwrap(),
-            kaikei_core::TagDef {
-                value_type: kaikei_core::TagValueType::Code,
-                aggregatable: true,
-                required_for: vec![AccountType::Revenue, AccountType::Expense],
-            },
-        )])
+        TagSchema::new(vec![
+            (
+                TagKey::parse("tax_category").unwrap(),
+                kaikei_core::TagDef {
+                    value_type: kaikei_core::TagValueType::Code,
+                    aggregatable: true,
+                    required_for: vec![AccountType::Revenue, AccountType::Expense],
+                },
+            ),
+            entry_kind_def(),
+        ])
     }
 
     /// 決算科目に同じ科目コードを渡したら構築時に弾かれること。
@@ -937,6 +988,7 @@ mod tests {
         // Asset に必須タグを課すスキーマ。元入金の明細は常にタグ無しなので、
         // 実際の種別（Asset）で検証すればここで弾ける。
         let schema = TagSchema::new(vec![
+            entry_kind_def(),
             (
                 TagKey::parse("tax_category").unwrap(),
                 kaikei_core::TagDef {
@@ -987,6 +1039,7 @@ mod tests {
     /// そうしないと収益の検証で先に落ち、Equity の検証まで到達したかが分からない。
     fn schema_requiring_a_tag_for_equity() -> TagSchema {
         TagSchema::new(vec![
+            entry_kind_def(),
             (
                 TagKey::parse("tax_category").unwrap(),
                 kaikei_core::TagDef {
@@ -1112,10 +1165,22 @@ mod tests {
             .iter()
             .find(|l| l.account().as_str() == "400")
             .unwrap();
-        assert!(
-            capital_line.tags().is_empty(),
-            "元入金の明細には tax_category を含むいかなるタグも付かないはず"
+        assert_eq!(
+            capital_line.tags().get(&category_key),
+            None,
+            "元入金の明細には tax_category を付けないはず"
         );
+        // **決算振替の印は全明細に付く。** 1行でも漏れると、決算書から
+        // 決算振替を外したときに貸借が合わなくなる。
+        let entry_kind_key = TagKey::parse("entry_kind").unwrap();
+        for line in &entry.lines {
+            assert_eq!(
+                line.tags().get(&entry_kind_key),
+                Some(&TagValue::Code("closing".to_string())),
+                "{} の明細に決算振替の印が無い",
+                line.account().as_str()
+            );
+        }
     }
 
     #[test]
@@ -1154,14 +1219,17 @@ mod tests {
     fn new_succeeds_with_none_tax_category_when_schema_does_not_require_it() {
         let chart = test_chart();
         // tax_category キー自体は登録されているが、required_for が空。
-        let schema = TagSchema::new(vec![(
-            TagKey::parse("tax_category").unwrap(),
-            kaikei_core::TagDef {
-                value_type: kaikei_core::TagValueType::Code,
-                aggregatable: true,
-                required_for: vec![],
-            },
-        )]);
+        let schema = TagSchema::new(vec![
+            entry_kind_def(),
+            (
+                TagKey::parse("tax_category").unwrap(),
+                kaikei_core::TagDef {
+                    value_type: kaikei_core::TagValueType::Code,
+                    aggregatable: true,
+                    required_for: vec![],
+                },
+            ),
+        ]);
         let policy = JpSoleProprietorClosingPolicy::new(
             &chart,
             &schema,
@@ -1317,13 +1385,24 @@ mod tests {
                 &p.description,
                 p.lines,
             );
-            // 元入金（Equity）の明細にはタグが付かないことも合わせて確認する。
+            // 元入金（Equity）の明細には決算振替の印だけが付くことを確認する
+            // （`tax_category` は付けない。純資産は消費税の対象外）。
             let capital_line = closing_entry
                 .lines()
                 .iter()
                 .find(|l| l.account().as_str() == "400")
                 .unwrap();
-            assert!(capital_line.tags().is_empty());
+            let entry_kind_key = TagKey::parse("entry_kind").unwrap();
+            assert_eq!(
+                capital_line.tags().get(&entry_kind_key),
+                Some(&TagValue::Code("closing".to_string()))
+            );
+            assert_eq!(
+                capital_line
+                    .tags()
+                    .get(&TagKey::parse("tax_category").unwrap()),
+                None
+            );
         }
     }
 

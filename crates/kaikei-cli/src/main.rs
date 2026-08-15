@@ -2042,8 +2042,19 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
             let policy = JpStatementPolicy::new(chart.clone());
             // 損益計算書は会計年度の期間、貸借対照表は帳簿の最初からの累計
             // （`write_reports` と同じ非対称。会計の性質であって都合ではない）。
-            let statements =
-                statements::execute(tx, &policy, &schema, StatementsInput { from, to }).await?;
+            let statements = statements::execute(
+                tx,
+                &policy,
+                &schema,
+                StatementsInput {
+                    from,
+                    to,
+                    // **決算書は決算振替を外して出す。** 外さないと、
+                    // 決算振替を記帳した瞬間に売上0・所得0になる。
+                    exclude_closing: true,
+                },
+            )
+            .await?;
             let cumulative = statements::execute(
                 tx,
                 &policy,
@@ -2051,6 +2062,7 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
                 StatementsInput {
                     from: book_beginning(),
                     to,
+                    exclude_closing: true,
                 },
             )
             .await?;
@@ -2418,8 +2430,19 @@ async fn write_reports(
                 let entries = tx.list_entries_in_period(from, to).await?;
                 let policy = JpStatementPolicy::new(chart.clone());
                 // 損益計算書は**会計年度の期間**。その期間の損益そのものである。
-                let statements =
-                    statements::execute(tx, &policy, &schema, StatementsInput { from, to }).await?;
+                let statements = statements::execute(
+                    tx,
+                    &policy,
+                    &schema,
+                    StatementsInput {
+                        from,
+                        to,
+                        // **決算書は決算振替を外して出す。** 外さないと、
+                        // 決算振替を記帳した瞬間に売上0・所得0になる。
+                        exclude_closing: true,
+                    },
+                )
+                .await?;
                 // 貸借対照表は**帳簿の最初からの累計**。ある時点の残高であって
                 // 期間の増減ではないので、期首残高（前期末の仕訳）を含めるには
                 // 会計年度より前まで遡る必要がある。この非対称は会計の性質で
@@ -2432,6 +2455,7 @@ async fn write_reports(
                     StatementsInput {
                         from: book_beginning(),
                         to,
+                        exclude_closing: true,
                     },
                 )
                 .await?;
@@ -2444,6 +2468,7 @@ async fn write_reports(
                     StatementsInput {
                         from: book_beginning(),
                         to: day_before(from),
+                        exclude_closing: true,
                     },
                 )
                 .await?;
