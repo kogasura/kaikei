@@ -137,6 +137,47 @@ pub struct DepreciationHint {
     pub depreciable_accounts: Vec<AccountCode>,
 }
 
+/// 事業主勘定。
+///
+/// # 何に使うか
+///
+/// 個人事業主では、事業主貸・事業主借は**翌期首に元入金へ振り替えて0に戻す**
+/// （`docs/04-jp-tax.md` §9）。振り替えないと、翌年度の帳簿が前年の残高を
+/// 抱えたまま始まり、年を追うごとに膨らむ。
+///
+/// 振替の時期と方式は未確定なので、このソフトは振替仕訳を作らない
+/// （`DECISIONS.md` D-065）。**作らない代わりに、持ち越されていることを
+/// 知らせる**ために科目コードを持つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerAccounts {
+    /// 元入金。
+    pub capital: AccountCode,
+    /// 事業主貸。
+    pub drawings: AccountCode,
+    /// 事業主借。
+    pub contributions: AccountCode,
+}
+
+/// 科目表から事業主勘定を読む。
+///
+/// **省略されていれば `None`。** 利用者が自分の科目表に差し替えたときに、
+/// この節を書かなければ持ち越しの指摘は行われない。
+///
+/// # Errors
+///
+/// YAML を読めない場合、または科目コードが不正な場合は [`JpError`]。
+pub fn load_owner_accounts(embedded: EmbeddedYaml) -> Result<Option<OwnerAccounts>, JpError> {
+    let raw: ChartRaw = crate::yaml::load_embedded(embedded)?;
+    let Some(raw) = raw.owner_accounts else {
+        return Ok(None);
+    };
+    Ok(Some(OwnerAccounts {
+        capital: parse_code(embedded.label, &raw.capital)?,
+        drawings: parse_code(embedded.label, &raw.drawings)?,
+        contributions: parse_code(embedded.label, &raw.contributions)?,
+    }))
+}
+
 /// 科目表から「向きが逆でよい科目」を読む。
 ///
 /// # なぜ要るのか
@@ -213,6 +254,9 @@ struct ChartRaw {
     /// 貸借が自然な向きと逆になってよい科目（評価勘定）。**省略できる。**
     #[serde(default)]
     contra_accounts: Vec<String>,
+    /// 事業主勘定（[`OwnerAccounts`]）。**省略できる。**
+    #[serde(default)]
+    owner_accounts: Option<OwnerAccountsRaw>,
     /// 減価償却の計上漏れを見つけるための対応（[`DepreciationHint`]）。
     ///
     /// **省略できる。** 利用者が自分の科目表に差し替えたときに、この節を
@@ -220,6 +264,15 @@ struct ChartRaw {
     /// ほどのものではない）。
     #[serde(default)]
     depreciation: Option<DepreciationRaw>,
+}
+
+/// [`OwnerAccounts`] の YAML 上の生の形。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerAccountsRaw {
+    capital: String,
+    drawings: String,
+    contributions: String,
 }
 
 /// [`DepreciationHint`] の YAML 上の生の形。
@@ -302,6 +355,32 @@ mod depreciation_tests {
         }
         // 減価償却累計額そのものも対象ではない。
         assert!(!codes.contains(&"240"), "{codes:?}");
+    }
+
+    /// **本命。** 同梱の科目表が事業主勘定を持っている。
+    ///
+    /// 持っていなければ、翌年度への持ち越しの指摘が黙って行われなくなる。
+    #[test]
+    fn the_bundled_chart_knows_the_owner_accounts() {
+        let owner = load_owner_accounts(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+            .expect("読めること")
+            .expect("同梱の科目表には入っていること");
+
+        assert_eq!(owner.capital.as_str(), "400", "元入金");
+        assert_eq!(owner.drawings.as_str(), "410", "事業主貸");
+        assert_eq!(owner.contributions.as_str(), "420", "事業主借");
+    }
+
+    /// 事業主貸と事業主借を取り違えていない。
+    ///
+    /// 取り違えると、指摘に出る科目名と金額が入れ替わる。
+    #[test]
+    fn the_owner_accounts_are_not_swapped() {
+        let owner = load_owner_accounts(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+            .unwrap()
+            .unwrap();
+        assert_ne!(owner.drawings, owner.contributions);
+        assert_ne!(owner.drawings, owner.capital);
     }
 
     /// 節が無くても読み込みは通る。
