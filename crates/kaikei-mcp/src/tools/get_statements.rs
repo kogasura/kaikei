@@ -125,7 +125,8 @@ from と to は取引日で、両端を含みます。どちらも必須です�
                         to,
                         // 決算書と同じ見え方にする（決算振替を外す）。
                         // 外さないと、決算振替を記帳した年度だけ売上0になる。
-                        exclude_closing: true,
+                        exclude_closing_on: Some(to),
+                        only_opening_on: None,
                     },
                 )
                 .await

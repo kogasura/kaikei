@@ -2051,7 +2051,8 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
                     to,
                     // **決算書は決算振替を外して出す。** 外さないと、
                     // 決算振替を記帳した瞬間に売上0・所得0になる。
-                    exclude_closing: true,
+                    exclude_closing_on: Some(year.end()),
+                    only_opening_on: None,
                 },
             )
             .await?;
@@ -2062,7 +2063,8 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
                 StatementsInput {
                     from: book_beginning(),
                     to,
-                    exclude_closing: true,
+                    exclude_closing_on: Some(year.end()),
+                    only_opening_on: None,
                 },
             )
             .await?;
@@ -2439,7 +2441,8 @@ async fn write_reports(
                         to,
                         // **決算書は決算振替を外して出す。** 外さないと、
                         // 決算振替を記帳した瞬間に売上0・所得0になる。
-                        exclude_closing: true,
+                        exclude_closing_on: Some(to),
+                        only_opening_on: None,
                     },
                 )
                 .await?;
@@ -2455,7 +2458,8 @@ async fn write_reports(
                     StatementsInput {
                         from: book_beginning(),
                         to,
-                        exclude_closing: true,
+                        exclude_closing_on: Some(to),
+                        only_opening_on: None,
                     },
                 )
                 .await?;
@@ -2467,8 +2471,19 @@ async fn write_reports(
                     &schema,
                     StatementsInput {
                         from: book_beginning(),
-                        to: day_before(from),
-                        exclude_closing: true,
+                        // **期首振替（1/1）まで含める。** 期首の姿とは
+                        // 「期首振替を済ませた後、その年の商売が始まる前」
+                        // である。前日で切ると事業主貸・事業主借が期首に
+                        // 残り、期首の貸借が合わなくなる。
+                        to: from,
+                        // 期首の列では決算振替を外さない。前年度の決算振替
+                        // （前年12/31の所得→元入金）は期首残高の一部である。
+                        // 外すと元入金が過少になり、前年度の収益・費用が
+                        // 期首の貸借対照表に漏れる。
+                        exclude_closing_on: None,
+                        // ただし 1/1 の普通の取引は入れない（期首の姿では
+                        // なく、その年の商売である）。
+                        only_opening_on: Some(from),
                     },
                 )
                 .await?;
@@ -2975,16 +2990,6 @@ fn build_tax_map(
         }
     }
     out
-}
-
-/// 会計年度の開始日の前日。決算書の貸借対照表の期首列に使う。
-///
-/// 暦年のみ対応（`KAIKEI_FISCAL_YEAR_RULE` が `calendar_year` であることを
-/// 呼び出し前に確かめている）なので、開始日は必ず 1/1 であり、前日は
-/// 前年の 12/31 になる。
-fn day_before(fiscal_year_start: AccountingDate) -> AccountingDate {
-    AccountingDate::new(fiscal_year_start.year() - 1, 12, 31)
-        .expect("前年の 12/31 は常に有効な日付である")
 }
 
 /// 青色申告決算書（貸借対照表）のデータを書き出す。

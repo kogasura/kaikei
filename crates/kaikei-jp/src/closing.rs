@@ -12,14 +12,20 @@
 //! これら3つを**1本の `ProposedEntry`**にまとめて返す（理由は
 //! [`zeroing_side`] のドキュメントと下記「貸借が一致する理由」を参照）。
 //!
-//! # `opening_entries` は実装しない（`DECISIONS.md` D-065）
+//! # `opening_entries` は翌年期首に置く（`DECISIONS.md` D-102。D-065 を更新）
 //!
-//! `kaikei-policy::ClosingPolicy::opening_entries` の既定実装（何も生成しない）を
-//! **そのまま使う**。個人事業主の元入金振替のうち「事業主借 − 事業主貸」を
-//! 反映する部分を当年度末と翌年期首のどちらに計上するか、事業主貸・事業主借の
-//! 期首リセットを振替仕訳で行うか期首残高の直接設定で行うかは、
-//! `docs/04-jp-tax.md` §9 と `docs/08-compliance.md` §9-4 が明示するとおり
-//! 未解決の税理士確認事項であるため、この PR では判断せず実装しない。
+//! 4. 事業主貸・事業主借をゼロにし、差額を元入金へ振り替える
+//!    （**翌年1月1日**の仕訳として提案する）
+//!
+//! D-065 は「当年度末と翌年期首のどちらに計上するか未確定」としていたが、
+//! **青色申告決算書の貸借対照表に事業主貸・事業主借の欄がある**（事業主貸は
+//! 資産の部、事業主借は負債・資本の部に期末残高を書く）。当年度末にゼロ化
+//! すると2つの欄が必ず0になり、様式と食い違う。これは税務判断ではなく
+//! 様式から読み取れる事実なので、翌年期首に決めた。
+//!
+//! 期首残高の直接設定ではなく**振替仕訳**にするのは、この帳簿が追記型で
+//! 「期首残高を直接書き換える」経路を持たないためである（残高は仕訳の
+//! 積み上げでしか動かない）。
 //!
 //! # 実装しないこと（`docs/04-jp-tax.md` §9「実装上の注意」）
 //!
@@ -335,8 +341,29 @@ fn closing_tags() -> TagSet {
     tags
 }
 
-/// `entry_kind` タグの値のうち、決算振替を表すもの。
+/// `entry_kind` タグの値のうち、当年度末の決算振替を表すもの。
 pub const CLOSING_ENTRY_KIND: &str = "closing";
+
+/// `entry_kind` タグの値のうち、翌年期首の振替を表すもの。
+///
+/// # なぜ `closing` と分けるのか
+///
+/// 決算振替（12/31）は決算書の集計から**外す**——外さないと売上0・所得0に
+/// なる。一方、期首振替（1/1）は**外してはいけない**——外すと事業主貸・
+/// 事業主借が翌年度の貸借対照表に残り続ける（実際に複製で確認した）。
+///
+/// 役割が逆なので、同じ値にはできない。
+pub const OPENING_ENTRY_KIND: &str = "opening";
+
+/// 期首振替であることを示すタグ。
+fn opening_tags() -> TagSet {
+    let mut tags = TagSet::new();
+    tags.insert(
+        entry_kind_key().clone(),
+        TagValue::Code(OPENING_ENTRY_KIND.to_string()),
+    );
+    tags
+}
 
 fn entry_kind_key() -> &'static TagKey {
     static KEY: OnceLock<TagKey> = OnceLock::new();
@@ -417,8 +444,113 @@ impl ClosingPolicy for JpSoleProprietorClosingPolicy {
         }])
     }
 
-    // opening_entries は既定実装（何も生成しない）のまま使う（モジュール doc
-    // 「opening_entries は実装しない」、`DECISIONS.md` D-065）。
+    /// 翌年期首の元入金振替を提案する（`docs/04-jp-tax.md` §9 手順3の残りと手順4）。
+    ///
+    /// # 何を生成するか
+    ///
+    /// `tb` は `fy` 期末の試算表。生成する仕訳の日付は **`fy` の翌年の1月1日**。
+    /// 事業主貸・事業主借をゼロにし、その差額を元入金で受ける。
+    ///
+    /// `closing_entries` が当年度末に所得を元入金へ振り替えているので、
+    /// 2つを合わせると `docs/04-jp-tax.md` §9 の式になる。
+    ///
+    /// ```text
+    /// 翌年期首の元入金 = 前年元入金 + 前年所得 + 事業主借 − 事業主貸
+    ///                                 ~~~~~~~~   ~~~~~~~~~~~~~~~~~~~
+    ///                                 closing    opening（ここ）
+    /// ```
+    ///
+    /// # なぜ当年度末ではなく翌年期首なのか
+    ///
+    /// **青色申告決算書の貸借対照表に事業主貸・事業主借の欄がある。**
+    /// 事業主貸は資産の部、事業主借は負債・資本の部に、それぞれ期末残高を
+    /// 書く様式である。当年度末にゼロ化すると、この2つの欄が必ず0になり、
+    /// 様式と食い違う。
+    ///
+    /// これは税務判断ではなく**様式から読み取れる事実**である
+    /// （`DECISIONS.md` D-102）。D-065 が「当年度末と翌年期首のどちらか
+    /// 未確定」としていた点を、この根拠で翌年期首に決めた。
+    ///
+    /// # 提案するだけで記帳はしない
+    ///
+    /// `ClosingPolicy` は `ProposedEntry` を返すだけ（`DECISIONS.md` D-027）。
+    /// 記帳するかどうかは人が決める。
+    ///
+    /// # 何も無ければ空を返す
+    ///
+    /// 事業主貸・事業主借がどちらも0なら振り替えるものが無い。
+    fn opening_entries(
+        &self,
+        tb: &TrialBalance,
+        fy: &FiscalYear,
+    ) -> Result<Vec<ProposedEntry>, PolicyError> {
+        // `TrialBalance` の残高は `AccountType::is_debit_normal` に従う符号付き。
+        // 事業主貸・事業主借はどちらも純資産（貸方が正常）なので、通常の
+        // 事業主貸（借方に積み上がる）は**負の残高**として出る。
+        let drawings = self.balance_or_zero(tb, &self.owner_drawings_account);
+        let contributions = self.balance_or_zero(tb, &self.owner_contributions_account);
+
+        if drawings.is_zero() && contributions.is_zero() {
+            return Ok(Vec::new());
+        }
+
+        let mut lines = Vec::new();
+        for (account, balance) in [
+            (&self.owner_drawings_account, &drawings),
+            (&self.owner_contributions_account, &contributions),
+        ] {
+            if balance.is_zero() {
+                continue;
+            }
+            lines.push(JournalLine::new(
+                account.clone(),
+                // 収益・費用のゼロ化と同じ規則を使う（符号の解釈を2箇所で
+                // 決めない）。事業主貸・事業主借は純資産である。
+                zeroing_side(AccountType::Equity, balance),
+                balance.abs(),
+                opening_tags(),
+                None,
+            )?);
+        }
+
+        // 元入金は「事業主借 − 事業主貸」だけ増える。符号付き残高のまま
+        // 足せばそれになる（どちらも純資産なので同じ符号規則に乗っている）。
+        let capital_change = contributions.add(&drawings)?;
+        if !capital_change.is_zero() {
+            lines.push(JournalLine::new(
+                self.capital_account.clone(),
+                // 増える（正）なら貸方、減る（負）なら借方。
+                if capital_change.is_negative() {
+                    Side::Debit
+                } else {
+                    Side::Credit
+                },
+                capital_change.abs(),
+                opening_tags(),
+                None,
+            )?);
+        }
+
+        verify_balanced(&lines)?;
+
+        let next_year = FiscalYear::calendar_year(fy.label() + 1);
+        Ok(vec![ProposedEntry {
+            entry_date: next_year.start(),
+            description: format!(
+                "期首振替: {}年度末の事業主貸・事業主借を元入金へ振替",
+                fy.label()
+            ),
+            lines,
+        }])
+    }
+}
+
+impl JpSoleProprietorClosingPolicy {
+    /// 試算表から残高を引く。科目が現れていなければ0円。
+    fn balance_or_zero(&self, tb: &TrialBalance, account: &AccountCode) -> Money {
+        tb.balance_of(account)
+            .unwrap_or_else(|| Money::from_minor(0, Currency::JPY))
+    }
 }
 
 /// 収益・費用科目をゼロにする仕訳の側（借方・貸方）を決める。
@@ -1402,6 +1534,146 @@ mod tests {
                     .tags()
                     .get(&TagKey::parse("tax_category").unwrap()),
                 None
+            );
+        }
+    }
+
+    // ---- 手順4: 翌年期首の元入金振替（opening_entries） ----
+
+    /// **本命。** 実帳簿（weBanana.SP の2026年）と同じ数字で確かめる。
+    ///
+    /// 事業主貸 10,013,438（借方）／事業主借 1,012,434（貸方）。
+    /// 期待: 事業主貸を貸方でゼロ化、事業主借を借方でゼロ化、差額
+    /// 9,001,004 を元入金の借方（＝元入金が減る）。
+    #[test]
+    fn opening_entries_transfers_owner_accounts_into_capital() {
+        let chart = test_chart();
+        let schema = schema();
+        let fy = fy();
+        let entries = [
+            cash_entry(&chart, &schema, &fy, 1, "410", Side::Debit, 10_013_438),
+            cash_entry(&chart, &schema, &fy, 2, "420", Side::Credit, 1_012_434),
+        ];
+        let tb = TrialBalance::from_entries(entries.iter(), &chart, &schema, &[]).unwrap();
+
+        let proposed = policy(&chart).opening_entries(&tb, &fy).unwrap();
+        assert_eq!(proposed.len(), 1);
+        let entry = &proposed[0];
+
+        // **翌年の1月1日。** 当年度末ではない（青色申告決算書の貸借対照表に
+        // 事業主貸・事業主借の欄があるため、期末はゼロにできない）。
+        assert_eq!(
+            entry.entry_date,
+            FiscalYear::calendar_year(fy.label() + 1).start()
+        );
+        assert_eq!(entry.entry_date.year(), fy.label() + 1);
+
+        assert_eq!(balance_of(entry, "410"), Some((Side::Credit, 10_013_438)));
+        assert_eq!(balance_of(entry, "420"), Some((Side::Debit, 1_012_434)));
+        assert_eq!(balance_of(entry, "400"), Some((Side::Debit, 9_001_004)));
+        assert_eq!(debit_total(entry), credit_total(entry));
+    }
+
+    /// 事業主借が事業主貸より大きければ、元入金は増える（貸方）。
+    #[test]
+    fn opening_entries_credits_capital_when_contributions_exceed_drawings() {
+        let chart = test_chart();
+        let schema = schema();
+        let fy = fy();
+        let entries = [
+            cash_entry(&chart, &schema, &fy, 1, "410", Side::Debit, 100_000),
+            cash_entry(&chart, &schema, &fy, 2, "420", Side::Credit, 300_000),
+        ];
+        let tb = TrialBalance::from_entries(entries.iter(), &chart, &schema, &[]).unwrap();
+
+        let entry = &policy(&chart).opening_entries(&tb, &fy).unwrap()[0];
+        assert_eq!(balance_of(entry, "400"), Some((Side::Credit, 200_000)));
+        assert_eq!(debit_total(entry), credit_total(entry));
+    }
+
+    /// 事業主貸と事業主借が同額なら、元入金は動かない（明細も作らない）。
+    #[test]
+    fn opening_entries_omits_the_capital_line_when_they_cancel_out() {
+        let chart = test_chart();
+        let schema = schema();
+        let fy = fy();
+        let entries = [
+            cash_entry(&chart, &schema, &fy, 1, "410", Side::Debit, 50_000),
+            cash_entry(&chart, &schema, &fy, 2, "420", Side::Credit, 50_000),
+        ];
+        let tb = TrialBalance::from_entries(entries.iter(), &chart, &schema, &[]).unwrap();
+
+        let entry = &policy(&chart).opening_entries(&tb, &fy).unwrap()[0];
+        assert_eq!(balance_of(entry, "400"), None, "0円の明細は作らない");
+        assert_eq!(entry.lines.len(), 2);
+        assert_eq!(debit_total(entry), credit_total(entry));
+    }
+
+    /// 片方だけ残高がある場合も貸借が合う。
+    #[test]
+    fn opening_entries_handles_only_one_of_the_two_accounts() {
+        let chart = test_chart();
+        let schema = schema();
+        let fy = fy();
+        let entries = [cash_entry(
+            &chart,
+            &schema,
+            &fy,
+            1,
+            "410",
+            Side::Debit,
+            7_000,
+        )];
+        let tb = TrialBalance::from_entries(entries.iter(), &chart, &schema, &[]).unwrap();
+
+        let entry = &policy(&chart).opening_entries(&tb, &fy).unwrap()[0];
+        assert_eq!(balance_of(entry, "420"), None);
+        assert_eq!(balance_of(entry, "410"), Some((Side::Credit, 7_000)));
+        assert_eq!(balance_of(entry, "400"), Some((Side::Debit, 7_000)));
+        assert_eq!(debit_total(entry), credit_total(entry));
+    }
+
+    /// 動きが無ければ何も提案しない。
+    #[test]
+    fn opening_entries_proposes_nothing_when_both_are_zero() {
+        let chart = test_chart();
+        let schema = schema();
+        let fy = fy();
+        let entries = [cash_entry(
+            &chart,
+            &schema,
+            &fy,
+            1,
+            "500",
+            Side::Credit,
+            1_000,
+        )];
+        let tb = TrialBalance::from_entries(entries.iter(), &chart, &schema, &[]).unwrap();
+
+        assert!(policy(&chart).opening_entries(&tb, &fy).unwrap().is_empty());
+    }
+
+    /// **期首振替の印は `opening`。** `closing` にすると決算書の集計から
+    /// 外れてしまい、事業主貸・事業主借が翌年度の貸借対照表に残り続ける。
+    #[test]
+    fn opening_entries_are_marked_as_opening() {
+        let chart = test_chart();
+        let schema = schema();
+        let fy = fy();
+        let entries = [
+            cash_entry(&chart, &schema, &fy, 1, "410", Side::Debit, 100_000),
+            cash_entry(&chart, &schema, &fy, 2, "420", Side::Credit, 30_000),
+        ];
+        let tb = TrialBalance::from_entries(entries.iter(), &chart, &schema, &[]).unwrap();
+
+        let entry = &policy(&chart).opening_entries(&tb, &fy).unwrap()[0];
+        let key = TagKey::parse("entry_kind").unwrap();
+        for line in &entry.lines {
+            assert_eq!(
+                line.tags().get(&key),
+                Some(&TagValue::Code("opening".to_string())),
+                "{} の明細に期首振替の印が無い",
+                line.account().as_str()
             );
         }
     }

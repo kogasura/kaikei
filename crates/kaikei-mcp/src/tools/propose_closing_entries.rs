@@ -129,17 +129,25 @@ fn success_body(fiscal_year: i32, output: &ClosingOutput) -> Map<String, Value> 
     let proposals: Vec<Value> = output.proposals.iter().map(proposal_to_json).collect();
     body.insert("proposals".to_string(), Value::Array(proposals));
 
+    // **当年度末の分と翌年期首の分を別のキーにする。** 混ぜると、日付の
+    // 違う2本の仕訳が1つの配列に並び、どちらをいつ記帳するのかが読めない。
+    let opening: Vec<Value> = output
+        .opening_proposals
+        .iter()
+        .map(proposal_to_json)
+        .collect();
+    body.insert("opening_proposals".to_string(), Value::Array(opening));
+
     body.insert(
         "next_step".to_string(),
         json!(next_step(output.proposals.len(), output.entry_count)),
     );
 
-    // ★何を振り替えていないかを必ず言う★（`DECISIONS.md` D-065）
+    // ★2本の仕訳の日付が違うことを必ず言う★（`DECISIONS.md` D-102）
     //
-    // この提案は収益・費用を元入金へ振り替えるだけで、**事業主貸・事業主借は
-    // そのまま残す**。そうと知らずに記帳すると、翌年度へ持ち越された残高を
-    // 見て「決算が失敗した」と読む。実装漏れではなく、当年度末と翌年期首の
-    // どちらで振り替えるかが決まっていないためである。
+    // `proposals` は当年度末（12/31）、`opening_proposals` は翌年期首（1/1）に
+    // 記帳する。同じ日に両方入れると、青色申告決算書の貸借対照表から
+    // 事業主貸・事業主借が消える（様式には両方の欄がある）。
     //
     // `posted` と同じく**条件によって省かない**——無いことに意味があるのか
     // 単に忘れたのかが読めなくなる。
@@ -147,8 +155,8 @@ fn success_body(fiscal_year: i32, output: &ClosingOutput) -> Map<String, Value> 
     body
 }
 
-/// この提案が扱わない範囲（`DECISIONS.md` D-065）。
-const SCOPE_NOTE: &str = "この提案は収益と費用を元入金へ振り替えるだけです。事業主貸と事業主借の残高はそのまま残り、元入金には反映されません。当年度末と翌年期首のどちらで振り替えるか、振替仕訳を起こすか期首残高として設定するかが決まっていないためで、実装漏れではありません。青色申告決算書の貸借対照表には、事業主貸と事業主借がそれぞれの残高のまま載ります。翌年度の元入金をどう置くかは、税理士に確認してから決めてください。";
+/// 2つの提案の使い分け（`DECISIONS.md` D-102）。
+const SCOPE_NOTE: &str = "提案は2本あり、記帳する日が違います。proposals は当年度末（12月31日）に記帳する分で、収益と費用を元入金へ振り替えます。opening_proposals は翌年の1月1日に記帳する分で、事業主貸と事業主借をゼロにして差額を元入金へ振り替えます。opening_proposals を当年度末に記帳しないでください。青色申告決算書の貸借対照表には事業主貸と事業主借の欄があり、期末残高をそのまま書く様式なので、年内にゼロにすると様式と食い違います。減価償却費・家事按分の年次調整・棚卸は、この提案には含まれません。";
 
 /// 次の手（`CLAUDE.md` §11）。
 ///
@@ -213,6 +221,11 @@ mod tests {
     /// この提案は収益・費用しか振り替えない。そうと知らずに記帳すると、
     /// 翌年度へ持ち越された事業主貸・事業主借の残高を見て「決算が失敗した」
     /// と読む。実装漏れではないことも併せて伝える。
+    /// 注記が「2本あって記帳する日が違う」ことを言う。
+    ///
+    /// 期首振替を当年度末に記帳すると、青色申告決算書の貸借対照表から
+    /// 事業主貸・事業主借が消える（様式には両方の欄がある）。追記型なので
+    /// 記帳してからでは戻せない。
     #[test]
     fn the_response_says_what_it_does_not_transfer() {
         let output = ClosingOutput {
@@ -220,6 +233,7 @@ mod tests {
             period_end: date(2026, 12, 31),
             entry_count: 10,
             proposals: vec![proposal()],
+            opening_proposals: Vec::new(),
         };
 
         let body = success_body(2026, &output);
@@ -227,7 +241,18 @@ mod tests {
         let note = body["scope_note"].as_str().expect("scope_note があること");
         assert!(note.contains("事業主貸"), "{note}");
         assert!(note.contains("事業主借"), "{note}");
-        assert!(note.contains("実装漏れではありません"), "{note}");
+        assert!(
+            note.contains("1月1日"),
+            "期首振替をいつ記帳するかを言うこと: {note}"
+        );
+        assert!(
+            note.contains("当年度末に記帳しないでください"),
+            "やってはいけないことを言うこと: {note}"
+        );
+        assert!(
+            body["opening_proposals"].is_array(),
+            "opening_proposals は常に出すこと（空でも）"
+        );
     }
 
     /// 提案が空でも注記は出る。
@@ -241,6 +266,7 @@ mod tests {
             period_end: date(2026, 12, 31),
             entry_count: 0,
             proposals: Vec::new(),
+            opening_proposals: Vec::new(),
         };
 
         let body = success_body(2026, &output);
@@ -287,6 +313,7 @@ mod tests {
     fn output(proposals: Vec<ProposedEntry>, entry_count: usize) -> ClosingOutput {
         ClosingOutput {
             proposals,
+            opening_proposals: Vec::new(),
             entry_count,
             period_start: date(2026, 1, 1),
             period_end: date(2026, 12, 31),
