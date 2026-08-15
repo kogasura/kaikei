@@ -16,6 +16,18 @@ tags:
     required_for: [Revenue, Expense]
     description: "消費税区分。tax/jp/{year}.yaml の categories[].code を参照"
 
+  entry_kind:
+    value_type: Code
+    # 集計軸にはしない。用途は決算書からの除外（絞り込み）であって、
+    # 「決算振替ごとの試算表」を出すことではない。true にすると
+    # get_trial_balance の group_by に増え、公開面が広がる
+    aggregatable: false
+    required_for: []
+    description: >-
+      仕訳の種類。決算振替は closing。**決算書は closing を除いて集計する**
+      （除かないと、決算振替を記帳した瞬間に売上0・所得0の決算書になる。
+      帳簿は追記型なので取り消せない）
+
   counterparty:
     value_type: Code
     aggregatable: true

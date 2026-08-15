@@ -40,6 +40,22 @@ pub struct StatementsInput {
     pub from: AccountingDate,
     /// 集計対象期間の終了日（取引日、両端を含む）。
     pub to: AccountingDate,
+
+    /// 決算振替（`entry_kind: closing`）の仕訳を集計から外すか。
+    ///
+    /// # なぜ外せる必要があるのか
+    ///
+    /// 決算振替は収益・費用をゼロにする。**記帳した瞬間から、その年度の
+    /// 決算書は売上0・所得0になる。** 帳簿は追記型なので取り消せず、逆仕訳
+    /// を切るしか戻す手がない。決算書が最も要る時期（申告直前）にこれが
+    /// 起きる。
+    ///
+    /// 青色申告決算書の貸借対照表は「青色申告特別控除前の所得金額」を独立の
+    /// 行として持つ——**所得を元入金へ振り替える前の姿**である。決算書を
+    /// 出す経路は常に外すのが正しい。
+    ///
+    /// 仕訳日記帳・総勘定元帳は外さない（帳簿に実在する仕訳である）。
+    pub exclude_closing: bool,
 }
 
 /// [`execute`] の出力。
@@ -103,7 +119,10 @@ where
     }
 
     let chart = tx.load_chart().await?;
-    let entries = tx.list_entries_in_period(input.from, input.to).await?;
+    let mut entries = tx.list_entries_in_period(input.from, input.to).await?;
+    if input.exclude_closing {
+        entries.retain(|entry| !is_closing_entry(entry));
+    }
 
     let entry_count = entries.len();
     // 並びは `(entry_date, entry_no)` 昇順なので先頭が最も古い
@@ -123,6 +142,24 @@ where
     })
 }
 
+/// 決算振替の仕訳か。
+///
+/// **1明細でも印が付いていれば決算振替とみなす。** 決算振替は1本の仕訳に
+/// 収益・費用のゼロ化と所得の振替をまとめており、一部だけを外すと貸借が
+/// 合わなくなる。印の付いていない明細が混ざるくらいなら、仕訳ごと外す方が
+/// 安全側に倒れる。
+fn is_closing_entry(entry: &kaikei_core::JournalEntry) -> bool {
+    let Ok(key) = kaikei_core::TagKey::parse("entry_kind") else {
+        return false;
+    };
+    entry.lines().iter().any(|line| {
+        matches!(
+            line.tags().get(&key),
+            Some(kaikei_core::TagValue::Code(kind)) if kind == "closing"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +174,17 @@ mod tests {
 
     fn date(year: i32, month: u8, day: u8) -> AccountingDate {
         AccountingDate::new(year, month, day).unwrap()
+    }
+
+    fn schema_with_entry_kind() -> TagSchema {
+        TagSchema::new(vec![(
+            kaikei_core::TagKey::parse("entry_kind").unwrap(),
+            kaikei_core::TagDef {
+                value_type: kaikei_core::TagValueType::Code,
+                aggregatable: false,
+                required_for: vec![],
+            },
+        )])
     }
 
     fn line(account: &str, side: Side, amount_minor: i128) -> JournalLine {
@@ -168,7 +216,9 @@ mod tests {
             },
             &FiscalYear::calendar_year(on.year()),
             &sample_chart_with_tax_account(),
-            &TagSchema::empty(),
+            // `entry_kind` を登録したスキーマ。決算振替の印を付けた明細を
+            // 作れないと、除外の検査が書けない。
+            &schema_with_entry_kind(),
             &AllOpen,
             &fixed_clock(),
         )
@@ -224,7 +274,11 @@ mod tests {
                     tx,
                     &ByAccountTypeStatement,
                     &TagSchema::empty(),
-                    StatementsInput { from, to },
+                    StatementsInput {
+                        from,
+                        to,
+                        exclude_closing: false,
+                    },
                 )
                 .await
             })
@@ -243,6 +297,123 @@ mod tests {
             .minor()
     }
 
+    /// `entry_kind: closing` を付けた明細を作る。
+    fn closing_line(account: &str, side: Side, amount: i128) -> JournalLine {
+        let mut tags = TagSet::new();
+        tags.insert(
+            kaikei_core::TagKey::parse("entry_kind").unwrap(),
+            kaikei_core::TagValue::Code("closing".to_string()),
+        );
+        JournalLine::new(
+            AccountCode::parse(account).unwrap(),
+            side,
+            Money::from_minor(amount, Currency::JPY),
+            tags,
+            None,
+        )
+        .unwrap()
+    }
+
+    async fn post_closing_entry(store: &InMemoryStore) {
+        with_tx(store, |tx| {
+            Box::pin(async move {
+                // 売上高 1,000 をゼロにする振替。相手科目はこの検査では
+                // 何でもよい（見ているのは収益が消えるかどうか）。実運用では
+                // 元入金だが、テスト用の勘定科目表に純資産の科目が無い。
+                tx.insert_entry(&entry(
+                    3,
+                    3,
+                    date(2026, 12, 31),
+                    "決算振替: 2026年度の収益・費用を元入金へ振替",
+                    vec![
+                        closing_line("500", Side::Debit, 1_000),
+                        closing_line("330", Side::Credit, 1_000),
+                    ],
+                ))
+                .await?;
+                Ok::<(), AppError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn run_excluding_closing(
+        store: &InMemoryStore,
+        from: AccountingDate,
+        to: AccountingDate,
+    ) -> StatementsOutput {
+        with_tx_err(store, |tx| {
+            Box::pin(async move {
+                execute(
+                    tx,
+                    &ByAccountTypeStatement,
+                    &TagSchema::empty(),
+                    StatementsInput {
+                        from,
+                        to,
+                        exclude_closing: true,
+                    },
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    // **本命。** 決算振替を記帳しても決算書が変わらない。
+    //
+    // 外さないと、決算振替を記帳した瞬間に売上0・所得0の決算書になる。
+    // 帳簿は追記型なので取り消せず、決算書が最も要る時期（申告直前）に
+    // 起きる。
+    #[tokio::test]
+    async fn posting_the_closing_entry_does_not_change_the_statements() {
+        let store = store_with_opening_and_period_entries().await;
+        let before = run_excluding_closing(&store, date(2026, 1, 1), date(2026, 12, 31)).await;
+
+        post_closing_entry(&store).await;
+
+        let after = run_excluding_closing(&store, date(2026, 1, 1), date(2026, 12, 31)).await;
+
+        assert_eq!(
+            section_subtotal(&after.income_statement, "収益"),
+            section_subtotal(&before.income_statement, "収益"),
+            "決算振替を記帳しても収益は変わらないこと"
+        );
+        assert_eq!(
+            section_subtotal(&after.income_statement, "収益"),
+            1_000,
+            "売上 1,000 が残ること"
+        );
+    }
+
+    // 外さなければ売上が消える（＝この検査が意味を持つことの確認）。
+    #[tokio::test]
+    async fn without_excluding_closing_the_revenue_disappears() {
+        let store = store_with_opening_and_period_entries().await;
+        post_closing_entry(&store).await;
+
+        let output = run(&store, date(2026, 1, 1), date(2026, 12, 31)).await;
+
+        assert_eq!(
+            section_subtotal(&output.income_statement, "収益"),
+            0,
+            "決算振替を含めると収益がゼロになる（これが避けたい状態）"
+        );
+    }
+
+    // 決算振替でない仕訳は外さない。
+    #[tokio::test]
+    async fn an_ordinary_entry_is_not_excluded() {
+        let store = store_with_opening_and_period_entries().await;
+
+        let output = run_excluding_closing(&store, date(2026, 1, 1), date(2026, 12, 31)).await;
+
+        assert_eq!(section_subtotal(&output.income_statement, "収益"), 1_000);
+        assert_eq!(output.entry_count, 2, "通常の仕訳2本は数に入ること");
+    }
+
     // ST-1: 期間の逆指定は「0件の空の決算書」にせず拒否する。
     #[tokio::test]
     async fn a_reversed_period_is_rejected_not_silently_empty() {
@@ -257,6 +428,7 @@ mod tests {
                     StatementsInput {
                         from: date(2026, 12, 31),
                         to: date(2026, 1, 1),
+                        exclude_closing: false,
                     },
                 )
                 .await
