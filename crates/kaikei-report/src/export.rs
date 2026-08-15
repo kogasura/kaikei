@@ -25,6 +25,7 @@
 
 use kaikei_core::{ChartOfAccounts, JournalEntry, Side, TagValue};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 
 /// この出力のスキーマ版。**形を変えたら上げる。**
 ///
@@ -46,6 +47,62 @@ const README: &[(&str, &str)] = &[
     ("recorded_at", "帳簿に記録した日時（UNIX時刻のナノ秒）。取引日ではありません"),
     ("tags", "明細に付けた分類。tax_category は消費税区分"),
 ];
+
+/// 書き出した JSON を読み直して、科目ごとの借方・貸方を集計する。
+///
+/// # なぜ読み直すのか
+///
+/// このファイルは**このソフトが無くなっても帳簿が残る**ための出口である
+/// （`docs/03-database.md` §8）。中身が欠けていても、必要になったときに
+/// 初めて気づく——そのときにはもう元の帳簿が無い。
+///
+/// 組み立てた構造体をそのまま数えても、書き出しの誤りは見つからない
+/// （同じ誤りを共有するため）。**書いた文字列を解析し直す。**
+///
+/// # Errors
+///
+/// JSON として読めない場合、または金額を数として読めない場合は理由を返す。
+/// **読めないことを 0 件として扱わない**——空の集計は「一致した」に見える。
+pub fn sum_by_account(json: &str) -> Result<BTreeMap<String, (i128, i128)>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| format!("JSON として読めません: {error}"))?;
+    let entries = value
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "entries が配列ではありません".to_string())?;
+
+    let mut totals: BTreeMap<String, (i128, i128)> = BTreeMap::new();
+    for entry in entries {
+        let lines = entry
+            .get("lines")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "lines が配列ではありません".to_string())?;
+        for line in lines {
+            let account = line
+                .get("account")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "account が文字列ではありません".to_string())?;
+            // **金額は文字列で書いている**（読み直しで誤差が出ないように）。
+            let amount: i128 = line
+                .get("amount_minor")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "amount_minor が文字列ではありません".to_string())?
+                .parse()
+                .map_err(|_| "amount_minor を数として読めません".to_string())?;
+            let side = line
+                .get("side")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "side が文字列ではありません".to_string())?;
+            let slot = totals.entry(account.to_string()).or_default();
+            match side {
+                "debit" => slot.0 += amount,
+                "credit" => slot.1 += amount,
+                other => return Err(format!("side が debit/credit ではありません: {other}")),
+            }
+        }
+    }
+    Ok(totals)
+}
 
 /// 帳簿を JSON にする。
 ///
@@ -171,6 +228,42 @@ fn tags_to_json(tags: &kaikei_core::TagSet) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **本命。** 書き出した JSON を読み直すと、帳簿と同じ集計になる。
+    ///
+    /// このファイルは帳簿が残るための出口である。明細が欠けていても、
+    /// 必要になったときに初めて気づく——そのときにはもう元の帳簿が無い。
+    #[test]
+    fn reading_the_written_json_back_gives_the_same_totals() {
+        let chart = chart();
+        let entries = vec![sample_entry()];
+
+        let totals = sum_by_account(&to_json(&entries, &chart)).expect("読み直せること");
+
+        let debit: i128 = totals.values().map(|(d, _)| d).sum();
+        let credit: i128 = totals.values().map(|(_, c)| c).sum();
+        assert_eq!(debit, credit, "貸借が一致すること: {totals:?}");
+        assert!(!totals.is_empty(), "空にならないこと");
+    }
+
+    /// 読めない JSON を「一致した」にしない。
+    ///
+    /// **空の集計は一致に見える。** 読めなかったことを黙って通すと、
+    /// 壊れたファイルが「確かめた」扱いになる。
+    #[test]
+    fn an_unreadable_json_is_an_error_not_an_empty_result() {
+        assert!(sum_by_account("これはJSONではない").is_err());
+        assert!(sum_by_account("{}").is_err(), "entries が無い");
+    }
+
+    /// 知らない貸借の値を黙って数えない。
+    #[test]
+    fn an_unknown_side_is_rejected() {
+        let json = r#"{"entries":[{"lines":[
+            {"account":"100","amount_minor":"1","side":"middle"}]}]}"#;
+        let error = sum_by_account(json).expect_err("拒否されること");
+        assert!(error.contains("debit/credit"), "{error}");
+    }
     use kaikei_core::{
         AccountCode, AccountDef, AccountType, AccountingDate, Currency, EntryId, EntryNumber,
         FiscalYear, FixedClock, JournalLine, Money, NewEntry, PeriodGuard, PeriodStatus, TagDef,
