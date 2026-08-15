@@ -21,6 +21,22 @@
 //!
 //! 安全化で名前が変わっても、`index.csv` を見れば元のファイル名と内容の
 //! ハッシュに辿り着ける。**変換で情報を捨てない。**
+//!
+//! # 電子取引とスキャナ保存は別の場所に置く
+//!
+//! 電子帳簿保存法では**電子取引データの保存**と**スキャナ保存**が別の制度で、
+//! 要件も違う。1つのフォルダに混ぜると、提示のときにどれがどちらか分からない。
+//!
+//! 授受の経路（`received_via`）で分ける:
+//!
+//! | 経路 | 置き場所 |
+//! |---|---|
+//! | email / download | `電子取引/` |
+//! | scan | `スキャン/` |
+//! | それ以外 | `その他/` |
+//!
+//! **区分が決まらないものを電子取引に混ぜない。** 制度が違うものを混ぜると、
+//! 電子取引データとして要件を満たしていないものが混ざったまま提示される。
 
 use crate::csv::CsvBuilder;
 use kaikei_app::view::DocumentView;
@@ -35,6 +51,7 @@ const MAX_COUNTERPARTY_CHARS: usize = 40;
 
 /// `index.csv` の見出し。
 const INDEX_HEADERS: &[&str] = &[
+    "置き場所",
     "エクスポート名",
     "取引年月日",
     "取引金額",
@@ -50,10 +67,29 @@ const INDEX_HEADERS: &[&str] = &[
 /// 証憑1件のエクスポート先。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportEntry {
+    /// 書き出す先のフォルダ名（`電子取引` / `スキャン` / `その他`）。
+    ///
+    /// **電子取引とスキャナ保存は制度が違う**ので分ける（モジュール doc）。
+    pub folder: String,
     /// 書き出す先のファイル名（安全化済み・重複解消済み）。
     pub file_name: String,
     /// 元の証憑。
     pub document: DocumentView,
+}
+
+/// 授受の経路から置き場所を決める。
+///
+/// **知らない経路を電子取引にしない。** 制度が違うものを混ぜると、要件を
+/// 満たしていないものが電子取引データとして提示される。
+pub fn folder_for(received_via: &str) -> &'static str {
+    match received_via {
+        // 電子的に授受したデータ。
+        "email" | "download" => "電子取引",
+        // 紙をスキャンしたもの。
+        "scan" => "スキャン",
+        // 手で登録したものは、どちらとも決まらない。
+        _ => "その他",
+    }
 }
 
 /// 証憑の一覧から、書き出す先の名前を決める。
@@ -61,12 +97,16 @@ pub struct ExportEntry {
 /// **同じ名前になったら連番を付ける。** 同じ日・同じ取引先・同じ金額の証憑は
 /// 普通にあるので、黙って上書きしない。
 pub fn plan_export(documents: &[DocumentView]) -> Vec<ExportEntry> {
-    let mut used: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    // 重複はフォルダごとに数える。別のフォルダに同じ名前があっても、
+    // 上書きは起きないので連番を付ける理由が無い。
+    let mut used: std::collections::BTreeMap<(String, String), u32> =
+        std::collections::BTreeMap::new();
     documents
         .iter()
         .map(|document| {
+            let folder = folder_for(&document.received_via).to_string();
             let base = human_file_name(document);
-            let count = used.entry(base.clone()).or_insert(0);
+            let count = used.entry((folder.clone(), base.clone())).or_insert(0);
             *count += 1;
             let file_name = if *count == 1 {
                 base
@@ -74,6 +114,7 @@ pub fn plan_export(documents: &[DocumentView]) -> Vec<ExportEntry> {
                 with_suffix(&base, *count)
             };
             ExportEntry {
+                folder,
                 file_name,
                 document: document.clone(),
             }
@@ -178,6 +219,7 @@ pub fn index_to_csv(entries: &[ExportEntry]) -> String {
     for entry in entries {
         let document = &entry.document;
         csv.push_row(vec![
+            entry.folder.clone(),
             entry.file_name.clone(),
             document.doc_date.to_iso_string(),
             document
@@ -325,17 +367,95 @@ mod tests {
         assert!(csv.contains(&planned[0].file_name), "{csv}");
     }
 
+    /// `index.csv` の1行目から、見出しで列を引く。
+    ///
+    /// **位置で引かない。** 列を1つ足しただけで、無関係なテストが落ちる
+    /// （実際に「置き場所」を足したときに落ちた）。
+    fn index_cell(csv: &str, header: &str, row: usize) -> String {
+        // **BOM を剥がす。** Excel で開けるように先頭に付いているので、
+        // そのまま比べると最初の見出しだけ一致しない。
+        let first = csv
+            .lines()
+            .next()
+            .expect("見出し行")
+            .trim_start_matches('\u{feff}');
+        let headers: Vec<&str> = first.split(',').collect();
+        let column = headers
+            .iter()
+            .position(|h| *h == header)
+            .unwrap_or_else(|| panic!("見出しに {header} がありません: {headers:?}"));
+        csv.lines()
+            .nth(row)
+            .expect("行があること")
+            .split(',')
+            .nth(column)
+            .expect("列があること")
+            .to_string()
+    }
+
     // EX-9: 金額の無い証憑は index.csv でも空欄（0 で埋めない）。
     #[test]
     fn the_index_leaves_a_missing_amount_blank() {
         let planned = plan_export(&[document(Some("A社"), None, "x.pdf")]);
 
         let csv = index_to_csv(&planned);
-        let line = csv.lines().nth(1).unwrap();
 
-        // 「エクスポート名,日付,金額,...」の金額が空。
-        let cells: Vec<&str> = line.split(',').collect();
-        assert_eq!(cells[2], "", "0 で埋めないこと: {line}");
+        assert_eq!(
+            index_cell(&csv, "取引金額", 1),
+            "",
+            "0 で埋めないこと: {csv}"
+        );
+    }
+
+    /// **本命。** 電子取引とスキャナ保存を混ぜない。
+    ///
+    /// 電子帳簿保存法では別の制度で要件も違う。1つのフォルダに混ぜると、
+    /// 提示のときにどれがどちらか分からない。
+    #[test]
+    fn electronic_and_scanned_documents_go_to_different_folders() {
+        assert_eq!(folder_for("email"), "電子取引");
+        assert_eq!(folder_for("download"), "電子取引");
+        assert_eq!(folder_for("scan"), "スキャン");
+    }
+
+    /// **本命。** 区分が決まらないものを電子取引に混ぜない。
+    ///
+    /// 混ぜると、要件を満たしていないものが電子取引データとして提示される。
+    #[test]
+    fn an_unknown_route_does_not_land_in_the_electronic_folder() {
+        assert_eq!(folder_for("manual"), "その他");
+        assert_eq!(folder_for("なにか知らない経路"), "その他");
+    }
+
+    /// 置き場所は index.csv にも載る。
+    ///
+    /// フォルダを見なくても、一覧だけでどちらの制度かが分かる。
+    #[test]
+    fn the_index_says_where_each_document_went() {
+        let planned = plan_export(&[document(Some("A社"), Some(1_000), "x.pdf")]);
+
+        let csv = index_to_csv(&planned);
+
+        assert_eq!(index_cell(&csv, "置き場所", 1), "電子取引", "{csv}");
+    }
+
+    /// 同じ名前でもフォルダが違えば連番を付けない。
+    ///
+    /// 上書きが起きないので、付ける理由が無い。
+    #[test]
+    fn the_same_name_in_different_folders_keeps_its_name() {
+        let mut scanned = document(Some("A社"), Some(1_000), "x.pdf");
+        scanned.received_via = "scan".to_string();
+        let electronic = document(Some("A社"), Some(1_000), "x.pdf");
+
+        let planned = plan_export(&[electronic, scanned]);
+
+        assert_eq!(planned[0].folder, "電子取引");
+        assert_eq!(planned[1].folder, "スキャン");
+        assert_eq!(
+            planned[0].file_name, planned[1].file_name,
+            "別のフォルダなので連番は要らない"
+        );
     }
 
     // EX-10: 拡張子として怪しいものは使わない。
