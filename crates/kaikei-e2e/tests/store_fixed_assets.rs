@@ -262,3 +262,113 @@ async fn an_unknown_account_is_rejected(pool_opts: PgPoolOptions, conn_opts: PgC
     .await
     .is_err());
 }
+
+// ─── CLI から入れる（実バイナリ） ────────────────────────────
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn cli_binary() -> PathBuf {
+    let test_exe = std::env::current_exe().expect("テスト実行ファイルの場所を取れること");
+    let profile_dir = test_exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("<target>/<profile>/deps/ の2つ上を取れること");
+    let binary = profile_dir.join(format!("kaikei{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        binary.is_file(),
+        "kaikei の実行ファイルがありません: {}\n先に cargo build -p kaikei-cli を実行してください",
+        binary.display()
+    );
+    binary
+}
+
+fn app_url(pool: &PgPool) -> String {
+    let options = pool.connect_options();
+    let database = options.get_database().expect("データベース名");
+    let port = options.get_port();
+    let password = std::env::var("KAIKEI_APP_PASSWORD").unwrap_or_else(|_| "app".to_string());
+    format!("postgres://kaikei_app:{password}@localhost:{port}/{database}")
+}
+
+fn run_add(pool: &PgPool, extra: &[&str], commit: bool) -> (String, String, bool) {
+    let mut command = Command::new(cli_binary());
+    command
+        .args(["fixedasset", "add"])
+        .args(["--name", "パソコン・周辺機器"])
+        .args(["--account", "210"])
+        .args(["--acquired", "2025-07-24"])
+        .args(["--cost", "280717"])
+        .args(extra)
+        .env("APP_DATABASE_URL", app_url(pool));
+    if commit {
+        command.arg("--commit");
+    }
+    let out = command.output().expect("kaikei を起動できること");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// **本命。** `--commit` を付けないと台帳に入らない。予定表だけが出る。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_dry_run_shows_the_schedule_without_writing(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "210", "工具器具備品", 1).await;
+
+    let (stdout, stderr, ok) = run_add(&app, &["--method", "straight-line", "--life", "4"], false);
+
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("2025 年"), "予定表を出すこと: {stdout}");
+    assert!(stdout.contains("35,089"), "初年度は月割: {stdout}");
+    assert!(
+        stdout.contains("2029 年"),
+        "耐用年数より1年多くかかる: {stdout}"
+    );
+    assert!(stdout.contains("下見"), "{stdout}");
+    assert!(list(&app).await.is_empty(), "台帳に入っていないこと");
+}
+
+/// **本命。** `--commit` を付けると入る。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn commit_writes_the_asset(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "210", "工具器具備品", 1).await;
+
+    let (stdout, stderr, ok) = run_add(&app, &["--method", "straight-line", "--life", "4"], true);
+
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("1 件入れました"), "{stdout}");
+
+    let rows = list(&app).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "パソコン・周辺機器");
+    assert_eq!(rows[0].method, 1);
+    assert_eq!(rows[0].useful_life_years, Some(4));
+}
+
+/// 予定表が出せないなら台帳にも入れない。
+///
+/// 入れてから計算に失敗すると、直せない値が台帳に残る。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_life_that_cannot_be_computed_is_not_written(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "210", "工具器具備品", 1).await;
+
+    // 耐用年数0は CLI の引数検査は通る（数字ではある）が、計算で弾かれる。
+    let (_stdout, _stderr, ok) = run_add(&app, &["--method", "straight-line", "--life", "0"], true);
+
+    assert!(!ok, "失敗すること");
+    assert!(list(&app).await.is_empty(), "台帳に入っていないこと");
+}

@@ -58,6 +58,8 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei import --profile <プロファイル.yaml> --file <明細.csv> [--commit]
     kaikei journalize --rules <ルール.yaml> [--year <西暦>]
     kaikei counterparty import --file <取引先.csv> [--commit]
+    kaikei fixedasset add --name <名前> --account <科目> --acquired <YYYY-MM-DD>
+                          --cost <円> --method <方法> [--life <年>] [--commit]
     kaikei depreciation --year <西暦>
 
 report は帳簿をファイルに書き出します。
@@ -65,6 +67,7 @@ verify は帳簿の整合性を検査します（書き出しません）。
 import は銀行・カードの明細 CSV を取り込みます。
 journalize は取り込んだ明細にルールを当てて、仕訳の案を見せます。
 counterparty import は取引先マスタを CSV から投入します。
+fixedasset add は固定資産を台帳に入れます（既定は下見）。
 depreciation は固定資産台帳から減価償却費を出します（記帳はしません）。
 
 引数:
@@ -177,6 +180,24 @@ counterparty import の引数:
     **既定は下見です。** --commit が無ければ読んで見せるだけです。
     既にあるコードは上書きしません（違いがあれば知らせます）。
 
+fixedasset add の引数:
+    --name <名前>        決算書に出す資産の名前（必須）
+    --account <科目>     帳簿上の科目コード（必須。例: 210）
+    --acquired <日付>    取得年月日 YYYY-MM-DD（必須）
+    --cost <円>          取得価額（必須）
+    --method <方法>      straight-line=定額法 / lump-sum=一括償却資産（3年均等）
+                         / immediate=少額減価償却資産（全額即時）（必須）
+    --life <年>          耐用年数。**定額法のときだけ指定します**
+    --ratio <割合>       事業専用割合（0より大きく1以下。省略時は100%）
+    --note <文>          備考
+    --commit             実際に台帳へ入れます
+
+    **耐用年数と償却方法は指定するものです。** 資産名から推定しません。
+    同じ資産でも扱いを選べることがあり、初年度の償却費が何倍も変わります。
+
+    **既定は下見です。** --commit が無ければ償却の予定表を見せるだけです。
+    台帳は後から直せますが、記帳した仕訳は追記型なので戻せません。
+
 report と verify は記帳しません。読み取りだけなので、税区分や決算科目の設定は
 要りません。
 ";
@@ -217,6 +238,7 @@ fn run() -> Result<Vec<PathBuf>, String> {
         Command::Journalize(args) => runtime.block_on(run_journalize(args)),
         Command::Counterparty(args) => runtime.block_on(run_counterparty_import(args)),
         Command::Depreciation { fiscal_year } => runtime.block_on(run_depreciation(fiscal_year)),
+        Command::FixedAsset(args) => runtime.block_on(run_fixed_asset_add(args)),
     }
 }
 
@@ -248,6 +270,8 @@ enum Command {
     Counterparty(CounterpartyArgs),
     /// 固定資産台帳から、その年度の減価償却費を出す。
     Depreciation { fiscal_year: i32 },
+    /// 固定資産を台帳に入れる。
+    FixedAsset(FixedAssetArgs),
 }
 
 /// `kaikei counterparty import` の引数。
@@ -344,6 +368,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     if subcommand == "depreciation" {
         return parse_depreciation(&args[1..]);
+    }
+    if subcommand == "fixedasset" {
+        return parse_fixed_asset(&args[1..]);
     }
     if subcommand != "report" && subcommand != "verify" {
         return Err(format!("不明なサブコマンドです: {subcommand}\n\n{USAGE}"));
@@ -1215,6 +1242,229 @@ async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
 /// `kaikei import` の引数を解析する。
 /// `kaikei counterparty import --file <CSV> [--commit]` を解釈する。
 /// `kaikei depreciation --year <西暦>` を解釈する。
+/// `kaikei fixedasset add` の引数。
+#[derive(Debug)]
+struct FixedAssetArgs {
+    name: String,
+    account: kaikei_core::AccountCode,
+    acquired_on: AccountingDate,
+    /// 取得価額（円）。
+    cost: i64,
+    /// 1=定額法 / 2=一括償却 / 3=少額特例。
+    method: i16,
+    useful_life_years: Option<i16>,
+    /// 事業専用割合（10進文字列）。`None` は100%。
+    business_ratio: Option<String>,
+    note: Option<String>,
+    /// 実際に台帳へ入れるか。**既定は下見。**
+    commit: bool,
+}
+
+/// `kaikei fixedasset add ...` を解釈する。
+fn parse_fixed_asset(args: &[String]) -> Result<Command, String> {
+    let Some(action) = args.first() else {
+        return Err(format!(
+            "fixedasset の後に add を指定してください\n\n{USAGE}"
+        ));
+    };
+    if action != "add" {
+        return Err(format!(
+            "fixedasset のサブコマンドは add だけです（受け取った値: {action}）\n\n{USAGE}"
+        ));
+    }
+
+    let mut name = None;
+    let mut account = None;
+    let mut acquired_on = None;
+    let mut cost = None;
+    let mut method = None;
+    let mut useful_life_years = None;
+    let mut business_ratio = None;
+    let mut note = None;
+    let mut commit = false;
+
+    let rest = &args[1..];
+    let mut index = 0;
+    while index < rest.len() {
+        let key = rest[index].as_str();
+        // 値を取る引数と取らない引数を混ぜない。
+        if key == "--commit" {
+            commit = true;
+            index += 1;
+            continue;
+        }
+        let value = rest
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?
+            .clone();
+        match key {
+            "--name" => name = Some(value),
+            "--account" => {
+                account =
+                    Some(kaikei_core::AccountCode::parse(&value).map_err(|error| {
+                        format!("--account が科目コードとして読めません: {error}")
+                    })?)
+            }
+            "--acquired" => {
+                acquired_on = Some(AccountingDate::parse(&value).map_err(|error| {
+                    format!("--acquired は YYYY-MM-DD で指定してください: {error}")
+                })?)
+            }
+            "--cost" => {
+                cost = Some(
+                    kaikei_app::amount::strip_thousands_separators(&value)
+                        .parse::<i64>()
+                        .map_err(|_| format!("--cost は数字で指定してください: {value}"))?,
+                )
+            }
+            "--method" => {
+                method = Some(match value.as_str() {
+                    "straight-line" => 1i16,
+                    "lump-sum" => 2,
+                    "immediate" => 3,
+                    other => {
+                        return Err(format!(
+                            "--method は straight-line / lump-sum / immediate のいずれかです\
+                             （受け取った値: {other}）。\
+                             straight-line=定額法、lump-sum=一括償却資産（3年均等）、\
+                             immediate=少額減価償却資産（全額即時）"
+                        ));
+                    }
+                })
+            }
+            "--life" => {
+                useful_life_years = Some(
+                    value
+                        .parse::<i16>()
+                        .map_err(|_| format!("--life は年数の数字で指定してください: {value}"))?,
+                )
+            }
+            "--ratio" => business_ratio = Some(value),
+            "--note" => note = Some(value),
+            other => return Err(format!("不明な引数です: {other}\n\n{USAGE}")),
+        }
+        index += 2;
+    }
+
+    let method =
+        method.ok_or("--method を指定してください（straight-line / lump-sum / immediate）")?;
+    // **定額法かどうかで耐用年数の要否が変わる。** DB の CHECK でも守って
+    // いるが、ここで止めた方が何を直せばよいか分かる。
+    if method == 1 && useful_life_years.is_none() {
+        return Err("定額法には --life（耐用年数）が要ります。\
+             耐用年数は申告上の判断なので、このソフトは推定しません"
+            .to_string());
+    }
+    if method != 1 && useful_life_years.is_some() {
+        return Err(
+            "一括償却（lump-sum）と少額特例（immediate）は耐用年数を使いません。\
+             --life を外してください。\
+             付けたままだと、効いていると思ったまま進むことになります"
+                .to_string(),
+        );
+    }
+
+    Ok(Command::FixedAsset(FixedAssetArgs {
+        name: name.ok_or("--name を指定してください（決算書に出す資産の名前）")?,
+        account: account.ok_or("--account を指定してください（例: --account 210）")?,
+        acquired_on: acquired_on
+            .ok_or("--acquired を指定してください（例: --acquired 2025-07-24）")?,
+        cost: cost.ok_or("--cost を指定してください（取得価額。円）")?,
+        method,
+        useful_life_years,
+        business_ratio,
+        note,
+        commit,
+    }))
+}
+
+/// 固定資産を台帳に入れる。
+///
+/// # 既定では入れない
+///
+/// **入れる前に償却の予定表を見せる。** 耐用年数や償却方法を取り違えると
+/// 何年にもわたって誤った償却費が出る。台帳は `UPDATE` できるので直せるが、
+/// 既に記帳した仕訳は追記型なので戻せない（`DECISIONS.md` D-104）。
+async fn run_fixed_asset_add(args: FixedAssetArgs) -> Result<Vec<PathBuf>, String> {
+    use kaikei_app::ports::{FixedAssetRepo, FixedAssetRow};
+
+    let row = FixedAssetRow {
+        id: uuid::Uuid::now_v7().to_string(),
+        name: args.name.clone(),
+        account: args.account.clone(),
+        acquired_on: args.acquired_on,
+        acquisition_cost: kaikei_core::Money::from_minor(
+            i128::from(args.cost),
+            kaikei_core::Currency::JPY,
+        ),
+        method: args.method,
+        useful_life_years: args.useful_life_years,
+        business_ratio: args.business_ratio.clone(),
+        disposed_on: None,
+        note: args.note.clone(),
+    };
+
+    // **予定表を先に出す。** 入力を取り違えていれば、ここで気づける。
+    let asset = to_fixed_asset(&row)?;
+    let schedule = kaikei_jp::depreciation::schedule(&asset)
+        .map_err(|error| format!("償却額を計算できませんでした: {error}"))?;
+
+    println!(
+        "{}  {}  取得 {}  {} 円  [{}]",
+        row.name,
+        row.account.as_str(),
+        row.acquired_on.to_iso_string(),
+        row.acquisition_cost.to_display_string(),
+        method_label(row.method),
+    );
+    if let Some(life) = row.useful_life_years {
+        println!("  耐用年数 {life} 年");
+    }
+    if let Some(ratio) = &row.business_ratio {
+        println!("  事業専用割合 {ratio}");
+    }
+    println!("  償却の予定:");
+    for year in &schedule.years {
+        println!(
+            "    {} 年: {:>12} 円（{}か月）  期末簿価 {} 円",
+            year.year,
+            year.amount.to_display_string(),
+            year.months,
+            year.book_value.to_display_string(),
+        );
+    }
+    let total = schedule
+        .total()
+        .map_err(|error| format!("償却費の合計を出せませんでした: {error}"))?;
+    println!("    合計 {} 円", total.to_display_string());
+
+    if !args.commit {
+        println!();
+        println!("下見です。まだ台帳に入れていません。");
+        println!("この予定でよければ --commit を付けて実行してください。");
+        return Ok(Vec::new());
+    }
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool);
+    let inserted = with_tx_err(&store, move |tx| {
+        let row = row.clone();
+        Box::pin(async move { tx.insert_fixed_assets(&[row]).await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| {
+        format!("固定資産台帳に入れられませんでした: {error}")
+    })?;
+
+    println!();
+    println!("台帳に {inserted} 件入れました。");
+    println!("償却費を出すには kaikei depreciation --year <西暦> を使います。");
+    Ok(Vec::new())
+}
+
 fn parse_depreciation(args: &[String]) -> Result<Command, String> {
     let mut fiscal_year = None;
     let mut index = 0;
@@ -3433,6 +3683,144 @@ abc,
             Command::Counterparty(args) => assert!(args.commit),
             other => panic!("counterparty として解釈されるはず: {other:?}"),
         }
+    }
+
+    fn fixed_asset_args(list: &[&str]) -> Vec<String> {
+        let mut v = vec!["fixedasset".to_string(), "add".to_string()];
+        v.extend(list.iter().map(|s| s.to_string()));
+        v
+    }
+
+    const MINIMAL: &[&str] = &[
+        "--name",
+        "パソコン",
+        "--account",
+        "210",
+        "--acquired",
+        "2025-07-24",
+        "--cost",
+        "280717",
+    ];
+
+    fn with(extra: &[&str]) -> Vec<String> {
+        let mut v: Vec<&str> = MINIMAL.to_vec();
+        v.extend_from_slice(extra);
+        fixed_asset_args(&v)
+    }
+
+    // **本命。** 定額法には耐用年数が要る。
+    //
+    // 無いまま台帳に入れると、償却額の計算時に落ちる。入口で止める。
+    #[test]
+    fn straight_line_without_a_life_is_rejected() {
+        let error = parse_args(&with(&["--method", "straight-line"])).unwrap_err();
+        assert!(error.contains("--life"), "{error}");
+        assert!(
+            error.contains("推定しません"),
+            "なぜ指定が要るかを言うこと: {error}"
+        );
+    }
+
+    // **本命。** 一括償却・少額特例に耐用年数を付けさせない。
+    //
+    // 無視されるだけで済ませると、効いていると思ったまま進むことになる。
+    #[test]
+    fn other_methods_reject_a_life() {
+        for method in ["lump-sum", "immediate"] {
+            let error = parse_args(&with(&["--method", method, "--life", "3"])).unwrap_err();
+            assert!(error.contains("--life を外して"), "{method}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_three_methods_map_to_their_codes() {
+        for (text, code) in [("straight-line", 1i16), ("lump-sum", 2), ("immediate", 3)] {
+            let extra: Vec<&str> = if code == 1 {
+                vec!["--method", text, "--life", "4"]
+            } else {
+                vec!["--method", text]
+            };
+            match parse_args(&with(&extra)).unwrap() {
+                Command::FixedAsset(args) => assert_eq!(args.method, code, "{text}"),
+                other => panic!("fixedasset として解釈されるはず: {other:?}"),
+            }
+        }
+    }
+
+    // 知らない償却方法は黙って通さない。
+    #[test]
+    fn an_unknown_method_is_rejected() {
+        let error = parse_args(&with(&["--method", "declining"])).unwrap_err();
+        assert!(
+            error.contains("declining"),
+            "受け取った値を見せること: {error}"
+        );
+        assert!(
+            error.contains("straight-line"),
+            "選べる値を挙げること: {error}"
+        );
+    }
+
+    // 既定は下見。--commit を付けたときだけ入れる。
+    #[test]
+    fn fixed_asset_add_does_not_write_without_commit() {
+        match parse_args(&with(&["--method", "lump-sum"])).unwrap() {
+            Command::FixedAsset(args) => assert!(!args.commit),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&with(&["--method", "lump-sum", "--commit"])).unwrap() {
+            Command::FixedAsset(args) => assert!(args.commit),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // 必須の引数が無ければ止まる。
+    #[test]
+    fn the_required_arguments_are_checked() {
+        let error = parse_args(&fixed_asset_args(&["--method", "lump-sum"])).unwrap_err();
+        assert!(error.contains("--name"), "{error}");
+
+        let error = parse_args(&fixed_asset_args(&[
+            "--name",
+            "x",
+            "--account",
+            "210",
+            "--acquired",
+            "2025-07-24",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("--method"), "{error}");
+    }
+
+    // 取得価額は3桁区切りでも読める。
+    #[test]
+    fn the_cost_accepts_thousands_separators() {
+        let mut v: Vec<&str> = vec![
+            "--name",
+            "x",
+            "--account",
+            "210",
+            "--acquired",
+            "2025-07-24",
+            "--cost",
+            "280,717",
+            "--method",
+            "lump-sum",
+        ];
+        v.dedup();
+        match parse_args(&fixed_asset_args(&v)).unwrap() {
+            Command::FixedAsset(args) => assert_eq!(args.cost, 280_717),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // add 以外のサブコマンドは受けない。
+    #[test]
+    fn only_add_is_accepted() {
+        let error = parse_args(&["fixedasset".to_string()]).unwrap_err();
+        assert!(error.contains("add を指定"), "{error}");
+        let error = parse_args(&["fixedasset".to_string(), "remove".to_string()]).unwrap_err();
+        assert!(error.contains("add だけ"), "{error}");
     }
 
     fn embedded_tax_rule_sets() -> kaikei_jp::tax::TaxRuleSets {
