@@ -244,6 +244,37 @@ pub fn convert(
     out
 }
 
+/// 書き出した行を読み直して、科目ごとの借方・貸方を集計する。
+///
+/// # なぜ読み直すのか
+///
+/// **税理士が取り込んだ数字が決算書と違えば、そこで気づけない。** 列を1つ
+/// ずらす、金額を取り違える、行を落とす——どれも書き出したファイルを
+/// 見ないと分からない。組み立てた構造体をそのまま数えても、**書き出しの
+/// 誤りは見つからない**（同じ誤りを共有するため）。
+///
+/// 行は `convert` が作った 25 項目の並びである。ここでは
+/// **列の位置を決め打ちで読む**——それがずれていれば、集計が帳簿と合わなく
+/// なって表面化する。
+///
+/// 借方・貸方が同じ科目に立つ仕訳（振替など）も、それぞれ足す。
+pub fn sum_by_account(rows: &[Vec<String>]) -> BTreeMap<String, (i128, i128)> {
+    let mut totals: BTreeMap<String, (i128, i128)> = BTreeMap::new();
+    for row in rows {
+        if row.len() < 25 {
+            continue;
+        }
+        // E=借方勘定科目(4) I=借方金額(8) K=貸方勘定科目(10) O=貸方金額(14)
+        if let Ok(amount) = row[8].parse::<i128>() {
+            totals.entry(row[4].clone()).or_default().0 += amount;
+        }
+        if let Ok(amount) = row[14].parse::<i128>() {
+            totals.entry(row[10].clone()).or_default().1 += amount;
+        }
+    }
+    totals
+}
+
 /// 弥生の税区分名。売上側と仕入側で分かれるものがある。
 ///
 /// **文字列1つにしない。** 非課税のように売上にも仕入にも立つ区分があり、
@@ -526,6 +557,55 @@ mod tests {
             &FixedClock(Timestamp::from_unix_nanos(1_700_000_000_000_000)),
         )
         .unwrap()
+    }
+
+    /// **本命。** 書き出した行を読み直すと、帳簿と同じ集計になる。
+    ///
+    /// 税理士が取り込んだ数字が決算書と違えば、そこで気づけない。
+    #[test]
+    fn reading_the_written_rows_back_gives_the_same_totals() {
+        let entries = vec![entry(
+            1,
+            "通信費",
+            vec![
+                line("604", Side::Debit, 1_000, Some("PURCHASE_10_QUALIFIED")),
+                line("110", Side::Credit, 1_000, None),
+            ],
+        )];
+
+        let result = convert(&entries, &chart(), &tax_map());
+        let totals = sum_by_account(&result.rows);
+
+        assert_eq!(totals.get("通信費"), Some(&(1_000, 0)));
+        assert_eq!(totals.get("普通預金"), Some(&(0, 1_000)));
+    }
+
+    /// 同じ科目が借方にも貸方にも立つ仕訳を、両方とも数える。
+    ///
+    /// 片方しか数えないと、振替の仕訳で集計が合わなくなる。
+    #[test]
+    fn an_account_on_both_sides_is_counted_on_both() {
+        let entries = vec![entry(
+            1,
+            "振替",
+            vec![
+                line("110", Side::Debit, 500, None),
+                line("110", Side::Credit, 500, None),
+            ],
+        )];
+
+        let totals = sum_by_account(&convert(&entries, &chart(), &tax_map()).rows);
+
+        assert_eq!(totals.get("普通預金"), Some(&(500, 500)));
+    }
+
+    /// 25項目に満たない行は数えない。
+    ///
+    /// 壊れた行を数えると、集計が合わない理由が分からなくなる。
+    #[test]
+    fn a_short_row_is_not_counted() {
+        let totals = sum_by_account(&[vec!["2000".to_string(), "x".to_string()]]);
+        assert!(totals.is_empty(), "{totals:?}");
     }
 
     // YA-1: 借方1・貸方1 の仕訳は1行になる（識別フラグ 2000）。
