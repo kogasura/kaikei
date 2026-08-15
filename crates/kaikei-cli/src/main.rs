@@ -20,7 +20,7 @@
 mod rules;
 
 use kaikei_app::context::{BookSettings, FiscalYearRule};
-use kaikei_app::ports::{ChartRepo, JournalRepo};
+use kaikei_app::ports::{ChartRepo, FixedAssetRepo, JournalRepo};
 use kaikei_app::tx::with_tx_err;
 use kaikei_app::usecase::ledger::{self, LedgerInput, MAX_LIMIT};
 use kaikei_app::usecase::report::{self, ReportInput};
@@ -2839,7 +2839,7 @@ async fn write_reports(
     // 仕訳と勘定科目表を1つのトランザクションで読む。**間に記帳が入ると、
     // 仕訳日記帳と財務諸表が別の帳簿を映す。**
     let schema = catalog.schema().clone();
-    let (entries, chart, statements, cumulative, opening_balance_sheet) =
+    let (entries, chart, statements, cumulative, opening_balance_sheet, fixed_assets) =
         with_tx_err(&store, move |tx| {
             let schema = schema.clone();
             Box::pin(async move {
@@ -2902,12 +2902,15 @@ async fn write_reports(
                     },
                 )
                 .await?;
+                // 固定資産台帳。決算書の「減価償却費の計算」欄に出す。
+                let fixed_assets = tx.list_fixed_assets().await?;
                 Ok((
                     entries,
                     chart,
                     statements,
                     cumulative,
                     opening_balance_sheet,
+                    fixed_assets,
                 ))
             })
         })
@@ -3018,6 +3021,14 @@ async fn write_reports(
         &cumulative.balance_sheet,
         to,
         &blue_return_fields,
+    )?);
+
+    written.extend(write_blue_return_depreciation(
+        &out_dir,
+        &fixed_assets,
+        fiscal_year_label,
+        &period_label,
+        &statements.income_statement,
     )?);
 
     // 全件 JSON。**この出力はこのソフトが消えてもデータが残るためのもの**
@@ -3405,6 +3416,117 @@ fn build_tax_map(
         }
     }
     out
+}
+
+/// 青色申告決算書の「減価償却費の計算」欄を書き出す。
+///
+/// # 損益計算書の減価償却費と突き合わせる
+///
+/// 台帳から出した合計と、帳簿に記帳されている減価償却費が食い違えば知らせる。
+/// **どちらが正しいかは決めない**——台帳の入力が違うのか、記帳が漏れているのか、
+/// 記帳し過ぎているのかは帳簿からは決まらない。事実だけを出す。
+fn write_blue_return_depreciation(
+    out_dir: &Path,
+    assets: &[kaikei_app::ports::FixedAssetRow],
+    fiscal_year: i32,
+    period_label: &str,
+    income_statement: &kaikei_app::policy::Statement,
+) -> Result<Vec<PathBuf>, String> {
+    use kaikei_report::blue_return_depreciation::DepreciationRow;
+
+    let mut rows = Vec::new();
+    let mut total: i128 = 0;
+    for asset in assets {
+        // 除却した年より後は載せない。
+        if let Some(disposed) = asset.disposed_on {
+            if disposed.year() < fiscal_year {
+                continue;
+            }
+        }
+        let input = to_fixed_asset(asset)?;
+        let schedule = kaikei_jp::depreciation::schedule(&input)
+            .map_err(|error| format!("{}: 償却額を計算できませんでした: {error}", asset.name))?;
+        let Some(year) = schedule.year(fiscal_year) else {
+            continue;
+        };
+        total += year.amount.minor();
+        rows.push(DepreciationRow {
+            name: asset.name.clone(),
+            acquired: format!(
+                "{:04}-{:02}",
+                asset.acquired_on.year(),
+                asset.acquired_on.month()
+            ),
+            acquisition_cost: asset.acquisition_cost,
+            // 定額法の「償却の基礎になる金額」は取得価額である
+            // （旧定額法の 90% ではない。2007-04-01 以降取得）。
+            base_amount: asset.acquisition_cost,
+            method: method_label(asset.method).to_string(),
+            useful_life_years: asset.useful_life_years,
+            rate: schedule
+                .rate_per_mille
+                .map(|per_mille| format!("{}.{:03}", per_mille / 1000, per_mille % 1000)),
+            period: format!("{}/12", year.months),
+            before_ratio: year.before_ratio,
+            business_ratio: match &asset.business_ratio {
+                Some(text) => text.to_string(),
+                None => "100%".to_string(),
+            },
+            amount: year.amount,
+            book_value: year.book_value,
+            note: asset.note.clone().unwrap_or_default(),
+        });
+    }
+
+    let total = kaikei_core::Money::from_minor(total, kaikei_core::Currency::JPY);
+    let written = write_pair(
+        out_dir,
+        "blue_return_depreciation",
+        &kaikei_report::blue_return_depreciation::to_csv(&rows),
+        &kaikei_report::blue_return_depreciation::to_html(period_label, &rows, &total),
+    )?;
+
+    warn_if_depreciation_does_not_match_the_book(&total, income_statement, rows.len())?;
+    Ok(written)
+}
+
+/// 台帳から出した償却費と、帳簿の減価償却費が合っているか。
+///
+/// **食い違いを黙らない。** 決算書には台帳から出した額を書くので、帳簿の
+/// 減価償却費と違っていると、決算書と損益計算書で数字が合わなくなる。
+fn warn_if_depreciation_does_not_match_the_book(
+    from_ledger: &kaikei_core::Money,
+    income_statement: &kaikei_app::policy::Statement,
+    asset_count: usize,
+) -> Result<(), String> {
+    let in_book = amount_of_expense(income_statement, "減価償却費");
+    if from_ledger.minor() == in_book {
+        return Ok(());
+    }
+    // どちらも0なら言うことはない（台帳が空で、記帳も無い）。
+    if from_ledger.minor() == 0 && in_book == 0 {
+        return Ok(());
+    }
+    eprintln!("注意: 固定資産台帳から出した償却費と、帳簿の減価償却費が違います。",);
+    eprintln!(
+        "  台帳（{asset_count} 件）: {} 円",
+        from_ledger.to_display_string()
+    );
+    eprintln!("  帳簿の減価償却費: {in_book} 円");
+    eprintln!("  決算書には台帳の額を書くので、このままだと損益計算書と食い違います。");
+    eprintln!("  台帳の入力・記帳の漏れ・記帳し過ぎのいずれかを確かめてください。");
+    Ok(())
+}
+
+/// 損益計算書から、名前で費用の金額を引く。無ければ0。
+fn amount_of_expense(statement: &kaikei_app::policy::Statement, name: &str) -> i128 {
+    statement
+        .sections
+        .iter()
+        .flat_map(|section| section.lines.iter())
+        .find(|line| line.label == name)
+        .map(|line| line.amount.minor())
+        .unwrap_or(0)
 }
 
 /// 青色申告決算書（貸借対照表）のデータを書き出す。

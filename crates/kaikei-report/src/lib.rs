@@ -24,6 +24,7 @@
 
 pub mod blue_return;
 pub mod blue_return_bs;
+pub mod blue_return_depreciation;
 pub mod csv;
 pub mod documents;
 pub mod export;

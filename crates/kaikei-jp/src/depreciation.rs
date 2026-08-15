@@ -93,6 +93,11 @@ pub struct YearlyDepreciation {
 pub struct Schedule {
     /// 年ごとの償却費（取得年から順に、償却し終わるまで）。
     pub years: Vec<YearlyDepreciation>,
+    /// 定額法の償却率（千分率）。定額法以外は `None`。
+    ///
+    /// 青色申告決算書の「減価償却費の計算」欄に**償却率を書く欄がある**ので、
+    /// 計算に使った値をそのまま出せるようにしておく。
+    pub rate_per_mille: Option<u32>,
 }
 
 impl Schedule {
@@ -120,6 +125,32 @@ impl Schedule {
     }
 }
 
+/// 定額法の償却率（千分率）。`0.334` なら `334` を返す。
+///
+/// # 1/耐用年数 ではない
+///
+/// 減価償却資産の耐用年数等に関する省令 別表第八の定額法償却率は、
+/// **1/耐用年数を小数第3位に切り上げた値**である。
+///
+/// | 耐用年数 | 1/n | 償却率 |
+/// |---|---|---|
+/// | 2年 | 0.500000 | 0.500 |
+/// | **3年** | 0.333333 | **0.334** |
+/// | 4年 | 0.250000 | 0.250 |
+/// | **6年** | 0.166667 | **0.167** |
+/// | **7年** | 0.142857 | **0.143** |
+///
+/// 切り上げなので、償却率を掛けた額の合計は取得価額を**超える**。
+/// 最終年で残額まで頭打ちにすることで辻褄が合う（[`schedule`] の doc）。
+///
+/// **2〜20年について別表第八と一致することを確かめた**
+/// （`the_rate_matches_the_published_table`）。それより長い耐用年数は
+/// 表と突き合わせていない——同じ規則で導けるはずだが、確認していない。
+pub fn straight_line_rate_per_mille(useful_life_years: u8) -> u32 {
+    // 切り上げ除算。1/n を小数第3位で切り上げる（＝1000/n の切り上げ）。
+    1000_u32.div_ceil(u32::from(useful_life_years))
+}
+
 /// 償却の予定表を作る。
 ///
 /// # 端数
@@ -145,6 +176,7 @@ pub fn schedule(asset: &FixedAsset) -> Result<Schedule, JpError> {
     let cost = asset.acquisition_cost;
     let currency = cost.currency();
     let first_year = asset.acquired_on.year();
+    let mut rate_per_mille = None;
 
     // 「毎年いくら」「何年」「最後に残す額」の3つに落としてから組み立てる。
     // 方法ごとの違いはここだけで、以降の処理は共通になる。
@@ -155,8 +187,11 @@ pub fn schedule(asset: &FixedAsset) -> Result<Schedule, JpError> {
                     reason: "定額法の耐用年数は1年以上である必要があります".to_string(),
                 });
             }
+            let rate = straight_line_rate_per_mille(useful_life_years);
+            rate_per_mille = Some(rate);
             (
-                cost.minor() / i128::from(useful_life_years),
+                // 取得価額 × 償却率。円未満は切り捨てる。
+                cost.minor() * i128::from(rate) / 1000,
                 usize::from(useful_life_years),
                 // 備忘価額1円を残す。**帳簿から資産が消えないようにするため**で、
                 // 除却するまで1円が載り続ける。
@@ -223,7 +258,10 @@ pub fn schedule(asset: &FixedAsset) -> Result<Schedule, JpError> {
         });
     }
 
-    Ok(Schedule { years })
+    Ok(Schedule {
+        years,
+        rate_per_mille,
+    })
 }
 
 #[cfg(test)]
@@ -251,6 +289,87 @@ mod tests {
 
     fn amounts(s: &Schedule) -> Vec<(i32, i128)> {
         s.years.iter().map(|y| (y.year, y.amount.minor())).collect()
+    }
+
+    // **本命。** 定額法の償却率が別表第八と一致する。
+    //
+    // 1/耐用年数ではない。**小数第3位への切り上げ**である。
+    // 3年・6年・7年・9年・11〜15年で 1/n と食い違う。
+    #[test]
+    fn the_rate_matches_the_published_table() {
+        // 減価償却資産の耐用年数等に関する省令 別表第八（定額法・2〜20年）。
+        let table = [
+            (2u8, 500u32),
+            (3, 334),
+            (4, 250),
+            (5, 200),
+            (6, 167),
+            (7, 143),
+            (8, 125),
+            (9, 112),
+            (10, 100),
+            (11, 91),
+            (12, 84),
+            (13, 77),
+            (14, 72),
+            (15, 67),
+            (16, 63),
+            (17, 59),
+            (18, 56),
+            (19, 53),
+            (20, 50),
+        ];
+        for (years, expected) in table {
+            assert_eq!(
+                straight_line_rate_per_mille(years),
+                expected,
+                "耐用年数 {years} 年の償却率"
+            );
+        }
+    }
+
+    // **本命。** 3年は 1/3 ではなく 0.334 で計算する。
+    //
+    // 100,000 ÷ 3 = 33,333 ではなく 100,000 × 0.334 = 33,400。
+    #[test]
+    fn a_three_year_life_uses_the_rounded_up_rate() {
+        let s = schedule(&asset(
+            100_000,
+            on(2025, 1, 1),
+            DepreciationMethod::StraightLine {
+                useful_life_years: 3,
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(s.rate_per_mille, Some(334));
+        assert_eq!(
+            amounts(&s),
+            vec![(2025, 33_400), (2026, 33_400), (2027, 33_199)],
+            "最終年は残額まで（33,400 × 3 = 100,200 は取得価額を超える）"
+        );
+        assert_eq!(s.total().unwrap().minor(), 99_999, "備忘価額1円を残す");
+        assert_eq!(s.years.last().unwrap().book_value.minor(), 1);
+    }
+
+    // 償却率は定額法のときだけ出る。
+    #[test]
+    fn only_straight_line_has_a_rate() {
+        let lump = schedule(&asset(
+            118_800,
+            on(2022, 8, 5),
+            DepreciationMethod::LumpSumOverThreeYears,
+        ))
+        .unwrap();
+        assert_eq!(lump.rate_per_mille, None);
+
+        let immediate = schedule(&asset(
+            100_000,
+            on(2025, 1, 1),
+            DepreciationMethod::ImmediateExpense,
+        ))
+        .unwrap();
+        assert_eq!(immediate.rate_per_mille, None);
     }
 
     // **本命。** 実帳簿の「pc」と一致する。
@@ -346,7 +465,8 @@ mod tests {
         assert_eq!(s.years[0].months, 12);
         assert_eq!(
             amounts(&s),
-            vec![(2025, 40_000), (2026, 40_000), (2027, 39_999)]
+            vec![(2025, 40_080), (2026, 40_080), (2027, 39_839)],
+            "償却率 0.334（1/3 ではない）。最終年は残額まで"
         );
         assert_eq!(s.years.last().unwrap().book_value.minor(), 1, "備忘価額1円");
     }
@@ -364,7 +484,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(s.years[0].months, 1);
-        assert_eq!(s.years[0].amount.minor(), 3_333, "40,000 × 1/12 を切り捨て");
+        assert_eq!(
+            s.years[0].amount.minor(),
+            3_340,
+            "120,000 × 0.334 = 40,080 の 1/12 を切り捨て"
+        );
     }
 
     // 少額減価償却資産は取得年に全額。
@@ -419,13 +543,13 @@ mod tests {
 
         assert_eq!(
             s.years[0].before_ratio.minor(),
-            40_000,
+            40_080,
             "按分前は変わらない"
         );
-        assert_eq!(s.years[0].amount.minor(), 32_000, "40,000 × 0.8");
+        assert_eq!(s.years[0].amount.minor(), 32_064, "40,080 × 0.8");
         assert_eq!(
             s.years[0].book_value.minor(),
-            80_000,
+            79_920,
             "帳簿価額は按分前で追う（資産の未償却残高そのもの）"
         );
     }
