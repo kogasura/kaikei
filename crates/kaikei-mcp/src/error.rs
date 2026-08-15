@@ -70,6 +70,8 @@ pub mod jp_codes {
 /// | `UnknownTaxCategoryCode` | [`codes::UNKNOWN_TAX_CATEGORY`] | `PolicyError::UnknownTaxCategory` と同義 |
 /// | `InvalidBusinessRatio` | [`codes::INVALID_VALUE`] | 値そのものが範囲外 |
 /// | `InvalidHouseholdSplitTotal` | [`codes::INVALID_AMOUNT`] | 金額が不正 |
+/// | `InvalidFixedAsset` | [`codes::INVALID_VALUE`] | 取得価額・耐用年数が不正 |
+/// | `DepreciationArithmetic` | [`codes::INVALID_AMOUNT`] | 償却額の演算に失敗 |
 /// | `InvalidChart` | [`codes::INVALID_CHART`] | `CoreError::InvalidChart` と同義（勘定科目表そのものが不正） |
 /// | マスタ・設定のロード失敗（9バリアント） | [`codes::INVALID_POLICY_DATA`] | 下表 |
 ///
@@ -128,6 +130,10 @@ pub fn jp_error_code(err: &JpError) -> &'static str {
         JpError::InvoiceRegNoCheckDigit { .. } => jp_codes::INVOICE_REG_NO_CHECK_DIGIT,
         JpError::InvalidBusinessRatio { .. } => codes::INVALID_VALUE,
         JpError::InvalidHouseholdSplitTotal { .. } => codes::INVALID_AMOUNT,
+        // 取得価額が0以下・耐用年数が0など、入力を直せば通る。
+        JpError::InvalidFixedAsset { .. } => codes::INVALID_VALUE,
+        // 償却額の計算中に金額の演算が失敗した（通貨違い・桁あふれ）。
+        JpError::DepreciationArithmetic { .. } => codes::INVALID_AMOUNT,
         JpError::InvalidSettingCode { .. } => jp_codes::INVALID_SETTING_CODE,
 
         // 勘定科目表そのものが不正。`CoreError::InvalidChart` と同じ条件を
@@ -334,6 +340,12 @@ mod tests {
              CoreError は kaikei-core が AI 向けに書いた文言であり、\
              外部クレートの生メッセージではない",
         ),
+        (
+            "DepreciationArithmetic",
+            "{source} は kaikei_core::CoreError。Core と同じ理由で、\
+             外部クレートの生メッセージではない。通貨違いと桁あふれの\
+             どちらで失敗したかが分からないと直しようがない",
+        ),
     ];
 
     fn all_jp_errors() -> Vec<JpError> {
@@ -403,6 +415,12 @@ mod tests {
             },
             JpError::InvalidHouseholdSplitTotal {
                 total: "0".to_string(),
+            },
+            JpError::InvalidFixedAsset {
+                reason: "取得価額は正の値である必要があります".to_string(),
+            },
+            JpError::DepreciationArithmetic {
+                source: kaikei_core::CoreError::EmptyDescription,
             },
             JpError::Core(kaikei_core::CoreError::EmptyDescription),
             JpError::InvalidSettingCode {

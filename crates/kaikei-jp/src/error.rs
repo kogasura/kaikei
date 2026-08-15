@@ -235,6 +235,25 @@ pub enum JpError {
         ratio: String,
     },
 
+    /// 減価償却（[`crate::depreciation::schedule`]）の入力が不正。
+    ///
+    /// 取得価額が0以下、定額法の耐用年数が0など。**耐用年数や償却方法が
+    /// 税法上ふさわしいかどうかは判定しない**（それは申告上の判断であり、
+    /// このソフトは受け取った値で計算するだけである。`CLAUDE.md` §10）。
+    #[error("減価償却の入力が不正です: {reason}")]
+    InvalidFixedAsset {
+        /// 何が不正だったか。
+        reason: String,
+    },
+
+    /// 減価償却の計算中に金額の演算が失敗した。
+    #[error("減価償却の金額を計算できませんでした: {source}")]
+    DepreciationArithmetic {
+        /// 元のエラー。
+        #[source]
+        source: kaikei_core::CoreError,
+    },
+
     /// 家事按分（[`crate::household_split::household_split`]）の対象金額が0以下。
     #[error(
         "家事按分の対象金額は正の値である必要があります: {total}。\
