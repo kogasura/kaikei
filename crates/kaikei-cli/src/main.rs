@@ -724,6 +724,39 @@ fn warn_if_the_year_looks_closed(
     eprintln!("  決算書は決算振替を記帳する前に作ってください。");
 }
 
+/// 証憑の検索要件が欠けていれば知らせる。
+///
+/// # 何が問題か
+///
+/// 電子取引データは**取引年月日・取引金額・取引先**の3項目で検索できる必要が
+/// ある（`docs/06-documents.md` §4）。取引先が空だと、その1つが欠ける。
+///
+/// 実際に帳簿の複製で稽古したところ、`--match-amount` で紐付けた証憑の取引先が
+/// どちらも空になった。**この帳簿には取引先タグが1件も無い**（1,395明細中0件）
+/// ので、仕訳から埋められない。
+///
+/// # 止めない
+///
+/// ファイルを保存しないより、取引先が空でも保存した方がよい。**保存した後で
+/// 取引先を足すことはできない**（証憑は追記のみ）ので、そこは知らせる。
+fn warn_if_the_search_fields_are_incomplete(counterparty: &Option<String>, amount: Option<i64>) {
+    let missing_counterparty = counterparty
+        .as_deref()
+        .map(|text| text.trim().is_empty())
+        .unwrap_or(true);
+    if !missing_counterparty {
+        return;
+    }
+
+    eprintln!("注意: 取引先が空のまま登録します。");
+    eprintln!("  電子取引データは取引年月日・取引金額・取引先で検索できる必要があり、");
+    eprintln!("  取引先が空だとその1つが欠けます。");
+    if amount.is_none() {
+        eprintln!("  取引金額も空です（契約書など金額の無い証憑なら、それで構いません）。");
+    }
+    eprintln!("  --counterparty で指定できます。証憑は後から書き換えられません。");
+}
+
 /// 前年の事業主貸・事業主借が期首に残っていれば知らせる。
 ///
 /// # なぜ要るのか
@@ -1015,6 +1048,11 @@ async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
             .as_ref()
             .and_then(|facts| facts.counterparty.clone())
     });
+
+    // **検索要件の3項目が揃っているか。** 取引先が空だと、取引先での検索が
+    // できない（`docs/06-documents.md` §4）。止めはしない——ファイルを
+    // 保存しないより、取引先が空でも保存した方がよい。
+    warn_if_the_search_fields_are_incomplete(&counterparty, amount_minor);
 
     let document = NewDocument {
         id: uuid::Uuid::now_v7().to_string(),
