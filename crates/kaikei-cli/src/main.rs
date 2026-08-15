@@ -120,6 +120,10 @@ attach の引数:
     --via <経路>         email / download / scan / manual（必須）
     --amount <円>        取引金額（検索要件。無い証憑もあるので任意）
     --counterparty <名>  取引先（検索要件）
+    --match-amount <円>  この金額の仕訳を探して紐付けます（--entry の代わり）
+                         領収書から読める金額で引けます。同じ額の仕訳が
+                         複数あれば、候補を並べて止まります
+    --match-year <西暦>  金額で探す年（省略時は --date の年）
     --entry <UUID>       紐付ける仕訳のID
                          指定すると、取引年月日・取引金額・取引先を
                          その仕訳から埋めます（明示した値の方が優先）
@@ -271,6 +275,13 @@ struct AttachArgs {
     mime_type: Option<String>,
     /// 紐付ける仕訳のID。
     entry_id: Option<String>,
+    /// 仕訳IDの代わりに、この金額の仕訳を探す。
+    ///
+    /// **領収書から読める値で引けるようにする。** 仕訳IDを人が探すのが、
+    /// 証憑を登録するときのいちばんの手間である。
+    match_amount: Option<i64>,
+    /// 金額で探すときの年（省略時は取引年月日の年）。
+    match_year: Option<i32>,
     /// 備考。
     note: Option<String>,
 }
@@ -598,6 +609,8 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
     let mut received_via: Option<String> = None;
     let mut mime_type: Option<String> = None;
     let mut entry_id: Option<String> = None;
+    let mut match_amount: Option<i64> = None;
+    let mut match_year: Option<i32> = None;
     let mut note: Option<String> = None;
 
     let mut rest = args.iter();
@@ -627,6 +640,21 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
             "--via" => received_via = Some(take()?),
             "--mime" => mime_type = Some(take()?),
             "--entry" => entry_id = Some(take()?),
+            "--match-amount" => {
+                let text = take()?;
+                match_amount = Some(
+                    kaikei_app::amount::strip_thousands_separators(&text)
+                        .parse::<i64>()
+                        .map_err(|_| format!("--match-amount は数字で指定してください: {text}"))?,
+                )
+            }
+            "--match-year" => {
+                let text = take()?;
+                match_year = Some(
+                    text.parse::<i32>()
+                        .map_err(|_| format!("--match-year は西暦で指定してください: {text}"))?,
+                )
+            }
             "--note" => note = Some(take()?),
             other => return Err(format!("不明な引数です: {other}")),
         }
@@ -634,9 +662,14 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
 
     // **`--entry` があれば検索要件は仕訳から採れる。** 1件ごとに5つの引数を
     // 打たせると、証憑の登録が現実的でなくなる（実際に1件も登録されていない）。
-    if doc_date.is_none() && entry_id.is_none() {
+    // **両方は受けない。** どちらを使ったのかが分からないまま登録されると、
+    // 意図しない仕訳に紐付いても気づけない。
+    if entry_id.is_some() && match_amount.is_some() {
+        return Err("--entry と --match-amount は同時に指定できません".to_string());
+    }
+    if doc_date.is_none() && entry_id.is_none() && match_amount.is_none() {
         return Err("--date を指定してください（例: --date 2026-06-15）。\
-             --entry で仕訳を指定すれば、その仕訳の取引日を使います"
+             --entry か --match-amount で仕訳を指定すれば、その仕訳の取引日を使います"
             .to_string());
     }
     Ok(Command::Attach(AttachArgs {
@@ -650,6 +683,8 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
             .ok_or("--via を指定してください（email / download / scan / manual）")?,
         mime_type,
         entry_id,
+        match_amount,
+        match_year,
         note,
     }))
 }
@@ -743,7 +778,12 @@ async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
         );
     }
 
-    let entry = args.entry_id.as_deref().map(parse_entry_id).transpose()?;
+    let entry = match (&args.entry_id, args.match_amount) {
+        (Some(text), _) => Some(parse_entry_id(text)?),
+        // 金額から引く。**候補が1つに絞れなければ止める。**
+        (None, Some(amount)) => Some(find_entry_by_amount(&store_pg, amount, &args).await?),
+        (None, None) => None,
+    };
 
     // **検索要件を仕訳から埋める。** 指定があればそちらを優先する
     // （証憑の日付・金額が仕訳と違うことはある）。
@@ -1519,6 +1559,91 @@ fn amount_of(
         .find(|line| &line.account == account)
         .map(|line| line.amount)
         .unwrap_or_else(|| kaikei_core::Money::from_minor(0, statement.total.currency()))
+}
+
+/// 金額で引いたときに並べる候補の上限。
+///
+/// 全部並べると、毎月同額のサブスクリプションで画面が流れる。
+const MAX_ENTRY_CANDIDATES: usize = 10;
+
+/// 金額から仕訳を1つ引く。
+///
+/// # なぜ金額で引くのか
+///
+/// **仕訳IDを人が探すのが、証憑を登録するときのいちばんの手間である。**
+/// 領収書を見れば金額は分かるので、それで引けるようにする。
+///
+/// # 1つに絞れなければ止める
+///
+/// 同じ額の取引は普通にある（毎月同額のサブスクリプションなど）。**勝手に
+/// 1つ選ぶと、意図しない仕訳に証憑が付く**——しかも紐付けは追記のみなので
+/// 消せない。候補を並べて止め、`--entry` で選んでもらう。
+async fn find_entry_by_amount(
+    store: &PgStore,
+    amount: i64,
+    args: &AttachArgs,
+) -> Result<kaikei_core::EntryId, String> {
+    use kaikei_app::ports::JournalRepo;
+
+    // 探す年は、指定 → 取引年月日 の順。どちらも無ければ決められない。
+    let year =
+        match (args.match_year, args.doc_date) {
+            (Some(year), _) => year,
+            (None, Some(date)) => date.year(),
+            (None, None) => return Err(
+                "--match-amount で探す年が決まりません。--match-year か --date を指定してください"
+                    .to_string(),
+            ),
+        };
+    let fiscal_year = FiscalYear::calendar_year(year);
+    let (from, to) = (fiscal_year.start(), fiscal_year.end());
+
+    let entries = with_tx_err(store, move |tx| {
+        Box::pin(async move { tx.list_entries_in_period(from, to).await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| format!("仕訳を読めませんでした: {error}"))?;
+
+    let target = i128::from(amount);
+    let matched: Vec<&kaikei_core::JournalEntry> = entries
+        .iter()
+        // 赤伝は候補にしない。証憑を付ける先ではない。
+        .filter(|entry| entry.reverses().is_none())
+        .filter(|entry| entry.debit_total().minor() == target)
+        .collect();
+
+    match matched.len() {
+        1 => Ok(matched[0].id()),
+        0 => Err(format!(
+            "{year}年に借方合計が {amount} 円の仕訳がありません。金額と年を確かめるか、--entry で仕訳を指定してください"
+        )),
+        _ => {
+            // **候補を並べる。** どれを選べばよいか分からないまま止めない。
+            // 行継続（`\` + 改行）は次の行の字下げを文字列に含めるので、
+            // つなぎ目は1行に収める。
+            let mut message = format!(
+                "{year}年に借方合計が {amount} 円の仕訳が {} 件あります。--entry でどれかを指定してください:",
+                matched.len()
+            );
+            for entry in matched.iter().take(MAX_ENTRY_CANDIDATES) {
+                message.push_str(&format!(
+                    "
+  {} {} {}",
+                    kaikei_app::id::entry_id_to_uuid_string(entry.id()),
+                    entry.entry_date().to_iso_string(),
+                    entry.description()
+                ));
+            }
+            if matched.len() > MAX_ENTRY_CANDIDATES {
+                message.push_str(&format!(
+                    "
+  （ほか {} 件）",
+                    matched.len() - MAX_ENTRY_CANDIDATES
+                ));
+            }
+            Err(message)
+        }
+    }
 }
 
 /// 証憑の検索要件を、紐付ける仕訳から採ったもの。
