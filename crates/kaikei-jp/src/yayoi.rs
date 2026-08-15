@@ -29,8 +29,19 @@ const SUPPORTED_VERSION: u32 = 1;
 /// 税区分1件の写像。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaxCategoryMapping {
-    /// 弥生側の税区分名。
+    /// 弥生側の税区分名（売上側、または向きを問わないもの）。
     pub yayoi: String,
+    /// 仕入側で使う弥生の税区分名。
+    ///
+    /// # 片方だけだと向きを取り違える
+    ///
+    /// 非課税のように**売上にも仕入にも立つ**区分がある。弥生は売上側と
+    /// 仕入側で区分が分かれているので、売上側だけを持つと、非課税の仕入が
+    /// 「非課売上」として出力される（住宅の家賃・支払利息・保険料など、
+    /// 個人事業主に普通にある取引で起きる）。
+    ///
+    /// `None` なら向きを問わない区分であり、[`Self::yayoi`] を使う。
+    pub yayoi_purchase: Option<String>,
     /// 弥生の実機で取り込めることを確認済みか。
     pub verified: bool,
 }
@@ -117,6 +128,7 @@ fn from_raw(label: &str, raw: MapRaw) -> Result<YayoiTaxMap, JpError> {
                 entry.kaikei.clone(),
                 TaxCategoryMapping {
                     yayoi: entry.yayoi,
+                    yayoi_purchase: entry.yayoi_purchase,
                     verified: entry.verified,
                 },
             )
@@ -149,6 +161,9 @@ struct MapRaw {
 struct CategoryRaw {
     kaikei: String,
     yayoi: String,
+    /// 仕入側の区分。**省略できる**（向きを問わない区分がほとんどのため）。
+    #[serde(default)]
+    yayoi_purchase: Option<String>,
     verified: bool,
 }
 

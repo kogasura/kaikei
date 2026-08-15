@@ -1891,7 +1891,7 @@ fn write_yayoi(
 /// 税区分の写像を、出力側が使う素の対応表にする。
 fn build_tax_map(
     map: &kaikei_jp::yayoi::YayoiTaxMap,
-) -> std::collections::BTreeMap<String, String> {
+) -> std::collections::BTreeMap<String, kaikei_report::yayoi::YayoiCategory> {
     // `kaikei-report` は `kaikei-jp` を知らない（層を保つ）ので、
     // ここで素の文字列の対応表に落とす。
     let mut out = std::collections::BTreeMap::new();
@@ -1908,7 +1908,15 @@ fn build_tax_map(
         "NOT_APPLICABLE",
     ] {
         if let Some(mapping) = map.get(code) {
-            out.insert(code.to_string(), mapping.yayoi.clone());
+            // 売上側と仕入側を両方渡す。片方だけにすると、非課税の仕入が
+            // 「非課売上」として出力される。
+            out.insert(
+                code.to_string(),
+                kaikei_report::yayoi::YayoiCategory {
+                    sales: mapping.yayoi.clone(),
+                    purchase: mapping.yayoi_purchase.clone(),
+                },
+            );
         }
     }
     out
