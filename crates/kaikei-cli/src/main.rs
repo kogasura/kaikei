@@ -815,6 +815,85 @@ fn warn_if_owner_accounts_carried_over(
     Ok(())
 }
 
+/// 適格請求書が要る税区分の明細を、取引先タグの有無で数える。
+///
+/// # なぜすり抜けるのか
+///
+/// `JpTaxPolicy` は、適格請求書が要る税区分（`requires_qualified_invoice`）に
+/// **取引先タグが付いていれば**、その取引先が適格請求書発行事業者かを見る。
+/// 取引先タグが無ければ、見るものが無いので何も言わない。
+///
+/// # なぜ日付でマスタを選ばないのか
+///
+/// `requires_qualified_invoice` は施行日で変わらない（適格請求書が要る区分は
+/// 要るまま）。日付でマスタを選ぶと、**期首仕訳のように会計期間の外に日付を
+/// 持つ仕訳で「該当マスタなし」になり、検査そのものが黙って飛ぶ**。
+/// 数え落としが警告なしで起きるので、コードを知っているマスタで判定する。
+///
+/// # 断定しない
+///
+/// 仕入税額控除が認められるかは、証憑の保存状況や相手方の登録状況で決まる。
+/// ここで出すのは**帳簿の事実**（件数）だけである（`CLAUDE.md` §10）。
+fn count_qualified_without_counterparty(
+    entries: &[kaikei_core::JournalEntry],
+    rule_sets: &kaikei_jp::tax::TaxRuleSets,
+) -> usize {
+    entries
+        .iter()
+        .flat_map(|entry| entry.lines().iter())
+        .filter(|line| line_needs_a_counterparty(line.tags(), rule_sets))
+        .count()
+}
+
+/// 明細1行の判定。**表示から切り離してある**（`accounts_on_the_wrong_side`
+/// と同じ理由。何を拾うかをテストで固定できないと、呼び出しごと消えても
+/// 気づけない）。
+fn line_needs_a_counterparty(
+    tags: &kaikei_core::TagSet,
+    rule_sets: &kaikei_jp::tax::TaxRuleSets,
+) -> bool {
+    let Ok(tax_key) = kaikei_core::TagKey::parse("tax_category") else {
+        return false;
+    };
+    let Ok(counterparty_key) = kaikei_core::TagKey::parse("counterparty") else {
+        return false;
+    };
+    let Some(kaikei_core::TagValue::Code(code)) = tags.get(&tax_key) else {
+        return false;
+    };
+    // 知らないコードは黙って見送る。ここは税区分の妥当性を検査する場所では
+    // ない（それは `JpTaxPolicy` が記帳時にやっている）。
+    let requires_qualified_invoice = rule_sets
+        .iter()
+        .find_map(|table| table.category(code).ok())
+        .is_some_and(|category| category.requires_qualified_invoice);
+
+    requires_qualified_invoice && tags.get(&counterparty_key).is_none()
+}
+
+/// 上の件数を知らせる。
+fn warn_if_qualified_invoice_lacks_a_counterparty(
+    entries: &[kaikei_core::JournalEntry],
+) -> Result<(), String> {
+    let rule_sets = kaikei_jp::tax::TaxRuleSets::from_embedded()
+        .map_err(|error| format!("同梱の消費税区分マスタを読めませんでした: {error}"))?;
+
+    let count = count_qualified_without_counterparty(entries, &rule_sets);
+    if count == 0 {
+        return Ok(());
+    }
+
+    eprintln!(
+        "注意: 適格請求書が要る税区分の明細が {count} 件ありますが、取引先が記録されていません。"
+    );
+    eprintln!("  誰から受け取った適格請求書なのかを、帳簿から辿れません。");
+    eprintln!("  記帳するときに counterparty タグを付けると記録されます。");
+    eprintln!(
+        "  仕入税額控除が認められるかどうかは、証憑の保存状況と相手方の登録状況で決まります。"
+    );
+    Ok(())
+}
+
 /// 収益も費用も残っていない年度か（＝決算振替済みに見えるか）。
 ///
 /// **表示から切り離してある。** 何を拾うかをテストで固定できないと、
@@ -1717,7 +1796,7 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
     let year = FiscalYear::calendar_year(fiscal_year);
     let (from, to) = (year.start(), year.end());
 
-    let (chart, income_statement, balance_sheet) = with_tx_err(store, move |tx| {
+    let (chart, income_statement, balance_sheet, entries) = with_tx_err(store, move |tx| {
         let schema = schema.clone();
         Box::pin(async move {
             let chart = tx.load_chart().await?;
@@ -1736,10 +1815,14 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
                 },
             )
             .await?;
+            // **仕訳そのものも読む。** 税区分と取引先はタグなので、
+            // 財務諸表からは見えない。
+            let entries = tx.list_entries_in_period(from, to).await?;
             Ok::<_, kaikei_app::error::AppError>((
                 chart,
                 statements.income_statement,
                 cumulative.balance_sheet,
+                entries,
             ))
         })
     })
@@ -1750,6 +1833,7 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
 
     warn_if_depreciation_is_missing(&income_statement, &balance_sheet)?;
     warn_if_a_balance_sits_on_the_wrong_side(&balance_sheet, &chart)?;
+    warn_if_qualified_invoice_lacks_a_counterparty(&entries)?;
     Ok(())
 }
 
@@ -2225,6 +2309,10 @@ async fn write_reports(
     // **決算振替を記帳した後では決算書が作れない。** 収益・費用がゼロ化
     // されているので、所得が 0 の決算書ができる。
     warn_if_the_year_looks_closed(&statements.income_statement, entries.len());
+
+    // **適格請求書ありの税区分に取引先が付いているか。** 取引先が無いと、
+    // 適格請求書発行事業者かどうかの検証がすり抜ける。
+    warn_if_qualified_invoice_lacks_a_counterparty(&entries)?;
 
     // **前年の事業主貸・事業主借が持ち越されていないか。** 翌期首に元入金へ
     // 振り替えないと、年を追うごとに膨らむ。
@@ -2773,6 +2861,80 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 税区分・取引先のタグを持つ明細のタグ集合を作る。
+    fn tags_of(tax_category: Option<&str>, counterparty: Option<&str>) -> kaikei_core::TagSet {
+        let mut tags = kaikei_core::TagSet::new();
+        if let Some(code) = tax_category {
+            tags.insert(
+                kaikei_core::TagKey::parse("tax_category").unwrap(),
+                kaikei_core::TagValue::Code(code.to_string()),
+            );
+        }
+        if let Some(code) = counterparty {
+            tags.insert(
+                kaikei_core::TagKey::parse("counterparty").unwrap(),
+                kaikei_core::TagValue::Code(code.to_string()),
+            );
+        }
+        tags
+    }
+
+    fn embedded_tax_rule_sets() -> kaikei_jp::tax::TaxRuleSets {
+        kaikei_jp::tax::TaxRuleSets::from_embedded().unwrap()
+    }
+
+    // 適格請求書が要る税区分なのに取引先が無い明細を拾う。
+    #[test]
+    fn a_qualified_purchase_without_a_counterparty_is_picked_up() {
+        let rule_sets = embedded_tax_rule_sets();
+        assert!(line_needs_a_counterparty(
+            &tags_of(Some("PURCHASE_10_QUALIFIED"), None),
+            &rule_sets
+        ));
+    }
+
+    // 取引先が付いていれば拾わない（`JpTaxPolicy` が検証できる状態にある）。
+    #[test]
+    fn a_qualified_purchase_with_a_counterparty_is_not_picked_up() {
+        let rule_sets = embedded_tax_rule_sets();
+        assert!(!line_needs_a_counterparty(
+            &tags_of(Some("PURCHASE_10_QUALIFIED"), Some("ANTHROPIC")),
+            &rule_sets
+        ));
+    }
+
+    // 適格請求書が要らない税区分は、取引先が無くても拾わない。
+    // **これが効かないと 771 行の税区分なし明細まで数えてしまう。**
+    #[test]
+    fn a_non_qualified_purchase_is_not_picked_up() {
+        let rule_sets = embedded_tax_rule_sets();
+        assert!(
+            !line_needs_a_counterparty(
+                &tags_of(Some("PURCHASE_10_NON_QUALIFIED"), None),
+                &rule_sets
+            ),
+            "非適格の仕入は適格請求書を前提にしていない"
+        );
+        assert!(!line_needs_a_counterparty(
+            &tags_of(Some("OUT_OF_SCOPE"), None),
+            &rule_sets
+        ));
+        assert!(
+            !line_needs_a_counterparty(&tags_of(None, None), &rule_sets),
+            "税区分が無い明細は対象外"
+        );
+    }
+
+    // 知らないコードで落ちたり数え上げたりしない。
+    #[test]
+    fn an_unknown_tax_category_is_not_picked_up() {
+        let rule_sets = embedded_tax_rule_sets();
+        assert!(!line_needs_a_counterparty(
+            &tags_of(Some("NO_SUCH_CATEGORY"), None),
+            &rule_sets
+        ));
     }
 
     #[test]
