@@ -118,6 +118,14 @@ jobs:
         # cargo を入れ子で起動させない代わりに、ここで先にビルドしておく。
         run: cargo build -p kaikei-mcp
 
+      - name: kaikei-cli のバイナリをビルド
+        # tests/cli_verify.rs が `kaikei` を**実行ファイルとして**起動する。
+        # verify が出す指摘は main.rs の中で関数を呼んでいるだけなので、
+        # 呼び出しを消しても使い方の文言を見るテストは通ってしまう
+        # （変異を入れて確かめたところ1件も落ちなかった）。
+        # 指摘が本当に出ることは動かしてみないと分からない。
+        run: cargo build -p kaikei-cli
+
       - name: kaikei-e2e の pg-tests を実行
         # Phase 2 PR-8: kaikei-jp（JpTaxPolicy 等）を実際に注入して記帳する
         # E2Eテスト（crates/kaikei-e2e）。kaikei-store とは別crateだが、同じ
