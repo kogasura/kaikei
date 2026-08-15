@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 use kaikei_app::error::RepoError;
 use kaikei_app::ports::{FixedAssetRepo, FixedAssetRow};
-use kaikei_core::{AccountCode, Currency, Money};
+use kaikei_core::{AccountCode, AccountingDate, Currency, Money};
 
 /// DB の1行。
 type Row = (
@@ -95,6 +95,27 @@ impl FixedAssetRepo for PgTx<'_> {
             inserted += result.rows_affected() as usize;
         }
         Ok(inserted)
+    }
+
+    /// # 除却済みは上書きしない
+    ///
+    /// `WHERE disposed_on IS NULL` を付ける。除却日を後から動かすのは過去の
+    /// 決算書の数字が変わるということで、投入経路が黙ってやってよいことでは
+    /// ない（`ChartWriteRepo` が既存を上書きしないのと同じ規律）。
+    async fn dispose_fixed_asset(
+        &mut self,
+        id: &str,
+        disposed_on: AccountingDate,
+    ) -> Result<usize, RepoError> {
+        let result = sqlx::query(
+            "UPDATE fixed_assets SET disposed_on = $2              WHERE id = $1::uuid AND disposed_on IS NULL",
+        )
+        .bind(id)
+        .bind(accounting_date_to_naive_date(disposed_on)?)
+        .execute(self.conn())
+        .await
+        .map_err(from_sqlx_error)?;
+        Ok(result.rows_affected() as usize)
     }
 }
 

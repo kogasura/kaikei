@@ -372,3 +372,119 @@ async fn a_life_that_cannot_be_computed_is_not_written(
     assert!(!ok, "失敗すること");
     assert!(list(&app).await.is_empty(), "台帳に入っていないこと");
 }
+
+// ─── 除却 ────────────────────────────────────────────────
+
+/// **本命。** 除却すると `disposed_on` が埋まる。行は消えない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn disposing_fills_the_date_and_keeps_the_row(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "210", "工具器具備品", 1).await;
+    let id = "11111111-1111-1111-1111-111111111111";
+    insert(&app, vec![asset(id, 2, None)]).await.unwrap();
+
+    let store = PgStore::new(app.clone());
+    let updated = with_tx_err(&store, move |tx| {
+        Box::pin(async move {
+            tx.dispose_fixed_asset(id, AccountingDate::new(2026, 6, 30).unwrap())
+                .await
+        })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(updated, 1);
+    let rows = list(&app).await;
+    assert_eq!(rows.len(), 1, "行は残る");
+    assert_eq!(
+        rows[0].disposed_on,
+        Some(AccountingDate::new(2026, 6, 30).unwrap())
+    );
+}
+
+/// **本命。** 除却済みは上書きしない。
+///
+/// 除却日を後から動かすのは、過去の決算書の数字が変わるということである。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn disposing_twice_does_not_move_the_date(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "210", "工具器具備品", 1).await;
+    let id = "11111111-1111-1111-1111-111111111111";
+    insert(&app, vec![asset(id, 2, None)]).await.unwrap();
+
+    let store = PgStore::new(app.clone());
+    for (date, expected) in [((2026, 6, 30), 1usize), ((2027, 1, 1), 0)] {
+        let updated = with_tx_err(&store, move |tx| {
+            Box::pin(async move {
+                tx.dispose_fixed_asset(id, AccountingDate::new(date.0, date.1, date.2).unwrap())
+                    .await
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(updated, expected, "{date:?}");
+    }
+
+    assert_eq!(
+        list(&app).await[0].disposed_on,
+        Some(AccountingDate::new(2026, 6, 30).unwrap()),
+        "最初の除却日のまま"
+    );
+}
+
+/// 知らない ID は0件（エラーにはしない）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn disposing_an_unknown_id_updates_nothing(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let store = PgStore::new(app.clone());
+    let updated = with_tx_err(&store, |tx| {
+        Box::pin(async move {
+            tx.dispose_fixed_asset(
+                "99999999-9999-9999-9999-999999999999",
+                AccountingDate::new(2026, 6, 30).unwrap(),
+            )
+            .await
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(updated, 0);
+}
+
+/// 取得日より前の除却は制約で止まる。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn disposing_before_acquisition_is_rejected_by_the_database(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "210", "工具器具備品", 1).await;
+    let id = "11111111-1111-1111-1111-111111111111";
+    // 取得は 2025-07-24。
+    insert(&app, vec![asset(id, 2, None)]).await.unwrap();
+
+    let store = PgStore::new(app.clone());
+    let result: Result<usize, kaikei_app::error::RepoError> = with_tx_err(&store, move |tx| {
+        Box::pin(async move {
+            tx.dispose_fixed_asset(id, AccountingDate::new(2024, 1, 1).unwrap())
+                .await
+        })
+    })
+    .await;
+
+    assert!(result.is_err(), "取得日より前の除却は入らないこと");
+    assert!(list(&app).await[0].disposed_on.is_none());
+}

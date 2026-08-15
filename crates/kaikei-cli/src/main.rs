@@ -61,6 +61,7 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei fixedasset add --name <名前> --account <科目> --acquired <YYYY-MM-DD>
                           --cost <円> --method <方法> [--life <年>] [--commit]
     kaikei fixedasset list [--year <西暦>]
+    kaikei fixedasset dispose --id <UUID> --on <YYYY-MM-DD> [--commit]
     kaikei depreciation --year <西暦>
 
 report は帳簿をファイルに書き出します。
@@ -70,6 +71,7 @@ journalize は取り込んだ明細にルールを当てて、仕訳の案を見
 counterparty import は取引先マスタを CSV から投入します。
 fixedasset add は固定資産を台帳に入れます（既定は下見）。
 fixedasset list は台帳の中身を並べます（--year でその年度の償却費も出ます）。
+fixedasset dispose は資産を除却します（既定は下見。行は消しません）。
 depreciation は固定資産台帳から減価償却費を出します（記帳はしません）。
 
 引数:
@@ -244,6 +246,9 @@ fn run() -> Result<Vec<PathBuf>, String> {
         Command::FixedAssetList { fiscal_year } => {
             runtime.block_on(run_fixed_asset_list(fiscal_year))
         }
+        Command::FixedAssetDispose { id, on, commit } => {
+            runtime.block_on(run_fixed_asset_dispose(id, on, commit))
+        }
     }
 }
 
@@ -279,6 +284,12 @@ enum Command {
     FixedAsset(FixedAssetArgs),
     /// 固定資産台帳の中身を並べる。
     FixedAssetList { fiscal_year: Option<i32> },
+    /// 固定資産を除却する。
+    FixedAssetDispose {
+        id: String,
+        on: AccountingDate,
+        commit: bool,
+    },
 }
 
 /// `kaikei counterparty import` の引数。
@@ -1269,6 +1280,161 @@ struct FixedAssetArgs {
 
 /// `kaikei fixedasset add ...` を解釈する。
 /// `kaikei fixedasset list [--year <西暦>]` を解釈する。
+/// `kaikei fixedasset dispose --id <UUID> --on <YYYY-MM-DD> [--commit]` を解釈する。
+fn parse_fixed_asset_dispose(args: &[String]) -> Result<Command, String> {
+    let mut id = None;
+    let mut on = None;
+    let mut commit = false;
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index].as_str();
+        if key == "--commit" {
+            commit = true;
+            index += 1;
+            continue;
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?
+            .clone();
+        match key {
+            "--id" => id = Some(value),
+            "--on" => {
+                on =
+                    Some(AccountingDate::parse(&value).map_err(|error| {
+                        format!("--on は YYYY-MM-DD で指定してください: {error}")
+                    })?)
+            }
+            other => return Err(format!("不明な引数です: {other}\n\n{USAGE}")),
+        }
+        index += 2;
+    }
+    Ok(Command::FixedAssetDispose {
+        id: id.ok_or("--id を指定してください（kaikei fixedasset list で確認できます）")?,
+        on: on.ok_or("--on を指定してください（除却した日。例: --on 2026-06-30）")?,
+        commit,
+    })
+}
+
+/// 固定資産を除却する。
+///
+/// # 行は消さない
+///
+/// 台帳から資産を外す唯一の手段が `disposed_on` を埋めることである
+/// （`DECISIONS.md` D-104）。消せると、過去の年度の償却費がどの資産のもの
+/// だったか辿れなくなる。
+///
+/// # 未償却残高を必ず見せる
+///
+/// 除却すると、その資産は台帳の計算対象から外れる。**帳簿にはまだ残高が
+/// 残っている**ので、除却損の記帳が要る。いくら残っているかを示さないと、
+/// 記帳しないまま `verify` の指摘だけが増える。
+///
+/// **除却損の額や科目は決めない。** 売却なら売却損益になり、金額も相手科目も
+/// 事情で変わる（`CLAUDE.md` §10）。
+async fn run_fixed_asset_dispose(
+    id: String,
+    on: AccountingDate,
+    commit: bool,
+) -> Result<Vec<PathBuf>, String> {
+    use kaikei_app::ports::FixedAssetRepo;
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool);
+
+    let rows = with_tx_err(&store, |tx| {
+        Box::pin(async move { tx.list_fixed_assets().await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| {
+        format!("固定資産台帳を読めませんでした: {error}")
+    })?;
+
+    let Some(asset) = rows.iter().find(|row| row.id == id) else {
+        return Err(format!(
+            "その ID の資産が台帳にありません: {id}。\
+             kaikei fixedasset list で確認してください"
+        ));
+    };
+    if let Some(disposed) = asset.disposed_on {
+        return Err(format!(
+            "{} は既に {} に除却済みです。除却日を動かすと過去の決算書の数字が\
+             変わるので、この操作では直せません",
+            asset.name,
+            disposed.to_iso_string()
+        ));
+    }
+    if on < asset.acquired_on {
+        return Err(format!(
+            "除却日が取得日より前です（取得 {} / 除却 {}）",
+            asset.acquired_on.to_iso_string(),
+            on.to_iso_string()
+        ));
+    }
+
+    // 除却する直前の未償却残高。**除却する年の前年末の簿価**である
+    // （除却した年は計算対象から外すため）。
+    let input = to_fixed_asset(asset)?;
+    let schedule = kaikei_jp::depreciation::schedule(&input)
+        .map_err(|error| format!("{}: 償却額を計算できませんでした: {error}", asset.name))?;
+    let book_value = schedule
+        .years
+        .iter()
+        .rfind(|y| y.year < on.year())
+        .map(|y| y.book_value)
+        .unwrap_or(asset.acquisition_cost);
+
+    println!("{}  [{}]", asset.name, method_label(asset.method));
+    println!("  科目      {}", asset.account.as_str());
+    println!(
+        "  取得      {}  {} 円",
+        asset.acquired_on.to_iso_string(),
+        asset.acquisition_cost.to_display_string()
+    );
+    println!("  除却      {}", on.to_iso_string());
+    println!(
+        "  除却直前の未償却残高  {} 円",
+        book_value.to_display_string()
+    );
+    println!();
+    println!("この額が帳簿に残ります。除却損などの記帳は別に必要です。");
+    println!(
+        "  借方 <除却損などの科目> / 貸方 {}",
+        asset.account.as_str()
+    );
+    println!("金額と科目は事情で変わる（売却なら売却損益）ので、こちらでは決めません。");
+    println!();
+    println!(
+        "除却した年（{} 年）以降、この資産は台帳の計算対象から外れます。",
+        on.year()
+    );
+    println!("除却した年の償却をどう扱うかは申告上の判断なので、計算しません。");
+
+    if !commit {
+        println!();
+        println!("下見です。まだ除却していません。");
+        println!("この内容でよければ --commit を付けて実行してください。");
+        return Ok(Vec::new());
+    }
+
+    let updated = with_tx_err(&store, move |tx| {
+        let id = id.clone();
+        Box::pin(async move { tx.dispose_fixed_asset(&id, on).await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| format!("除却できませんでした: {error}"))?;
+
+    println!();
+    if updated == 0 {
+        return Err("除却できませんでした（既に除却済みか、行が見つかりません）".to_string());
+    }
+    println!("除却しました。");
+    Ok(Vec::new())
+}
+
 fn parse_fixed_asset_list(args: &[String]) -> Result<Command, String> {
     let mut fiscal_year = None;
     let mut index = 0;
@@ -1379,6 +1545,9 @@ fn parse_fixed_asset(args: &[String]) -> Result<Command, String> {
     };
     if action == "list" {
         return parse_fixed_asset_list(&args[1..]);
+    }
+    if action == "dispose" {
+        return parse_fixed_asset_dispose(&args[1..]);
     }
     if action != "add" {
         return Err(format!(
@@ -1685,11 +1854,8 @@ async fn run_depreciation(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
     let mut total: i128 = 0;
     let mut counted = 0usize;
     for row in &rows {
-        // 除却した年より後は償却しない。
-        if let Some(disposed) = row.disposed_on {
-            if disposed.year() < fiscal_year {
-                continue;
-            }
+        if is_outside_the_ledger_for(row, fiscal_year) {
+            continue;
         }
         let asset = to_fixed_asset(row)?;
         let schedule = kaikei_jp::depreciation::schedule(&asset)
@@ -2628,6 +2794,26 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
     Ok(())
 }
 
+/// その年度に台帳の計算対象から外すか。
+///
+/// # 除却した年**以降**を外す
+///
+/// 除却した年の償却をどう扱うか（月割で計上するか、除却損に含めるか）は
+/// 申告上の判断であり、帳簿からは決まらない（`CLAUDE.md` §10）。
+/// **決めないので計算しない。** 除却した時点の未償却残高は
+/// `fixedasset dispose` が示すので、除却損の記帳は人が決める。
+///
+/// 取得前も外す。数えると、来年買う予定のものが今年の帳簿と食い違って見える。
+fn is_outside_the_ledger_for(asset: &kaikei_app::ports::FixedAssetRow, fiscal_year: i32) -> bool {
+    if asset.acquired_on.year() > fiscal_year {
+        return true;
+    }
+    match asset.disposed_on {
+        Some(disposed) => disposed.year() <= fiscal_year,
+        None => false,
+    }
+}
+
 /// 固定資産台帳の期末簿価と、帳簿の残高が科目ごとに合っているか。
 ///
 /// **表示から切り離してある**（`accounts_on_the_wrong_side` と同じ理由。
@@ -2665,10 +2851,8 @@ fn fixed_asset_book_values(
 
     let mut by_account: BTreeMap<kaikei_core::AccountCode, i128> = BTreeMap::new();
     for asset in assets {
-        if let Some(disposed) = asset.disposed_on {
-            if disposed.year() < fiscal_year {
-                continue;
-            }
+        if is_outside_the_ledger_for(asset, fiscal_year) {
+            continue;
         }
         let input = to_fixed_asset(asset)?;
         let schedule = kaikei_jp::depreciation::schedule(&input)
@@ -2678,11 +2862,8 @@ fn fixed_asset_book_values(
         let book_value = match schedule.year(fiscal_year) {
             Some(year) => year.book_value.minor(),
             None => {
-                if asset.acquired_on.year() > fiscal_year {
-                    // まだ取得していない。帳簿にも載っていないはず。
-                    continue;
-                }
-                // 償却し終わっている。最後の年の簿価が続く。
+                // 取得前は `is_outside_the_ledger_for` が外している。
+                // ここに来るのは償却し終わった資産で、最後の年の簿価が続く。
                 schedule
                     .years
                     .last()
@@ -3667,11 +3848,8 @@ fn write_blue_return_depreciation(
     let mut rows = Vec::new();
     let mut total: i128 = 0;
     for asset in assets {
-        // 除却した年より後は載せない。
-        if let Some(disposed) = asset.disposed_on {
-            if disposed.year() < fiscal_year {
-                continue;
-            }
+        if is_outside_the_ledger_for(asset, fiscal_year) {
+            continue;
         }
         let input = to_fixed_asset(asset)?;
         let schedule = kaikei_jp::depreciation::schedule(&input)
@@ -4215,6 +4393,85 @@ abc,
             error.contains("remove"),
             "受け取った値を見せること: {error}"
         );
+    }
+
+    // ---- fixedasset dispose ----
+
+    #[test]
+    fn dispose_needs_an_id_and_a_date() {
+        let error = parse_args(&["fixedasset".to_string(), "dispose".to_string()]).unwrap_err();
+        assert!(error.contains("--id"), "{error}");
+
+        let error = parse_args(&[
+            "fixedasset".to_string(),
+            "dispose".to_string(),
+            "--id".to_string(),
+            "x".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("--on"), "{error}");
+    }
+
+    // 既定は下見。--commit を付けたときだけ除却する。
+    #[test]
+    fn dispose_does_not_write_without_commit() {
+        let base = [
+            "fixedasset".to_string(),
+            "dispose".to_string(),
+            "--id".to_string(),
+            "abc".to_string(),
+            "--on".to_string(),
+            "2026-06-30".to_string(),
+        ];
+        match parse_args(&base).unwrap() {
+            Command::FixedAssetDispose { id, on, commit } => {
+                assert_eq!(id, "abc");
+                assert_eq!(on, AccountingDate::new(2026, 6, 30).unwrap());
+                assert!(!commit);
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut with_commit = base.to_vec();
+        with_commit.push("--commit".to_string());
+        match parse_args(&with_commit).unwrap() {
+            Command::FixedAssetDispose { commit, .. } => assert!(commit),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ---- 除却した年以降を計算対象から外す ----
+
+    // **本命。** 除却した年**そのもの**から外す。
+    //
+    // 除却した年の償却をどう扱うか（月割で計上するか、除却損に含めるか）は
+    // 申告上の判断なので、このソフトは計算しない。
+    #[test]
+    fn the_year_of_disposal_is_already_outside_the_ledger() {
+        let mut asset = fa("220", (2025, 3, 10), 108_000, 1, Some(2));
+        asset.disposed_on = Some(AccountingDate::new(2026, 6, 30).unwrap());
+
+        assert!(
+            !is_outside_the_ledger_for(&asset, 2025),
+            "除却前の年は対象に入る"
+        );
+        assert!(
+            is_outside_the_ledger_for(&asset, 2026),
+            "除却した年から外れる"
+        );
+        assert!(is_outside_the_ledger_for(&asset, 2027), "その後も外れる");
+    }
+
+    #[test]
+    fn an_asset_not_yet_acquired_is_outside_the_ledger() {
+        let asset = fa("210", (2027, 1, 1), 100_000, 1, Some(2));
+        assert!(is_outside_the_ledger_for(&asset, 2026));
+        assert!(!is_outside_the_ledger_for(&asset, 2027));
+    }
+
+    #[test]
+    fn an_asset_without_a_disposal_date_stays_in_the_ledger() {
+        let asset = fa("210", (2025, 1, 1), 100_000, 1, Some(2));
+        assert!(!is_outside_the_ledger_for(&asset, 2030));
     }
 
     // ---- 固定資産台帳と帳簿の突き合わせ ----

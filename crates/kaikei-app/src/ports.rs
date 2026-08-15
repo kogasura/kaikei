@@ -334,6 +334,26 @@ pub trait FixedAssetRepo: Send {
     ///
     /// 科目が存在しない・制約に反する場合は [`RepoError`]。
     async fn insert_fixed_assets(&mut self, list: &[FixedAssetRow]) -> Result<usize, RepoError>;
+
+    /// 資産を除却する（`disposed_on` を埋める）。
+    ///
+    /// **これが「台帳から資産を外す」唯一の手段である。** 行は消さない
+    /// （`DECISIONS.md` D-104）。過去の年度の償却費がどの資産のものだったか
+    /// 辿れなくなるため。
+    ///
+    /// 既に除却済みの資産は**上書きしない**。除却日を後から動かすのは、
+    /// 過去の決算書の数字が変わるということである。
+    ///
+    /// 戻り値は実際に更新した行数（0 なら該当なし、または除却済み）。
+    ///
+    /// # Errors
+    ///
+    /// 除却日が取得日より前の場合など、制約に反すれば [`RepoError`]。
+    async fn dispose_fixed_asset(
+        &mut self,
+        id: &str,
+        disposed_on: AccountingDate,
+    ) -> Result<usize, RepoError>;
 }
 
 /// 会計期間の締め状態（の生データ）の読み込み。
