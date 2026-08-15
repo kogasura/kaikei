@@ -689,6 +689,52 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
     }))
 }
 
+/// 全件エクスポートが帳簿の試算表と一致するかを確かめる。
+///
+/// # なぜ要るのか
+///
+/// `export.json` は**このソフトが無くなっても帳簿が残る**ための出口である
+/// （`docs/03-database.md` §8）。明細が欠けていても、必要になったときに初めて
+/// 気づく——**そのときにはもう元の帳簿が無い。**
+fn warn_if_export_does_not_match_the_book(
+    json: &str,
+    trial_balance: &kaikei_app::view::TrialBalanceView,
+) {
+    let totals = match kaikei_report::export::sum_by_account(json) {
+        Ok(totals) => totals,
+        Err(reason) => {
+            // **読めないことを「一致した」にしない。**
+            eprintln!("注意: 全件エクスポートを読み直せませんでした: {reason}");
+            return;
+        }
+    };
+
+    let mut mismatched: Vec<String> = Vec::new();
+    for row in trial_balance.rows() {
+        let code = row.account.as_str();
+        let (debit, credit) = totals.get(code).copied().unwrap_or((0, 0));
+        if debit != row.debit_total.minor() || credit != row.credit_total.minor() {
+            mismatched.push(format!(
+                "  {code}: 帳簿 借{} 貸{} / export.json 借{debit} 貸{credit}",
+                row.debit_total.minor(),
+                row.credit_total.minor()
+            ));
+        }
+    }
+
+    if mismatched.is_empty() {
+        return;
+    }
+    eprintln!(
+        "注意: 全件エクスポートが帳簿と一致しません（{} 科目）:",
+        mismatched.len()
+    );
+    for line in &mismatched {
+        eprintln!("{line}");
+    }
+    eprintln!("  このファイルからは帳簿を復元できません。");
+}
+
 /// 弥生向けの出力が帳簿の試算表と一致するかを確かめる。
 ///
 /// # なぜ要るのか
@@ -2038,11 +2084,17 @@ async fn write_reports(
     // 全件 JSON。**この出力はこのソフトが消えてもデータが残るためのもの**
     // なので、既定で必ず出す（docs/03-database.md §8）。
     let export_path = out_dir.join("export.json");
-    std::fs::write(
-        &export_path,
-        kaikei_report::export::to_json(&entries, &chart),
-    )
-    .map_err(|error| format!("書き出せませんでした: {}（{error}）", export_path.display()))?;
+    let export_json = kaikei_report::export::to_json(&entries, &chart);
+
+    // ★書き出したものを読み直して、帳簿と突き合わせる★
+    //
+    // このファイルは**このソフトが無くなっても帳簿が残る**ための出口である。
+    // 中身が欠けていても、必要になったときに初めて気づく——そのときにはもう
+    // 元の帳簿が無い。
+    warn_if_export_does_not_match_the_book(&export_json, &trial_balance);
+
+    std::fs::write(&export_path, &export_json)
+        .map_err(|error| format!("書き出せませんでした: {}（{error}）", export_path.display()))?;
     written.push(export_path);
 
     if yayoi {
