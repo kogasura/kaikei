@@ -106,6 +106,12 @@ verify が見るもの:
     証憑が登録されていれば、保存されているファイルの中身が
     帳簿の記録と一致するかも確かめます。
 
+    あわせて、決算書を書き出したときと同じ指摘も出します:
+      ・固定資産があるのに減価償却費が1円も計上されていない
+      ・資産がマイナス残高、負債がプラス残高になっている
+    どちらも貸借は一致したままなので、決算書を見ても分かりません。
+    指摘があっても検査は失敗しません（誤りと決まったわけではないため）。
+
 attach の引数:
     --file <パス>        取り込むファイル（必須）
     --date <YYYY-MM-DD>  取引年月日（必須。検索要件の1つ）
@@ -387,6 +393,11 @@ async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
     .map_err(|error: kaikei_app::error::AppError| format!("検査できませんでした: {error}"))?;
 
     println!("検査した仕訳: {} 件", output.entry_count);
+
+    // **検査するコマンドが、決算書の出力より検査が緩いのはおかしい。**
+    // `report` が出しているのと同じ指摘を、同じ関数を呼んで出す
+    // （文言が2箇所に分かれると、片方だけ直したときに食い違う）。
+    warn_from_statements(&store, fiscal_year).await?;
 
     // 疑いは不整合と分けて出す。**混ぜると本当の不整合が埋もれる。**
     // 正当な重複（同じ日に同額の交通費など）は普通にあるので、疑いの件数は
@@ -1311,6 +1322,59 @@ fn warn_if_a_balance_sits_on_the_wrong_side(
         "  記帳先の取り違え・期首残高の誤り・仕訳の抜けのいずれかを疑ってください。\
          評価勘定（減価償却累計額など）はこの指摘の対象外です。"
     );
+    Ok(())
+}
+
+/// 決算書を作らずに、決算書と同じ指摘だけを出す。
+///
+/// # なぜ `verify` からも呼ぶのか
+///
+/// **検査するコマンドが、書き出すコマンドより検査が緩いのはおかしい。**
+/// 「帳簿は大丈夫か」を確かめたい人は `verify` を打つのであって、
+/// `report` を打って警告を読むわけではない。
+///
+/// 指摘の中身は `report` と同じ関数を呼ぶ。文言や判定が2箇所に分かれると、
+/// 片方だけ直したときに食い違う。
+async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), String> {
+    let catalog = TagCatalog::from_embedded(kaikei_jp_data::TAGS)
+        .map_err(|error| format!("同梱のタグ定義を読めませんでした: {error}"))?;
+    let schema = catalog.schema().clone();
+    let year = FiscalYear::calendar_year(fiscal_year);
+    let (from, to) = (year.start(), year.end());
+
+    let (chart, income_statement, balance_sheet) = with_tx_err(store, move |tx| {
+        let schema = schema.clone();
+        Box::pin(async move {
+            let chart = tx.load_chart().await?;
+            let policy = JpStatementPolicy::new(chart.clone());
+            // 損益計算書は会計年度の期間、貸借対照表は帳簿の最初からの累計
+            // （`write_reports` と同じ非対称。会計の性質であって都合ではない）。
+            let statements =
+                statements::execute(tx, &policy, &schema, StatementsInput { from, to }).await?;
+            let cumulative = statements::execute(
+                tx,
+                &policy,
+                &schema,
+                StatementsInput {
+                    from: book_beginning(),
+                    to,
+                },
+            )
+            .await?;
+            Ok::<_, kaikei_app::error::AppError>((
+                chart,
+                statements.income_statement,
+                cumulative.balance_sheet,
+            ))
+        })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::AppError| {
+        format!("財務諸表を組み立てられませんでした: {error}")
+    })?;
+
+    warn_if_depreciation_is_missing(&income_statement, &balance_sheet)?;
+    warn_if_a_balance_sits_on_the_wrong_side(&balance_sheet, &chart)?;
     Ok(())
 }
 
@@ -2878,6 +2942,30 @@ mod tests {
         let wrong = accounts_on_the_wrong_side(&bs, &chart_for_sides(), &[]);
 
         assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// **本命。** 検査するコマンドが、書き出すコマンドより検査が緩くない。
+    ///
+    /// 「帳簿は大丈夫か」を確かめたい人は verify を打つのであって、
+    /// report を打って警告を読むわけではない。
+    #[test]
+    fn the_usage_says_verify_makes_the_same_checks_as_report() {
+        // 使い方の verify の節に、report と同じ指摘が載っている。
+        let verify_section = USAGE
+            .split("verify が見るもの:")
+            .nth(1)
+            .expect("verify の節があること");
+        assert!(verify_section.contains("減価償却費"), "{verify_section}");
+        assert!(verify_section.contains("マイナス残高"), "{verify_section}");
+    }
+
+    /// 指摘が出ても検査は失敗しない。
+    ///
+    /// 失敗させると、償却額が決まるまで verify が通らなくなる。
+    #[test]
+    fn the_usage_says_a_warning_does_not_fail_the_check() {
+        let verify_section = USAGE.split("verify が見るもの:").nth(1).unwrap();
+        assert!(verify_section.contains("失敗しません"), "{verify_section}");
     }
 
     // 使い方に、書き出すファイル名と要る環境変数が載っている
