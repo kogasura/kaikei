@@ -689,6 +689,58 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
     }))
 }
 
+/// 弥生向けの出力が帳簿の試算表と一致するかを確かめる。
+///
+/// # なぜ要るのか
+///
+/// 弥生CSV は**税理士に渡す形**である。取り込んだ数字が決算書と違っていても、
+/// 渡した側も受け取った側も気づけない。列のずれ・金額の取り違え・行の脱落は、
+/// **書き出したものを数え直して初めて分かる。**
+///
+/// # 何を比べるか
+///
+/// 科目ごとの借方合計・貸方合計を比べる。残高だけを比べると、借方と貸方に
+/// 同じ額が余分に立っていても気づけない。
+///
+/// 決算振替のように帳簿に無い行を弥生側だけに足すことはしていないので、
+/// 一致するのが正しい。
+fn warn_if_yayoi_does_not_match_the_book(
+    rows: &[Vec<String>],
+    chart: &kaikei_core::ChartOfAccounts,
+    trial_balance: &kaikei_app::view::TrialBalanceView,
+) {
+    let from_csv = kaikei_report::yayoi::sum_by_account(rows);
+
+    let mut mismatched: Vec<String> = Vec::new();
+    for row in trial_balance.rows() {
+        let Some(def) = chart.get(&row.account) else {
+            continue;
+        };
+        let (debit, credit) = from_csv.get(&def.name).copied().unwrap_or((0, 0));
+        if debit != row.debit_total.minor() || credit != row.credit_total.minor() {
+            mismatched.push(format!(
+                "  {} {}: 帳簿 借{} 貸{} / 弥生CSV 借{debit} 貸{credit}",
+                row.account.as_str(),
+                def.name,
+                row.debit_total.minor(),
+                row.credit_total.minor()
+            ));
+        }
+    }
+
+    if mismatched.is_empty() {
+        return;
+    }
+    eprintln!(
+        "注意: 弥生向けの出力が帳簿と一致しません（{} 科目）:",
+        mismatched.len()
+    );
+    for line in &mismatched {
+        eprintln!("{line}");
+    }
+    eprintln!("  このファイルを税理士に渡すと、決算書と違う数字が取り込まれます。");
+}
+
 /// 拡張子から MIME タイプを決める。
 ///
 /// **分からなければ推測しない。** 誤った型で保存すると、後から中身が何かを
@@ -1994,7 +2046,7 @@ async fn write_reports(
     written.push(export_path);
 
     if yayoi {
-        written.extend(write_yayoi(&out_dir, &entries, &chart)?);
+        written.extend(write_yayoi(&out_dir, &entries, &chart, &trial_balance)?);
     }
 
     written.extend(write_document_export(&out_dir, &pool_for_documents, from, to).await?);
@@ -2210,6 +2262,7 @@ fn write_yayoi(
     out_dir: &Path,
     entries: &[kaikei_core::JournalEntry],
     chart: &kaikei_core::ChartOfAccounts,
+    trial_balance: &kaikei_app::view::TrialBalanceView,
 ) -> Result<Vec<PathBuf>, String> {
     let map = kaikei_jp::yayoi::load_embedded(kaikei_jp_data::YAYOI_TAX_CATEGORIES)
         .map_err(|error| format!("弥生の税区分の写像を読めませんでした: {error}"))?;
@@ -2229,6 +2282,13 @@ fn write_yayoi(
 
     let conversion = kaikei_report::yayoi::convert(entries, chart, &tax_map);
     let (bytes, had_encoding_errors) = kaikei_report::yayoi::to_shift_jis_csv(&conversion.rows);
+
+    // ★書き出したものを読み直して、帳簿と突き合わせる★
+    //
+    // **税理士が取り込んだ数字が決算書と違えば、そこで気づけない。**
+    // 列のずれ・金額の取り違え・行の脱落は、書き出したものを数えないと
+    // 分からない。
+    warn_if_yayoi_does_not_match_the_book(&conversion.rows, chart, trial_balance);
 
     let mut written = Vec::new();
     let csv_path = out_dir.join("yayoi_journal.csv");
