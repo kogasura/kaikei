@@ -18,6 +18,7 @@
 
 pub mod closing;
 pub mod import_chart;
+pub mod import_counterparties;
 pub mod ledger;
 pub mod post_entry;
 pub mod report;

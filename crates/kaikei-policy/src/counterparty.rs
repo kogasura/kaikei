@@ -59,6 +59,14 @@ impl CounterpartyIndex {
         self.by_code.get(code)
     }
 
+    /// 登録されている取引先を巡回する（`code` の昇順）。
+    ///
+    /// `ChartOfAccounts::iter` と同じく、索引の中身をそのまま出す経路
+    /// （マスタの投入・書き出し）が要る。
+    pub fn iter(&self) -> impl Iterator<Item = &Counterparty> {
+        self.by_code.values()
+    }
+
     /// 登録されている取引先数を返す。
     pub fn len(&self) -> usize {
         self.by_code.len()

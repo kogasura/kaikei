@@ -44,7 +44,7 @@ use kaikei_core::{
     AccountCode, AccountDef, AccountingDate, ChartOfAccounts, Clock, Currency, EntryId,
     EntryNumber, JournalEntry, Money, TagKey, Timestamp,
 };
-use kaikei_policy::CounterpartyIndex;
+use kaikei_policy::{Counterparty, CounterpartyIndex};
 
 /// トランザクションを開始する起点。
 ///
@@ -234,6 +234,43 @@ pub trait ChartWriteRepo: Send {
     ///
     /// 挿入に失敗した場合は [`RepoError`]（親科目が存在しない場合など）。
     async fn insert_accounts(&mut self, defs: &[AccountDef]) -> Result<usize, RepoError>;
+}
+
+/// 取引先マスタへの**追加**（外部からの投入）。
+///
+/// # なぜ [`ChartRepo`] と分けるのか
+///
+/// [`ChartWriteRepo`] と同じ理由である。`ChartRepo::load_counterparties` は
+/// 記帳の経路（消費税区分の検証）が使う読み取り専用のポートで、[`TxOps`] の
+/// 束ねに含まれている。ここに書き込みを足すと、**記帳しかしないユースケースの
+/// `Tx` にも取引先マスタを書き換える能力が付いて回る**。
+///
+/// # 実装の契約（★これを破ると会計上の実害が出る★）
+///
+/// - **既存行を `UPDATE` / `DELETE` してはならない。**
+///   同じ取引先コードが既に存在する場合は**何もしない**
+///   （PostgreSQL 実装は `ON CONFLICT (code) DO NOTHING`）。
+/// - とくに `is_qualified`（適格請求書発行事業者か）を投入経路が黙って
+///   書き換えてはならない。**この列は「ユーザーが確認した」という記録**で
+///   あり、外部システムの値で上書きすると、確認していないものを確認済みに
+///   見せることになる。`None`（未確認）と `Some(false)`（非適格と確認した）
+///   の区別が消えるのは、`JpTaxPolicy` が `Some(false)` のときだけ記帳を
+///   拒む設計（`QualifiedInvoiceUnverified`）を無意味にする。
+/// - `counterparties` は帳簿本体と違い append-only ではなく、DB 権限としては
+///   `UPDATE` が許可されている（`0005_counterparties.sql`）。
+///   **それでもこのポートは追加しか行わない。** 編集はユーザーの明示的な
+///   操作の領分である。
+#[async_trait]
+pub trait CounterpartyWriteRepo: Send {
+    /// まだ存在しない取引先コードの定義を追加する。
+    ///
+    /// 実際に挿入された行数を返す（既存コードと重複した分は数えない）。
+    /// `list` が空なら何もせず `Ok(0)` を返す。
+    ///
+    /// # Errors
+    ///
+    /// 挿入に失敗した場合は [`RepoError`]。
+    async fn insert_counterparties(&mut self, list: &[Counterparty]) -> Result<usize, RepoError>;
 }
 
 /// 会計期間の締め状態（の生データ）の読み込み。

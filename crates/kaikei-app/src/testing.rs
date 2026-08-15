@@ -12,13 +12,14 @@
 
 use crate::error::RepoError;
 use crate::ports::{
-    ChartRepo, ChartWriteRepo, JournalRepo, NumberingRepo, PeriodRepo, Store, TxOps, TxScope,
+    ChartRepo, ChartWriteRepo, CounterpartyWriteRepo, JournalRepo, NumberingRepo, PeriodRepo,
+    Store, TxOps, TxScope,
 };
 use async_trait::async_trait;
 use kaikei_core::{
     AccountDef, AccountingDate, ChartOfAccounts, EntryId, EntryNumber, JournalEntry,
 };
-use kaikei_policy::CounterpartyIndex;
+use kaikei_policy::{Counterparty, CounterpartyIndex};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -109,6 +110,7 @@ impl Store for InMemoryStore {
             shared: Arc::clone(&self.state),
             inserted_entries: Vec::new(),
             inserted_accounts: Vec::new(),
+            inserted_counterparties: Vec::new(),
             issued_numbers: BTreeMap::new(),
         })
     }
@@ -126,6 +128,9 @@ pub struct InMemoryTx {
     /// このトランザクション内で追加した勘定科目
     /// （[`ChartWriteRepo::insert_accounts`]）。commit 時に共有状態へ反映する。
     inserted_accounts: Vec<AccountDef>,
+    /// このトランザクション内で追加した取引先
+    /// （[`CounterpartyWriteRepo::insert_counterparties`]）。
+    inserted_counterparties: Vec<Counterparty>,
     /// 会計年度ラベル → このトランザクション内で払い出した最後の番号。
     issued_numbers: BTreeMap<i32, u32>,
 }
@@ -252,7 +257,37 @@ impl ChartRepo for InMemoryTx {
     }
 
     async fn load_counterparties(&mut self) -> Result<CounterpartyIndex, RepoError> {
-        Ok(self.lock_shared().counterparties.clone())
+        let committed = self.lock_shared().counterparties.clone();
+        if self.inserted_counterparties.is_empty() {
+            return Ok(committed);
+        }
+        // read-your-writes を実 DB と揃える（`load_chart` と同じ）。
+        let mut list: Vec<Counterparty> = committed.iter().cloned().collect();
+        list.extend(self.inserted_counterparties.iter().cloned());
+        Ok(CounterpartyIndex::new(list))
+    }
+}
+
+#[async_trait]
+impl CounterpartyWriteRepo for InMemoryTx {
+    async fn insert_counterparties(&mut self, list: &[Counterparty]) -> Result<usize, RepoError> {
+        // 契約どおり、既にあるコードは**何もしない**（上書きしない）。
+        // PostgreSQL 実装の `ON CONFLICT (code) DO NOTHING` に対応する。
+        let committed = self.lock_shared().counterparties.clone();
+        let mut inserted = 0usize;
+        for candidate in list {
+            let already_committed = committed.get(&candidate.code).is_some();
+            let already_buffered = self
+                .inserted_counterparties
+                .iter()
+                .any(|existing| existing.code == candidate.code);
+            if already_committed || already_buffered {
+                continue;
+            }
+            self.inserted_counterparties.push(candidate.clone());
+            inserted += 1;
+        }
+        Ok(inserted)
     }
 }
 
@@ -324,6 +359,7 @@ impl TxScope for InMemoryTx {
             shared,
             inserted_entries,
             inserted_accounts,
+            inserted_counterparties,
             issued_numbers,
         } = self;
         let mut guard = shared
@@ -338,6 +374,11 @@ impl TxScope for InMemoryTx {
             guard.chart = ChartOfAccounts::new(defs).map_err(|e| RepoError::Corrupt {
                 reason: format!("勘定科目表が整合しません: {e}"),
             })?;
+        }
+        if !inserted_counterparties.is_empty() {
+            let mut list: Vec<Counterparty> = guard.counterparties.iter().cloned().collect();
+            list.extend(inserted_counterparties);
+            guard.counterparties = CounterpartyIndex::new(list);
         }
         for (fiscal_year, next) in issued_numbers {
             guard.next_no.insert(fiscal_year, next);

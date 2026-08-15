@@ -40,6 +40,9 @@ chrono = { workspace = true }
 # kaikei-app は serde に依存しない作りなので、読み取りはこの端が持つ。
 serde = { workspace = true }
 serde_norway = { workspace = true }
+# 取引先マスタの CSV を読む（kaikei counterparty import）。引用符付きの
+# 社名（"株式会社A, B事業部"）が普通にあるので、split(',') では読めない。
+csv = { workspace = true }
 # 証憑IDの採番（attach）。時刻順に並ぶ v7 を使う。
 uuid = { workspace = true }
 tokio = { workspace = true }
