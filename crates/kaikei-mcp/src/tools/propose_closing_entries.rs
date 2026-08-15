@@ -70,6 +70,10 @@ impl McpTool for ProposeClosingEntries {
 帳簿にその年度の仕訳が無い場合も提案は空になるので、\
 どちらであるかは entry_count で判別してください。\
 期間の締め（以後の記帳を拒否する操作）はこのツールでは行いません。\
+事業主貸と事業主借は元入金へ振り替えません。\
+当年度末と翌年期首のどちらで振り替えるか、\
+振替仕訳を起こすか期首残高として設定するかが決まっていないためで、実装漏れではありません。\
+応答の scope_note を読んでください。\
 決算の内容が税務上適切かどうかの判断はこのサーバーでは行いません。";
 
     async fn run(ctx: &ToolContext<'_>, input: Self::Input) -> Result<ToolSuccess, ToolFailure> {
@@ -129,8 +133,22 @@ fn success_body(fiscal_year: i32, output: &ClosingOutput) -> Map<String, Value> 
         "next_step".to_string(),
         json!(next_step(output.proposals.len(), output.entry_count)),
     );
+
+    // ★何を振り替えていないかを必ず言う★（`DECISIONS.md` D-065）
+    //
+    // この提案は収益・費用を元入金へ振り替えるだけで、**事業主貸・事業主借は
+    // そのまま残す**。そうと知らずに記帳すると、翌年度へ持ち越された残高を
+    // 見て「決算が失敗した」と読む。実装漏れではなく、当年度末と翌年期首の
+    // どちらで振り替えるかが決まっていないためである。
+    //
+    // `posted` と同じく**条件によって省かない**——無いことに意味があるのか
+    // 単に忘れたのかが読めなくなる。
+    body.insert("scope_note".to_string(), json!(SCOPE_NOTE));
     body
 }
+
+/// この提案が扱わない範囲（`DECISIONS.md` D-065）。
+const SCOPE_NOTE: &str = "この提案は収益と費用を元入金へ振り替えるだけです。事業主貸と事業主借の残高はそのまま残り、元入金には反映されません。当年度末と翌年期首のどちらで振り替えるか、振替仕訳を起こすか期首残高として設定するかが決まっていないためで、実装漏れではありません。青色申告決算書の貸借対照表には、事業主貸と事業主借がそれぞれの残高のまま載ります。翌年度の元入金をどう置くかは、税理士に確認してから決めてください。";
 
 /// 次の手（`CLAUDE.md` §11）。
 ///
@@ -188,6 +206,57 @@ mod tests {
 
     fn date(year: i32, month: u8, day: u8) -> AccountingDate {
         AccountingDate::new(year, month, day).unwrap()
+    }
+
+    /// **本命。** 何を振り替えていないかを必ず言う。
+    ///
+    /// この提案は収益・費用しか振り替えない。そうと知らずに記帳すると、
+    /// 翌年度へ持ち越された事業主貸・事業主借の残高を見て「決算が失敗した」
+    /// と読む。実装漏れではないことも併せて伝える。
+    #[test]
+    fn the_response_says_what_it_does_not_transfer() {
+        let output = ClosingOutput {
+            period_start: date(2026, 1, 1),
+            period_end: date(2026, 12, 31),
+            entry_count: 10,
+            proposals: vec![proposal()],
+        };
+
+        let body = success_body(2026, &output);
+
+        let note = body["scope_note"].as_str().expect("scope_note があること");
+        assert!(note.contains("事業主貸"), "{note}");
+        assert!(note.contains("事業主借"), "{note}");
+        assert!(note.contains("実装漏れではありません"), "{note}");
+    }
+
+    /// 提案が空でも注記は出る。
+    ///
+    /// **条件によって省かない**——無いことに意味があるのか単に忘れたのかが
+    /// 読めなくなる（`posted` と同じ扱い）。
+    #[test]
+    fn the_scope_note_is_there_even_when_nothing_is_proposed() {
+        let output = ClosingOutput {
+            period_start: date(2026, 1, 1),
+            period_end: date(2026, 12, 31),
+            entry_count: 0,
+            proposals: Vec::new(),
+        };
+
+        let body = success_body(2026, &output);
+
+        assert!(body.contains_key("scope_note"), "{body:?}");
+    }
+
+    /// 説明にも、事業主貸・事業主借を振り替えないことが書いてある。
+    ///
+    /// 応答を読む前に「決算振替＝全部やってくれる」と思われると、
+    /// 記帳してから気づくことになる。
+    #[test]
+    fn the_description_says_the_owner_accounts_are_left_alone() {
+        let description = ProposeClosingEntries::DESCRIPTION;
+        assert!(description.contains("事業主貸"), "{description}");
+        assert!(description.contains("scope_note"), "{description}");
     }
 
     fn proposal() -> ProposedEntry {
