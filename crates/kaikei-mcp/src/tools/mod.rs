@@ -29,6 +29,7 @@ pub mod list_pending_transactions;
 pub mod list_tax_categories;
 pub mod post_journal_entry;
 pub mod propose_closing_entries;
+pub mod propose_depreciation_entries;
 pub mod reverse_journal_entry;
 pub mod search_documents;
 pub mod search_entries;

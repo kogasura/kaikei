@@ -229,6 +229,7 @@ pub fn tool_registry() -> ToolRegistry {
     use crate::tools::list_tax_categories::ListTaxCategories;
     use crate::tools::post_journal_entry::PostJournalEntry;
     use crate::tools::propose_closing_entries::ProposeClosingEntries;
+    use crate::tools::propose_depreciation_entries::ProposeDepreciationEntries;
     use crate::tools::reverse_journal_entry::ReverseJournalEntry;
     use crate::tools::search_documents::SearchDocuments;
     use crate::tools::search_entries::SearchEntries;
@@ -246,6 +247,8 @@ pub fn tool_registry() -> ToolRegistry {
         .with::<GetTrialBalance>()
         .with::<GetStatements>()
         .with::<ProposeClosingEntries>()
+        // 減価償却費の提案（Phase 5。D-109）。台帳の値をそのまま使う。
+        .with::<ProposeDepreciationEntries>()
         .with::<ListTaxCategories>()
         // 証憑（Phase 4）。
         .with::<SearchDocuments>()

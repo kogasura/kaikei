@@ -57,7 +57,7 @@ const FORBIDDEN_TOOLS: [&str; 4] = [
 /// **増やすときは設計書（§2 の表）と `DECISIONS.md` を先に更新すること。**
 /// 下の検査はこの一覧を許可リストとして使うので、ここだけ書き換えれば
 /// 通ってしまう——順序を守るのは人間の側である。
-const ALLOWED_TOOLS: [&str; 17] = [
+const ALLOWED_TOOLS: [&str; 18] = [
     "list_accounts",
     "get_entry",
     "get_trial_balance",
@@ -71,6 +71,8 @@ const ALLOWED_TOOLS: [&str; 17] = [
     "validate_invoice_number",
     "get_statements",
     "propose_closing_entries",
+    // Phase 5（D-109）。固定資産台帳から減価償却費の仕訳を提案する。
+    "propose_depreciation_entries",
     // Phase 4: 証憑検索（docs/07-mcp-server.md §2）。
     "search_documents",
     // Phase 4: 取り込んだ明細の一覧（D-096）。**仕訳ではない**。
