@@ -41,7 +41,7 @@ pub struct StatementsInput {
     /// 集計対象期間の終了日（取引日、両端を含む）。
     pub to: AccountingDate,
 
-    /// 決算振替（`entry_kind: closing`）の仕訳を集計から外すか。
+    /// この日付の決算振替（`entry_kind: closing`）を集計から外す。
     ///
     /// # なぜ外せる必要があるのか
     ///
@@ -55,7 +55,40 @@ pub struct StatementsInput {
     /// 出す経路は常に外すのが正しい。
     ///
     /// 仕訳日記帳・総勘定元帳は外さない（帳簿に実在する仕訳である）。
-    pub exclude_closing: bool,
+    ///
+    /// # なぜ日付で絞るのか（全部外さないのか）
+    ///
+    /// 外すべきなのは**その年度の**決算振替だけである。全部外すと:
+    ///
+    /// - **前年度の決算振替**（前年12/31の所得→元入金）まで外れ、元入金が
+    ///   過少になり、前年度の収益・費用が当年度の貸借対照表に漏れる
+    /// - 期首振替（`entry_kind: opening`）は別種別なので元から外れない
+    ///
+    /// 実際、最初は真偽値で全部外していた。実帳簿の複製で2027年の決算書を
+    /// 出したところ、期首振替を記帳済みなのに**事業主貸 10,013,438 が
+    /// 貸借対照表に残った**。
+    ///
+    /// `None` なら何も外さない。
+    pub exclude_closing_on: Option<AccountingDate>,
+
+    /// この日付の仕訳は、期首振替（`entry_kind: opening`）だけを入れる。
+    ///
+    /// # 何のためか
+    ///
+    /// 決算書の**期首の列**を作るための指定である。期首の姿とは
+    /// 「期首振替を済ませた後、その年の商売が始まる前」であって、
+    /// 期首振替（1月1日）はそこに**含まれる**。
+    ///
+    /// 前日（前年12/31）までで切ると期首振替が入らず、事業主貸・事業主借が
+    /// 期首に残ったままになり、元入金も前年のままになる。実際に実帳簿の
+    /// 複製で2027年の決算書を出したところ、**期首の貸借が合わなかった**
+    /// （資産 10,121,943 に対し負債・資本 1,120,939）。
+    ///
+    /// 同じ日の普通の取引（1月1日の売上など）は入れない。それは期首の姿では
+    /// なく、その年の商売である。
+    ///
+    /// `None` なら何もしない。
+    pub only_opening_on: Option<AccountingDate>,
 }
 
 /// [`execute`] の出力。
@@ -120,8 +153,11 @@ where
 
     let chart = tx.load_chart().await?;
     let mut entries = tx.list_entries_in_period(input.from, input.to).await?;
-    if input.exclude_closing {
-        entries.retain(|entry| !is_closing_entry(entry));
+    if let Some(on) = input.exclude_closing_on {
+        entries.retain(|entry| !(entry.entry_date() == on && is_closing_entry(entry)));
+    }
+    if let Some(on) = input.only_opening_on {
+        entries.retain(|entry| entry.entry_date() != on || is_opening_entry(entry));
     }
 
     let entry_count = entries.len();
@@ -142,20 +178,33 @@ where
     })
 }
 
-/// 決算振替の仕訳か。
+/// 当年度末の決算振替（`entry_kind: closing`）の仕訳か。
 ///
 /// **1明細でも印が付いていれば決算振替とみなす。** 決算振替は1本の仕訳に
 /// 収益・費用のゼロ化と所得の振替をまとめており、一部だけを外すと貸借が
 /// 合わなくなる。印の付いていない明細が混ざるくらいなら、仕訳ごと外す方が
 /// 安全側に倒れる。
+///
+/// **期首振替（`entry_kind: opening`）はここに含めない。** 役割が逆で、
+/// あちらは外してはいけない（外すと事業主貸・事業主借が翌年度の貸借対照表に
+/// 残り続ける）。
 fn is_closing_entry(entry: &kaikei_core::JournalEntry) -> bool {
+    entry_kind_is(entry, "closing")
+}
+
+/// 期首振替（`entry_kind: opening`）の仕訳か。
+fn is_opening_entry(entry: &kaikei_core::JournalEntry) -> bool {
+    entry_kind_is(entry, "opening")
+}
+
+fn entry_kind_is(entry: &kaikei_core::JournalEntry, kind: &str) -> bool {
     let Ok(key) = kaikei_core::TagKey::parse("entry_kind") else {
         return false;
     };
     entry.lines().iter().any(|line| {
         matches!(
             line.tags().get(&key),
-            Some(kaikei_core::TagValue::Code(kind)) if kind == "closing"
+            Some(kaikei_core::TagValue::Code(found)) if found == kind
         )
     })
 }
@@ -277,7 +326,8 @@ mod tests {
                     StatementsInput {
                         from,
                         to,
-                        exclude_closing: false,
+                        exclude_closing_on: None,
+                        only_opening_on: None,
                     },
                 )
                 .await
@@ -352,7 +402,8 @@ mod tests {
                     StatementsInput {
                         from,
                         to,
-                        exclude_closing: true,
+                        exclude_closing_on: Some(date(2026, 12, 31)),
+                        only_opening_on: None,
                     },
                 )
                 .await
@@ -414,6 +465,185 @@ mod tests {
         assert_eq!(output.entry_count, 2, "通常の仕訳2本は数に入ること");
     }
 
+    /// `entry_kind: opening` を付けた明細。
+    fn opening_line(account: &str, side: Side, amount: i128) -> JournalLine {
+        let mut tags = TagSet::new();
+        tags.insert(
+            kaikei_core::TagKey::parse("entry_kind").unwrap(),
+            kaikei_core::TagValue::Code("opening".to_string()),
+        );
+        JournalLine::new(
+            AccountCode::parse(account).unwrap(),
+            side,
+            Money::from_minor(amount, Currency::JPY),
+            tags,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// 期首残高を**前年末日付**で入れた帳簿。
+    ///
+    /// 実帳簿（weBanana.SP）もこの形である（「前期末日付で計上」）。
+    /// 期首残高を 1/1 に置くと、期首の列から外れる——1月1日に立っている
+    /// のが期首の姿なのか初日の商売なのかを、日付だけでは区別できないため。
+    /// 区別できるのは期首振替（`entry_kind: opening`）だけである。
+    async fn store_with_prior_year_opening_balance() -> InMemoryStore {
+        let store = InMemoryStore::with_chart(sample_chart_with_tax_account());
+        with_tx(&store, |tx| {
+            Box::pin(async move {
+                tx.insert_entry(&entry(
+                    1,
+                    1,
+                    date(2025, 12, 31),
+                    "期首残高",
+                    vec![
+                        line("100", Side::Debit, 10_000),
+                        line("330", Side::Credit, 10_000),
+                    ],
+                ))
+                .await?;
+                tx.insert_entry(&entry(
+                    2,
+                    2,
+                    date(2026, 6, 1),
+                    "売上",
+                    vec![
+                        line("100", Side::Debit, 1_000),
+                        line("500", Side::Credit, 1_000),
+                    ],
+                ))
+                .await?;
+                Ok::<(), AppError>(())
+            })
+        })
+        .await
+        .unwrap();
+        store
+    }
+
+    async fn run_opening_column(store: &InMemoryStore, from: AccountingDate) -> StatementsOutput {
+        with_tx_err(store, |tx| {
+            Box::pin(async move {
+                execute(
+                    tx,
+                    &ByAccountTypeStatement,
+                    &TagSchema::empty(),
+                    StatementsInput {
+                        from: date(2020, 1, 1),
+                        to: from,
+                        exclude_closing_on: None,
+                        only_opening_on: Some(from),
+                    },
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    // **本命。** 期首の列には期首振替（1/1）が入る。
+    //
+    // 入らないと事業主貸・事業主借が期首に残り、期首の貸借が合わなくなる。
+    // 実帳簿の複製で、資産 10,121,943 に対し負債・資本 1,120,939 になった。
+    #[tokio::test]
+    async fn the_opening_column_includes_the_opening_transfer() {
+        let store = store_with_prior_year_opening_balance().await;
+        with_tx(&store, |tx| {
+            Box::pin(async move {
+                // 1/1 の期首振替: 現金 500 / 借入金 500
+                tx.insert_entry(&entry(
+                    3,
+                    3,
+                    date(2026, 1, 1),
+                    "期首振替",
+                    vec![
+                        opening_line("100", Side::Debit, 500),
+                        opening_line("330", Side::Credit, 500),
+                    ],
+                ))
+                .await?;
+                Ok::<(), AppError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let output = run_opening_column(&store, date(2026, 1, 1)).await;
+
+        // 期首残高 10,000 + 期首振替 500 = 10,500。6/1 の売上は入らない。
+        assert_eq!(section_subtotal(&output.balance_sheet, "資産"), 10_500);
+    }
+
+    // **本命。** 同じ 1/1 でも、普通の取引は期首の列に入らない。
+    //
+    // 入れてしまうと、その年の商売が期首残高に混ざる。
+    #[tokio::test]
+    async fn an_ordinary_entry_on_the_same_day_is_not_in_the_opening_column() {
+        let store = store_with_prior_year_opening_balance().await;
+        with_tx(&store, |tx| {
+            Box::pin(async move {
+                tx.insert_entry(&entry(
+                    4,
+                    4,
+                    date(2026, 1, 1),
+                    "元日の売上",
+                    vec![
+                        line("100", Side::Debit, 777),
+                        line("500", Side::Credit, 777),
+                    ],
+                ))
+                .await?;
+                Ok::<(), AppError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let output = run_opening_column(&store, date(2026, 1, 1)).await;
+
+        assert_eq!(
+            section_subtotal(&output.balance_sheet, "資産"),
+            10_000,
+            "1/1 の普通の取引は期首に入らないこと"
+        );
+    }
+
+    // **本命。** 前年度の決算振替は当年度の集計から外さない。
+    //
+    // 外すと元入金が過少になり、前年度の収益・費用が当年度の貸借対照表に漏れる。
+    #[tokio::test]
+    async fn a_prior_year_closing_entry_is_not_excluded() {
+        let store = store_with_opening_and_period_entries().await;
+        post_closing_entry(&store).await; // 2026-12-31 の決算振替
+
+        // 2027年度として集計する（外すのは 2027-12-31 の決算振替だけ）。
+        let output = with_tx_err(&store, |tx| {
+            Box::pin(async move {
+                execute(
+                    tx,
+                    &ByAccountTypeStatement,
+                    &TagSchema::empty(),
+                    StatementsInput {
+                        from: date(2020, 1, 1),
+                        to: date(2027, 12, 31),
+                        exclude_closing_on: Some(date(2027, 12, 31)),
+                        only_opening_on: None,
+                    },
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output.entry_count, 3,
+            "2026-12-31 の決算振替も数に入ること（外すのは 2027-12-31 のものだけ）"
+        );
+    }
+
     // ST-1: 期間の逆指定は「0件の空の決算書」にせず拒否する。
     #[tokio::test]
     async fn a_reversed_period_is_rejected_not_silently_empty() {
@@ -428,7 +658,8 @@ mod tests {
                     StatementsInput {
                         from: date(2026, 12, 31),
                         to: date(2026, 1, 1),
-                        exclude_closing: false,
+                        exclude_closing_on: None,
+                        only_opening_on: None,
                     },
                 )
                 .await

@@ -53,6 +53,14 @@ pub struct ClosingOutput {
     /// 既に決算振替が済んでいる）。モジュール doc「二重の決算振替は自然に
     /// 防がれる」を参照。
     pub proposals: Vec<ProposedEntry>,
+    /// 翌年期首に計上する振替仕訳の提案。**記帳はされていない。**
+    ///
+    /// 事業主貸・事業主借をゼロにし、差額を元入金へ振り替える
+    /// （`docs/04-jp-tax.md` §9 手順4）。日付は**翌年の1月1日**である
+    /// （`DECISIONS.md` D-102）。
+    ///
+    /// 空の場合、事業主貸・事業主借がどちらも0（振り替えるものが無い）。
+    pub opening_proposals: Vec<ProposedEntry>,
     /// 集計に使った仕訳の件数。
     ///
     /// 提案が空だったとき、「帳簿が空」なのか「既に決算済み」なのかを
@@ -95,9 +103,13 @@ where
 
     let trial_balance = TrialBalance::from_entries(entries.iter(), &chart, tag_schema, &[])?;
     let proposals = policy.closing_entries(&trial_balance, &fiscal_year)?;
+    // **同じ試算表から両方を作る。** 期首振替は当年度末の事業主貸・事業主借の
+    // 残高で決まるので、決算振替と同じ集計を使う。
+    let opening_proposals = policy.opening_entries(&trial_balance, &fiscal_year)?;
 
     Ok(ClosingOutput {
         proposals,
+        opening_proposals,
         entry_count,
         period_start,
         period_end,
