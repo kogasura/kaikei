@@ -2450,58 +2450,167 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
     let year = FiscalYear::calendar_year(fiscal_year);
     let (from, to) = (year.start(), year.end());
 
-    let (chart, income_statement, balance_sheet, entries) = with_tx_err(store, move |tx| {
-        let schema = schema.clone();
-        Box::pin(async move {
-            let chart = tx.load_chart().await?;
-            let policy = JpStatementPolicy::new(chart.clone());
-            // 損益計算書は会計年度の期間、貸借対照表は帳簿の最初からの累計
-            // （`write_reports` と同じ非対称。会計の性質であって都合ではない）。
-            let statements = statements::execute(
-                tx,
-                &policy,
-                &schema,
-                StatementsInput {
-                    from,
-                    to,
-                    // **決算書は決算振替を外して出す。** 外さないと、
-                    // 決算振替を記帳した瞬間に売上0・所得0になる。
-                    exclude_closing_on: Some(year.end()),
-                    only_opening_on: None,
-                },
-            )
-            .await?;
-            let cumulative = statements::execute(
-                tx,
-                &policy,
-                &schema,
-                StatementsInput {
-                    from: book_beginning(),
-                    to,
-                    exclude_closing_on: Some(year.end()),
-                    only_opening_on: None,
-                },
-            )
-            .await?;
-            // **仕訳そのものも読む。** 税区分と取引先はタグなので、
-            // 財務諸表からは見えない。
-            let entries = tx.list_entries_in_period(from, to).await?;
-            Ok::<_, kaikei_app::error::AppError>((
-                chart,
-                statements.income_statement,
-                cumulative.balance_sheet,
-                entries,
-            ))
+    let (chart, income_statement, balance_sheet, entries, fixed_assets) =
+        with_tx_err(store, move |tx| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                let chart = tx.load_chart().await?;
+                let policy = JpStatementPolicy::new(chart.clone());
+                // 損益計算書は会計年度の期間、貸借対照表は帳簿の最初からの累計
+                // （`write_reports` と同じ非対称。会計の性質であって都合ではない）。
+                let statements = statements::execute(
+                    tx,
+                    &policy,
+                    &schema,
+                    StatementsInput {
+                        from,
+                        to,
+                        // **決算書は決算振替を外して出す。** 外さないと、
+                        // 決算振替を記帳した瞬間に売上0・所得0になる。
+                        exclude_closing_on: Some(year.end()),
+                        only_opening_on: None,
+                    },
+                )
+                .await?;
+                let cumulative = statements::execute(
+                    tx,
+                    &policy,
+                    &schema,
+                    StatementsInput {
+                        from: book_beginning(),
+                        to,
+                        exclude_closing_on: Some(year.end()),
+                        only_opening_on: None,
+                    },
+                )
+                .await?;
+                // **仕訳そのものも読む。** 税区分と取引先はタグなので、
+                // 財務諸表からは見えない。
+                let entries = tx.list_entries_in_period(from, to).await?;
+                // 固定資産台帳。**verify でも見る**——report を出したときにしか
+                // 気づけないと、年末まで食い違いが放置される。
+                let fixed_assets = tx.list_fixed_assets().await?;
+                Ok::<_, kaikei_app::error::AppError>((
+                    chart,
+                    statements.income_statement,
+                    cumulative.balance_sheet,
+                    entries,
+                    fixed_assets,
+                ))
+            })
         })
-    })
-    .await
-    .map_err(|error: kaikei_app::error::AppError| {
-        format!("財務諸表を組み立てられませんでした: {error}")
-    })?;
+        .await
+        .map_err(|error: kaikei_app::error::AppError| {
+            format!("財務諸表を組み立てられませんでした: {error}")
+        })?;
 
     warn_if_depreciation_is_missing(&income_statement, &balance_sheet)?;
     warn_if_a_balance_sits_on_the_wrong_side(&balance_sheet, &chart)?;
     warn_if_qualified_invoice_lacks_a_counterparty(&entries)?;
+    warn_if_the_fixed_asset_ledger_does_not_match_the_book(
+        &fixed_assets,
+        fiscal_year,
+        &balance_sheet,
+    )?;
+    Ok(())
+}
+
+/// 固定資産台帳の期末簿価と、帳簿の残高が科目ごとに合っているか。
+///
+/// **表示から切り離してある**（`accounts_on_the_wrong_side` と同じ理由。
+/// 何を拾うかをテストで固定できないと、呼び出しごと消えても気づけない）。
+///
+/// 返すのは `(科目コード, 台帳の期末簿価, 帳簿の残高)` の一覧。
+fn fixed_asset_accounts_that_do_not_match(
+    ledger: &[(kaikei_core::AccountCode, i128)],
+    balance_sheet: &kaikei_app::policy::Statement,
+) -> Vec<(String, i128, i128)> {
+    let mut mismatches = Vec::new();
+    for (account, book_value) in ledger {
+        let in_book = balance_sheet
+            .sections
+            .iter()
+            .flat_map(|section| section.lines.iter())
+            .find(|line| &line.account == account)
+            .map(|line| line.amount.minor())
+            .unwrap_or(0);
+        if *book_value != in_book {
+            mismatches.push((account.as_str().to_string(), *book_value, in_book));
+        }
+    }
+    mismatches
+}
+
+/// 台帳の期末簿価を科目ごとにまとめる。
+///
+/// 除却した年より後の資産は数えない。
+fn fixed_asset_book_values(
+    assets: &[kaikei_app::ports::FixedAssetRow],
+    fiscal_year: i32,
+) -> Result<Vec<(kaikei_core::AccountCode, i128)>, String> {
+    use std::collections::BTreeMap;
+
+    let mut by_account: BTreeMap<kaikei_core::AccountCode, i128> = BTreeMap::new();
+    for asset in assets {
+        if let Some(disposed) = asset.disposed_on {
+            if disposed.year() < fiscal_year {
+                continue;
+            }
+        }
+        let input = to_fixed_asset(asset)?;
+        let schedule = kaikei_jp::depreciation::schedule(&input)
+            .map_err(|error| format!("{}: 償却額を計算できませんでした: {error}", asset.name))?;
+        // その年度末の簿価。償却が終わっていれば最後の年の簿価、
+        // 取得前なら取得価額（まだ償却していない）。
+        let book_value = match schedule.year(fiscal_year) {
+            Some(year) => year.book_value.minor(),
+            None => {
+                if asset.acquired_on.year() > fiscal_year {
+                    // まだ取得していない。帳簿にも載っていないはず。
+                    continue;
+                }
+                // 償却し終わっている。最後の年の簿価が続く。
+                schedule
+                    .years
+                    .last()
+                    .map(|y| y.book_value.minor())
+                    .unwrap_or(asset.acquisition_cost.minor())
+            }
+        };
+        *by_account.entry(asset.account.clone()).or_insert(0) += book_value;
+    }
+    Ok(by_account.into_iter().collect())
+}
+
+/// 上の食い違いを知らせる。
+fn warn_if_the_fixed_asset_ledger_does_not_match_the_book(
+    assets: &[kaikei_app::ports::FixedAssetRow],
+    fiscal_year: i32,
+    balance_sheet: &kaikei_app::policy::Statement,
+) -> Result<(), String> {
+    if assets.is_empty() {
+        return Ok(());
+    }
+    let ledger = fixed_asset_book_values(assets, fiscal_year)?;
+    let mismatches = fixed_asset_accounts_that_do_not_match(&ledger, balance_sheet);
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "注意: 固定資産台帳の期末簿価と帳簿の残高が違う科目が {} 件あります:",
+        mismatches.len()
+    );
+    for (account, book_value, in_book) in &mismatches {
+        eprintln!(
+            "  {account}  台帳 {book_value} 円 / 帳簿 {in_book} 円（差 {}）",
+            in_book - book_value
+        );
+    }
+    eprintln!(
+        "  償却の記帳漏れ、記帳先の科目の取り違え、台帳の入力誤りのいずれかを疑ってください。"
+    );
+    eprintln!("  貸借は一致したままなので、決算書を見ても分かりません。");
     Ok(())
 }
 
@@ -3030,6 +3139,14 @@ async fn write_reports(
         &period_label,
         &statements.income_statement,
     )?);
+
+    // 台帳の期末簿価と帳簿の残高。**verify と同じ指摘を report でも出す**
+    // （どちらか一方でしか出ないと、見ている方によって気づけない）。
+    warn_if_the_fixed_asset_ledger_does_not_match_the_book(
+        &fixed_assets,
+        fiscal_year_label,
+        &cumulative.balance_sheet,
+    )?;
 
     // 全件 JSON。**この出力はこのソフトが消えてもデータが残るためのもの**
     // なので、既定で必ず出す（docs/03-database.md §8）。
@@ -3943,6 +4060,135 @@ abc,
         assert!(error.contains("add を指定"), "{error}");
         let error = parse_args(&["fixedasset".to_string(), "remove".to_string()]).unwrap_err();
         assert!(error.contains("add だけ"), "{error}");
+    }
+
+    // ---- 固定資産台帳と帳簿の突き合わせ ----
+
+    fn fa(
+        account: &str,
+        acquired: (i32, u8, u8),
+        cost: i128,
+        method: i16,
+        life: Option<i16>,
+    ) -> kaikei_app::ports::FixedAssetRow {
+        kaikei_app::ports::FixedAssetRow {
+            id: format!("{account}-{}", acquired.0),
+            name: format!("資産{account}"),
+            account: kaikei_core::AccountCode::parse(account).unwrap(),
+            acquired_on: AccountingDate::new(acquired.0, acquired.1, acquired.2).unwrap(),
+            acquisition_cost: kaikei_core::Money::from_minor(cost, kaikei_core::Currency::JPY),
+            method,
+            useful_life_years: life,
+            business_ratio: None,
+            disposed_on: None,
+            note: None,
+        }
+    }
+
+    fn balance_sheet_with(lines: &[(&str, i128)]) -> kaikei_app::policy::Statement {
+        kaikei_app::policy::Statement {
+            title: "貸借対照表".to_string(),
+            sections: vec![kaikei_app::policy::StatementSection {
+                title: "資産".to_string(),
+                lines: lines
+                    .iter()
+                    .map(|(code, amount)| kaikei_app::policy::StatementLine {
+                        account: kaikei_core::AccountCode::parse(code).unwrap(),
+                        label: (*code).to_string(),
+                        amount: kaikei_core::Money::from_minor(*amount, kaikei_core::Currency::JPY),
+                    })
+                    .collect(),
+                subtotal: kaikei_core::Money::from_minor(0, kaikei_core::Currency::JPY),
+            }],
+            total: kaikei_core::Money::from_minor(0, kaikei_core::Currency::JPY),
+        }
+    }
+
+    // **本命。** 償却済みの資産が帳簿に取得価額のまま残っていれば拾う。
+    //
+    // 実帳簿がこれ。2022年取得の pc（一括償却）は2024年で償却し終えている
+    // のに、償却の相手科目を取り違えていたため機械装置が 118,800 のまま残った。
+    #[test]
+    fn a_fully_depreciated_asset_still_on_the_books_is_caught() {
+        let assets = [fa("205", (2022, 8, 5), 118_800, 2, None)];
+        let ledger = fixed_asset_book_values(&assets, 2026).unwrap();
+        assert_eq!(
+            ledger,
+            vec![(kaikei_core::AccountCode::parse("205").unwrap(), 0)]
+        );
+
+        let found = fixed_asset_accounts_that_do_not_match(
+            &ledger,
+            &balance_sheet_with(&[("205", 118_800)]),
+        );
+        assert_eq!(found, vec![("205".to_string(), 0, 118_800)]);
+    }
+
+    // **本命。** 償却の記帳漏れを拾う。
+    #[test]
+    fn an_unposted_depreciation_is_caught() {
+        // 2025年取得・定額法2年。2026年末の簿価は 9,000。
+        let assets = [fa("220", (2025, 3, 10), 108_000, 1, Some(2))];
+        let ledger = fixed_asset_book_values(&assets, 2026).unwrap();
+        assert_eq!(ledger[0].1, 9_000);
+
+        // 帳簿は取得価額のまま（1円も償却していない）。
+        let found = fixed_asset_accounts_that_do_not_match(
+            &ledger,
+            &balance_sheet_with(&[("220", 108_000)]),
+        );
+        assert_eq!(found, vec![("220".to_string(), 9_000, 108_000)]);
+    }
+
+    // 合っていれば何も出ない。
+    #[test]
+    fn a_matching_ledger_reports_nothing() {
+        let assets = [fa("220", (2025, 3, 10), 108_000, 1, Some(2))];
+        let ledger = fixed_asset_book_values(&assets, 2026).unwrap();
+        assert!(fixed_asset_accounts_that_do_not_match(
+            &ledger,
+            &balance_sheet_with(&[("220", 9_000)])
+        )
+        .is_empty());
+    }
+
+    // 同じ科目の資産は合算する。
+    #[test]
+    fn assets_on_the_same_account_are_summed() {
+        let assets = [
+            fa("210", (2025, 1, 1), 100_000, 1, Some(2)),
+            fa("210", (2025, 1, 1), 40_000, 1, Some(2)),
+        ];
+        let ledger = fixed_asset_book_values(&assets, 2025).unwrap();
+        assert_eq!(ledger.len(), 1);
+        // 100,000 × 0.5 = 50,000 残 50,000 ／ 40,000 × 0.5 = 20,000 残 20,000
+        assert_eq!(ledger[0].1, 70_000);
+    }
+
+    // **本命。** まだ取得していない資産は数えない。
+    //
+    // 数えると、来年買う予定のものが今年の帳簿と食い違って見える。
+    #[test]
+    fn an_asset_acquired_later_is_not_counted() {
+        let assets = [fa("210", (2027, 1, 1), 100_000, 1, Some(2))];
+        assert!(fixed_asset_book_values(&assets, 2026).unwrap().is_empty());
+    }
+
+    // 除却した年より後は数えない。
+    #[test]
+    fn a_disposed_asset_is_not_counted() {
+        let mut asset = fa("210", (2025, 1, 1), 100_000, 1, Some(2));
+        asset.disposed_on = Some(AccountingDate::new(2025, 12, 31).unwrap());
+        assert!(fixed_asset_book_values(&[asset], 2026).unwrap().is_empty());
+    }
+
+    // 帳簿に科目が現れない場合は残高0として比べる。
+    #[test]
+    fn an_account_missing_from_the_book_counts_as_zero() {
+        let assets = [fa("210", (2025, 1, 1), 100_000, 1, Some(2))];
+        let ledger = fixed_asset_book_values(&assets, 2025).unwrap();
+        let found = fixed_asset_accounts_that_do_not_match(&ledger, &balance_sheet_with(&[]));
+        assert_eq!(found, vec![("210".to_string(), 50_000, 0)]);
     }
 
     fn embedded_tax_rule_sets() -> kaikei_jp::tax::TaxRuleSets {
