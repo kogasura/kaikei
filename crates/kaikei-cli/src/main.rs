@@ -724,6 +724,64 @@ fn warn_if_the_year_looks_closed(
     eprintln!("  決算書は決算振替を記帳する前に作ってください。");
 }
 
+/// 前年の事業主貸・事業主借が期首に残っていれば知らせる。
+///
+/// # なぜ要るのか
+///
+/// 個人事業主では、事業主貸・事業主借は**翌期首に元入金へ振り替えて0に戻す**
+/// （`docs/04-jp-tax.md` §9）。振り替えないと、翌年度の帳簿が前年の残高を
+/// 抱えたまま始まり、**年を追うごとに膨らむ**。
+///
+/// 帳簿の複製で2027年度を開く稽古をしたところ、事業主貸 10,013,438 円・
+/// 事業主借 1,012,434 円が持ち越されたまま2027年が始まった。貸借は一致して
+/// いるので、決算書を見ても気づけない。
+///
+/// # 振替仕訳は作らない
+///
+/// 当年度末と翌年期首のどちらで振り替えるか、振替仕訳を起こすか期首残高と
+/// して設定するかが決まっていない（`DECISIONS.md` D-065）。**判断を先取り
+/// しない代わりに、持ち越されていることを知らせる。**
+fn warn_if_owner_accounts_carried_over(
+    opening_balance_sheet: &kaikei_app::policy::Statement,
+    fiscal_year: i32,
+) -> Result<(), String> {
+    let owner = kaikei_jp::chart::load_owner_accounts(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+        .map_err(|error| format!("科目表の owner_accounts を読めませんでした: {error}"))?;
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+
+    let drawings = amount_of(opening_balance_sheet, &owner.drawings);
+    let contributions = amount_of(opening_balance_sheet, &owner.contributions);
+    if drawings.is_zero() && contributions.is_zero() {
+        return Ok(());
+    }
+
+    eprintln!("注意: 前年の事業主貸・事業主借が {fiscal_year} 年の期首に残っています:");
+    // **残高の大きさで出す。** 事業主貸・事業主借は純資産に分類されるので、
+    // 財務諸表では貸方を正とした符号が付く。事業主貸は借方に立つのが自然
+    // なので負の数として出てしまい、「マイナスの事業主貸」と読めてしまう。
+    // 決算書の貸借対照表と同じ見え方（大きさ）に揃える。
+    if !drawings.is_zero() {
+        eprintln!(
+            "  {} 事業主貸 {}",
+            owner.drawings.as_str(),
+            group_digits(i64::try_from(drawings.minor().abs()).unwrap_or(i64::MAX))
+        );
+    }
+    if !contributions.is_zero() {
+        eprintln!(
+            "  {} 事業主借 {}",
+            owner.contributions.as_str(),
+            group_digits(i64::try_from(contributions.minor().abs()).unwrap_or(i64::MAX))
+        );
+    }
+    eprintln!("  これらは翌期首に元入金へ振り替えて0に戻すものです。");
+    eprintln!("  振り替えないと、年を追うごとに残高が膨らみます。");
+    eprintln!("  振替の時期と方式は税理士に確認してから決めてください（このソフトは振替仕訳を作りません）。");
+    Ok(())
+}
+
 /// 収益も費用も残っていない年度か（＝決算振替済みに見えるか）。
 ///
 /// **表示から切り離してある。** 何を拾うかをテストで固定できないと、
@@ -2129,6 +2187,10 @@ async fn write_reports(
     // **決算振替を記帳した後では決算書が作れない。** 収益・費用がゼロ化
     // されているので、所得が 0 の決算書ができる。
     warn_if_the_year_looks_closed(&statements.income_statement, entries.len());
+
+    // **前年の事業主貸・事業主借が持ち越されていないか。** 翌期首に元入金へ
+    // 振り替えないと、年を追うごとに膨らむ。
+    warn_if_owner_accounts_carried_over(&opening_balance_sheet.balance_sheet, fiscal_year_label)?;
 
     written.extend(write_blue_return_balance_sheet(
         &out_dir,
