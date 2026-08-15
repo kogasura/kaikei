@@ -23,6 +23,7 @@
 //! | `P0001` | raise_exception（ERRCODE を指定しない汎用の `RAISE EXCEPTION`。どのトリガかを断定できない） | [`RepoError::Backend`]（理由は下記） |
 //! | `23505` | unique_violation | [`RepoError::Conflict`] |
 //! | `22003` | numeric_value_out_of_range（`SUM(...)::BIGINT` の桁あふれ等。`DECISIONS.md` D-033） | [`RepoError::OutOfRange`] |
+//! | `42P01` | undefined_table（**マイグレーション未適用**） | [`RepoError::SchemaOutOfDate`] |
 //! | `23502` / `23514` | not_null_violation / check_violation | [`RepoError::Corrupt`]（理由は下記） |
 //! | その他 | 未分類 | [`RepoError::Backend`] |
 //!
@@ -124,6 +125,19 @@ pub fn map_sqlstate(code: &str, message: &str) -> RepoError {
             reason: format!(
                 "データベース側で数値が表現可能な範囲を超えました\
                  （SQLSTATE 22003: numeric_value_out_of_range）: {message}"
+            ),
+        },
+        // **スキーマが古い。** コードを更新したのに帳簿へマイグレーションを
+        // 当てていないと、新しいテーブルを読む経路がここに落ちる。
+        // 生のメッセージ（relation "..." does not exist）だけでは、
+        // **何をすればよいかが分からない**。実際に踏んだ（fixed_assets を
+        // 追加した回に本番の帳簿へ当て忘れ、kaikei verify が失敗した）。
+        "42P01" => RepoError::SchemaOutOfDate {
+            reason: format!(
+                "帳簿のスキーマが古いようです（SQLSTATE 42P01: undefined_table）: {message}。\
+                 コードが要求するテーブルが帳簿にありません。\
+                 マイグレーションを当ててください（MIGRATOR_DATABASE_URL を対象の帳簿へ向けて \
+                 cargo run -p kaikei-store --bin kaikei-migrate）"
             ),
         },
         "23502" | "23514" => RepoError::Corrupt {
@@ -250,5 +264,37 @@ mod tests {
             }
             other => panic!("RepoError::Conflict を期待しましたが {other:?} でした"),
         }
+    }
+
+    /// **本命。** マイグレーション未適用を `Backend` に混ぜない。
+    ///
+    /// `Backend` は「こちらではどうにもならない」種類の失敗だが、これは
+    /// **やることが決まっている**。同じ扱いにすると、
+    /// `relation "..." does not exist` という生のメッセージだけを見て
+    /// 原因を探すことになる（実際に踏んだ）。
+    #[test]
+    fn an_undefined_table_is_reported_as_a_stale_schema() {
+        match map_sqlstate("42P01", r#"relation "fixed_assets" does not exist"#) {
+            RepoError::SchemaOutOfDate { reason } => {
+                assert!(
+                    reason.contains("kaikei-migrate"),
+                    "何をすればよいかを言うこと: {reason}"
+                );
+                assert!(
+                    reason.contains("fixed_assets"),
+                    "どのテーブルが無いかを残すこと（診断用）: {reason}"
+                );
+            }
+            other => panic!("RepoError::SchemaOutOfDate を期待しましたが {other:?} でした"),
+        }
+    }
+
+    /// 知らない SQLSTATE は従来どおり `Backend`。
+    #[test]
+    fn an_unmapped_sqlstate_is_still_backend() {
+        assert!(matches!(
+            map_sqlstate("08006", "connection failure"),
+            RepoError::Backend { .. }
+        ));
     }
 }

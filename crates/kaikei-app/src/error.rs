@@ -141,6 +141,8 @@ pub mod codes {
     pub const OUT_OF_RANGE: &str = "out_of_range";
     /// `RepoError::Unsupported`（永続化層が未対応の操作）。
     pub const REPO_UNSUPPORTED: &str = "repo_unsupported";
+    /// `RepoError::SchemaOutOfDate`（マイグレーション未適用）。
+    pub const SCHEMA_OUT_OF_DATE: &str = "schema_out_of_date";
     /// `RepoError::Backend`（接続断等、上記に分類できない永続化層の失敗）。
     pub const BACKEND: &str = "backend";
 
@@ -288,6 +290,19 @@ pub enum RepoError {
         reason: String,
     },
 
+    /// 帳簿のスキーマがコードより古い（マイグレーション未適用）。
+    ///
+    /// **`Backend` と分ける。** `Backend` は「こちらではどうにもならない」
+    /// 種類の失敗だが、これは**やることが決まっている**（マイグレーションを
+    /// 当てる）。同じ扱いにすると、生のメッセージだけを見て原因を探すことに
+    /// なる。実際に踏んだ（`fixed_assets` を追加した回に本番の帳簿へ当て忘れ、
+    /// `kaikei verify` が `relation "fixed_assets" does not exist` で失敗した）。
+    #[error("帳簿のスキーマが古い可能性があります: {reason}")]
+    SchemaOutOfDate {
+        /// 何が足りないか、どう直すか。
+        reason: String,
+    },
+
     /// 保存されているデータが不正（永続化層からの復元処理の直前に行う
     /// 再検証で検出）。panic させず、この形で呼び出し側に返す。
     #[error("保存データが不正です: {reason}")]
@@ -333,6 +348,7 @@ impl RepoError {
             RepoError::AppendOnlyViolation { .. } => codes::APPEND_ONLY_VIOLATION,
             RepoError::Conflict { .. } => codes::CONFLICT,
             RepoError::Corrupt { .. } => codes::CORRUPT,
+            RepoError::SchemaOutOfDate { .. } => codes::SCHEMA_OUT_OF_DATE,
             RepoError::OutOfRange { .. } => codes::OUT_OF_RANGE,
             RepoError::Unsupported { .. } => codes::REPO_UNSUPPORTED,
             RepoError::Backend { .. } => codes::BACKEND,
@@ -352,7 +368,7 @@ impl RepoError {
     /// |---|---|
     /// | `NotFound` | `Display` をそのまま（`reason` は app 層が組み立てる。仕訳IDの UUID 正準表記を含む） |
     /// | `Unsupported` | `Display` をそのまま（未実装の説明であり DB 由来ではない） |
-    /// | `AppendOnlyViolation` / `Conflict` / `OutOfRange` / `Corrupt` / `Backend` | **正規化**（`reason` を出さず、分類ごとの汎用文言 + 次の手） |
+    /// | `AppendOnlyViolation` / `Conflict` / `OutOfRange` / `Corrupt` / `SchemaOutOfDate` / `Backend` | **正規化**（`reason` を出さず、分類ごとの汎用文言 + 次の手） |
     ///
     /// 正規化した側でも「次の手が分かる文言」は保つ（`CLAUDE.md` §11）。
     /// 消えた詳細は `Display` 側に残っているので、**サーバのログには
@@ -377,6 +393,13 @@ impl RepoError {
             RepoError::OutOfRange { .. } => {
                 "値が保存可能な範囲を超えています。金額の桁数を確認してください".to_string()
             }
+            // **やることが決まっているので、それを言う。** 生の DB メッセージ
+            // （テーブル名を含む）は出さないが、次の手は出す（`CLAUDE.md` §11）。
+            RepoError::SchemaOutOfDate { .. } => "帳簿のスキーマがコードより古い可能性があります。\
+                 マイグレーションを当ててください\
+                 （kaikei-store の kaikei-migrate を対象の帳簿に対して実行します）。\
+                 当てても解消しない場合は、サーバのログを添えて管理者に連絡してください"
+                .to_string(),
             RepoError::Corrupt { .. } => {
                 "保存データの整合性検証に失敗しました。この操作は完了していません。\
                  入力を変えても解消しません。サーバのログを添えて管理者に連絡してください"
@@ -707,6 +730,9 @@ mod tests {
             RepoError::Unsupported {
                 reason: "証憑の紐付けは未実装です".to_string(),
             },
+            RepoError::SchemaOutOfDate {
+                reason: r#"relation "fixed_assets" does not exist"#.to_string(),
+            },
             RepoError::Backend {
                 reason: "接続が切れました".to_string(),
             },
@@ -766,11 +792,36 @@ mod tests {
             .all(|e| policy_error_code(e) != codes::INTERNAL));
     }
 
-    // EC-3: RepoError の全7バリアントからコードが引け、すべて異なる。
+    /// **本命。** スキーマが古いときは、次に何をすればよいかを言う。
+    ///
+    /// 生の DB メッセージ（テーブル名を含む）は外に出さないが、
+    /// 「マイグレーションを当てる」という次の手は出す（`CLAUDE.md` §11）。
+    #[test]
+    fn a_stale_schema_says_what_to_do_without_leaking_the_table_name() {
+        let error = RepoError::SchemaOutOfDate {
+            reason: r#"relation "fixed_assets" does not exist"#.to_string(),
+        };
+
+        let public = error.public_message();
+        assert!(
+            public.contains("マイグレーション"),
+            "次の手を言うこと: {public}"
+        );
+        assert!(
+            !public.contains("fixed_assets"),
+            "生の DB メッセージを漏らさないこと: {public}"
+        );
+        assert_eq!(error.code(), codes::SCHEMA_OUT_OF_DATE);
+
+        // 詳細は Display 側に残る（サーバのログ用）。
+        assert!(error.to_string().contains("fixed_assets"));
+    }
+
+    // EC-3: RepoError の全バリアントからコードが引け、すべて異なる。
     #[test]
     fn every_repo_error_variant_has_a_distinct_code() {
         let errors = all_repo_errors();
-        assert_eq!(errors.len(), 7, "RepoError は7バリアント");
+        assert_eq!(errors.len(), 8, "RepoError は8バリアント");
         let mut codes: Vec<&str> = errors.iter().map(RepoError::code).collect();
         codes.sort_unstable();
         let distinct = codes.len();
