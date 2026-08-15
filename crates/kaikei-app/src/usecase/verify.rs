@@ -276,39 +276,58 @@ fn check_suspected_duplicates(entries: &[kaikei_core::JournalEntry]) -> Vec<Find
         )
     };
 
-    let mut seen: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    // 金額も持つ。**金額が無いと 145円 の重複と 300,000円 の重複が
+    // 同じに見える。** 実際に freee 側で見つかった二重計上は
+    // 事業主貸 300,000円 のような大きな額で、同じ日に同額が並ぶ交通費
+    // （正当な重複）に埋もれると気づけない。
+    let mut seen: BTreeMap<String, (Vec<u32>, i128)> = BTreeMap::new();
     for entry in entries.iter().filter(|entry| !entry.is_reversal()) {
-        seen.entry(fingerprint(entry))
-            .or_default()
-            .push(entry.entry_no().as_u32());
+        let amount = entry.debit_total().minor();
+        let slot = seen
+            .entry(fingerprint(entry))
+            .or_insert((Vec::new(), amount));
+        slot.0.push(entry.entry_no().as_u32());
     }
 
-    seen.into_iter()
-        .filter(|(_, numbers)| numbers.len() > 1)
-        .map(|(key, numbers)| {
+    let mut findings: Vec<(i128, Finding)> = seen
+        .into_iter()
+        .filter(|(_, (numbers, _))| numbers.len() > 1)
+        .map(|(key, (numbers, amount))| {
             let date = key.split('|').next().unwrap_or("");
             let description = key.split('|').nth(1).unwrap_or("");
-            Finding {
-                kind: FindingKind::SuspectedDuplicate,
-                detail: format!(
-                    concat!(
-                        "取引日・摘要・明細が同じ仕訳が {} 件あります",
-                        "（{}「{}」/ 仕訳番号 {}）。",
-                        "同じ取引を2回入れていないか確認してください。",
-                        "正当な重複であればそのままで構いません"
+            // 余分な分（2件なら1件、3件なら2件）が、疑わしい金額である。
+            let at_risk = amount * (numbers.len() as i128 - 1);
+            (
+                at_risk,
+                Finding {
+                    kind: FindingKind::SuspectedDuplicate,
+                    detail: format!(
+                        concat!(
+                            "取引日・摘要・明細が同じ仕訳が {} 件あります",
+                            "（{}「{}」/ 1件あたり {} 円 / 仕訳番号 {}）。",
+                            "同じ取引を2回入れていないか確認してください。",
+                            "正当な重複であればそのままで構いません"
+                        ),
+                        numbers.len(),
+                        date,
+                        description,
+                        amount,
+                        numbers
+                            .iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
-                    numbers.len(),
-                    date,
-                    description,
-                    numbers
-                        .iter()
-                        .map(|n| n.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            }
+                },
+            )
         })
-        .collect()
+        .collect();
+
+    // **金額の大きい順に並べる。** 呼び出し側は先頭の数件しか出さないので、
+    // 並び順がそのまま「何を見せるか」になる。日付順だと 145円 の重複が
+    // 先に出て、300,000円 の重複が「ほか N 件」に隠れる。
+    findings.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.detail.cmp(&b.1.detail)));
+    findings.into_iter().map(|(_, finding)| finding).collect()
 }
 
 /// ドメインモデルと read model の残高を突き合わせる。
@@ -660,6 +679,89 @@ mod tests {
                 .detail
                 .contains("正当な重複であればそのままで構いません"),
             "{}",
+            findings[0].detail
+        );
+    }
+
+    // **本命。** 金額の大きい順に並べる。
+    //
+    // 呼び出し側は先頭の数件しか出さないので、並び順がそのまま
+    // 「何を見せるか」になる。日付順だと 145円 の重複が先に出て、
+    // 300,000円 の重複が「ほか N 件」に隠れる。実際に freee 側で見つかった
+    // 二重計上は 事業主貸 300,000円 のような大きな額だった。
+    #[test]
+    fn the_biggest_amounts_come_first() {
+        let entries = vec![
+            // 1月: 145円 の重複（正当な手数料の重複でも起こりうる）
+            entry_on(1, 1, 10, "振込手数料", pair(145)),
+            entry_on(2, 1, 10, "振込手数料", pair(145)),
+            // 3月: 300,000円 の重複（これが見たい）
+            entry_on(3, 3, 24, "事業主貸", pair(300_000)),
+            entry_on(4, 3, 24, "事業主貸", pair(300_000)),
+            // 2月: 5,000円 の重複
+            entry_on(5, 2, 1, "消耗品費", pair(5_000)),
+            entry_on(6, 2, 1, "消耗品費", pair(5_000)),
+        ];
+
+        let findings = check_suspected_duplicates(&entries);
+
+        assert_eq!(findings.len(), 3);
+        assert!(
+            findings[0].detail.contains("事業主貸"),
+            "300,000円 が先頭に来ること: {}",
+            findings[0].detail
+        );
+        assert!(
+            findings[1].detail.contains("消耗品費"),
+            "{}",
+            findings[1].detail
+        );
+        assert!(
+            findings[2].detail.contains("振込手数料"),
+            "{}",
+            findings[2].detail
+        );
+    }
+
+    // **本命。** 金額を出す。
+    //
+    // 金額が無いと 145円 の重複と 300,000円 の重複が同じに見える。
+    #[test]
+    fn the_amount_is_stated() {
+        let entries = vec![
+            entry_on(1, 3, 24, "事業主貸", pair(300_000)),
+            entry_on(2, 3, 24, "事業主貸", pair(300_000)),
+        ];
+
+        let findings = check_suspected_duplicates(&entries);
+
+        assert!(
+            findings[0].detail.contains("300000"),
+            "1件あたりの金額を出すこと: {}",
+            findings[0].detail
+        );
+    }
+
+    // 3件以上あれば、余分な分で重み付けする。
+    //
+    // 1,000円が3件（余分2件＝2,000円）は、1,500円が2件（余分1件＝1,500円）より
+    // 疑わしい金額が大きい。
+    #[test]
+    fn more_copies_weigh_more() {
+        let entries = vec![
+            entry_on(1, 1, 10, "A", pair(1_000)),
+            entry_on(2, 1, 10, "A", pair(1_000)),
+            entry_on(3, 1, 10, "A", pair(1_000)),
+            entry_on(4, 2, 10, "B", pair(1_500)),
+            entry_on(5, 2, 10, "B", pair(1_500)),
+        ];
+
+        let findings = check_suspected_duplicates(&entries);
+
+        assert_eq!(findings.len(), 2);
+        assert!(
+            findings[0].detail.contains("「A」"),
+            "余分2件×1,000円 が先: {}",
             findings[0].detail
         );
     }
