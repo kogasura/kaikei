@@ -184,6 +184,139 @@ async fn an_explicit_value_wins_over_the_entry(
     assert_eq!(counterparty.as_deref(), Some("CP9999"));
 }
 
+/// **本命。** 金額で仕訳を引ける。
+///
+/// 仕訳IDを人が探すのが、証憑を登録するときのいちばんの手間である。
+/// 領収書を見れば金額は分かる。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_entry_can_be_found_by_its_amount(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_entry(&app).await;
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-4");
+    let file = temp_file("byamount.txt", "アマゾンの領収書");
+
+    let (out, ok) = run_attach(
+        &app,
+        &blob,
+        &file,
+        &["--match-amount", "11332", "--match-year", "2026"],
+    );
+
+    assert!(ok, "金額だけで紐付けられること: {out}");
+    let (date, amount, _) = registered(&app).await;
+    assert_eq!(date, "2026-07-14", "見つけた仕訳の取引日");
+    assert_eq!(amount, Some(11_332));
+}
+
+/// **本命。** 同じ額の仕訳が複数あれば止めて候補を出す。
+///
+/// 勝手に1つ選ぶと意図しない仕訳に証憑が付く。**紐付けは追記のみなので
+/// 消せない。**
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn several_entries_with_the_same_amount_stop_with_candidates(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_entry(&app).await;
+    // 同じ額の仕訳をもう1件（毎月同額のサブスクリプションを模す）。
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ('66666666-6666-6666-6666-666666666666'::uuid, 2026, 901,                  DATE '2026-08-14', 'カ)アマゾン 2回目', now())",
+    )
+    .execute(&app)
+    .await
+    .expect("仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ('66666666-6666-6666-6666-666666666666'::uuid, 1, '609', 1, 11332, 'JPY', 0),                 ('66666666-6666-6666-6666-666666666666'::uuid, 2, '110', 2, 11332, 'JPY', 0)",
+    )
+    .execute(&app)
+    .await
+    .expect("明細");
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-5");
+    let file = temp_file("ambiguous.txt", "どちらの領収書か分からない");
+
+    let (out, ok) = run_attach(
+        &app,
+        &blob,
+        &file,
+        &["--match-amount", "11332", "--match-year", "2026"],
+    );
+
+    assert!(!ok, "止まること: {out}");
+    assert!(out.contains("2 件あります"), "件数を言うこと: {out}");
+    // どれを選べばよいか分からないまま止めない。
+    assert!(out.contains(ENTRY_ID), "候補を並べること: {out}");
+    assert!(out.contains("--entry"), "次の手を示すこと: {out}");
+}
+
+/// **本命。** 赤伝は候補にしない。
+///
+/// 訂正で起こした赤伝は、原仕訳と同じ額で立つ。候補に入れると**必ず2件に
+/// なって止まる**——訂正した取引には証憑を付けられなくなる。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_reversal_is_not_a_candidate(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_entry(&app).await;
+    // 原仕訳を取り消す赤伝（同じ額・借方貸方が逆）。
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at,           reverses, reverse_reason)          VALUES ('77777777-7777-7777-7777-777777777777'::uuid, 2026, 902,                  DATE '2026-07-20', '【訂正】カ)アマゾン', now(), $1::uuid, '誤記帳のため')",
+    )
+    .bind(ENTRY_ID)
+    .execute(&app)
+    .await
+    .expect("赤伝");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ('77777777-7777-7777-7777-777777777777'::uuid, 1, '110', 1, 11332, 'JPY', 0),                 ('77777777-7777-7777-7777-777777777777'::uuid, 2, '609', 2, 11332, 'JPY', 0)",
+    )
+    .execute(&app)
+    .await
+    .expect("明細");
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-7");
+    let file = temp_file("withreversal.txt", "原仕訳の領収書");
+
+    let (out, ok) = run_attach(
+        &app,
+        &blob,
+        &file,
+        &["--match-amount", "11332", "--match-year", "2026"],
+    );
+
+    assert!(ok, "赤伝を数えず1件に絞れること: {out}");
+    let (date, _, _) = registered(&app).await;
+    assert_eq!(date, "2026-07-14", "原仕訳の取引日であること");
+}
+
+/// `--entry` と `--match-amount` は同時に指定できない。
+///
+/// どちらを使ったのかが分からないまま登録されると、意図しない仕訳に
+/// 紐付いても気づけない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn entry_and_match_amount_cannot_be_combined(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-6");
+    let file = temp_file("both.txt", "両方指定");
+
+    let (out, ok) = run_attach(
+        &app,
+        &blob,
+        &file,
+        &["--entry", ENTRY_ID, "--match-amount", "11332"],
+    );
+
+    assert!(!ok, "拒否されること: {out}");
+    assert!(out.contains("同時に指定できません"), "{out}");
+}
+
 /// **本命。** 見つからない仕訳を黙って通さない。
 ///
 /// 紐付けに失敗した証憑は帳簿から辿れないまま保存される——それは登録しないのと
