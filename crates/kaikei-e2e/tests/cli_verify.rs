@@ -122,6 +122,106 @@ async fn seed_entry(pool: &PgPool, entry_no: i32, debit: &str, credit: &str, amo
     tx.commit().await.expect("コミット");
 }
 
+/// 税区分・取引先のタグを付けた仕訳を1本入れる。
+async fn seed_entry_with_tags(
+    pool: &PgPool,
+    entry_no: i32,
+    debit: &str,
+    credit: &str,
+    amount: i64,
+    debit_tags: &str,
+) {
+    let mut tx = pool.begin().await.expect("トランザクション");
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, 2026, $2, DATE '2026-06-15', 'テスト', now())",
+    )
+    .bind(&id)
+    .bind(entry_no)
+    .execute(&mut *tx)
+    .await
+    .expect("仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit, tags)          VALUES ($1::uuid, 1, $2, 1, $4, 'JPY', 0, $5::jsonb),                 ($1::uuid, 2, $3, 2, $4, 'JPY', 0, '{}'::jsonb)",
+    )
+    .bind(&id)
+    .bind(debit)
+    .bind(credit)
+    .bind(amount)
+    .bind(debit_tags)
+    .execute(&mut *tx)
+    .await
+    .expect("明細");
+    tx.commit().await.expect("コミット");
+}
+
+/// **本命。** 適格請求書が要る税区分に取引先が無ければ指摘する。
+///
+/// 実際に weBanana.SP の帳簿が 603 件この状態だった。`JpTaxPolicy` は
+/// 取引先タグが**有る**ときにしか適格性を見ないので、無いまま記帳されると
+/// 検証がすり抜ける。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn verify_reports_a_qualified_purchase_without_a_counterparty(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    // 5=Expense, 1=Asset。
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_entry_with_tags(
+        &app,
+        1,
+        "609",
+        "110",
+        35_829,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "指摘があっても検査は失敗しないこと: {stderr}");
+    assert!(stderr.contains("適格請求書"), "{stderr}");
+    assert!(
+        stderr.contains("1 件"),
+        "件数を出すこと（明細1行だけが対象）: {stderr}"
+    );
+}
+
+/// 取引先が付いていれば指摘しない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_qualified_purchase_with_a_counterparty_is_not_reported(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_entry_with_tags(
+        &app,
+        1,
+        "609",
+        "110",
+        35_829,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}, "counterparty": {"t": "code", "v": "ANTHROPIC"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        !stderr.contains("適格請求書"),
+        "取引先が記録されていれば指摘しないこと: {stderr}"
+    );
+}
+
 /// **本命。** 固定資産があるのに減価償却費が0なら指摘する。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn verify_reports_missing_depreciation(
