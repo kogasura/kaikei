@@ -561,6 +561,42 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
     // 帳簿はまだ4件のまま（提案では増えない）。
     assert_eq!(journal_entry_count(&app).await, 4);
 
+    // -----------------------------------------------------------------
+    // 9-d. 減価償却費を提案させる（D-109）
+    // -----------------------------------------------------------------
+    //
+    // この帳簿には固定資産を1件も登録していない。**0件は成功**である。
+    // ただし「台帳が空」と「その年度に償却するものが無い」で次にやることが
+    // 違うので、AI が区別できることをここで確かめる。
+    let depreciation = server
+        .call_tool(
+            "propose_depreciation_entries",
+            json!({ "fiscal_year": 2026 }),
+        )
+        .await;
+    assert!(
+        !is_error(&depreciation),
+        "0件はエラーにしない: {depreciation}"
+    );
+    let dp = body(&depreciation);
+
+    assert_eq!(
+        dp["posted"],
+        json!(false),
+        "記帳していないことを必ず言う: {dp}"
+    );
+    assert_eq!(dp["asset_count"], json!(0), "台帳が空であること: {dp}");
+    assert_eq!(dp["proposals"].as_array().expect("提案の配列").len(), 0);
+    assert!(
+        dp["next_step"]
+            .as_str()
+            .expect("next_step")
+            .contains("登録がありません"),
+        "台帳が空だと分かる案内であること（「償却するものが無い」とは別）: {dp}"
+    );
+    assert_eq!(dp["period_start"], json!("2026-01-01"), "{dp}");
+    assert_eq!(dp["period_end"], json!("2026-12-31"), "{dp}");
+
     // ── 証憑を探す（Phase 4）──────────────────────────────
     //
     // この帳簿には証憑を1件も登録していない。**0件は成功**であり、
@@ -714,6 +750,7 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
             ("get_ledger".to_string(), "ok".to_string()),
             ("get_statements".to_string(), "ok".to_string()),
             ("propose_closing_entries".to_string(), "ok".to_string()),
+            ("propose_depreciation_entries".to_string(), "ok".to_string()),
             ("search_documents".to_string(), "ok".to_string()),
             ("list_pending_transactions".to_string(), "ok".to_string()),
             ("list_pending_transactions".to_string(), "error".to_string()),
