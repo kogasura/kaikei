@@ -524,12 +524,20 @@ async fn write_document_export(
             continue;
         }
 
-        let path = dir.join(&entry.file_name);
+        // **電子取引とスキャナ保存は別の場所に置く。** 制度が違うものを
+        // 混ぜると、提示のときにどれがどちらか分からない
+        // （`kaikei_report::documents` のモジュール doc）。
+        let folder = dir.join(&entry.folder);
+        std::fs::create_dir_all(&folder)
+            .map_err(|error| format!("作れませんでした: {}（{error}）", folder.display()))?;
+        let path = folder.join(&entry.file_name);
         std::fs::write(&path, &bytes)
             .map_err(|error| format!("書き出せませんでした: {}（{error}）", path.display()))?;
+        // checksums にも置き場所を入れる。同じ名前が別のフォルダにあるとき、
+        // どちらのハッシュか分からなくなる。
         checksums.push_str(&format!(
-            "{}  {}\n",
-            entry.document.blob_hash, entry.file_name
+            "{}  {}/{}\n",
+            entry.document.blob_hash, entry.folder, entry.file_name
         ));
         written.push(path);
     }
