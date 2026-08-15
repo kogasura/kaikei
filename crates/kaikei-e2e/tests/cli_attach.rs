@@ -292,6 +292,79 @@ async fn a_reversal_is_not_a_candidate(pool_opts: PgPoolOptions, conn_opts: PgCo
     assert_eq!(date, "2026-07-14", "原仕訳の取引日であること");
 }
 
+/// 取引先タグの**無い**仕訳を仕込む。
+///
+/// 実帳簿はこちらが普通である（1,395明細中、取引先タグは0件）。
+async fn seed_entry_without_counterparty(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO accounts (code, name, account_type, postable)          VALUES ('609','消耗品費',5,true), ('110','普通預金',1,true)          ON CONFLICT (code) DO NOTHING",
+    )
+    .execute(pool)
+    .await
+    .expect("科目");
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, 2026, 900, DATE '2026-07-14', 'カ)アマゾン', now())",
+    )
+    .bind(ENTRY_ID)
+    .execute(pool)
+    .await
+    .expect("仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ($1::uuid, 1, '609', 1, 11332, 'JPY', 0),                 ($1::uuid, 2, '110', 2, 11332, 'JPY', 0)",
+    )
+    .bind(ENTRY_ID)
+    .execute(pool)
+    .await
+    .expect("明細");
+}
+
+/// **本命。** 取引先が空のまま登録するときは知らせる。
+///
+/// 電子取引データは取引年月日・取引金額・取引先で検索できる必要がある。
+/// 実帳簿には取引先タグが1件も無い（1,395明細中0件）ので、仕訳から埋め
+/// られない。**証憑は後から書き換えられない**ので、登録時に言う。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_empty_counterparty_is_reported(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    // 取引先タグの無い仕訳（実帳簿はこちらが普通）。
+    seed_entry_without_counterparty(&app).await;
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-8");
+    let file = temp_file("nocp.txt", "取引先の分からない領収書");
+
+    let (out, ok) = run_attach(&app, &blob, &file, &["--entry", ENTRY_ID]);
+
+    // 止めない——ファイルを保存しないより、取引先が空でも保存した方がよい。
+    assert!(ok, "登録は通ること: {out}");
+    assert!(out.contains("取引先が空"), "{out}");
+    assert!(out.contains("--counterparty"), "次の手を示すこと: {out}");
+}
+
+/// 取引先を指定していれば知らせない。
+///
+/// 正しい使い方で毎回出る指摘は、当たり前になって本当の抜けを覆い隠す。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_given_counterparty_is_not_reported(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_entry(&app).await;
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-9");
+    let file = temp_file("withcp.txt", "取引先の分かる領収書");
+
+    let (out, ok) = run_attach(
+        &app,
+        &blob,
+        &file,
+        &["--entry", ENTRY_ID, "--counterparty", "CP0001"],
+    );
+
+    assert!(ok, "{out}");
+    assert!(!out.contains("取引先が空"), "{out}");
+}
+
 /// `--entry` と `--match-amount` は同時に指定できない。
 ///
 /// どちらを使ったのかが分からないまま登録されると、意図しない仕訳に
