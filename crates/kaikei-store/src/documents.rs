@@ -153,6 +153,27 @@ impl DocumentQueryPort for PgDocumentQuery {
         rows.into_iter().map(DocumentRow::into_view).collect()
     }
 
+    async fn entries_with_documents(
+        &self,
+        from: AccountingDate,
+        to: AccountingDate,
+    ) -> Result<u64, RepoError> {
+        // **仕訳の側を数える。** 証憑の数を数えると、1つの仕訳に複数の証憑が
+        // 付いているときに「何件の仕訳が裏付けられているか」が分からない。
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT e.id) FROM journal_entries e              JOIN entry_documents ed ON ed.entry_id = e.id              WHERE e.entry_date >= $1 AND e.entry_date <= $2",
+        )
+        .bind(to_naive_date(from)?)
+        .bind(to_naive_date(to)?)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(crate::error::from_sqlx_error)?;
+
+        u64::try_from(count).map_err(|_| RepoError::OutOfRange {
+            reason: format!("証憑の付いた仕訳の件数が範囲外です: {count}"),
+        })
+    }
+
     async fn all_blob_hashes(&self) -> Result<Vec<String>, RepoError> {
         sqlx::query_scalar("SELECT DISTINCT blob_hash FROM documents ORDER BY blob_hash")
             .fetch_all(&self.pool)

@@ -164,6 +164,140 @@ async fn verify_reports_an_asset_with_a_negative_balance(
     assert!(stderr.contains("工具器具備品"), "{stderr}");
 }
 
+/// **本命。** 証憑が1件も付いていないことを数字で出す。
+///
+/// 1件も登録されていないことは帳簿を見ても分からない。**数字が見えないと、
+/// 登録が進んでいるかどうかも分からない。**
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn verify_shows_how_many_entries_have_documents(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "500", "売上高", 4).await;
+    seed_entry(&app, 1, "110", "500", 100_000).await;
+
+    let (stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("証憑が付いている仕訳: 0 / 1 件"),
+        "件数を数字で出すこと: {stdout}"
+    );
+    // 数字だけでは、登録の仕方が分からないまま放置される。
+    assert!(
+        stdout.contains("kaikei attach"),
+        "次の手を示すこと: {stdout}"
+    );
+    // **断定しない。** 保存義務を満たしているかは事業者の状況で変わる。
+    assert!(
+        stdout.contains("事業者の状況によります"),
+        "断定しないこと: {stdout}"
+    );
+}
+
+/// 証憑が付いていれば、その数が出る。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn verify_counts_the_entries_that_have_documents(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "500", "売上高", 4).await;
+    seed_entry(&app, 1, "110", "500", 100_000).await;
+    seed_entry(&app, 2, "110", "500", 200_000).await;
+
+    // 1件目の仕訳にだけ証憑を紐付ける。
+    let entry_id: String =
+        sqlx::query_scalar("SELECT id::text FROM journal_entries ORDER BY entry_no LIMIT 1")
+            .fetch_one(&app)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO documents          (id, blob_hash, original_name, mime_type, byte_size, doc_date, doc_type,           received_via, received_at, created_at)          VALUES ('33333333-3333-3333-3333-333333333333', repeat('a', 64), 'x.pdf',                  'application/pdf', 10, DATE '2026-06-15', 'receipt', 'download', now(), now())",
+    )
+    .execute(&app)
+    .await
+    .expect("証憑");
+    sqlx::query(
+        "INSERT INTO entry_documents (entry_id, document_id)          VALUES ($1::uuid, '33333333-3333-3333-3333-333333333333')",
+    )
+    .bind(&entry_id)
+    .execute(&app)
+    .await
+    .expect("紐付け");
+
+    let (stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("証憑が付いている仕訳: 1 / 2 件"),
+        "紐付いた仕訳だけを数えること: {stdout}"
+    );
+    // 全部に付いていないので、案内は出さない（0件のときだけ出す）。
+    assert!(
+        !stdout.contains("1件も紐付いていません"),
+        "0件でないのに0件の案内を出さないこと: {stdout}"
+    );
+}
+
+/// **本命。** 1つの仕訳に証憑が複数付いていても、仕訳の数として数える。
+///
+/// 証憑の数を数えると「何件の仕訳が裏付けられているか」が分からない。
+/// 請求書と領収書の両方を付けるのは普通にあるので、放っておくと件数が
+/// 仕訳の総数を超える。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn two_documents_on_one_entry_still_count_as_one_entry(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "500", "売上高", 4).await;
+    seed_entry(&app, 1, "110", "500", 100_000).await;
+
+    let entry_id: String = sqlx::query_scalar("SELECT id::text FROM journal_entries LIMIT 1")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    // 同じ仕訳に請求書と領収書を付ける。
+    for (id, hash, doc_type) in [
+        ("44444444-4444-4444-4444-444444444444", "a", "invoice"),
+        ("55555555-5555-5555-5555-555555555555", "b", "receipt"),
+    ] {
+        sqlx::query(
+            "INSERT INTO documents              (id, blob_hash, original_name, mime_type, byte_size, doc_date, doc_type,               received_via, received_at, created_at)              VALUES ($1::uuid, repeat($2, 64), 'x.pdf', 'application/pdf', 10,                      DATE '2026-06-15', $3, 'download', now(), now())",
+        )
+        .bind(id)
+        .bind(hash)
+        .bind(doc_type)
+        .execute(&app)
+        .await
+        .expect("証憑");
+        sqlx::query(
+            "INSERT INTO entry_documents (entry_id, document_id) VALUES ($1::uuid, $2::uuid)",
+        )
+        .bind(&entry_id)
+        .bind(id)
+        .execute(&app)
+        .await
+        .expect("紐付け");
+    }
+
+    let (stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("証憑が付いている仕訳: 1 / 1 件"),
+        "証憑の数ではなく仕訳の数を数えること: {stdout}"
+    );
+}
+
 /// **本命。** 正常な帳簿では指摘が出ない。
 ///
 /// 正しい帳簿で毎回出る指摘は、当たり前になって本当の異常を覆い隠す。

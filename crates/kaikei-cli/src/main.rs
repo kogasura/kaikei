@@ -399,6 +399,11 @@ async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
 
     println!("検査した仕訳: {} 件", output.entry_count);
 
+    // **証憑がどれだけ付いているかを数字で出す。**
+    // 1件も登録されていないことは帳簿を見ても分からない。数字が見えないと、
+    // 登録が進んでいるかどうかも分からない。
+    print_document_coverage(&documents, fiscal_year, output.entry_count).await?;
+
     // **検査するコマンドが、決算書の出力より検査が緩いのはおかしい。**
     // `report` が出しているのと同じ指摘を、同じ関数を呼んで出す
     // （文言が2箇所に分かれると、片方だけ直したときに食い違う）。
@@ -1366,6 +1371,45 @@ fn warn_if_a_balance_sits_on_the_wrong_side(
         "  記帳先の取り違え・期首残高の誤り・仕訳の抜けのいずれかを疑ってください。\
          評価勘定（減価償却累計額など）はこの指摘の対象外です。"
     );
+    Ok(())
+}
+
+/// 証憑が付いている仕訳の割合を出す。
+///
+/// # 断定しない
+///
+/// 出すのは**数字だけ**である。保存義務を満たしているかどうかは、事業者の
+/// 状況（猶予措置の適用可否など）で変わるので、このソフトでは判断しない
+/// （`CLAUDE.md` §10）。0件のときに何を確かめればよいかは添える。
+async fn print_document_coverage(
+    documents: &PgDocumentQuery,
+    fiscal_year: i32,
+    entry_count: usize,
+) -> Result<(), String> {
+    use kaikei_app::ports::DocumentQueryPort;
+
+    let year = FiscalYear::calendar_year(fiscal_year);
+    let with_documents = documents
+        .entries_with_documents(year.start(), year.end())
+        .await
+        .map_err(|error| format!("証憑の紐付けを数えられませんでした: {error}"))?;
+
+    println!("証憑が付いている仕訳: {with_documents} / {entry_count} 件");
+
+    if with_documents == 0 && entry_count > 0 {
+        // **何をすればよいかを添える**（`CLAUDE.md` §11）。数字だけでは、
+        // 登録の仕方が分からないまま放置される。
+        println!("  この年度の仕訳には証憑が1件も紐付いていません。");
+        // **1行を1文にする。** Rust の行継続（`\` + 改行）は、次の行の
+        // 字下げをそのまま文字列に含める。整形のための空白が本文に混ざる。
+        println!("  メールやダウンロードで受け取った請求書・領収書は、");
+        println!("  電子データのまま保存することが求められる場合があります");
+        println!("  （適用の可否は事業者の状況によります）。");
+        println!("  登録するには:");
+        println!(
+            "    kaikei attach --file <ファイル> --type receipt --via download --entry <仕訳ID>"
+        );
+    }
     Ok(())
 }
 

@@ -381,6 +381,28 @@ pub trait DocumentQueryPort: Send + Sync {
     /// 中身が変わっていないかを確かめるために使う。**メタデータは返さない**
     /// ——検査に要るのはハッシュだけで、件数が多くても軽く済ませたい。
     async fn all_blob_hashes(&self) -> Result<Vec<String>, RepoError>;
+
+    /// 期間内の仕訳のうち、証憑が1件以上紐付いているものの数を返す。
+    ///
+    /// # なぜ数だけ返すのか
+    ///
+    /// **登録が進んでいるかを見るための数字である。** どの仕訳に付いているかは
+    /// ここでは要らないし、件数が多くても軽く済ませたい
+    /// （[`Self::all_blob_hashes`] と同じ考え方）。
+    ///
+    /// # なぜ要るのか
+    ///
+    /// 証憑が1件も登録されていないことは、帳簿を見ても分からない。**数字が
+    /// 見えないと、登録が進んでいるかどうかも分からない。**
+    ///
+    /// # Errors
+    ///
+    /// 問い合わせに失敗した場合は [`RepoError`]。
+    async fn entries_with_documents(
+        &self,
+        from: AccountingDate,
+        to: AccountingDate,
+    ) -> Result<u64, RepoError>;
 }
 
 /// 取り込んだ明細の向き（`docs/05-csv-import.md` §2）。
