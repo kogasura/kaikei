@@ -20,6 +20,15 @@
 //! 最も長い語**でもう一度探す。どちらで当たったかは根拠に載せる——緩めた
 //! ことを隠すと、たまたま当たった別の取引を「よく似ている」と読んでしまう。
 //!
+//! # 一致は「含む」であって「同じ」ではない
+//!
+//! 過去の仕訳は摘要の**部分一致**で探す。摘要が `ATM手数料` の明細は、過去の
+//! `ATM手数料（個人利用分）` にも当たる。実際に帳簿の複製で稽古したところ、
+//! 事業の手数料に対して**個人利用の記帳が候補として出た**（過去1件・medium）。
+//!
+//! だから根拠には過去の仕訳の**摘要をそのまま載せる**。候補の科目だけを見て
+//! 決めると、似た名前の別の取引を引き継いでしまう。
+//!
 //! # 断定しない
 //!
 //! 確信度は件数と揃い方から決め、`high` でも「確定」とは言わない。
@@ -76,7 +85,7 @@ impl McpTool for SuggestJournalEntry {
 明細のIDは list_pending_transactions で取得します。\
 候補には必ず根拠が付きます（どの摘要で探したか、過去のどの仕訳が当たったか、何件あったか）。\
 摘要の全体で探して当たらない場合は、摘要から取り出した語でもう一度探します。\
-どちらで探した結果かは matched_by に入るので、緩めた検索の結果かどうかを判断できます。\
+どちらで探した結果かは matched_by に入るので、緩めた検索の結果かどうかを判断できます。一致は「含む」であって「同じ」ではありません。摘要が ATM手数料 の明細は、過去の ATM手数料（個人利用分）にも当たります。examples の摘要を読んで、同じ種類の取引かどうかを確かめてください。\
 似た取引が過去に無い場合は候補が空になります。これは異常ではありません。\
 confidence は件数と揃い方から決めた目安で、high でも確定ではありません\
 （過去の記帳が間違っていれば、同じ間違いを繰り返す候補になります）。\
@@ -157,7 +166,7 @@ async fn search_past(
     if !whole.is_empty() {
         let found = run_search(query, &whole).await?;
         if !found.is_empty() {
-            return Ok(("摘要の全体", whole, found));
+            return Ok(("摘要の全体を含む過去の仕訳", whole, found));
         }
     }
 
@@ -165,9 +174,9 @@ async fn search_past(
     match longest_word(raw_description) {
         Some(word) if word != whole => {
             let found = run_search(query, &word).await?;
-            Ok(("摘要から取り出した語", word, found))
+            Ok(("摘要から取り出した語を含む過去の仕訳", word, found))
         }
-        _ => Ok(("摘要の全体", whole, Vec::new())),
+        _ => Ok(("摘要の全体を含む過去の仕訳", whole, Vec::new())),
     }
 }
 
@@ -436,6 +445,34 @@ mod tests {
     fn the_description_does_not_oversell_the_confidence() {
         let description = SuggestJournalEntry::DESCRIPTION;
         assert!(description.contains("確定ではありません"), "{description}");
+    }
+
+    /// **本命。** 説明に、一致が「含む」であることが書いてある。
+    ///
+    /// 帳簿の複製で稽古したところ、摘要が `ATM手数料` の明細に対して過去の
+    /// `ATM手数料（個人利用分）` が候補として出た。**事業の手数料が個人利用に
+    /// 化ける。** 候補の科目だけを見て決めると引き継いでしまうので、
+    /// examples の摘要を読むよう書いておく。
+    #[test]
+    fn the_description_says_matching_is_by_substring() {
+        let description = SuggestJournalEntry::DESCRIPTION;
+        assert!(description.contains("「含む」"), "{description}");
+        assert!(description.contains("examples"), "{description}");
+    }
+
+    /// `matched_by` が「同じ」と読めない言い回しである。
+    ///
+    /// 「摘要の全体」だけだと完全一致に見える。実際は部分一致なので、
+    /// 過去の長い摘要にも当たる。
+    #[test]
+    fn matched_by_does_not_read_as_an_exact_match() {
+        // 探し方の文言は `search_past` が返す定数。両方に「含む」が入る。
+        for label in [
+            "摘要の全体を含む過去の仕訳",
+            "摘要から取り出した語を含む過去の仕訳",
+        ] {
+            assert!(label.contains("含む"), "{label}");
+        }
     }
 
     /// 説明に、根拠が付くことが書いてある。
