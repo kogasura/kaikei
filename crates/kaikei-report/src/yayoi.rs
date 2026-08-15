@@ -85,7 +85,7 @@ impl Conversion {
 pub fn convert(
     entries: &[JournalEntry],
     chart: &ChartOfAccounts,
-    tax_map: &BTreeMap<String, String>,
+    tax_map: &BTreeMap<String, YayoiCategory>,
 ) -> Conversion {
     let mut out = Conversion::default();
 
@@ -169,14 +169,14 @@ pub fn convert(
                 }
             };
 
-            let debit_tax = match tax_category_of(debit_line, tax_map) {
+            let debit_tax = match tax_category_of(debit_line, chart, tax_map) {
                 Ok(value) => value,
                 Err(reason) => {
                     failed = Some(reason);
                     break;
                 }
             };
-            let credit_tax = match tax_category_of(credit_line, tax_map) {
+            let credit_tax = match tax_category_of(credit_line, chart, tax_map) {
                 Ok(value) => value,
                 Err(reason) => {
                     failed = Some(reason);
@@ -244,10 +244,34 @@ pub fn convert(
     out
 }
 
+/// 弥生の税区分名。売上側と仕入側で分かれるものがある。
+///
+/// **文字列1つにしない。** 非課税のように売上にも仕入にも立つ区分があり、
+/// 片方だけを持つと向きを取り違える。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YayoiCategory {
+    /// 売上側、または向きを問わない区分名。
+    pub sales: String,
+    /// 仕入側の区分名。`None` なら向きを問わない。
+    pub purchase: Option<String>,
+}
+
 /// 明細の税区分を弥生の名称に直す。
+///
+/// # 向きで区分が変わる
+///
+/// 非課税のように**売上にも仕入にも立つ**区分がある。弥生は売上側と仕入側で
+/// 区分が分かれているので、売上側だけを使うと**非課税の仕入が「非課売上」
+/// として出力される**（住宅の家賃・支払利息・保険料など、個人事業主に
+/// 普通にある取引で起きる）。
+///
+/// どちらを使うかは**明細の科目の種別**で決める。収益なら売上側、それ以外
+/// （費用・資産・負債・純資産）なら仕入側の区分がある場合はそれを使う。
+/// 仕入側を持たない区分は向きを問わないので、そのまま使う。
 fn tax_category_of(
     line: &kaikei_core::JournalLine,
-    tax_map: &BTreeMap<String, String>,
+    chart: &kaikei_core::ChartOfAccounts,
+    tax_map: &BTreeMap<String, YayoiCategory>,
 ) -> Result<String, String> {
     let key = match kaikei_core::TagKey::parse("tax_category") {
         Ok(key) => key,
@@ -258,11 +282,22 @@ fn tax_category_of(
         None => Ok(NO_TAX_CATEGORY.to_string()),
         Some(kaikei_core::TagValue::Code(code)) => {
             let code = code.clone();
-            tax_map.get(&code).cloned().ok_or_else(|| {
+            let mapping = tax_map.get(&code).ok_or_else(|| {
                 format!(
                     "税区分 {code} に対応する弥生の区分がありません。\
                      近い区分に置き換えることはしません（消費税の申告額が変わります）"
                 )
+            })?;
+            // 収益の明細だけを売上側とみなす。**科目が勘定科目表に無い場合は
+            // 売上側と決めつけない**——仕入側の区分があるならそちらを使う
+            // （非課税の仕入を売上として出す方が実害が大きい）。
+            let is_sales = chart
+                .get(line.account())
+                .map(|def| def.account_type == kaikei_core::AccountType::Revenue)
+                .unwrap_or(false);
+            Ok(match (&mapping.purchase, is_sales) {
+                (Some(purchase), false) => purchase.clone(),
+                _ => mapping.sales.clone(),
             })
         }
         // 税区分はコード値で入る想定。別の型なら**黙って対象外にしない**。
@@ -374,8 +409,56 @@ mod tests {
             def("500", "売上高", AccountType::Revenue),
             def("604", "通信費", AccountType::Expense),
             def("609", "消耗品費", AccountType::Expense),
+            def("615", "地代家賃", AccountType::Expense),
         ])
         .unwrap()
+    }
+
+    /// **本命。** 非課税の仕入が「非課売上」として出力されない。
+    ///
+    /// 非課税は売上にも仕入にも立つ。売上側の区分だけを持っていると、
+    /// 住宅の家賃・支払利息・保険料のような**非課税の仕入が売上として
+    /// 出力される**。税理士に渡す CSV で経費が売上に化ける。
+    ///
+    /// 実際に weBanana.SP の帳簿で、非課税仕入の地代家賃 205,000 円が
+    /// 「非課売上」として出力されていた。
+    #[test]
+    fn a_tax_free_purchase_is_not_written_as_a_tax_free_sale() {
+        let entries = vec![entry(
+            1,
+            "地代家賃",
+            vec![
+                line("615", Side::Debit, 205_000, Some("TAX_FREE")),
+                line("110", Side::Credit, 205_000, None),
+            ],
+        )];
+
+        let result = convert(&entries, &chart(), &tax_map());
+
+        assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+        let row = &result.rows[0];
+        assert_eq!(row[4], "地代家賃");
+        assert_eq!(row[7], "非課仕入", "費用の明細を売上側の区分で出さないこと");
+    }
+
+    /// 非課税の売上は売上側の区分のままである。
+    ///
+    /// 仕入側を足したことで売上side が変わっていないことを確かめる。
+    #[test]
+    fn a_tax_free_sale_still_uses_the_sales_category() {
+        let entries = vec![entry(
+            1,
+            "非課税売上",
+            vec![
+                line("110", Side::Debit, 50_000, None),
+                line("500", Side::Credit, 50_000, Some("TAX_FREE")),
+            ],
+        )];
+
+        let result = convert(&entries, &chart(), &tax_map());
+
+        assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+        assert_eq!(result.rows[0][13], "非課売上");
     }
 
     fn def(code: &str, name: &str, account_type: AccountType) -> AccountDef {
@@ -388,13 +471,22 @@ mod tests {
         }
     }
 
-    fn tax_map() -> BTreeMap<String, String> {
+    fn both(sales: &str, purchase: Option<&str>) -> YayoiCategory {
+        YayoiCategory {
+            sales: sales.to_string(),
+            purchase: purchase.map(str::to_string),
+        }
+    }
+
+    fn tax_map() -> BTreeMap<String, YayoiCategory> {
         let mut map = BTreeMap::new();
-        map.insert("SALES_10".to_string(), "課税売上込10%".to_string());
+        map.insert("SALES_10".to_string(), both("課税売上込10%", None));
         map.insert(
             "PURCHASE_10_QUALIFIED".to_string(),
-            "課対仕入込10%適格".to_string(),
+            both("課対仕入込10%適格", None),
         );
+        // 非課税は売上にも仕入にも立つ。
+        map.insert("TAX_FREE".to_string(), both("非課売上", Some("非課仕入")));
         map
     }
 
