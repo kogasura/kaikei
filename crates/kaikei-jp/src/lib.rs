@@ -105,6 +105,7 @@ pub mod blue_return_fill;
 pub mod chart;
 pub mod closing;
 pub mod compose;
+pub mod depreciation;
 pub mod error;
 pub mod household_split;
 pub mod invoice;
