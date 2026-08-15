@@ -60,6 +60,7 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei counterparty import --file <取引先.csv> [--commit]
     kaikei fixedasset add --name <名前> --account <科目> --acquired <YYYY-MM-DD>
                           --cost <円> --method <方法> [--life <年>] [--commit]
+    kaikei fixedasset list [--year <西暦>]
     kaikei depreciation --year <西暦>
 
 report は帳簿をファイルに書き出します。
@@ -68,6 +69,7 @@ import は銀行・カードの明細 CSV を取り込みます。
 journalize は取り込んだ明細にルールを当てて、仕訳の案を見せます。
 counterparty import は取引先マスタを CSV から投入します。
 fixedasset add は固定資産を台帳に入れます（既定は下見）。
+fixedasset list は台帳の中身を並べます（--year でその年度の償却費も出ます）。
 depreciation は固定資産台帳から減価償却費を出します（記帳はしません）。
 
 引数:
@@ -239,6 +241,9 @@ fn run() -> Result<Vec<PathBuf>, String> {
         Command::Counterparty(args) => runtime.block_on(run_counterparty_import(args)),
         Command::Depreciation { fiscal_year } => runtime.block_on(run_depreciation(fiscal_year)),
         Command::FixedAsset(args) => runtime.block_on(run_fixed_asset_add(args)),
+        Command::FixedAssetList { fiscal_year } => {
+            runtime.block_on(run_fixed_asset_list(fiscal_year))
+        }
     }
 }
 
@@ -272,6 +277,8 @@ enum Command {
     Depreciation { fiscal_year: i32 },
     /// 固定資産を台帳に入れる。
     FixedAsset(FixedAssetArgs),
+    /// 固定資産台帳の中身を並べる。
+    FixedAssetList { fiscal_year: Option<i32> },
 }
 
 /// `kaikei counterparty import` の引数。
@@ -1261,15 +1268,121 @@ struct FixedAssetArgs {
 }
 
 /// `kaikei fixedasset add ...` を解釈する。
+/// `kaikei fixedasset list [--year <西暦>]` を解釈する。
+fn parse_fixed_asset_list(args: &[String]) -> Result<Command, String> {
+    let mut fiscal_year = None;
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?;
+        match key {
+            "--year" => {
+                fiscal_year = Some(value.parse::<i32>().map_err(|_| {
+                    format!("--year は西暦の数字で指定してください（受け取った値: {value}）")
+                })?)
+            }
+            other => return Err(format!("不明な引数です: {other}\n\n{USAGE}")),
+        }
+        index += 2;
+    }
+    Ok(Command::FixedAssetList { fiscal_year })
+}
+
+/// 固定資産台帳の中身を並べる。
+///
+/// # なぜ要るのか
+///
+/// `fixedasset add` で入れた後、**台帳を見る手段が SQL しか無かった**。
+/// 入力を取り違えていても気づけない。台帳から行は消せない（`DECISIONS.md`
+/// D-104）ので、入っているものを確かめられることがなおさら要る。
+///
+/// # ID を必ず出す
+///
+/// 台帳の行を後から直すには ID が要る。**見えないと直せない。**
+async fn run_fixed_asset_list(fiscal_year: Option<i32>) -> Result<Vec<PathBuf>, String> {
+    use kaikei_app::ports::FixedAssetRepo;
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool);
+    let rows = with_tx_err(&store, |tx| {
+        Box::pin(async move { tx.list_fixed_assets().await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| {
+        format!("固定資産台帳を読めませんでした: {error}")
+    })?;
+
+    if rows.is_empty() {
+        println!("固定資産台帳に登録がありません。");
+        println!("入れるには kaikei fixedasset add を使います。");
+        return Ok(Vec::new());
+    }
+
+    println!("固定資産台帳 {} 件", rows.len());
+    for row in &rows {
+        println!();
+        println!("  {}  [{}]", row.name, method_label(row.method));
+        println!("    ID        {}", row.id);
+        println!(
+            "    科目      {}   取得 {}   取得価額 {} 円",
+            row.account.as_str(),
+            row.acquired_on.to_iso_string(),
+            row.acquisition_cost.to_display_string(),
+        );
+        if let Some(life) = row.useful_life_years {
+            println!("    耐用年数  {life} 年");
+        }
+        if let Some(ratio) = &row.business_ratio {
+            println!("    事業割合  {ratio}");
+        }
+        if let Some(disposed) = row.disposed_on {
+            println!("    除却      {}", disposed.to_iso_string());
+        }
+        if let Some(note) = &row.note {
+            println!("    備考      {note}");
+        }
+        // 年を指定されていれば、その年度の償却費と期末簿価も出す。
+        // **指定が無ければ出さない**——どの年の数字なのかが読めなくなる。
+        if let Some(year) = fiscal_year {
+            let asset = to_fixed_asset(row)?;
+            let schedule = kaikei_jp::depreciation::schedule(&asset)
+                .map_err(|error| format!("{}: 償却額を計算できませんでした: {error}", row.name))?;
+            match schedule.year(year) {
+                Some(y) => println!(
+                    "    {year} 年   償却費 {} 円（{}か月）  期末簿価 {} 円",
+                    y.amount.to_display_string(),
+                    y.months,
+                    y.book_value.to_display_string(),
+                ),
+                None => println!("    {year} 年   償却なし（取得前か、償却し終わっています）"),
+            }
+        }
+    }
+
+    if fiscal_year.is_none() {
+        println!();
+        println!("年度の償却費を見るには --year を付けます。");
+    }
+    Ok(Vec::new())
+}
+
 fn parse_fixed_asset(args: &[String]) -> Result<Command, String> {
     let Some(action) = args.first() else {
         return Err(format!(
-            "fixedasset の後に add を指定してください\n\n{USAGE}"
+            "fixedasset の後に add か list を指定してください\n\n{USAGE}"
         ));
     };
+    if action == "list" {
+        return parse_fixed_asset_list(&args[1..]);
+    }
     if action != "add" {
         return Err(format!(
-            "fixedasset のサブコマンドは add だけです（受け取った値: {action}）\n\n{USAGE}"
+            "fixedasset のサブコマンドは add と list です（受け取った値: {action}）\n\n{USAGE}"
         ));
     }
 
@@ -4053,13 +4166,55 @@ abc,
         }
     }
 
-    // add 以外のサブコマンドは受けない。
+    // サブコマンドを指定しなければ、何を指定すればよいか言う。
     #[test]
-    fn only_add_is_accepted() {
+    fn the_subcommand_is_required() {
         let error = parse_args(&["fixedasset".to_string()]).unwrap_err();
-        assert!(error.contains("add を指定"), "{error}");
+        assert!(error.contains("add か list"), "{error}");
+    }
+
+    // ---- fixedasset list ----
+
+    #[test]
+    fn fixed_asset_list_takes_an_optional_year() {
+        match parse_args(&["fixedasset".to_string(), "list".to_string()]).unwrap() {
+            Command::FixedAssetList { fiscal_year } => assert_eq!(fiscal_year, None),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&[
+            "fixedasset".to_string(),
+            "list".to_string(),
+            "--year".to_string(),
+            "2026".to_string(),
+        ])
+        .unwrap()
+        {
+            Command::FixedAssetList { fiscal_year } => assert_eq!(fiscal_year, Some(2026)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixed_asset_list_rejects_unknown_arguments() {
+        let error = parse_args(&[
+            "fixedasset".to_string(),
+            "list".to_string(),
+            "--name".to_string(),
+            "x".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("--name"), "{error}");
+    }
+
+    // add と list 以外は受けない。
+    #[test]
+    fn fixed_asset_rejects_other_subcommands() {
         let error = parse_args(&["fixedasset".to_string(), "remove".to_string()]).unwrap_err();
-        assert!(error.contains("add だけ"), "{error}");
+        assert!(error.contains("add と list"), "{error}");
+        assert!(
+            error.contains("remove"),
+            "受け取った値を見せること: {error}"
+        );
     }
 
     // ---- 固定資産台帳と帳簿の突き合わせ ----
