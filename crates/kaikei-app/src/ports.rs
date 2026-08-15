@@ -273,6 +273,69 @@ pub trait CounterpartyWriteRepo: Send {
     async fn insert_counterparties(&mut self, list: &[Counterparty]) -> Result<usize, RepoError>;
 }
 
+/// 固定資産台帳の1件（`DECISIONS.md` D-103）。
+///
+/// **償却額の計算に要る入力だけを持つ。** 耐用年数も償却方法も人が決めて
+/// 入れる値であり、このソフトは推定しない。
+///
+/// `kaikei-app` は `kaikei-jp` に依存できない（CI が禁じている）ので、
+/// 償却方法は数値で持つ。`kaikei_jp::depreciation::DepreciationMethod` への
+/// 翻訳は端（CLI / MCP）が行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedAssetRow {
+    /// 台帳のID。
+    pub id: String,
+    /// 決算書の「減価償却費の計算」欄に出す名前。
+    pub name: String,
+    /// 帳簿上どの科目に載っているか。
+    pub account: AccountCode,
+    /// 取得年月日。
+    pub acquired_on: AccountingDate,
+    /// 取得価額（常に正）。
+    pub acquisition_cost: Money,
+    /// 1=定額法 / 2=一括償却資産 / 3=少額減価償却資産。
+    pub method: i16,
+    /// 耐用年数。**定額法のときだけ意味がある。**
+    pub useful_life_years: Option<i16>,
+    /// 事業専用割合（表示用の10進文字列）。`None` は100%。
+    ///
+    /// 文字列で持つのは、`kaikei-app` が `Decimal` を公開の型に出さない
+    /// ためである（`Ratio` の構築は端が行う）。
+    pub business_ratio: Option<String>,
+    /// 除却・売却した日。
+    pub disposed_on: Option<AccountingDate>,
+    /// 備考。
+    pub note: Option<String>,
+}
+
+/// 固定資産台帳の読み書き。
+///
+/// # なぜ [`ChartRepo`] と分けるのか
+///
+/// [`ChartWriteRepo`] / [`CounterpartyWriteRepo`] と同じ理由。記帳しかしない
+/// ユースケースの `Tx` に台帳を書き換える能力を付けて回らない。
+///
+/// # 実装の契約
+///
+/// - **DELETE を実装しない。** 資産を帳簿から外すのは除却（`disposed_on` を
+///   埋める）であって、台帳から消すことではない。消せると、過去の年度の
+///   償却費がどの資産のものだったか辿れなくなる
+/// - `UPDATE` は許す（耐用年数の見直し・事業専用割合の変更が起きる）
+#[async_trait]
+pub trait FixedAssetRepo: Send {
+    /// 台帳を全件読む（`acquired_on`、同日なら `id` の昇順）。
+    async fn list_fixed_assets(&mut self) -> Result<Vec<FixedAssetRow>, RepoError>;
+
+    /// 台帳に追加する。
+    ///
+    /// 実際に挿入された行数を返す。`list` が空なら `Ok(0)`。
+    ///
+    /// # Errors
+    ///
+    /// 科目が存在しない・制約に反する場合は [`RepoError`]。
+    async fn insert_fixed_assets(&mut self, list: &[FixedAssetRow]) -> Result<usize, RepoError>;
+}
+
 /// 会計期間の締め状態（の生データ）の読み込み。
 ///
 /// [`kaikei_core::PeriodGuard::status`] は同期の純関数なので、DB を引く

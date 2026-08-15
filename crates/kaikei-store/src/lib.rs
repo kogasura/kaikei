@@ -35,6 +35,7 @@ mod chart;
 pub mod convert;
 pub mod documents;
 pub mod error;
+pub mod fixed_assets;
 pub mod imported;
 mod journal;
 mod numbering;

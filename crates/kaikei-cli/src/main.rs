@@ -58,12 +58,14 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei import --profile <プロファイル.yaml> --file <明細.csv> [--commit]
     kaikei journalize --rules <ルール.yaml> [--year <西暦>]
     kaikei counterparty import --file <取引先.csv> [--commit]
+    kaikei depreciation --year <西暦>
 
 report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
 import は銀行・カードの明細 CSV を取り込みます。
 journalize は取り込んだ明細にルールを当てて、仕訳の案を見せます。
 counterparty import は取引先マスタを CSV から投入します。
+depreciation は固定資産台帳から減価償却費を出します（記帳はしません）。
 
 引数:
     --year <西暦>       会計年度（暦年）。例: 2026
@@ -214,6 +216,7 @@ fn run() -> Result<Vec<PathBuf>, String> {
         Command::Import(args) => runtime.block_on(run_import(args)),
         Command::Journalize(args) => runtime.block_on(run_journalize(args)),
         Command::Counterparty(args) => runtime.block_on(run_counterparty_import(args)),
+        Command::Depreciation { fiscal_year } => runtime.block_on(run_depreciation(fiscal_year)),
     }
 }
 
@@ -243,6 +246,8 @@ enum Command {
     Journalize(JournalizeArgs),
     /// 取引先マスタを CSV から投入する。
     Counterparty(CounterpartyArgs),
+    /// 固定資産台帳から、その年度の減価償却費を出す。
+    Depreciation { fiscal_year: i32 },
 }
 
 /// `kaikei counterparty import` の引数。
@@ -336,6 +341,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     if subcommand == "counterparty" {
         return parse_counterparty(&args[1..]);
+    }
+    if subcommand == "depreciation" {
+        return parse_depreciation(&args[1..]);
     }
     if subcommand != "report" && subcommand != "verify" {
         return Err(format!("不明なサブコマンドです: {subcommand}\n\n{USAGE}"));
@@ -1206,6 +1214,163 @@ async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
 
 /// `kaikei import` の引数を解析する。
 /// `kaikei counterparty import --file <CSV> [--commit]` を解釈する。
+/// `kaikei depreciation --year <西暦>` を解釈する。
+fn parse_depreciation(args: &[String]) -> Result<Command, String> {
+    let mut fiscal_year = None;
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?;
+        match key {
+            "--year" => {
+                fiscal_year = Some(value.parse::<i32>().map_err(|_| {
+                    format!("--year は西暦の数字で指定してください（受け取った値: {value}）")
+                })?)
+            }
+            other => return Err(format!("不明な引数です: {other}\n\n{USAGE}")),
+        }
+        index += 2;
+    }
+    Ok(Command::Depreciation {
+        fiscal_year: fiscal_year.ok_or("--year を指定してください（例: --year 2026）")?,
+    })
+}
+
+/// 台帳の1件を、償却計算の入力に翻訳する。
+///
+/// # なぜ端で翻訳するのか
+///
+/// `kaikei-app` は `kaikei-jp` に依存できない（CI が禁じている）。台帳は
+/// 償却方法を数値で持っており、`DepreciationMethod` への写像はこの端が持つ。
+fn to_fixed_asset(
+    row: &kaikei_app::ports::FixedAssetRow,
+) -> Result<kaikei_jp::depreciation::FixedAsset, String> {
+    use kaikei_jp::depreciation::DepreciationMethod;
+
+    let method = match row.method {
+        1 => {
+            let life = row
+                .useful_life_years
+                .ok_or_else(|| format!("{}: 定額法なのに耐用年数がありません", row.name))?;
+            DepreciationMethod::StraightLine {
+                useful_life_years: u8::try_from(life)
+                    .map_err(|_| format!("{}: 耐用年数が範囲外です: {life}", row.name))?,
+            }
+        }
+        2 => DepreciationMethod::LumpSumOverThreeYears,
+        3 => DepreciationMethod::ImmediateExpense,
+        other => {
+            return Err(format!(
+                "{}: 知らない償却方法です: {other}（1=定額法 / 2=一括償却 / 3=少額特例）",
+                row.name
+            ));
+        }
+    };
+
+    let business_ratio = match &row.business_ratio {
+        Some(text) => Some(
+            kaikei_core::Ratio::parse_fraction(text)
+                .map_err(|error| format!("{}: 事業専用割合を読めません: {error}", row.name))?,
+        ),
+        None => None,
+    };
+
+    Ok(kaikei_jp::depreciation::FixedAsset {
+        name: row.name.clone(),
+        acquired_on: row.acquired_on,
+        acquisition_cost: row.acquisition_cost,
+        method,
+        business_ratio,
+    })
+}
+
+/// 固定資産台帳から、その年度の減価償却費を出す。
+///
+/// # 記帳はしない
+///
+/// 出すだけである。**どの扱いを選ぶかは申告上の判断**であり、台帳に入れる値
+/// （耐用年数・償却方法）を決めるのは人である（`DECISIONS.md` D-103）。
+/// 記帳するかどうかも人が決める。
+async fn run_depreciation(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
+    use kaikei_app::ports::FixedAssetRepo;
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool);
+
+    let rows = with_tx_err(&store, |tx| {
+        Box::pin(async move { tx.list_fixed_assets().await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| {
+        format!("固定資産台帳を読めませんでした: {error}")
+    })?;
+
+    if rows.is_empty() {
+        println!("固定資産台帳に登録がありません。");
+        println!("減価償却費を出すには、取得日・取得価額・償却方法・耐用年数を台帳に入れます。");
+        return Ok(Vec::new());
+    }
+
+    println!("{fiscal_year} 年の減価償却費");
+    println!();
+
+    let mut total: i128 = 0;
+    let mut counted = 0usize;
+    for row in &rows {
+        // 除却した年より後は償却しない。
+        if let Some(disposed) = row.disposed_on {
+            if disposed.year() < fiscal_year {
+                continue;
+            }
+        }
+        let asset = to_fixed_asset(row)?;
+        let schedule = kaikei_jp::depreciation::schedule(&asset)
+            .map_err(|error| format!("{}: 償却額を計算できませんでした: {error}", row.name))?;
+        let Some(year) = schedule.year(fiscal_year) else {
+            continue;
+        };
+        total += year.amount.minor();
+        counted += 1;
+        println!(
+            "  {}  {} 円（{}か月）  期末簿価 {} 円  [{}]",
+            row.name,
+            year.amount.to_display_string(),
+            year.months,
+            year.book_value.to_display_string(),
+            method_label(row.method),
+        );
+    }
+
+    println!();
+    if counted == 0 {
+        println!("この年度に償却する資産はありません（取得前か、償却し終わっています）。");
+        return Ok(Vec::new());
+    }
+    println!(
+        "合計 {} 円（{counted} 件）",
+        kaikei_core::Money::from_minor(total, kaikei_core::Currency::JPY).to_display_string()
+    );
+    println!();
+    println!("記帳はしていません。仕訳にするには post_journal_entry を使います。");
+    println!("  借方 減価償却費 / 貸方 それぞれの資産の科目");
+    Ok(Vec::new())
+}
+
+/// 償却方法の表示名。
+fn method_label(method: i16) -> &'static str {
+    match method {
+        1 => "定額法",
+        2 => "一括償却",
+        3 => "少額特例",
+        _ => "不明",
+    }
+}
+
 fn parse_counterparty(args: &[String]) -> Result<Command, String> {
     let Some(action) = args.first() else {
         return Err(format!(
