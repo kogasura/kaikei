@@ -57,11 +57,13 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei attach --file <ファイル> --date <取引年月日> --type <種別> --via <経路>
     kaikei import --profile <プロファイル.yaml> --file <明細.csv> [--commit]
     kaikei journalize --rules <ルール.yaml> [--year <西暦>]
+    kaikei counterparty import --file <取引先.csv> [--commit]
 
 report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
 import は銀行・カードの明細 CSV を取り込みます。
 journalize は取り込んだ明細にルールを当てて、仕訳の案を見せます。
+counterparty import は取引先マスタを CSV から投入します。
 
 引数:
     --year <西暦>       会計年度（暦年）。例: 2026
@@ -158,6 +160,21 @@ journalize の引数:
     ルールが無い明細を出します。ルールを書く手がかりにしてください。
     記帳するには MCP の post_journal_entry を使います。
 
+counterparty import の引数:
+    --file <パス>        取引先の CSV（必須）
+    --commit             実際に投入します
+
+    列は code,name,invoice_registration_no,is_qualified です。見出し行が
+    要ります。code と name 以外は省略できます。
+
+    **is_qualified の空欄は「まだ確認していない」という意味です。**
+    false（非適格だと確認した）とは別に扱われ、false のときだけ記帳が
+    拒まれます。外部システムから写すときは、登録番号を確認していない
+    取引先を false にしないでください。
+
+    **既定は下見です。** --commit が無ければ読んで見せるだけです。
+    既にあるコードは上書きしません（違いがあれば知らせます）。
+
 report と verify は記帳しません。読み取りだけなので、税区分や決算科目の設定は
 要りません。
 ";
@@ -196,6 +213,7 @@ fn run() -> Result<Vec<PathBuf>, String> {
         Command::Attach(args) => runtime.block_on(run_attach(args)),
         Command::Import(args) => runtime.block_on(run_import(args)),
         Command::Journalize(args) => runtime.block_on(run_journalize(args)),
+        Command::Counterparty(args) => runtime.block_on(run_counterparty_import(args)),
     }
 }
 
@@ -223,6 +241,17 @@ enum Command {
     Import(ImportArgs),
     /// 取り込んだ明細にルールを当てて、仕訳の案を見せる。
     Journalize(JournalizeArgs),
+    /// 取引先マスタを CSV から投入する。
+    Counterparty(CounterpartyArgs),
+}
+
+/// `kaikei counterparty import` の引数。
+#[derive(Debug)]
+struct CounterpartyArgs {
+    /// 取り込む CSV。
+    file: PathBuf,
+    /// 実際に書き込むか。**既定は下見。**
+    commit: bool,
 }
 
 /// `kaikei journalize` の引数。
@@ -304,6 +333,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     if subcommand == "journalize" {
         return parse_journalize(&args[1..]);
+    }
+    if subcommand == "counterparty" {
+        return parse_counterparty(&args[1..]);
     }
     if subcommand != "report" && subcommand != "verify" {
         return Err(format!("不明なサブコマンドです: {subcommand}\n\n{USAGE}"));
@@ -1173,6 +1205,213 @@ async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
 }
 
 /// `kaikei import` の引数を解析する。
+/// `kaikei counterparty import --file <CSV> [--commit]` を解釈する。
+fn parse_counterparty(args: &[String]) -> Result<Command, String> {
+    let Some(action) = args.first() else {
+        return Err(format!(
+            "counterparty の後に import を指定してください\n\n{USAGE}"
+        ));
+    };
+    if action != "import" {
+        return Err(format!(
+            "counterparty のサブコマンドは import だけです（受け取った値: {action}）\n\n{USAGE}"
+        ));
+    }
+
+    let mut file = None;
+    let mut commit = false;
+    let rest = &args[1..];
+    let mut index = 0;
+    while index < rest.len() {
+        let key = rest[index].as_str();
+        // 値を取る引数と取らない引数を混ぜない（`parse_import` と同じ理由）。
+        if key == "--commit" {
+            commit = true;
+            index += 1;
+            continue;
+        }
+        let value = rest
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?
+            .clone();
+        match key {
+            "--file" => file = Some(PathBuf::from(value)),
+            other => return Err(format!("不明な引数です: {other}\n\n{USAGE}")),
+        }
+        index += 2;
+    }
+
+    Ok(Command::Counterparty(CounterpartyArgs {
+        file: file.ok_or("--file を指定してください（取引先の CSV）")?,
+        commit,
+    }))
+}
+
+/// 取引先 CSV の1行。
+#[derive(Debug)]
+struct CounterpartyRow {
+    counterparty: kaikei_app::Counterparty,
+    /// 何行目か（1始まり。見出しを除く）。エラーの位置を示すため。
+    line_no: usize,
+}
+
+/// 取引先 CSV を読む。
+///
+/// 列は `code,name,invoice_registration_no,is_qualified`。見出し行が要る
+/// （列の順番を覚えさせない）。`code` と `name` 以外は省略できる。
+///
+/// # 未確認と非適格を区別する
+///
+/// `is_qualified` が**空欄なら未確認**（`None`）、`true`/`false` ならその値。
+/// この区別は `JpTaxPolicy` が記帳を拒むかどうかを決めている
+/// （`Some(false)` のときだけ拒む）。外部システムの「誰も入力していないので
+/// false」をそのまま `false` として持ち込むと、確認していない取引先を
+/// 「非適格だと確認済み」に仕立ててしまう。**実際に freee の取引先 34 件は
+/// 全件が `qualified_invoice_issuer: false` かつ登録番号 `null` だった。**
+fn parse_counterparty_csv(text: &str) -> Result<Vec<CounterpartyRow>, String> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(false)
+        .from_reader(text.as_bytes());
+
+    let headers = reader
+        .headers()
+        .map_err(|error| format!("CSV の見出し行を読めませんでした: {error}"))?
+        .clone();
+    let column = |name: &str| -> Option<usize> {
+        headers
+            .iter()
+            // BOM 付きで保存された CSV では最初の列名に BOM が残る。
+            .position(|h| h.trim_start_matches('\u{feff}').trim() == name)
+    };
+    let code_at = column("code").ok_or("CSV に code 列がありません")?;
+    let name_at = column("name").ok_or("CSV に name 列がありません")?;
+    let reg_at = column("invoice_registration_no");
+    let qualified_at = column("is_qualified");
+
+    let mut rows = Vec::new();
+    for (index, record) in reader.records().enumerate() {
+        let line_no = index + 1;
+        let record =
+            record.map_err(|error| format!("{line_no} 行目を読めませんでした: {error}"))?;
+        let cell = |at: Option<usize>| -> Option<String> {
+            at.and_then(|at| record.get(at))
+                .map(|text| text.trim().to_string())
+        };
+        let code = record.get(code_at).unwrap_or("").trim().to_string();
+        let name = record.get(name_at).unwrap_or("").trim().to_string();
+        if code.is_empty() {
+            return Err(format!("{line_no} 行目: code が空です"));
+        }
+        if name.is_empty() {
+            return Err(format!("{line_no} 行目: name が空です（{code}）"));
+        }
+
+        let invoice_registration_no = cell(reg_at).filter(|text| !text.is_empty());
+        let is_qualified_invoice_issuer = match cell(qualified_at).unwrap_or_default().as_str() {
+            "" => None,
+            "true" => Some(true),
+            "false" => Some(false),
+            other => {
+                return Err(format!(
+                    "{line_no} 行目: is_qualified は true / false / 空欄のいずれかです（受け取った値: {other}）。空欄は「まだ確認していない」という意味で、false（非適格だと確認した）とは別に扱われます"
+                ));
+            }
+        };
+
+        rows.push(CounterpartyRow {
+            counterparty: kaikei_app::Counterparty {
+                code,
+                name,
+                invoice_registration_no,
+                is_qualified_invoice_issuer,
+            },
+            line_no,
+        });
+    }
+
+    Ok(rows)
+}
+
+/// 下見で並べて見せる取引先の件数。
+const COUNTERPARTY_PREVIEW_ROWS: usize = 15;
+
+/// 取引先マスタを CSV から投入する。
+///
+/// # 既定では保存しない
+///
+/// `kaikei import` と同じ（`--commit` が無ければ読んで見せるだけ）。
+/// 取引先コードは仕訳のタグに入る値であり、**一度タグを付けた後にコードを
+/// 変えると、過去の仕訳が指す先が消える**（`journal_lines` は追記型なので
+/// タグを直せない）。入れる前に目で確かめられるようにする。
+async fn run_counterparty_import(args: CounterpartyArgs) -> Result<Vec<PathBuf>, String> {
+    let text = std::fs::read_to_string(&args.file)
+        .map_err(|error| format!("{} を読めませんでした: {error}", args.file.display()))?;
+    let rows = parse_counterparty_csv(&text)?;
+    if rows.is_empty() {
+        println!("取り込む取引先がありません（{}）", args.file.display());
+        return Ok(Vec::new());
+    }
+
+    println!(
+        "{} 件を読み取りました（{}）",
+        rows.len(),
+        args.file.display()
+    );
+    for row in rows.iter().take(COUNTERPARTY_PREVIEW_ROWS) {
+        let qualified = match row.counterparty.is_qualified_invoice_issuer {
+            None => "未確認",
+            Some(true) => "適格",
+            Some(false) => "非適格",
+        };
+        println!(
+            "  {:>3}  {}  {}  登録番号={}  適格={}",
+            row.line_no,
+            row.counterparty.code,
+            row.counterparty.name,
+            row.counterparty
+                .invoice_registration_no
+                .as_deref()
+                .unwrap_or("(なし)"),
+            qualified,
+        );
+    }
+    if rows.len() > COUNTERPARTY_PREVIEW_ROWS {
+        println!("  ... 他 {} 件", rows.len() - COUNTERPARTY_PREVIEW_ROWS);
+    }
+
+    if !args.commit {
+        println!();
+        println!("下見です。まだ書き込んでいません。");
+        println!("この内容でよければ --commit を付けて実行してください。");
+        return Ok(Vec::new());
+    }
+
+    let list: Vec<kaikei_app::Counterparty> =
+        rows.into_iter().map(|row| row.counterparty).collect();
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool);
+    let output = with_tx_err(&store, move |tx| {
+        let list = list.clone();
+        Box::pin(
+            async move { kaikei_app::usecase::import_counterparties::execute(tx, &list).await },
+        )
+    })
+    .await
+    .map_err(|error: kaikei_app::error::AppError| {
+        format!("取引先マスタを投入できませんでした: {error}")
+    })?;
+
+    println!("{}", output.summary());
+    for difference in &output.kept_existing {
+        eprintln!("注意: {}", difference.describe());
+    }
+    Ok(Vec::new())
+}
+
 fn parse_import(args: &[String]) -> Result<Command, String> {
     let mut profile = None;
     let mut file = None;
@@ -2879,6 +3118,126 @@ mod tests {
             );
         }
         tags
+    }
+
+    // 空欄は「未確認」であって「非適格」ではない。**この区別が消えると、
+    // 誰も確認していない取引先が「非適格だと確認済み」になる。**
+    #[test]
+    fn a_blank_is_qualified_means_unverified_not_false() {
+        let rows = parse_counterparty_csv(
+            "code,name,invoice_registration_no,is_qualified
+             anthropic,Anthropic,,
+             bitech,ビーテック,T1234567890123,true
+             kojin,個人商店,,false
+",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].counterparty.is_qualified_invoice_issuer, None,
+            "空欄は未確認"
+        );
+        assert_eq!(rows[1].counterparty.is_qualified_invoice_issuer, Some(true));
+        assert_eq!(
+            rows[2].counterparty.is_qualified_invoice_issuer,
+            Some(false)
+        );
+        assert_eq!(
+            rows[1].counterparty.invoice_registration_no.as_deref(),
+            Some("T1234567890123")
+        );
+        assert_eq!(rows[0].counterparty.invoice_registration_no, None);
+    }
+
+    // 列の順番を変えても読める（見出しで引く）。
+    #[test]
+    fn columns_are_found_by_header_not_by_position() {
+        let rows = parse_counterparty_csv(
+            "name,is_qualified,code
+Anthropic,true,anthropic
+",
+        )
+        .unwrap();
+        assert_eq!(rows[0].counterparty.code, "anthropic");
+        assert_eq!(rows[0].counterparty.name, "Anthropic");
+        assert_eq!(rows[0].counterparty.is_qualified_invoice_issuer, Some(true));
+    }
+
+    // 社名にカンマが入っていても壊れない（split(',') では読めない）。
+    #[test]
+    fn a_comma_inside_a_quoted_name_is_not_a_separator() {
+        let rows = parse_counterparty_csv(
+            "code,name
+abc,\"株式会社A, B事業部\"
+",
+        )
+        .unwrap();
+        assert_eq!(rows[0].counterparty.name, "株式会社A, B事業部");
+    }
+
+    // 知らない値を黙って未確認に丸めない。
+    #[test]
+    fn an_unreadable_is_qualified_is_an_error() {
+        let error = parse_counterparty_csv(
+            "code,name,is_qualified
+abc,A,yes
+",
+        )
+        .unwrap_err();
+        assert!(error.contains("1 行目"), "{error}");
+        assert!(error.contains("yes"), "受け取った値を見せること: {error}");
+    }
+
+    // code / name が無いCSVは受け取らない。
+    #[test]
+    fn code_and_name_are_required() {
+        let error = parse_counterparty_csv(
+            "name,is_qualified
+A,true
+",
+        )
+        .unwrap_err();
+        assert!(error.contains("code"), "{error}");
+        let error = parse_counterparty_csv(
+            "code,name
+,A
+",
+        )
+        .unwrap_err();
+        assert!(error.contains("code が空"), "{error}");
+        let error = parse_counterparty_csv(
+            "code,name
+abc,
+",
+        )
+        .unwrap_err();
+        assert!(error.contains("name が空"), "{error}");
+    }
+
+    // 既定は下見。--commit を付けたときだけ書き込む。
+    #[test]
+    fn counterparty_import_does_not_write_without_commit() {
+        let command = parse_args(&args(&["counterparty", "import", "--file", "./cp.csv"])).unwrap();
+        match command {
+            Command::Counterparty(args) => {
+                assert_eq!(args.file, PathBuf::from("./cp.csv"));
+                assert!(!args.commit, "--commit が無ければ書き込まない");
+            }
+            other => panic!("counterparty として解釈されるはず: {other:?}"),
+        }
+
+        let command = parse_args(&args(&[
+            "counterparty",
+            "import",
+            "--file",
+            "./cp.csv",
+            "--commit",
+        ]))
+        .unwrap();
+        match command {
+            Command::Counterparty(args) => assert!(args.commit),
+            other => panic!("counterparty として解釈されるはず: {other:?}"),
+        }
     }
 
     fn embedded_tax_rule_sets() -> kaikei_jp::tax::TaxRuleSets {

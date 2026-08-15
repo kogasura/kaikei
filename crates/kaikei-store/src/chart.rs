@@ -6,7 +6,7 @@ use crate::error::from_sqlx_error;
 use crate::store::PgTx;
 use async_trait::async_trait;
 use kaikei_app::error::RepoError;
-use kaikei_app::ports::{ChartRepo, ChartWriteRepo};
+use kaikei_app::ports::{ChartRepo, ChartWriteRepo, CounterpartyWriteRepo};
 use kaikei_app::{Counterparty, CounterpartyIndex};
 use kaikei_core::{AccountCode, AccountDef, ChartOfAccounts};
 
@@ -65,6 +65,43 @@ impl ChartRepo for PgTx<'_> {
             .collect();
 
         Ok(CounterpartyIndex::new(counterparties))
+    }
+}
+
+#[async_trait]
+impl CounterpartyWriteRepo for PgTx<'_> {
+    /// # 既存行は絶対に触らない
+    ///
+    /// `ON CONFLICT (code) DO NOTHING`。`DO UPDATE` に書き換えないこと。
+    /// **`is_qualified` は「ユーザーが確認した」という記録**であり、
+    /// 投入経路が上書きすると、確認していないものを確認済みに見せる
+    /// （`kaikei_app::ports::CounterpartyWriteRepo` の契約）。
+    async fn insert_counterparties(&mut self, list: &[Counterparty]) -> Result<usize, RepoError> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+
+        let codes: Vec<String> = list.iter().map(|c| c.code.clone()).collect();
+        let names: Vec<String> = list.iter().map(|c| c.name.clone()).collect();
+        let reg_nos: Vec<Option<String>> = list
+            .iter()
+            .map(|c| c.invoice_registration_no.clone())
+            .collect();
+        let qualified: Vec<Option<bool>> =
+            list.iter().map(|c| c.is_qualified_invoice_issuer).collect();
+
+        let result = sqlx::query(
+            "INSERT INTO counterparties (code, name, invoice_reg_no, is_qualified)              SELECT code, name, invoice_reg_no, is_qualified              FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bool[])                   AS t(code, name, invoice_reg_no, is_qualified)              ON CONFLICT (code) DO NOTHING",
+        )
+        .bind(&codes)
+        .bind(&names)
+        .bind(&reg_nos)
+        .bind(&qualified)
+        .execute(self.conn())
+        .await
+        .map_err(from_sqlx_error)?;
+
+        Ok(result.rows_affected() as usize)
     }
 }
 
