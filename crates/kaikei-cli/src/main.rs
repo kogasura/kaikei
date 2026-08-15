@@ -114,12 +114,15 @@ verify が見るもの:
 
 attach の引数:
     --file <パス>        取り込むファイル（必須）
-    --date <YYYY-MM-DD>  取引年月日（必須。検索要件の1つ）
+    --date <YYYY-MM-DD>  取引年月日（検索要件の1つ）
+                         --entry を指定すれば省略できます（仕訳の取引日を使う）
     --type <種別>        invoice / receipt / contract / other（必須）
     --via <経路>         email / download / scan / manual（必須）
     --amount <円>        取引金額（検索要件。無い証憑もあるので任意）
     --counterparty <名>  取引先（検索要件）
     --entry <UUID>       紐付ける仕訳のID
+                         指定すると、取引年月日・取引金額・取引先を
+                         その仕訳から埋めます（明示した値の方が優先）
     --mime <型>          MIME タイプ（省略時は拡張子から決める）
     --note <文>          備考
 
@@ -253,7 +256,9 @@ struct AttachArgs {
     /// 取り込むファイル。
     file: PathBuf,
     /// 取引年月日（検索要件）。
-    doc_date: AccountingDate,
+    ///
+    /// `--entry` を指定した場合は省略できる（仕訳の取引日を使う）。
+    doc_date: Option<AccountingDate>,
     /// 取引金額（検索要件）。**無い証憑があるので Option**。
     amount_minor: Option<i64>,
     /// 取引先（検索要件）。
@@ -622,9 +627,16 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
         }
     }
 
+    // **`--entry` があれば検索要件は仕訳から採れる。** 1件ごとに5つの引数を
+    // 打たせると、証憑の登録が現実的でなくなる（実際に1件も登録されていない）。
+    if doc_date.is_none() && entry_id.is_none() {
+        return Err("--date を指定してください（例: --date 2026-06-15）。\
+             --entry で仕訳を指定すれば、その仕訳の取引日を使います"
+            .to_string());
+    }
     Ok(Command::Attach(AttachArgs {
         file: file.ok_or("--file を指定してください")?,
-        doc_date: doc_date.ok_or("--date を指定してください（例: --date 2026-06-15）")?,
+        doc_date,
         amount_minor,
         counterparty,
         doc_type: doc_type
@@ -704,6 +716,8 @@ async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
         .await
         .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
 
+    let store_pg = PgStore::new(pool.clone());
+
     // **同じ内容が既に登録されていれば知らせる。** 同じ請求書を別の取引の
     // 証憑にすることはあるので止めはしないが、二重登録に気づけるようにする。
     let query = PgDocumentQuery::new(pool.clone());
@@ -724,24 +738,46 @@ async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
         );
     }
 
+    let entry = args.entry_id.as_deref().map(parse_entry_id).transpose()?;
+
+    // **検索要件を仕訳から埋める。** 指定があればそちらを優先する
+    // （証憑の日付・金額が仕訳と違うことはある）。
+    let from_entry = match entry {
+        Some(entry_id) => find_entry_facts(&store_pg, entry_id).await?,
+        None => None,
+    };
+    let doc_date = match (args.doc_date, &from_entry) {
+        (Some(date), _) => date,
+        (None, Some(facts)) => facts.date,
+        (None, None) => {
+            return Err("--date か --entry のどちらかが要ります".to_string());
+        }
+    };
+    let amount_minor = args
+        .amount_minor
+        .or_else(|| from_entry.as_ref().and_then(|facts| facts.amount));
+    let counterparty = args.counterparty.clone().or_else(|| {
+        from_entry
+            .as_ref()
+            .and_then(|facts| facts.counterparty.clone())
+    });
+
     let document = NewDocument {
         id: uuid::Uuid::now_v7().to_string(),
         blob_hash: hash.to_hex(),
         original_name,
         mime_type,
         byte_size: bytes.len() as i64,
-        doc_date: args.doc_date,
-        amount_minor: args.amount_minor,
-        counterparty: args.counterparty,
+        doc_date,
+        amount_minor,
+        counterparty,
         doc_type: args.doc_type,
         received_via: args.received_via,
         received_at: kaikei_core::Timestamp::from_unix_nanos(now_unix_nanos()?),
         note: args.note,
     };
     let document_id = document.id.clone();
-    let entry = args.entry_id.as_deref().map(parse_entry_id).transpose()?;
 
-    let store_pg = PgStore::new(pool);
     with_tx_err(&store_pg, move |tx| {
         let document = document.clone();
         let document_id = document_id.clone();
@@ -1439,6 +1475,73 @@ fn amount_of(
         .find(|line| &line.account == account)
         .map(|line| line.amount)
         .unwrap_or_else(|| kaikei_core::Money::from_minor(0, statement.total.currency()))
+}
+
+/// 証憑の検索要件を、紐付ける仕訳から採ったもの。
+struct EntryFacts {
+    date: AccountingDate,
+    amount: Option<i64>,
+    counterparty: Option<String>,
+}
+
+/// 仕訳から、証憑の検索要件に使える値を引く。
+///
+/// # なぜ仕訳から採るのか
+///
+/// 証憑1件ごとに取引年月日・取引金額・取引先を打たせると、登録が現実的で
+/// なくなる。**実際にこの帳簿には証憑が1件も登録されていない。**
+/// 紐付ける仕訳が決まっているなら、3項目はそこにある。
+///
+/// # 見つからない仕訳を黙って通さない
+///
+/// 指定した仕訳が無ければエラーにする。**紐付けに失敗した証憑は、帳簿から
+/// 辿れないまま保存される**——それは登録しないのとほとんど変わらない。
+async fn find_entry_facts(
+    store: &PgStore,
+    entry_id: kaikei_core::EntryId,
+) -> Result<Option<EntryFacts>, String> {
+    use kaikei_app::ports::JournalRepo;
+
+    let found = with_tx_err(store, move |tx| {
+        Box::pin(async move { tx.find_entry(entry_id).await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| format!("仕訳を読めませんでした: {error}"))?;
+
+    let Some(entry) = found else {
+        return Err(format!(
+            "--entry で指定した仕訳が見つかりません（{}）",
+            kaikei_app::id::entry_id_to_uuid_string(entry_id)
+        ));
+    };
+
+    // 金額は借方合計。1つの仕訳に複数の明細があっても、証憑の金額は
+    // 取引全体の額である。
+    let amount = i64::try_from(entry.debit_total().minor()).ok();
+    // 取引先は明細のタグから採る。**複数あって食い違う場合は採らない**
+    // ——どちらが証憑の取引先かを決められない。
+    let key = kaikei_core::TagKey::parse("counterparty").ok();
+    let mut counterparties: Vec<String> = Vec::new();
+    if let Some(key) = &key {
+        for line in entry.lines() {
+            if let Some(value) = line.tags().get(key) {
+                let text = kaikei_jp::tags::tag_value_to_string(value);
+                if !counterparties.contains(&text) {
+                    counterparties.push(text);
+                }
+            }
+        }
+    }
+    let counterparty = match counterparties.len() {
+        1 => counterparties.into_iter().next(),
+        _ => None,
+    };
+
+    Ok(Some(EntryFacts {
+        date: entry.entry_date(),
+        amount,
+        counterparty,
+    }))
 }
 
 /// 仕訳IDを解釈する。
@@ -2974,6 +3077,86 @@ mod tests {
     fn the_usage_says_a_warning_does_not_fail_the_check() {
         let verify_section = USAGE.split("verify が見るもの:").nth(1).unwrap();
         assert!(verify_section.contains("失敗しません"), "{verify_section}");
+    }
+
+    // ─── attach の引数 ──────────────────────────────────
+
+    /// **本命。** `--entry` があれば `--date` を要求しない。
+    ///
+    /// 1件ごとに5つの引数を打たせると、証憑の登録が現実的でなくなる。
+    /// 実際にこの帳簿には証憑が1件も登録されていない。
+    #[test]
+    fn attach_does_not_need_a_date_when_an_entry_is_given() {
+        let command = parse_attach(&args(&[
+            "--file",
+            "x.pdf",
+            "--type",
+            "receipt",
+            "--via",
+            "download",
+            "--entry",
+            "11111111-1111-1111-1111-111111111111",
+        ]))
+        .expect("--date なしで通ること");
+
+        match command {
+            Command::Attach(attach) => assert_eq!(attach.doc_date, None),
+            other => panic!("attach が返らない: {other:?}"),
+        }
+    }
+
+    /// `--entry` が無ければ `--date` は要る。
+    ///
+    /// **どちらも無いまま通すと、取引年月日の無い証憑ができる**——
+    /// 検索要件の1つが欠ける。
+    #[test]
+    fn attach_still_needs_a_date_without_an_entry() {
+        let error = parse_attach(&args(&[
+            "--file", "x.pdf", "--type", "receipt", "--via", "download",
+        ]))
+        .expect_err("拒否されること");
+
+        assert!(error.contains("--date"), "{error}");
+        // 次の手を示す（`--entry` でも済むことを知らせる）。
+        assert!(error.contains("--entry"), "{error}");
+    }
+
+    /// 明示した日付は仕訳より優先される。
+    ///
+    /// 証憑の日付が仕訳と違うことはある（請求書の日付と計上日など）。
+    #[test]
+    fn an_explicit_date_is_kept_even_with_an_entry() {
+        let command = parse_attach(&args(&[
+            "--file",
+            "x.pdf",
+            "--type",
+            "receipt",
+            "--via",
+            "download",
+            "--entry",
+            "11111111-1111-1111-1111-111111111111",
+            "--date",
+            "2026-06-01",
+        ]))
+        .unwrap();
+
+        match command {
+            Command::Attach(attach) => assert_eq!(
+                attach.doc_date,
+                Some(AccountingDate::new(2026, 6, 1).unwrap())
+            ),
+            other => panic!("attach が返らない: {other:?}"),
+        }
+    }
+
+    /// 使い方に、仕訳から埋まることが書いてある。
+    #[test]
+    fn the_usage_says_the_entry_fills_the_search_fields() {
+        let attach_section = USAGE.split("attach の引数:").nth(1).expect("attach の節");
+        assert!(
+            attach_section.contains("その仕訳から埋めます"),
+            "{attach_section}"
+        );
     }
 
     // 使い方に、書き出すファイル名と要る環境変数が載っている
