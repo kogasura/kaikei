@@ -689,6 +689,59 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
     }))
 }
 
+/// 決算振替が記帳済みに見えるなら知らせる。
+///
+/// # なぜ順序が効くのか
+///
+/// 決算振替は収益・費用をゼロにして元入金へ振り替える。損益計算書は会計年度の
+/// 期間で集計するので、**同じ年度に記帳された決算振替もその期間に入る**。
+/// 結果、決算書の所得が 0 になる。
+///
+/// 実際に帳簿の複製で通し稽古したところ、決算振替を記帳した後の決算書は
+/// 売上 0・所得 0・所得金額 −650,000（控除だけが残る）になった。貸借対照表の
+/// 元入金も期首欄が期末の値になり、期首の貸借が合わなくなった。
+///
+/// **決算書を作ってから決算振替を記帳する。** この順序をここで思い出せる
+/// ようにする。
+///
+/// # 断定しない
+///
+/// 収益も費用も 0 の年度は、決算振替済みとは限らない（開業前など）。
+/// 「そう見える」までにとどめる。
+fn warn_if_the_year_looks_closed(
+    income_statement: &kaikei_app::policy::Statement,
+    entry_count: usize,
+) {
+    if !year_looks_closed(income_statement, entry_count) {
+        return;
+    }
+
+    eprintln!("注意: この年度には仕訳が {entry_count} 件ありますが、収益も費用も残っていません。");
+    eprintln!("  決算振替を記帳した後の帳簿に見えます。");
+    eprintln!(
+        "  決算振替は収益・費用をゼロにするので、その後に作った決算書は所得が 0 になります。"
+    );
+    eprintln!("  決算書は決算振替を記帳する前に作ってください。");
+}
+
+/// 収益も費用も残っていない年度か（＝決算振替済みに見えるか）。
+///
+/// **表示から切り離してある。** 何を拾うかをテストで固定できないと、
+/// 「落ちないこと」しか確かめられない。
+fn year_looks_closed(income_statement: &kaikei_app::policy::Statement, entry_count: usize) -> bool {
+    if entry_count == 0 {
+        // **空の帳簿を「決算振替済み」と言わない。** 収益も費用も0なのは
+        // 当たり前で、指摘しても何の手がかりにもならない。
+        return false;
+    }
+    // 収益も費用も1件残らずゼロなら、ゼロ化された後の姿である。
+    income_statement
+        .sections
+        .iter()
+        .flat_map(|section| section.lines.iter())
+        .all(|line| line.amount.is_zero())
+}
+
 /// 全件エクスポートが帳簿の試算表と一致するかを確かめる。
 ///
 /// # なぜ要るのか
@@ -2073,6 +2126,10 @@ async fn write_reports(
     // 決算書を見ても気づけない。
     warn_if_a_balance_sits_on_the_wrong_side(&cumulative.balance_sheet, &chart)?;
 
+    // **決算振替を記帳した後では決算書が作れない。** 収益・費用がゼロ化
+    // されているので、所得が 0 の決算書ができる。
+    warn_if_the_year_looks_closed(&statements.income_statement, entries.len());
+
     written.extend(write_blue_return_balance_sheet(
         &out_dir,
         &opening_balance_sheet.balance_sheet,
@@ -2550,11 +2607,16 @@ fn write_blue_return_balance_sheet(
     // 期首と期末で同額であることを前提にしている（所得金額を別の行に書く
     // ため）。動いていたら、決算書は振替前の帳簿から作り直す必要がある。
     for (label, book_opening, book_closing) in &filled.same_column_mismatches {
+        // 1行を1文にする。行継続（`\` + 改行）は次の行の字下げを
+        // 文字列に含めるので、整形のための空白が本文に混ざる。
+        eprintln!("注意: 決算書は「{label}」が期首と期末で同額であることを前提にしていますが、");
         eprintln!(
-            "注意: 決算書は「{label}」が期首と期末で同額であることを前提にしていますが、             帳簿では期首 {} / 期末 {} と動いています。             決算振替を記帳した後に決算書を出していないか確認してください             （決算書は振替前の帳簿から作ります）",
+            "  帳簿では期首 {} / 期末 {} と動いています。",
             kaikei_app::amount::money_to_plain_string(book_opening),
             kaikei_app::amount::money_to_plain_string(book_closing)
         );
+        eprintln!("  決算振替を記帳した後に決算書を出していないか確認してください");
+        eprintln!("  （決算書は振替前の帳簿から作ります）。");
     }
 
     Ok(written)
@@ -3438,6 +3500,40 @@ mod tests {
             attach_section.contains("その仕訳から埋めます"),
             "{attach_section}"
         );
+    }
+
+    // ─── 決算振替の後に決算書を作っていないか ──────────
+
+    /// **本命。** 収益も費用も残っていない年度を指摘する。
+    ///
+    /// 帳簿の複製で通し稽古したところ、決算振替を記帳した後の決算書は
+    /// 売上0・所得0・所得金額 −650,000（控除だけが残る）になった。
+    #[test]
+    fn a_year_with_no_revenue_and_no_expense_is_reported() {
+        let pl = statement("損益計算書", vec![("500", 0), ("609", 0)]);
+
+        assert!(year_looks_closed(&pl, 695));
+    }
+
+    /// 仕訳が無い年度では指摘しない。
+    ///
+    /// **空の帳簿を「決算振替済み」と言わない。** 収益も費用も0なのは
+    /// 当たり前で、指摘しても何の手がかりにもならない。
+    #[test]
+    fn an_empty_year_is_not_reported() {
+        let pl = statement("損益計算書", vec![]);
+
+        assert!(!year_looks_closed(&pl, 0));
+    }
+
+    /// 収益か費用が残っていれば指摘しない。
+    ///
+    /// 正しい帳簿で毎回出る指摘は、当たり前になって本当の異常を覆い隠す。
+    #[test]
+    fn a_year_with_activity_is_not_reported() {
+        let pl = statement("損益計算書", vec![("500", 11_520_080), ("609", 0)]);
+
+        assert!(!year_looks_closed(&pl, 695));
     }
 
     // 使い方に、書き出すファイル名と要る環境変数が載っている
