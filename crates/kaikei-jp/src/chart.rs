@@ -137,6 +137,29 @@ pub struct DepreciationHint {
     pub depreciable_accounts: Vec<AccountCode>,
 }
 
+/// 科目表から「向きが逆でよい科目」を読む。
+///
+/// # なぜ要るのか
+///
+/// 資産がマイナス残高、負債がプラス残高になっているのは普通おかしい
+/// （預金がマイナス、取得価額の無い備品に償却だけ積まれている等）。**貸借は
+/// 一致したままなので決算書を見ても気づけない。**
+///
+/// ただし**評価勘定は逆で正しい**——減価償却累計額は資産に分類されるが
+/// 貸方に立つ。これを指摘すると、正しい帳簿で毎回警告が出て、本当の異常が
+/// 埋もれる。
+///
+/// # Errors
+///
+/// YAML を読めない場合、または科目コードが不正な場合は [`JpError`]。
+pub fn load_contra_accounts(embedded: EmbeddedYaml) -> Result<Vec<AccountCode>, JpError> {
+    let raw: ChartRaw = crate::yaml::load_embedded(embedded)?;
+    raw.contra_accounts
+        .iter()
+        .map(|code| parse_code(embedded.label, code))
+        .collect()
+}
+
 /// 科目表から減価償却の対応を読む。
 ///
 /// **省略されていれば `None`。** 利用者が自分の科目表に差し替えたときに、
@@ -187,6 +210,9 @@ struct ChartRaw {
     #[allow(dead_code)]
     name: String,
     accounts: Vec<AccountRaw>,
+    /// 貸借が自然な向きと逆になってよい科目（評価勘定）。**省略できる。**
+    #[serde(default)]
+    contra_accounts: Vec<String>,
     /// 減価償却の計上漏れを見つけるための対応（[`DepreciationHint`]）。
     ///
     /// **省略できる。** 利用者が自分の科目表に差し替えたときに、この節を

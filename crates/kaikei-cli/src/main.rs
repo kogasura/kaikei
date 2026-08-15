@@ -1269,6 +1269,92 @@ fn warn_if_depreciation_is_missing(
     Ok(())
 }
 
+/// 資産がマイナス残高、負債がプラス残高になっていれば知らせる。
+///
+/// # なぜ黙って出さないか
+///
+/// **貸借は一致したままなので決算書を見ても気づけない。** 実際に weBanana.SP で、
+/// 償却の相手科目を取り違えたために工具器具備品が -118,800 円になっていた誤りが
+/// 4年間気づかれずに残った。預金がマイナスのまま貸借対照表に載るのも同じ形である。
+///
+/// # 評価勘定は指摘しない
+///
+/// 減価償却累計額は資産に分類されるが**貸方に立つのが正しい**。これを指摘すると
+/// 正しい帳簿で毎回警告が出て、本当の異常が埋もれる。どれが評価勘定かは科目表が
+/// 持つ（`contra_accounts`）。
+///
+/// 事業主貸・事業主借は純資産なので対象外——どちらの向きにも立ちうる。
+fn warn_if_a_balance_sits_on_the_wrong_side(
+    balance_sheet: &kaikei_app::policy::Statement,
+    chart: &kaikei_core::ChartOfAccounts,
+) -> Result<(), String> {
+    let contra = kaikei_jp::chart::load_contra_accounts(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+        .map_err(|error| format!("科目表の contra_accounts を読めませんでした: {error}"))?;
+
+    let wrong = accounts_on_the_wrong_side(balance_sheet, chart, &contra);
+    if wrong.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "注意: 貸借が自然な向きと逆になっている科目が {} 件あります:",
+        wrong.len()
+    );
+    for (code, name, amount) in &wrong {
+        eprintln!("  {code} {name} {}", amount.to_display_string());
+    }
+    eprintln!(
+        "  資産がマイナス、負債がプラスの残高は普通ではありません\
+         （貸借は一致したままなので決算書を見ても分かりません）。"
+    );
+    eprintln!(
+        "  記帳先の取り違え・期首残高の誤り・仕訳の抜けのいずれかを疑ってください。\
+         評価勘定（減価償却累計額など）はこの指摘の対象外です。"
+    );
+    Ok(())
+}
+
+/// 貸借が自然な向きと逆になっている科目を挙げる。
+///
+/// **表示から切り離してある。** 何を拾うかをテストで固定できないと、
+/// 「落ちないこと」しか確かめられない。
+fn accounts_on_the_wrong_side(
+    balance_sheet: &kaikei_app::policy::Statement,
+    chart: &kaikei_core::ChartOfAccounts,
+    contra: &[kaikei_core::AccountCode],
+) -> Vec<(String, String, kaikei_core::Money)> {
+    use kaikei_core::AccountType;
+
+    let mut wrong = Vec::new();
+    for line in balance_sheet
+        .sections
+        .iter()
+        .flat_map(|section| section.lines.iter())
+    {
+        if line.amount.is_zero() || contra.contains(&line.account) {
+            continue;
+        }
+        let Some(def) = chart.get(&line.account) else {
+            continue;
+        };
+        // 資産は借方、負債は貸方が自然な向き。財務諸表の金額は、その科目の
+        // 自然な向きを正として出ている。純資産は対象外——事業主貸・事業主借は
+        // どちらの向きにも立ちうる。
+        let natural = matches!(
+            def.account_type,
+            AccountType::Asset | AccountType::Liability
+        );
+        if natural && line.amount.is_negative() {
+            wrong.push((
+                line.account.as_str().to_string(),
+                def.name.clone(),
+                line.amount,
+            ));
+        }
+    }
+    wrong
+}
+
 /// 財務諸表から1科目の金額を取る。**無ければ0。**
 fn amount_of(
     statement: &kaikei_app::policy::Statement,
@@ -1540,6 +1626,10 @@ async fn write_reports(
     // **減価償却の計上漏れを指摘する。** 貸借は一致したままで所得だけが
     // 過大になる誤りで、決算書を見ても分からない。
     warn_if_depreciation_is_missing(&statements.income_statement, &cumulative.balance_sheet)?;
+
+    // **貸借が自然な向きと逆の科目を指摘する。** 貸借は一致したままなので
+    // 決算書を見ても気づけない。
+    warn_if_a_balance_sits_on_the_wrong_side(&cumulative.balance_sheet, &chart)?;
 
     written.extend(write_blue_return_balance_sheet(
         &out_dir,
@@ -2699,6 +2789,95 @@ mod tests {
             warn_if_depreciation_is_missing(&pl, &bs).is_ok(),
             "指摘しても出力は続けること"
         );
+    }
+
+    // ─── 貸借が逆向きの科目 ─────────────────────────────
+
+    fn chart_for_sides() -> kaikei_core::ChartOfAccounts {
+        use kaikei_core::{AccountDef, AccountType};
+        let def = |code: &str, name: &str, account_type: AccountType| AccountDef {
+            code: kaikei_core::AccountCode::parse(code).unwrap(),
+            name: name.to_string(),
+            account_type,
+            parent: None,
+            postable: true,
+        };
+        kaikei_core::ChartOfAccounts::new(vec![
+            def("110", "普通預金", AccountType::Asset),
+            def("210", "工具器具備品", AccountType::Asset),
+            def("240", "減価償却累計額", AccountType::Asset),
+            def("325", "未払金", AccountType::Liability),
+            def("410", "事業主貸", AccountType::Equity),
+        ])
+        .unwrap()
+    }
+
+    /// **本命。** 資産のマイナス残高を見つける。
+    ///
+    /// 実際に weBanana.SP で、償却の相手科目を取り違えたために工具器具備品が
+    /// -118,800 円になっていた誤りが4年間気づかれずに残った。貸借は一致した
+    /// ままなので決算書を見ても分からない。
+    #[test]
+    fn an_asset_with_a_negative_balance_is_reported() {
+        let bs = statement("貸借対照表", vec![("210", -118_800)]);
+
+        let wrong = accounts_on_the_wrong_side(&bs, &chart_for_sides(), &[]);
+
+        assert_eq!(wrong.len(), 1, "{wrong:?}");
+        assert_eq!(wrong[0].0, "210");
+        assert_eq!(wrong[0].1, "工具器具備品");
+    }
+
+    /// **本命。** 評価勘定は指摘しない。
+    ///
+    /// 減価償却累計額は資産に分類されるが貸方に立つのが正しい。指摘すると
+    /// 正しい帳簿で毎回警告が出て、本当の異常が埋もれる。
+    #[test]
+    fn a_contra_account_is_not_reported() {
+        let bs = statement("貸借対照表", vec![("240", -50_000)]);
+        let contra = vec![kaikei_core::AccountCode::parse("240").unwrap()];
+
+        let wrong = accounts_on_the_wrong_side(&bs, &chart_for_sides(), &contra);
+
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// 同梱の科目表が、評価勘定だけを例外にしている。
+    #[test]
+    fn the_bundled_chart_excepts_only_the_contra_accounts() {
+        let contra =
+            kaikei_jp::chart::load_contra_accounts(kaikei_jp_data::CHART_SOLE_PROPRIETOR).unwrap();
+        let codes: Vec<&str> = contra.iter().map(|c| c.as_str()).collect();
+
+        assert!(
+            codes.contains(&"240"),
+            "減価償却累計額が例外に無い: {codes:?}"
+        );
+        // 預金や備品を例外にしてしまうと、本当の異常を拾えなくなる。
+        assert!(!codes.contains(&"110"), "{codes:?}");
+        assert!(!codes.contains(&"210"), "{codes:?}");
+    }
+
+    /// 純資産は対象外。
+    ///
+    /// 事業主貸・事業主借はどちらの向きにも立ちうる。
+    #[test]
+    fn an_equity_account_is_out_of_scope() {
+        let bs = statement("貸借対照表", vec![("410", -500_000)]);
+
+        let wrong = accounts_on_the_wrong_side(&bs, &chart_for_sides(), &[]);
+
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// 自然な向きの帳簿では何も挙がらない。
+    #[test]
+    fn a_normal_balance_sheet_is_quiet() {
+        let bs = statement("貸借対照表", vec![("110", 500_000), ("325", 200_000)]);
+
+        let wrong = accounts_on_the_wrong_side(&bs, &chart_for_sides(), &[]);
+
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 
     // 使い方に、書き出すファイル名と要る環境変数が載っている
