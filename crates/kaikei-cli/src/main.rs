@@ -1744,6 +1744,24 @@ async fn run_fixed_asset_add(args: FixedAssetArgs) -> Result<Vec<PathBuf>, Strin
         .map_err(|error| format!("償却費の合計を出せませんでした: {error}"))?;
     println!("    合計 {} 円", total.to_display_string());
 
+    // **取得価額と償却方法が合っているかを見る。** 選べない方法を選んでも
+    // 帳簿は何も言わない。50万円に少額特例を当てれば初年度に50万円が経費に
+    // なり、貸借は一致したまま所得だけが減る。`verify` でも拾えない
+    // （台帳の方法で計算した結果と帳簿は一致してしまう）。
+    let concerns = kaikei_jp::depreciation::cost_concerns(
+        &row.acquisition_cost,
+        asset.method,
+        jp_settings()?.tax_mode,
+    );
+    if !concerns.is_empty() {
+        println!();
+        println!("  確かめてください:");
+        for concern in &concerns {
+            println!("    ・{}", concern.message);
+            println!("      （{}）", concern.basis);
+        }
+    }
+
     if !args.commit {
         println!();
         println!("下見です。まだ台帳に入れていません。");
@@ -1794,26 +1812,34 @@ fn parse_depreciation(args: &[String]) -> Result<Command, String> {
     })
 }
 
-/// 家事按分の計算に使う設定。
+/// 帳簿の税制設定。
 ///
-/// # 丸め方だけを読む
+/// # 環境変数から読み、既定値を持たない
 ///
-/// `year_end_household_split` が `JpSettings` から読むのは `rounding` だけで
-/// ある（事業分を `Money::mul_ratio` で計算し、家事分は引き算で求める）。
-/// 消費税の課税方式（`tax_mode` / `simplified_taxation` 等）は按分の金額に
-/// 影響しない。**それでも `JpSettings` を組み立てる必要はある**ので、
-/// 影響しない項目には見て分かる値を置く。
+/// 丸め方（`KAIKEI_ROUNDING`）と経理方式（`KAIKEI_TAX_MODE`）は MCP と同じ
+/// 環境変数から読む。**帳簿ごとに違う値を黙って決め打ちしない**
+/// （`docs/04-jp-tax.md`）。
 ///
-/// 丸め方は MCP と同じ `KAIKEI_ROUNDING` から読み、**既定値を持たない**。
-/// 帳簿ごとに違う値を、黙って決め打ちしないためである（`docs/04-jp-tax.md`）。
+/// **決め打ちにしていて誤りだった。** 最初これを家事按分専用に書いたとき、
+/// 按分の金額は丸め方だけで決まるからと `tax_mode` に `Exclusive` を
+/// 置いていた。その後、固定資産の取得価額の判定（10万/20万/30万円の帯）に
+/// 使ったところ、**税込経理の帳簿を税抜として扱ってしまった**。実帳簿は
+/// 税込経理で、108,000円 が税抜なら 98,181円 で帯が変わる——まさに
+/// 気づきたかった場面で黙る形になっていた。
+///
+/// `rounding_unit` / `is_taxable_business` / `simplified_taxation` は
+/// **まだどの計算にも効いていない**。効かせるときに読むこと。
 fn jp_settings() -> Result<kaikei_jp::tax::JpSettings, String> {
     let code = env_var("KAIKEI_ROUNDING")?;
     let rounding = kaikei_jp::tax::round_mode_from_code(&code)
         .map_err(|error| format!("KAIKEI_ROUNDING を読めません: {error}"))?;
+    let mode = env_var("KAIKEI_TAX_MODE")?;
+    let tax_mode = kaikei_jp::tax::TaxMode::from_code(&mode)
+        .map_err(|error| format!("KAIKEI_TAX_MODE を読めません: {error}"))?;
     Ok(kaikei_jp::tax::JpSettings {
         rounding,
-        // 以下は按分の金額に影響しない（上の doc を参照）。
-        tax_mode: kaikei_jp::tax::TaxMode::Exclusive,
+        tax_mode,
+        // 以下はまだどの計算にも効いていない（上の doc を参照）。
         rounding_unit: kaikei_jp::tax::RoundingUnit::Line,
         is_taxable_business: true,
         simplified_taxation: false,

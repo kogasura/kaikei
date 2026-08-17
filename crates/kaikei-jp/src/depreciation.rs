@@ -264,6 +264,128 @@ pub fn schedule(asset: &FixedAsset) -> Result<Schedule, JpError> {
     })
 }
 
+// ─── 取得価額と償却方法の食い違い ──────────────────────────
+
+/// 取得価額から見て、その償却方法が選べるかの指摘。
+///
+/// **エラーではない。** 判定には帳簿から分からない要素（後述）が絡むので、
+/// 断定せず「確かめる価値がある」と伝えるにとどめる（`CLAUDE.md` §10）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostConcern {
+    /// 何が引っかかったか。
+    pub message: String,
+    /// 根拠の条文。**必ず付ける**——確かめようがない指摘は無視されるだけである。
+    pub basis: &'static str,
+}
+
+/// 一括償却資産の上限（所令139条）。20万円未満。
+const LUMP_SUM_LIMIT: i128 = 200_000;
+/// 少額減価償却資産の特例の上限（措法28条の2）。30万円未満。
+///
+/// **令和8年4月1日以後の取得は40万円未満に引き上げられた**（令和8年度税制改正）。
+/// ただしこの数字は税制改正大綱に基づく二次情報での確認にとどまり、公布後の
+/// 条文を当たれていない。**だから引き上げ後の額でこちらから通すことはしない。**
+/// 30万円を超える取得を見たら、引き上げの可能性がある旨を添えて指摘する。
+const IMMEDIATE_LIMIT_BEFORE_R8_APRIL: i128 = 300_000;
+/// 減価償却をしない額（所令138条）。10万円未満。
+const NOT_DEPRECIABLE_LIMIT: i128 = 100_000;
+
+/// 取得価額と償却方法が食い違っていないかを見る。
+///
+/// # なぜ要るのか
+///
+/// **選べない方法を選んでも、帳簿は何も言わない。** 50万円の資産に少額特例を
+/// 当てれば初年度に50万円が経費になり、決算書の貸借は一致したまま所得だけが
+/// 減る。`verify` でも拾えない——台帳に書いてある方法で計算した結果と帳簿が
+/// 一致してしまうからである。
+///
+/// # 断定しない理由
+///
+/// 判定額は**経理方式**で変わる（タックスアンサー No.2100「取得価額の判定に
+/// 際し、消費税の額を含めるかどうかは納税者の経理方式によります」）。
+/// また少額特例には青色申告・年間300万円・貸付用でないことなど、取得価額
+/// 以外の要件がある。**ここで見るのは金額の帯だけ**である。
+///
+/// # 税込経理で境目をまたぐ場合
+///
+/// 実例がある。電動アシスト自転車等 108,000円（税込）は10万円以上だが、
+/// 税抜なら 98,181円 で10万円を下回り、**全額を必要経費にできる区分**
+/// （所令138条）に落ちる。金額の帯が変わるので、経理方式の選択が償却額を
+/// 左右する。境目の近くではそれを伝える。
+pub fn cost_concerns(
+    cost: &Money,
+    method: DepreciationMethod,
+    tax_mode: crate::tax::TaxMode,
+) -> Vec<CostConcern> {
+    let amount = cost.minor();
+    let mut concerns = Vec::new();
+
+    match method {
+        DepreciationMethod::LumpSumOverThreeYears if amount >= LUMP_SUM_LIMIT => {
+            concerns.push(CostConcern {
+                message: format!(
+                    "取得価額 {amount} 円は20万円以上です。一括償却資産は20万円未満が対象です。"
+                ),
+                basis: "所得税法施行令139条",
+            });
+        }
+        DepreciationMethod::ImmediateExpense if amount >= IMMEDIATE_LIMIT_BEFORE_R8_APRIL => {
+            concerns.push(CostConcern {
+                message: format!(
+                    "取得価額 {amount} 円は30万円以上です。少額減価償却資産の特例は30万円未満が対象です
+      （令和8年4月1日以後の取得は40万円未満に引き上げられたとされますが、条文で確認できていません）。"
+                ),
+                basis: "租税特別措置法28条の2",
+            });
+        }
+        _ => {}
+    }
+
+    // 10万円未満は、そもそも償却せず全額を必要経費にできる区分がある。
+    if amount < NOT_DEPRECIABLE_LIMIT && !matches!(method, DepreciationMethod::ImmediateExpense) {
+        concerns.push(CostConcern {
+            message: format!(
+                "取得価額 {amount} 円は10万円未満です。償却せず全額を必要経費にできる区分があります。"
+            ),
+            basis: "所得税法施行令138条",
+        });
+    }
+
+    // 税込経理で、税抜にすると帯が変わる場合。
+    if tax_mode == crate::tax::TaxMode::Inclusive {
+        if let Some(note) = the_band_changes_without_tax(amount) {
+            concerns.push(note);
+        }
+    }
+
+    concerns
+}
+
+/// 税込の額から税抜（10%）に直すと帯が変わるか。
+///
+/// **10%で見る。** 軽減税率8%の資産（固定資産で該当することはまず無い）を
+/// 網羅するより、境目をまたぐことに気づける方が大事である。
+fn the_band_changes_without_tax(inclusive: i128) -> Option<CostConcern> {
+    // 税抜額 = 税込 ÷ 1.1 の切り捨て。整数で計算する。
+    let exclusive = inclusive * 10 / 11;
+    for (limit, label) in [
+        (NOT_DEPRECIABLE_LIMIT, "10万円"),
+        (LUMP_SUM_LIMIT, "20万円"),
+        (IMMEDIATE_LIMIT_BEFORE_R8_APRIL, "30万円"),
+    ] {
+        if inclusive >= limit && exclusive < limit {
+            return Some(CostConcern {
+                message: format!(
+                    "この帳簿は税込経理です。取得価額 {inclusive} 円は{label}以上ですが、税抜なら {exclusive} 円で{label}を下回ります。
+      **経理方式によって選べる扱いが変わります。**"
+                ),
+                basis: "タックスアンサー No.2100（取得価額の判定は経理方式による）",
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +713,185 @@ mod tests {
         assert_eq!(s.year(2023).unwrap().amount.minor(), 39_600);
         assert!(s.year(2025).is_none(), "償却し終わった年は無い");
         assert!(s.year(2021).is_none(), "取得前の年も無い");
+    }
+
+    // ---- 取得価額と償却方法の食い違い ----
+
+    use crate::tax::TaxMode;
+
+    /// **本命。** 20万円以上に一括償却を当てたら指摘する。
+    ///
+    /// 実帳簿のパソコン・周辺機器 280,717円 でこれを選ぶと、3年で全額が
+    /// 経費になる。所令139条は20万円未満が対象である。
+    #[test]
+    fn lump_sum_over_two_hundred_thousand_is_flagged() {
+        let concerns = cost_concerns(
+            &yen(280_717),
+            DepreciationMethod::LumpSumOverThreeYears,
+            TaxMode::Exclusive,
+        );
+        assert_eq!(concerns.len(), 1, "{concerns:?}");
+        assert!(concerns[0].message.contains("20万円未満"), "{concerns:?}");
+        assert_eq!(concerns[0].basis, "所得税法施行令139条");
+    }
+
+    /// 20万円ちょうどは対象外（「20万円未満」なので）。
+    #[test]
+    fn lump_sum_at_exactly_two_hundred_thousand_is_flagged() {
+        let concerns = cost_concerns(
+            &yen(200_000),
+            DepreciationMethod::LumpSumOverThreeYears,
+            TaxMode::Exclusive,
+        );
+        assert_eq!(concerns.len(), 1, "20万円ちょうどは帯の外: {concerns:?}");
+    }
+
+    #[test]
+    fn lump_sum_just_under_the_limit_is_fine() {
+        let concerns = cost_concerns(
+            &yen(199_999),
+            DepreciationMethod::LumpSumOverThreeYears,
+            TaxMode::Exclusive,
+        );
+        assert!(concerns.is_empty(), "{concerns:?}");
+    }
+
+    /// **本命。** 30万円以上に少額特例を当てたら指摘する。
+    #[test]
+    fn the_immediate_expense_over_three_hundred_thousand_is_flagged() {
+        let concerns = cost_concerns(
+            &yen(500_000),
+            DepreciationMethod::ImmediateExpense,
+            TaxMode::Exclusive,
+        );
+        assert_eq!(concerns.len(), 1, "{concerns:?}");
+        assert!(concerns[0].message.contains("30万円未満"), "{concerns:?}");
+        assert_eq!(concerns[0].basis, "租税特別措置法28条の2");
+    }
+
+    /// 実帳簿の 280,717円 に少額特例は帯としては通る。
+    #[test]
+    fn the_real_book_pc_fits_the_immediate_expense_band() {
+        let concerns = cost_concerns(
+            &yen(280_717),
+            DepreciationMethod::ImmediateExpense,
+            TaxMode::Exclusive,
+        );
+        assert!(concerns.is_empty(), "{concerns:?}");
+    }
+
+    /// **本命。** 10万円未満は、償却せず全額を経費にできる区分がある。
+    #[test]
+    fn under_one_hundred_thousand_points_at_the_immediate_deduction() {
+        let concerns = cost_concerns(
+            &yen(98_181),
+            DepreciationMethod::LumpSumOverThreeYears,
+            TaxMode::Exclusive,
+        );
+        assert_eq!(concerns.len(), 1, "{concerns:?}");
+        assert_eq!(concerns[0].basis, "所得税法施行令138条");
+    }
+
+    /// 少額特例を選んでいるなら、10万円未満でも重ねて言わない。
+    ///
+    /// どちらも初年度に全額が経費になるので、言っても行動が変わらない。
+    #[test]
+    fn the_immediate_expense_under_one_hundred_thousand_says_nothing() {
+        let concerns = cost_concerns(
+            &yen(98_181),
+            DepreciationMethod::ImmediateExpense,
+            TaxMode::Exclusive,
+        );
+        assert!(concerns.is_empty(), "{concerns:?}");
+    }
+
+    /// **本命。** 税込経理で境目をまたぐ額は、それを伝える。
+    ///
+    /// 実帳簿の電動アシスト自転車等 108,000円（税込）は10万円以上だが、
+    /// 税抜なら 98,181円 で10万円を下回る。**経理方式の選択が償却額を
+    /// 左右する**ので、気づけないと選択そのものを誤る。
+    #[test]
+    fn an_amount_that_crosses_a_band_without_tax_is_reported() {
+        let concerns = cost_concerns(
+            &yen(108_000),
+            DepreciationMethod::LumpSumOverThreeYears,
+            TaxMode::Inclusive,
+        );
+        assert_eq!(concerns.len(), 1, "{concerns:?}");
+        assert!(
+            concerns[0].message.contains("98181"),
+            "税抜額を出すこと: {concerns:?}"
+        );
+        assert!(concerns[0].message.contains("10万円"), "{concerns:?}");
+    }
+
+    /// 税抜経理なら、この指摘は出ない（既に税抜で入っている）。
+    #[test]
+    fn the_band_note_is_only_for_tax_inclusive_books() {
+        let concerns = cost_concerns(
+            &yen(108_000),
+            DepreciationMethod::LumpSumOverThreeYears,
+            TaxMode::Exclusive,
+        );
+        assert!(concerns.is_empty(), "{concerns:?}");
+    }
+
+    /// 境目から離れていれば言わない（毎回出る注意書きにしない）。
+    #[test]
+    fn an_amount_far_from_a_band_says_nothing() {
+        let concerns = cost_concerns(
+            &yen(150_000),
+            DepreciationMethod::LumpSumOverThreeYears,
+            TaxMode::Inclusive,
+        );
+        assert!(concerns.is_empty(), "{concerns:?}");
+    }
+
+    /// 定額法には帯の制限が無い（どの額でも選べる）。
+    #[test]
+    fn the_straight_line_has_no_band() {
+        for amount in [100_000_i128, 280_717, 5_000_000] {
+            let concerns = cost_concerns(
+                &yen(amount),
+                DepreciationMethod::StraightLine {
+                    useful_life_years: 4,
+                },
+                TaxMode::Exclusive,
+            );
+            assert!(concerns.is_empty(), "{amount}: {concerns:?}");
+        }
+    }
+
+    /// 指摘には必ず条文を付ける。確かめようがない指摘は無視されるだけである。
+    #[test]
+    fn every_concern_carries_its_basis() {
+        let cases = [
+            (
+                280_717_i128,
+                DepreciationMethod::LumpSumOverThreeYears,
+                TaxMode::Exclusive,
+            ),
+            (
+                500_000,
+                DepreciationMethod::ImmediateExpense,
+                TaxMode::Exclusive,
+            ),
+            (
+                98_181,
+                DepreciationMethod::LumpSumOverThreeYears,
+                TaxMode::Exclusive,
+            ),
+            (
+                108_000,
+                DepreciationMethod::LumpSumOverThreeYears,
+                TaxMode::Inclusive,
+            ),
+        ];
+        for (amount, method, mode) in cases {
+            for concern in cost_concerns(&yen(amount), method, mode) {
+                assert!(!concern.basis.is_empty(), "{amount}");
+                assert!(!concern.message.is_empty(), "{amount}");
+            }
+        }
     }
 }
