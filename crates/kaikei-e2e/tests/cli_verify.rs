@@ -298,6 +298,46 @@ async fn a_refund_on_the_credit_side_is_not_counted(
         stderr.contains("1万円以上 1 件・43,967 円"),
         "返金を数えないこと: {stderr}"
     );
+    // **貸方に何件あるかは言う。** 黙って落とすと「1件しか無い」と読まれる。
+    assert!(
+        stderr.contains("うち 1 件は貸方に立っています"),
+        "貸方の件数を伝えること: {stderr}"
+    );
+    assert!(
+        stderr.contains("適格返還請求書"),
+        "要る書類が違うことを言うこと: {stderr}"
+    );
+    // 見出しは借方と貸方を合わせた数（606 = 598 + 8 の形）。
+    assert!(
+        stderr.contains("課税仕入れの明細 2 件"),
+        "見出しは合計: {stderr}"
+    );
+}
+
+/// 貸方が無ければ、貸方の話はしない（毎回出る注意書きにしない）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn nothing_is_said_about_the_credit_side_when_there_is_none(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_entry_with_tags(
+        &app,
+        1,
+        "609",
+        "110",
+        43_967,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("貸方に立っています"), "{stderr}");
 }
 
 /// **本命。** 1万円ちょうどは1万円以上として数える。

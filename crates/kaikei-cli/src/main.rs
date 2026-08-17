@@ -950,12 +950,20 @@ fn warn_if_owner_accounts_carried_over(
 fn count_qualified_without_counterparty(
     entries: &[kaikei_core::JournalEntry],
     rule_sets: &kaikei_jp::tax::TaxRuleSets,
-) -> usize {
-    entries
-        .iter()
-        .flat_map(|entry| entry.lines().iter())
-        .filter(|line| line_needs_a_counterparty(line.tags(), rule_sets))
-        .count()
+) -> (usize, usize) {
+    let mut debit = 0;
+    let mut credit = 0;
+    for line in entries.iter().flat_map(|entry| entry.lines().iter()) {
+        if !line_needs_a_counterparty(line.tags(), rule_sets) {
+            continue;
+        }
+        if line.side() == kaikei_core::Side::Debit {
+            debit += 1;
+        } else {
+            credit += 1;
+        }
+    }
+    (debit, credit)
 }
 
 /// 取引先が無い課税仕入れの取引を、少額特例の金額の境目で分ける。
@@ -1115,16 +1123,28 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
     let rule_sets = kaikei_jp::tax::TaxRuleSets::from_embedded()
         .map_err(|error| format!("同梱の消費税区分マスタを読めませんでした: {error}"))?;
 
-    let count = count_qualified_without_counterparty(entries, &rule_sets);
-    if count == 0 {
+    let (debit, credit) = count_qualified_without_counterparty(entries, &rule_sets);
+    if debit + credit == 0 {
         return Ok(());
     }
 
     eprintln!(
-        "注意: 適格請求書が要る税区分の明細が {count} 件ありますが、取引先が記録されていません。"
+        "注意: 課税仕入れの明細 {} 件に取引先が記録されていません。",
+        debit + credit
     );
-    eprintln!("  誰から受け取った適格請求書なのかを、帳簿から辿れません。");
+    eprintln!("  誰との取引なのかを、帳簿から辿れません。");
     eprintln!("  記帳するときに counterparty タグを付けると記録されます。");
+    // **借方と貸方を分けて言う。** 貸方に立つものは「仕入れ」ではなく返還
+    // （返金・値引き）か、家事按分のような**内部の振替**である。後者には
+    // そもそも相手方が存在しないので、「請求書を揃えてください」は的外れに
+    // なる。実際、家事按分を記帳したら3件増えた。
+    if credit > 0 {
+        eprintln!(
+            "  うち {credit} 件は貸方に立っています（返金・値引き、または家事按分などの内部の振替）。"
+        );
+        eprintln!("    返金・値引きに要るのは適格請求書ではなく適格返還請求書です。");
+        eprintln!("    内部の振替には相手方が無いので、取引先を付けようがありません。");
+    }
     eprintln!(
         "  仕入税額控除が認められるかどうかは、証憑の保存状況と相手方の登録状況で決まります。"
     );
@@ -1139,7 +1159,7 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
         // 内訳は借方だけを見ている。分母を出さないと「足しても合わない」と
         // 読まれる。
         eprintln!(
-            "  このうち借方に立つ {} 取引を、税込1万円で分けると:",
+            "  借方の {} 取引を、税込1万円で分けると:",
             split.small + split.large
         );
         eprintln!(
@@ -1152,8 +1172,6 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
             kaikei_core::Money::from_minor(split.large_total_minor, kaikei_core::Currency::JPY)
                 .to_display_string()
         );
-        eprintln!("  ※ 貸方に立つ課税仕入れ（返金・値引き）はここに数えていません。");
-        eprintln!("    要るのは適格請求書ではなく適格返還請求書だからです。");
         eprintln!("  ※ 少額特例には基準期間の課税売上高1億円以下などの要件があり、");
         eprintln!("    このソフトでは判定していません（前々年の帳簿が無いことがあるため）。");
         eprintln!("    免除されるのは適格請求書の保存だけで、帳簿の記載事項は免除されません。");
