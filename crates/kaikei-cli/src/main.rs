@@ -102,6 +102,10 @@ household は決算時の家事按分の振替仕訳を出します（記帳は�
     このほか blue_return_not_on_form.csv に、決算書のどの欄にも
     載らなかった科目を理由付きで書き出します。
 
+    invoices_to_collect.csv には、適格請求書を揃えるべき取引を並べます
+    （取引先が記録されていない課税仕入れのうち、税込1万円以上のもの）。
+    日付・金額・摘要・科目が入っているので、そのまま作業リストに使えます。
+
     証憑が登録されていれば documents/ にも書き出します（KAIKEI_BLOB_ROOT が
     要ります）。保存はハッシュ、閲覧は「日付_取引先_金額_種別」の名前です。
     index.csv に元のファイル名とハッシュ、checksums.txt に各ファイルの
@@ -981,28 +985,47 @@ fn split_by_small_amount(
 ) -> SplitBySmallAmount {
     let mut split = SplitBySmallAmount::default();
     for entry in entries {
-        if !entry
-            .lines()
-            .iter()
-            .any(|line| line_needs_a_counterparty(line.tags(), rule_sets))
-        {
+        let (needs, total) = needs_an_invoice(entry, rule_sets);
+        // **借方の明細だけを数える。** 貸方に立つ課税仕入れは返還（返金・
+        // 値引き）で、要るのは適格返還請求書である。`invoices_to_collect`
+        // と同じ条件にしないと、件数と一覧の行数が食い違う。
+        if !entry.lines().iter().any(|line| {
+            line.side() == kaikei_core::Side::Debit
+                && line_needs_a_counterparty(line.tags(), rule_sets)
+        }) {
             continue;
         }
-        let total: i128 = entry
-            .lines()
-            .iter()
-            .filter(|line| line.side() == kaikei_core::Side::Debit)
-            .map(|line| line.amount().minor())
-            .sum();
-        let total = kaikei_core::Money::from_minor(total, kaikei_core::Currency::JPY);
-        if kaikei_jp::invoice::is_within_the_small_amount_special(&total, entry.entry_date()) {
-            split.small += 1;
-        } else {
+        if needs {
             split.large += 1;
-            split.large_total_minor += total.minor();
+            split.large_total_minor += total;
+        } else {
+            split.small += 1;
         }
     }
     split
+}
+
+/// その取引に適格請求書の保存が要るか、と取引額。
+///
+/// **数える側（`split_by_small_amount`）と並べる側（`invoices_to_collect`）が
+/// 同じ判定を使う。** 二重に書くと、件数と一覧の行数が食い違ったときに
+/// どちらが正しいのか分からなくなる。
+///
+/// 戻り値の `bool` は「取引先が無い課税仕入れであること」を前提にしていない
+/// ——呼び出し側がそちらを先に確かめる。ここは金額と日付だけを見る。
+fn needs_an_invoice(
+    entry: &kaikei_core::JournalEntry,
+    _rule_sets: &kaikei_jp::tax::TaxRuleSets,
+) -> (bool, i128) {
+    let total: i128 = entry
+        .lines()
+        .iter()
+        .filter(|line| line.side() == kaikei_core::Side::Debit)
+        .map(|line| line.amount().minor())
+        .sum();
+    let money = kaikei_core::Money::from_minor(total, kaikei_core::Currency::JPY);
+    let small = kaikei_jp::invoice::is_within_the_small_amount_special(&money, entry.entry_date());
+    (!small, total)
 }
 
 /// 明細1行の判定。**表示から切り離してある**（`accounts_on_the_wrong_side`
@@ -1031,6 +1054,60 @@ fn line_needs_a_counterparty(
     requires_qualified_invoice && tags.get(&counterparty_key).is_none()
 }
 
+/// 適格請求書を揃えるべき取引を並べる。
+///
+/// **`split_by_small_amount` と同じ条件で選ぶ。** 数えた件数と一覧の行数が
+/// 食い違うと、どちらが正しいのか分からなくなる。数える側と並べる側で条件を
+/// 二重に書かないよう、判定そのもの（`needs_an_invoice`）を共有する。
+///
+/// 並び順は**金額の大きい順**。先頭しか読まれないことがあるので、並び順が
+/// 「何を見せるか」になる（`check_suspected_duplicates` と同じ理由）。
+fn invoices_to_collect(
+    entries: &[kaikei_core::JournalEntry],
+    rule_sets: &kaikei_jp::tax::TaxRuleSets,
+    chart: &kaikei_core::ChartOfAccounts,
+) -> Vec<kaikei_report::invoices_to_collect::InvoiceToCollect> {
+    let mut rows: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| {
+            let (needs, total) = needs_an_invoice(entry, rule_sets);
+            if !needs {
+                return None;
+            }
+            // **借方の明細だけを載せる。** 貸方に立つ課税仕入れは「仕入れ」
+            // ではなく**返還**（返金・値引き）である。返還に要るのは適格請求書
+            // ではなく**適格返還請求書**で、必要な書類が違う。同じ一覧に混ぜると
+            // 「請求書を探しても見つからない」ことになる。
+            //
+            // 実帳簿では 603 件中5件がこれ（ドメイン代の返金 60,831円）。
+            // 返還の側の検査は、必要になったら別に作ること。
+            let line = entry.lines().iter().find(|line| {
+                line.side() == kaikei_core::Side::Debit
+                    && line_needs_a_counterparty(line.tags(), rule_sets)
+            })?;
+            let account = line.account().as_str().to_string();
+            let account_name = chart
+                .get(line.account())
+                .map(|def| def.name.clone())
+                .unwrap_or_else(|| account.clone());
+            Some(kaikei_report::invoices_to_collect::InvoiceToCollect {
+                date: entry.entry_date().to_iso_string(),
+                entry_no: i64::from(entry.entry_no().as_u32()),
+                amount_minor: total,
+                description: entry.description().to_string(),
+                account,
+                account_name,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.amount_minor
+            .cmp(&a.amount_minor)
+            .then_with(|| a.entry_no.cmp(&b.entry_no))
+    });
+    rows
+}
+
 /// 上の件数を知らせる。
 fn warn_if_qualified_invoice_lacks_a_counterparty(
     entries: &[kaikei_core::JournalEntry],
@@ -1056,18 +1133,27 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
     // 少額特例（税込1万円未満は適格請求書の保存が不要）で分ければ、
     // 実際に請求書を揃える必要がある取引はずっと少ないことがある。
     let split = split_by_small_amount(entries, &rule_sets);
-    if split.small > 0 {
+    if split.small + split.large > 0 {
         eprintln!();
+        // **分母を必ず言う。** 上の件数（明細）と内訳（取引）は数え方が違ううえ、
+        // 内訳は借方だけを見ている。分母を出さないと「足しても合わない」と
+        // 読まれる。
         eprintln!(
-            "  このうち取引単位で見ると、{} 件が税込1万円未満です（少額特例の対象になりうる）。",
+            "  このうち借方に立つ {} 取引を、税込1万円で分けると:",
+            split.small + split.large
+        );
+        eprintln!(
+            "    1万円未満 {} 件（少額特例の対象になりうる）",
             split.small
         );
         eprintln!(
-            "  1万円以上は {} 件・{} 円で、こちらは適格請求書の保存が要ります。",
+            "    1万円以上 {} 件・{} 円（適格請求書の保存が要ります）",
             split.large,
             kaikei_core::Money::from_minor(split.large_total_minor, kaikei_core::Currency::JPY)
                 .to_display_string()
         );
+        eprintln!("  ※ 貸方に立つ課税仕入れ（返金・値引き）はここに数えていません。");
+        eprintln!("    要るのは適格請求書ではなく適格返還請求書だからです。");
         eprintln!("  ※ 少額特例には基準期間の課税売上高1億円以下などの要件があり、");
         eprintln!("    このソフトでは判定していません（前々年の帳簿が無いことがあるため）。");
         eprintln!("    免除されるのは適格請求書の保存だけで、帳簿の記載事項は免除されません。");
@@ -3838,6 +3924,34 @@ async fn write_reports(
         fiscal_year_label,
         &cumulative.balance_sheet,
     )?;
+
+    // 適格請求書を揃えるべき取引の一覧。
+    //
+    // **件数だけでは進まない。** verify が「1万円以上は 33 件」と言っても、
+    // どの取引なのかが分からなければ請求書を探しに行けない。日付・金額・
+    // 摘要・科目があれば、通帳やメールから元の取引を辿れる。
+    // 0 件でも見出しだけのファイルを書く（`blue_return_not_on_form.csv` と同じ）。
+    let rule_sets = kaikei_jp::tax::TaxRuleSets::from_embedded()
+        .map_err(|error| format!("同梱の消費税区分マスタを読めませんでした: {error}"))?;
+    let to_collect = invoices_to_collect(&entries, &rule_sets, &chart);
+    let collect_path = out_dir.join("invoices_to_collect.csv");
+    std::fs::write(
+        &collect_path,
+        kaikei_report::invoices_to_collect::to_csv(&to_collect),
+    )
+    .map_err(|error| {
+        format!(
+            "書き出せませんでした: {}（{error}）",
+            collect_path.display()
+        )
+    })?;
+    written.push(collect_path);
+    if !to_collect.is_empty() {
+        println!(
+            "適格請求書を揃えるべき取引が {} 件あります（invoices_to_collect.csv）",
+            to_collect.len()
+        );
+    }
 
     // 全件 JSON。**この出力はこのソフトが消えてもデータが残るためのもの**
     // なので、既定で必ず出す（docs/03-database.md §8）。

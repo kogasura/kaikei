@@ -158,6 +158,42 @@ async fn seed_entry_with_tags(
     tx.commit().await.expect("コミット");
 }
 
+/// 税区分のタグを**貸方**に付けた仕訳を1本入れる（返金・値引きの形）。
+async fn seed_entry_with_tags_on_credit(
+    pool: &PgPool,
+    entry_no: i32,
+    debit: &str,
+    credit: &str,
+    amount: i64,
+    credit_tags: &str,
+) {
+    let mut tx = pool.begin().await.expect("トランザクション");
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries (id, fiscal_year, entry_no, entry_date, description, recorded_at) VALUES ($1::uuid, 2026, $2, DATE '2026-06-15', '返金', now())",
+    )
+    .bind(&id)
+    .bind(entry_no)
+    .execute(&mut *tx)
+    .await
+    .expect("仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit, tags) VALUES ($1::uuid, 1, $2, 1, $4, 'JPY', 0, '{}'::jsonb), ($1::uuid, 2, $3, 2, $4, 'JPY', 0, $5::jsonb)",
+    )
+    .bind(&id)
+    .bind(debit)
+    .bind(credit)
+    .bind(amount)
+    .bind(credit_tags)
+    .execute(&mut *tx)
+    .await
+    .expect("明細");
+    tx.commit().await.expect("コミット");
+}
+
 /// **本命。** 適格請求書が要る税区分に取引先が無ければ指摘する。
 ///
 /// 実際に weBanana.SP の帳簿が 603 件この状態だった。`JpTaxPolicy` は
@@ -217,11 +253,11 @@ async fn verify_splits_the_count_at_the_small_amount_threshold(
 
     assert!(ok, "{stderr}");
     assert!(
-        stderr.contains("2 件が税込1万円未満"),
+        stderr.contains("1万円未満 2 件"),
         "1万円未満の件数: {stderr}"
     );
     assert!(
-        stderr.contains("1万円以上は 1 件・35,829 円"),
+        stderr.contains("1万円以上 1 件・35,829 円"),
         "1万円以上は件数と金額の両方: {stderr}"
     );
     // **免除されるのは請求書の保存だけ**であることを必ず添える。
@@ -232,6 +268,35 @@ async fn verify_splits_the_count_at_the_small_amount_threshold(
     assert!(
         stderr.contains("令和11年9月30日"),
         "期限を出すこと: {stderr}"
+    );
+}
+
+/// **本命。** 貸方に立つ課税仕入れ（返金・値引き）は数えない。
+///
+/// 返還に要るのは適格請求書ではなく**適格返還請求書**である。同じ数に混ぜると
+/// 「請求書を探しても見つからない」ことになる。実帳簿では 603件 のうち5件が
+/// これ（ドメイン代の返金 60,831円）だった。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_refund_on_the_credit_side_is_not_counted(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    let qualified = r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#;
+    // 仕入れ（借方 通信費）。
+    seed_entry_with_tags(&app, 1, "609", "110", 43_967, qualified).await;
+    // 返金（借方 普通預金 / 貸方 通信費）。税区分は貸方に付く。
+    seed_entry_with_tags_on_credit(&app, 2, "110", "609", 43_967, qualified).await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("1万円以上 1 件・43,967 円"),
+        "返金を数えないこと: {stderr}"
     );
 }
 
@@ -252,9 +317,9 @@ async fn exactly_ten_thousand_counts_as_large(
     let (_stdout, stderr, ok) = run_verify(&app);
 
     assert!(ok, "{stderr}");
-    assert!(stderr.contains("1 件が税込1万円未満"), "{stderr}");
+    assert!(stderr.contains("1万円未満 1 件"), "{stderr}");
     assert!(
-        stderr.contains("1万円以上は 1 件・10,000 円"),
+        stderr.contains("1万円以上 1 件・10,000 円"),
         "1万円ちょうどは対象外: {stderr}"
     );
 }
