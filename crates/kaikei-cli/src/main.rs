@@ -1088,6 +1088,26 @@ fn line_needs_a_counterparty(
     requires_qualified_invoice && tags.get(&counterparty_key).is_none()
 }
 
+/// その明細の税区分が、適格請求書の保存を要求しているか。
+///
+/// **取引先の有無は見ない**（`line_needs_a_counterparty` はそこも見る）。
+/// 取引先が付いている明細について、相手の適格性まで確かめたいときに使う。
+fn line_requires_a_qualified_invoice(
+    tags: &kaikei_core::TagSet,
+    rule_sets: &kaikei_jp::tax::TaxRuleSets,
+) -> bool {
+    let Ok(tax_key) = kaikei_core::TagKey::parse("tax_category") else {
+        return false;
+    };
+    let Some(kaikei_core::TagValue::Code(code)) = tags.get(&tax_key) else {
+        return false;
+    };
+    rule_sets
+        .iter()
+        .find_map(|table| table.category(code).ok())
+        .is_some_and(|category| category.requires_qualified_invoice)
+}
+
 /// 適格請求書を揃えるべき取引を並べる。
 ///
 /// **`split_by_small_amount` と同じ条件で選ぶ。** 数えた件数と一覧の行数が
@@ -1189,9 +1209,73 @@ async fn entries_with_an_invoice_document(
     Ok(done)
 }
 
+/// 取引先は付いているが、その取引先の**登録番号が分からない**明細を数える。
+///
+/// # 取引先が付いていれば済む話ではない
+///
+/// `warn_if_qualified_invoice_lacks_a_counterparty` は取引先タグの有無しか
+/// 見ていない。**タグが付いていても、その相手が適格請求書発行事業者かどうかを
+/// 確かめていなければ、仕入税額控除の根拠にならない。**
+///
+/// 実帳簿（2026-08-17）では、取引先マスタ31件すべてが未確認だった
+/// （`invoice_registration_no` も `is_qualified_invoice_issuer` も空）。
+/// freee 側の取引先34件も登録番号が全件未入力である。
+///
+/// # 「未確認」と「非適格」は違う
+///
+/// `is_qualified_invoice_issuer` が `false` なら「非適格だと確認した」で、
+/// 経過措置の対象として処理できる。`None` は**まだ調べていない**であり、
+/// どちらの扱いもできない。この2つを混ぜない（`list_partners` と同じ立場）。
+fn count_counterparties_without_a_registration_number(
+    entries: &[kaikei_core::JournalEntry],
+    rule_sets: &kaikei_jp::tax::TaxRuleSets,
+    counterparties: &kaikei_app::policy::CounterpartyIndex,
+) -> (usize, std::collections::BTreeSet<String>) {
+    let mut lines = 0;
+    let mut names = std::collections::BTreeSet::new();
+    for line in entries.iter().flat_map(|entry| entry.lines().iter()) {
+        if line.side() != kaikei_core::Side::Debit {
+            continue;
+        }
+        if let Some(name) = unverified_counterparty_name(line.tags(), rule_sets, counterparties) {
+            lines += 1;
+            names.insert(name);
+        }
+    }
+    (lines, names)
+}
+
+/// 明細1行の判定。**表示から切り離してある**（`line_needs_a_counterparty`
+/// と同じ理由。何を拾うかをテストで固定できないと、呼び出しごと消えても
+/// 気づけない）。
+///
+/// 適格請求書が要る税区分で、取引先が付いていて、その取引先の適格性が
+/// **未確認**なら、その取引先名を返す。
+fn unverified_counterparty_name(
+    tags: &kaikei_core::TagSet,
+    rule_sets: &kaikei_jp::tax::TaxRuleSets,
+    counterparties: &kaikei_app::policy::CounterpartyIndex,
+) -> Option<String> {
+    if !line_requires_a_qualified_invoice(tags, rule_sets) {
+        return None;
+    }
+    let key = kaikei_core::TagKey::parse("counterparty").ok()?;
+    let kaikei_core::TagValue::Code(code) = tags.get(&key)? else {
+        return None;
+    };
+    let party = counterparties.get(code)?;
+    // **未確認だけを数える。** 非適格と確認済みなら経過措置で処理できる。
+    if party.is_qualified_invoice_issuer.is_none() && party.invoice_registration_no.is_none() {
+        Some(party.name.clone())
+    } else {
+        None
+    }
+}
+
 /// 上の件数を知らせる。
 fn warn_if_qualified_invoice_lacks_a_counterparty(
     entries: &[kaikei_core::JournalEntry],
+    counterparties: &kaikei_app::policy::CounterpartyIndex,
 ) -> Result<(), String> {
     let rule_sets = kaikei_jp::tax::TaxRuleSets::from_embedded()
         .map_err(|error| format!("同梱の消費税区分マスタを読めませんでした: {error}"))?;
@@ -1221,6 +1305,23 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
     eprintln!(
         "  仕入税額控除が認められるかどうかは、証憑の保存状況と相手方の登録状況で決まります。"
     );
+
+    // **取引先が付いていれば済む話ではない。** 相手が適格請求書発行事業者か
+    // どうかを確かめていなければ、控除の根拠にならない。
+    let (unverified, names) =
+        count_counterparties_without_a_registration_number(entries, &rule_sets, counterparties);
+    if unverified > 0 {
+        eprintln!();
+        eprintln!(
+            "  取引先が付いている明細のうち {unverified} 件は、相手の登録番号が分かりません。"
+        );
+        eprintln!(
+            "    {}",
+            names.iter().cloned().collect::<Vec<_>>().join(" / ")
+        );
+        eprintln!("    「未確認」であって「非適格」ではありません。非適格と確認できれば");
+        eprintln!("    経過措置で処理できますが、未確認のままではどちらの扱いもできません。");
+    }
 
     // **件数だけでは動けない。** 603件と言われても手の付けようがないが、
     // 少額特例（税込1万円未満は適格請求書の保存が不要）で分ければ、
@@ -3307,11 +3408,14 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
     let year = FiscalYear::calendar_year(fiscal_year);
     let (from, to) = (year.start(), year.end());
 
-    let (chart, income_statement, balance_sheet, entries, fixed_assets) =
+    let (chart, income_statement, balance_sheet, entries, fixed_assets, counterparties) =
         with_tx_err(store, move |tx| {
             let schema = schema.clone();
             Box::pin(async move {
                 let chart = tx.load_chart().await?;
+                // **取引先マスタも読む。** 取引先タグが付いていても、その相手の
+                // 登録番号を確かめていなければ控除の根拠にならない。
+                let counterparties = tx.load_counterparties().await?;
                 let policy = JpStatementPolicy::new(chart.clone());
                 // 損益計算書は会計年度の期間、貸借対照表は帳簿の最初からの累計
                 // （`write_reports` と同じ非対称。会計の性質であって都合ではない）。
@@ -3353,6 +3457,7 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
                     cumulative.balance_sheet,
                     entries,
                     fixed_assets,
+                    counterparties,
                 ))
             })
         })
@@ -3363,7 +3468,7 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
 
     warn_if_depreciation_is_missing(&income_statement, &balance_sheet)?;
     warn_if_a_balance_sits_on_the_wrong_side(&balance_sheet, &chart)?;
-    warn_if_qualified_invoice_lacks_a_counterparty(&entries)?;
+    warn_if_qualified_invoice_lacks_a_counterparty(&entries, &counterparties)?;
     warn_if_the_fixed_asset_ledger_does_not_match_the_book(
         &fixed_assets,
         fiscal_year,
@@ -3868,83 +3973,93 @@ async fn write_reports(
     // 仕訳と勘定科目表を1つのトランザクションで読む。**間に記帳が入ると、
     // 仕訳日記帳と財務諸表が別の帳簿を映す。**
     let schema = catalog.schema().clone();
-    let (entries, chart, statements, cumulative, opening_balance_sheet, fixed_assets) =
-        with_tx_err(&store, move |tx| {
-            let schema = schema.clone();
-            Box::pin(async move {
-                let chart = tx.load_chart().await?;
-                let entries = tx.list_entries_in_period(from, to).await?;
-                let policy = JpStatementPolicy::new(chart.clone());
-                // 損益計算書は**会計年度の期間**。その期間の損益そのものである。
-                let statements = statements::execute(
-                    tx,
-                    &policy,
-                    &schema,
-                    StatementsInput {
-                        from,
-                        to,
-                        // **決算書は決算振替を外して出す。** 外さないと、
-                        // 決算振替を記帳した瞬間に売上0・所得0になる。
-                        exclude_closing_on: Some(to),
-                        only_opening_on: None,
-                    },
-                )
-                .await?;
-                // 貸借対照表は**帳簿の最初からの累計**。ある時点の残高であって
-                // 期間の増減ではないので、期首残高（前期末の仕訳）を含めるには
-                // 会計年度より前まで遡る必要がある。この非対称は会計の性質で
-                // あって実装の都合ではない（`usecase::statements` のモジュール
-                // doc「貸借対照表には期首残高が要る」）。
-                let cumulative = statements::execute(
-                    tx,
-                    &policy,
-                    &schema,
-                    StatementsInput {
-                        from: book_beginning(),
-                        to,
-                        exclude_closing_on: Some(to),
-                        only_opening_on: None,
-                    },
-                )
-                .await?;
-                // 決算書の貸借対照表は期首列も要る。期首＝会計年度の開始日の
-                // **前日**までの累計（期首残高は前期末の日付で記帳する）。
-                let opening_balance_sheet = statements::execute(
-                    tx,
-                    &policy,
-                    &schema,
-                    StatementsInput {
-                        from: book_beginning(),
-                        // **期首振替（1/1）まで含める。** 期首の姿とは
-                        // 「期首振替を済ませた後、その年の商売が始まる前」
-                        // である。前日で切ると事業主貸・事業主借が期首に
-                        // 残り、期首の貸借が合わなくなる。
-                        to: from,
-                        // 期首の列では決算振替を外さない。前年度の決算振替
-                        // （前年12/31の所得→元入金）は期首残高の一部である。
-                        // 外すと元入金が過少になり、前年度の収益・費用が
-                        // 期首の貸借対照表に漏れる。
-                        exclude_closing_on: None,
-                        // ただし 1/1 の普通の取引は入れない（期首の姿では
-                        // なく、その年の商売である）。
-                        only_opening_on: Some(from),
-                    },
-                )
-                .await?;
-                // 固定資産台帳。決算書の「減価償却費の計算」欄に出す。
-                let fixed_assets = tx.list_fixed_assets().await?;
-                Ok((
-                    entries,
-                    chart,
-                    statements,
-                    cumulative,
-                    opening_balance_sheet,
-                    fixed_assets,
-                ))
-            })
+    let (
+        entries,
+        chart,
+        statements,
+        cumulative,
+        opening_balance_sheet,
+        fixed_assets,
+        counterparties,
+    ) = with_tx_err(&store, move |tx| {
+        let schema = schema.clone();
+        Box::pin(async move {
+            let chart = tx.load_chart().await?;
+            let entries = tx.list_entries_in_period(from, to).await?;
+            let policy = JpStatementPolicy::new(chart.clone());
+            // 損益計算書は**会計年度の期間**。その期間の損益そのものである。
+            let statements = statements::execute(
+                tx,
+                &policy,
+                &schema,
+                StatementsInput {
+                    from,
+                    to,
+                    // **決算書は決算振替を外して出す。** 外さないと、
+                    // 決算振替を記帳した瞬間に売上0・所得0になる。
+                    exclude_closing_on: Some(to),
+                    only_opening_on: None,
+                },
+            )
+            .await?;
+            // 貸借対照表は**帳簿の最初からの累計**。ある時点の残高であって
+            // 期間の増減ではないので、期首残高（前期末の仕訳）を含めるには
+            // 会計年度より前まで遡る必要がある。この非対称は会計の性質で
+            // あって実装の都合ではない（`usecase::statements` のモジュール
+            // doc「貸借対照表には期首残高が要る」）。
+            let cumulative = statements::execute(
+                tx,
+                &policy,
+                &schema,
+                StatementsInput {
+                    from: book_beginning(),
+                    to,
+                    exclude_closing_on: Some(to),
+                    only_opening_on: None,
+                },
+            )
+            .await?;
+            // 決算書の貸借対照表は期首列も要る。期首＝会計年度の開始日の
+            // **前日**までの累計（期首残高は前期末の日付で記帳する）。
+            let opening_balance_sheet = statements::execute(
+                tx,
+                &policy,
+                &schema,
+                StatementsInput {
+                    from: book_beginning(),
+                    // **期首振替（1/1）まで含める。** 期首の姿とは
+                    // 「期首振替を済ませた後、その年の商売が始まる前」
+                    // である。前日で切ると事業主貸・事業主借が期首に
+                    // 残り、期首の貸借が合わなくなる。
+                    to: from,
+                    // 期首の列では決算振替を外さない。前年度の決算振替
+                    // （前年12/31の所得→元入金）は期首残高の一部である。
+                    // 外すと元入金が過少になり、前年度の収益・費用が
+                    // 期首の貸借対照表に漏れる。
+                    exclude_closing_on: None,
+                    // ただし 1/1 の普通の取引は入れない（期首の姿では
+                    // なく、その年の商売である）。
+                    only_opening_on: Some(from),
+                },
+            )
+            .await?;
+            // 固定資産台帳。決算書の「減価償却費の計算」欄に出す。
+            let fixed_assets = tx.list_fixed_assets().await?;
+            // 取引先マスタ。登録番号が確かめられているかを見る。
+            let counterparties = tx.load_counterparties().await?;
+            Ok((
+                entries,
+                chart,
+                statements,
+                cumulative,
+                opening_balance_sheet,
+                fixed_assets,
+                counterparties,
+            ))
         })
-        .await
-        .map_err(|error: kaikei_app::error::AppError| format!("帳簿を読めませんでした: {error}"))?;
+    })
+    .await
+    .map_err(|error: kaikei_app::error::AppError| format!("帳簿を読めませんでした: {error}"))?;
 
     // 総勘定元帳。科目ごとに引き、ページングを辿り切る。
     let ledger_query = PgLedgerQuery::new(pool.clone());
@@ -4038,7 +4153,7 @@ async fn write_reports(
 
     // **適格請求書ありの税区分に取引先が付いているか。** 取引先が無いと、
     // 適格請求書発行事業者かどうかの検証がすり抜ける。
-    warn_if_qualified_invoice_lacks_a_counterparty(&entries)?;
+    warn_if_qualified_invoice_lacks_a_counterparty(&entries, &counterparties)?;
 
     // **前年の事業主貸・事業主借が持ち越されていないか。** 翌期首に元入金へ
     // 振り替えないと、年を追うごとに膨らむ。
@@ -5351,6 +5466,135 @@ abc,
         assert!(
             !line_needs_a_counterparty(&tags_of(None, None), &rule_sets),
             "税区分が無い明細は対象外"
+        );
+    }
+
+    // ---- 取引先の登録番号が確かめられているか ----
+
+    fn party(
+        code: &str,
+        name: &str,
+        reg: Option<&str>,
+        qualified: Option<bool>,
+    ) -> kaikei_app::policy::Counterparty {
+        kaikei_app::policy::Counterparty {
+            code: code.to_string(),
+            name: name.to_string(),
+            invoice_registration_no: reg.map(str::to_string),
+            is_qualified_invoice_issuer: qualified,
+        }
+    }
+
+    fn index(list: Vec<kaikei_app::policy::Counterparty>) -> kaikei_app::policy::CounterpartyIndex {
+        kaikei_app::policy::CounterpartyIndex::new(list)
+    }
+
+    // **本命。** 適格請求書が要る税区分は、取引先の有無に関わらず true。
+    #[test]
+    fn the_tax_category_alone_decides_whether_an_invoice_is_required() {
+        let rule_sets = embedded_tax_rule_sets();
+        assert!(line_requires_a_qualified_invoice(
+            &tags_of(Some("PURCHASE_10_QUALIFIED"), None),
+            &rule_sets
+        ));
+        assert!(
+            line_requires_a_qualified_invoice(
+                &tags_of(Some("PURCHASE_10_QUALIFIED"), Some("apple")),
+                &rule_sets
+            ),
+            "取引先の有無で変わらない"
+        );
+        assert!(!line_requires_a_qualified_invoice(
+            &tags_of(Some("OUT_OF_SCOPE"), None),
+            &rule_sets
+        ));
+    }
+
+    // **本命。** 「未確認」と「非適格」を混ぜない。
+    //
+    // 非適格と確認できていれば経過措置で処理できる。未確認のままでは
+    // どちらの扱いもできない——だから未確認だけを拾う。
+    #[test]
+    fn only_an_unverified_counterparty_is_picked_up() {
+        let rule_sets = embedded_tax_rule_sets();
+        let parties = index(vec![
+            party("unknown", "未確認の相手", None, None),
+            party("not_qualified", "非適格と確認済み", None, Some(false)),
+            party(
+                "qualified",
+                "適格と確認済み",
+                Some("T1234567890123"),
+                Some(true),
+            ),
+        ]);
+
+        assert_eq!(
+            unverified_counterparty_name(
+                &tags_of(Some("PURCHASE_10_QUALIFIED"), Some("unknown")),
+                &rule_sets,
+                &parties
+            ),
+            Some("未確認の相手".to_string())
+        );
+        assert_eq!(
+            unverified_counterparty_name(
+                &tags_of(Some("PURCHASE_10_QUALIFIED"), Some("not_qualified")),
+                &rule_sets,
+                &parties
+            ),
+            None,
+            "非適格と確認済みなら経過措置で処理できる"
+        );
+        assert_eq!(
+            unverified_counterparty_name(
+                &tags_of(Some("PURCHASE_10_QUALIFIED"), Some("qualified")),
+                &rule_sets,
+                &parties
+            ),
+            None
+        );
+    }
+
+    // 取引先マスタに無いコードは拾わない（ここは整合性を見る場所ではない）。
+    #[test]
+    fn a_counterparty_missing_from_the_master_is_skipped() {
+        let rule_sets = embedded_tax_rule_sets();
+        assert_eq!(
+            unverified_counterparty_name(
+                &tags_of(Some("PURCHASE_10_QUALIFIED"), Some("no_such_code")),
+                &rule_sets,
+                &index(vec![])
+            ),
+            None
+        );
+    }
+
+    // 適格請求書が要らない税区分は拾わない。
+    #[test]
+    fn a_line_that_needs_no_invoice_is_not_picked_up() {
+        let rule_sets = embedded_tax_rule_sets();
+        let parties = index(vec![party("apple", "Apple", None, None)]);
+        assert_eq!(
+            unverified_counterparty_name(
+                &tags_of(Some("OUT_OF_SCOPE"), Some("apple")),
+                &rule_sets,
+                &parties
+            ),
+            None
+        );
+    }
+
+    // 取引先が付いていない明細は拾わない（そちらは別の指摘が出る）。
+    #[test]
+    fn a_line_without_a_counterparty_is_not_picked_up_here() {
+        let rule_sets = embedded_tax_rule_sets();
+        assert_eq!(
+            unverified_counterparty_name(
+                &tags_of(Some("PURCHASE_10_QUALIFIED"), None),
+                &rule_sets,
+                &index(vec![party("apple", "Apple", None, None)])
+            ),
+            None
         );
     }
 
