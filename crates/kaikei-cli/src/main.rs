@@ -130,6 +130,7 @@ verify が見るもの:
       ・資産がマイナス残高、負債がプラス残高になっている
       ・毎月ほぼ同じ日の同額の支出が、月によって違う科目に入っている
       ・同じ費用科目の中で消費税の区分が割れている（控除額が変わります）
+      ・売上があるのに売掛金・買掛金・前受金・前払金がどれも0
     いずれも貸借は一致したままなので、決算書を見ても分かりません。
     指摘があっても検査は失敗しません（誤りと決まったわけではないため）。
 
@@ -3263,6 +3264,89 @@ fn summarize_unmatched(rows: &[&kaikei_app::view::ImportedTxView]) -> Vec<(Strin
 ///
 /// 科目表に `depreciation` 節が無ければ何もしない（利用者が自分の科目表に
 /// 差し替えた場合）。
+/// 債権・債務の科目名。**勘定科目表の名前と一致していなければ検査が効かない。**
+///
+/// 科目コードではなく名前で見ているのは、この検査が「一般的な帳簿の形」を
+/// 見ているからである。コードの体系は帳簿ごとに違いうるが、この4つの名前は
+/// 青色申告決算書の様式にある。
+///
+/// **名前が変わると黙って効かなくなる。** 同梱の勘定科目表にこの名前が実在
+/// することをテストで固定してある（`the_chart_still_has_the_names_this_check_needs`）。
+const RECEIVABLE_AND_PAYABLE_NAMES: [&str; 4] = ["売掛金", "買掛金", "前受金", "前払金"];
+
+/// 売上があるのに、**債権・債務の科目が1件も動いていない**ことを知らせる。
+///
+/// # 入出金ベースの記帳は決算で足りない
+///
+/// 個人事業主の原則は発生主義である（所得税法36条1項「その年において
+/// **収入すべき**金額」）。入金した日に売上を立てる形のままだと、
+/// **12月に役務提供が終わって1月に入金される分がその年の所得に入らない。**
+///
+/// 現金主義の特例（所法67条）は前々年の事業所得等が300万円以下という要件が
+/// あり、多くの場合は使えない。
+///
+/// # 「使っていない」と「要らない」は違う
+///
+/// 売掛金が0件でも、**その年のうちに全部入金されていれば正しい**。
+/// 前受金・前払金も同じで、無いのが正常な年はある。**だから断定しない。**
+///
+/// # 決算書を見ても分からない
+///
+/// 貸借は一致したままで、売掛金の行が 0 と表示されるだけである。
+/// 「立て忘れ」と「立てる必要が無かった」は、決算書の上では同じに見える。
+///
+/// # 売上が無い年は言わない
+///
+/// 開業前や休業中に「売掛金がありません」と言っても手がかりにならない。
+fn warn_if_receivables_are_never_used(
+    income_statement: &kaikei_app::policy::Statement,
+    balance_sheet: &kaikei_app::policy::Statement,
+    chart: &kaikei_core::ChartOfAccounts,
+) -> Result<(), String> {
+    if !receivables_are_never_used(income_statement, balance_sheet, chart) {
+        return Ok(());
+    }
+
+    eprintln!("注意: 売上がありますが、売掛金・買掛金・前受金・前払金がどれも0です。");
+    eprintln!("  入金した日に売上を立てる記帳（入出金ベース）になっていないか確かめてください。");
+    eprintln!("  個人事業主の原則は発生主義（所得税法36条1項）で、");
+    eprintln!("  12月に役務提供が終わって1月に入金される分は、その年の所得に入ります。");
+    eprintln!("  その年のうちに全部入金・支払済みであれば、0のままで正しいです。");
+    Ok(())
+}
+
+/// 判定だけ。**表示から切り離してある**（`year_looks_closed` と同じ理由。
+/// 何を拾うかをテストで固定できないと、「落ちないこと」しか確かめられない）。
+fn receivables_are_never_used(
+    income_statement: &kaikei_app::policy::Statement,
+    balance_sheet: &kaikei_app::policy::Statement,
+    chart: &kaikei_core::ChartOfAccounts,
+) -> bool {
+    // 収益が1円も無ければ何も言わない。
+    let has_revenue = income_statement
+        .sections
+        .iter()
+        .flat_map(|section| section.lines.iter())
+        .any(|line| {
+            !line.amount.is_zero()
+                && chart
+                    .get(&line.account)
+                    .is_some_and(|def| def.account_type == kaikei_core::AccountType::Revenue)
+        });
+    if !has_revenue {
+        return false;
+    }
+
+    // 債権・債務の科目が1つでも動いていれば何も言わない。
+    !RECEIVABLE_AND_PAYABLE_NAMES.iter().any(|name| {
+        balance_sheet
+            .sections
+            .iter()
+            .flat_map(|section| section.lines.iter())
+            .any(|line| line.label.contains(name) && !line.amount.is_zero())
+    })
+}
+
 fn warn_if_depreciation_is_missing(
     income_statement: &kaikei_app::policy::Statement,
     balance_sheet: &kaikei_app::policy::Statement,
@@ -3467,6 +3551,7 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
         })?;
 
     warn_if_depreciation_is_missing(&income_statement, &balance_sheet)?;
+    warn_if_receivables_are_never_used(&income_statement, &balance_sheet, &chart)?;
     warn_if_a_balance_sits_on_the_wrong_side(&balance_sheet, &chart)?;
     warn_if_qualified_invoice_lacks_a_counterparty(&entries, &counterparties)?;
     warn_if_the_fixed_asset_ledger_does_not_match_the_book(
@@ -6649,5 +6734,123 @@ abc,
             matches!(command, Command::Household { .. }),
             "記帳を伴う型に変わっていないこと"
         );
+    }
+
+    // ---- 入出金ベースの記帳（warn_if_receivables_are_never_used） ----
+
+    /// ラベル付きの財務諸表を作る（`statement` はコードをラベルにしてしまう）。
+    fn statement_with_labels(
+        title: &str,
+        lines: Vec<(&str, &str, i128)>,
+    ) -> kaikei_app::policy::Statement {
+        use kaikei_core::{Currency, Money};
+        kaikei_app::policy::Statement {
+            title: title.to_string(),
+            sections: vec![kaikei_app::policy::StatementSection {
+                title: "区分".to_string(),
+                lines: lines
+                    .into_iter()
+                    .map(|(code, label, amount)| kaikei_app::policy::StatementLine {
+                        account: kaikei_core::AccountCode::parse(code).unwrap(),
+                        label: label.to_string(),
+                        amount: Money::from_minor(amount, Currency::JPY),
+                    })
+                    .collect(),
+                subtotal: Money::from_minor(0, Currency::JPY),
+            }],
+            total: Money::from_minor(0, Currency::JPY),
+        }
+    }
+
+    fn chart_for_receivables() -> kaikei_core::ChartOfAccounts {
+        use kaikei_core::{AccountCode, AccountDef, AccountType, ChartOfAccounts};
+        ChartOfAccounts::new(vec![
+            AccountDef {
+                code: AccountCode::parse("500").unwrap(),
+                name: "売上高".to_string(),
+                account_type: AccountType::Revenue,
+                parent: None,
+                postable: true,
+            },
+            AccountDef {
+                code: AccountCode::parse("135").unwrap(),
+                name: "売掛金".to_string(),
+                account_type: AccountType::Asset,
+                parent: None,
+                postable: true,
+            },
+        ])
+        .unwrap()
+    }
+
+    /// **本命。** 売上があるのに債権・債務が全部0なら知らせる。
+    ///
+    /// 実帳簿がこれ（売上11件すべてが「普通預金／売上高」で、売掛金の明細は0件）。
+    /// **決算書を見ても分からない**——売掛金の行が 0 と表示されるだけである。
+    #[test]
+    fn revenue_without_any_receivable_is_reported() {
+        let pl = statement_with_labels("損益計算書", vec![("500", "売上高", 1_000_000)]);
+        let bs = statement_with_labels("貸借対照表", vec![("135", "売掛金", 0)]);
+
+        // 出力そのものは stderr なので、ここでは落ちないことと Ok を見る。
+        assert!(warn_if_receivables_are_never_used(&pl, &bs, &chart_for_receivables()).is_ok());
+        assert!(
+            receivables_are_never_used(&pl, &bs, &chart_for_receivables()),
+            "指摘すべき状態と判定すること"
+        );
+    }
+
+    /// 売掛金が動いていれば言わない。
+    #[test]
+    fn a_used_receivable_is_quiet() {
+        let pl = statement_with_labels("損益計算書", vec![("500", "売上高", 1_000_000)]);
+        let bs = statement_with_labels("貸借対照表", vec![("135", "売掛金", 220_000)]);
+        assert!(!receivables_are_never_used(
+            &pl,
+            &bs,
+            &chart_for_receivables()
+        ));
+    }
+
+    /// **本命。** 売上が無い年は言わない。
+    ///
+    /// 開業前や休業中に「売掛金がありません」と言っても手がかりにならない。
+    #[test]
+    fn a_year_without_revenue_is_quiet() {
+        let pl = statement_with_labels("損益計算書", vec![("500", "売上高", 0)]);
+        let bs = statement_with_labels("貸借対照表", vec![("135", "売掛金", 0)]);
+        assert!(!receivables_are_never_used(
+            &pl,
+            &bs,
+            &chart_for_receivables()
+        ));
+    }
+
+    /// 買掛金だけでも動いていれば言わない（4つのどれか1つで足りる）。
+    #[test]
+    fn any_one_of_the_four_is_enough() {
+        let pl = statement_with_labels("損益計算書", vec![("500", "売上高", 1_000_000)]);
+        let bs = statement_with_labels("貸借対照表", vec![("310", "買掛金", 50_000)]);
+        assert!(!receivables_are_never_used(
+            &pl,
+            &bs,
+            &chart_for_receivables()
+        ));
+    }
+
+    /// **本命。** 同梱の勘定科目表に、この検査が頼っている名前が実在する。
+    ///
+    /// **名前で見ているので、科目名が変わると黙って効かなくなる。**
+    /// このテストが落ちたら、検査の名前も直すこと。
+    #[test]
+    fn the_chart_still_has_the_names_this_check_needs() {
+        let chart = kaikei_jp::chart::load_embedded(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+            .expect("同梱の勘定科目表が読めること");
+        for name in RECEIVABLE_AND_PAYABLE_NAMES {
+            assert!(
+                chart.iter().any(|def| def.name == name),
+                "勘定科目表に「{name}」がありません。検査が効かなくなります"
+            );
+        }
     }
 }
