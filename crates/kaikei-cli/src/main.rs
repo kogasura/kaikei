@@ -4334,6 +4334,26 @@ fn book_beginning() -> AccountingDate {
 ///
 /// 変換できなかった仕訳は別の CSV（UTF-8）に理由付きで書き出す。**弥生に
 /// 渡すファイルに混ぜない**——取り込む側が読むファイルではない。
+/// この帳簿で実際に使われている税区分のコードを集める。
+///
+/// **表に載っているだけの区分と区別する。** 未確認の写像を知らせるとき、
+/// 使っていない区分まで数えると「8件」のような数字になり、どれを確かめれば
+/// よいのか分からなくなる。
+fn tax_categories_used(
+    entries: &[kaikei_core::JournalEntry],
+) -> std::collections::BTreeSet<String> {
+    let mut used = std::collections::BTreeSet::new();
+    let Ok(key) = kaikei_core::TagKey::parse("tax_category") else {
+        return used;
+    };
+    for line in entries.iter().flat_map(|entry| entry.lines().iter()) {
+        if let Some(kaikei_core::TagValue::Code(code)) = line.tags().get(&key) {
+            used.insert(code.clone());
+        }
+    }
+    used
+}
+
 fn write_yayoi(
     out_dir: &Path,
     entries: &[kaikei_core::JournalEntry],
@@ -4401,11 +4421,31 @@ fn write_yayoi(
     // **写像が未確認であることを必ず伝える。** ある区分を別の区分として
     // 出力することは、その取引の税務上の扱いを変える。
     if !map.all_verified() {
-        eprintln!(
-            "注意: 弥生の税区分の写像は実機で確認していません（未確認 {} 件）。\
-             取り込む前に税理士に確認してください",
-            map.unverified_count()
-        );
+        // **この帳簿が実際に使っている区分に絞る。** 「未確認 8 件」とだけ
+        // 言われても、そのうちどれが自分に効くのか分からない。確認を求める
+        // 相手は税理士なので、**確かめる対象を絞れないと依頼そのものが
+        // 重くなる。**
+        let used = tax_categories_used(entries);
+        let unverified = map.unverified_among(&used);
+        if unverified.is_empty() {
+            eprintln!(
+                "注意: 弥生の税区分の写像には未確認のものが {} 件ありますが、この帳簿では使っていません",
+                map.unverified_count()
+            );
+        } else {
+            eprintln!(
+                "注意: 弥生の税区分の写像を実機で確認していません。この帳簿が使っている {} 件が未確認です:",
+                unverified.len()
+            );
+            for (kaikei_code, yayoi_label) in &unverified {
+                eprintln!("  {kaikei_code} → {yayoi_label}");
+            }
+            eprintln!("  取り込む前に税理士に確認してください。");
+            eprintln!(
+                "  （表は全 {} 件が未確認ですが、残りはこの帳簿で使っていません）",
+                map.unverified_count()
+            );
+        }
     }
     if !conversion.skipped.is_empty() {
         eprintln!(
