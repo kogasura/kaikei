@@ -146,6 +146,9 @@ attach の引数:
     --entry <UUID>       紐付ける仕訳のID
                          指定すると、取引年月日・取引金額・取引先を
                          その仕訳から埋めます（明示した値の方が優先）
+    --entry-no <番号>    仕訳番号で紐付けます（--entry の代わり）
+                         invoices_to_collect.csv が出すのはこの番号です。
+                         年は --match-year か --date から決めます
     --mime <型>          MIME タイプ（省略時は拡張子から決める）
     --note <文>          備考
 
@@ -383,6 +386,11 @@ struct AttachArgs {
     match_amount: Option<i64>,
     /// 金額で探すときの年（省略時は取引年月日の年）。
     match_year: Option<i32>,
+    /// 仕訳IDの代わりに、この**仕訳番号**の仕訳を探す。
+    ///
+    /// `invoices_to_collect.csv` が出すのは仕訳番号である。UUID しか
+    /// 受けないと、32件を紐付けるのに毎回引き直すことになる。
+    match_entry_no: Option<u32>,
     /// 備考。
     note: Option<String>,
 }
@@ -724,6 +732,7 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
     let mut entry_id: Option<String> = None;
     let mut match_amount: Option<i64> = None;
     let mut match_year: Option<i32> = None;
+    let mut match_entry_no: Option<u32> = None;
     let mut note: Option<String> = None;
 
     let mut rest = args.iter();
@@ -753,6 +762,11 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
             "--via" => received_via = Some(take()?),
             "--mime" => mime_type = Some(take()?),
             "--entry" => entry_id = Some(take()?),
+            "--entry-no" => {
+                match_entry_no = Some(take()?.parse::<u32>().map_err(|_| {
+                    "--entry-no は仕訳番号（正の整数）で指定してください".to_string()
+                })?)
+            }
             "--match-amount" => {
                 let text = take()?;
                 match_amount = Some(
@@ -777,12 +791,21 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
     // 打たせると、証憑の登録が現実的でなくなる（実際に1件も登録されていない）。
     // **両方は受けない。** どちらを使ったのかが分からないまま登録されると、
     // 意図しない仕訳に紐付いても気づけない。
-    if entry_id.is_some() && match_amount.is_some() {
-        return Err("--entry と --match-amount は同時に指定できません".to_string());
+    let ways = [
+        entry_id.is_some(),
+        match_amount.is_some(),
+        match_entry_no.is_some(),
+    ]
+    .iter()
+    .filter(|used| **used)
+    .count();
+    if ways > 1 {
+        return Err("--entry / --match-amount / --entry-no は同時に指定できません".to_string());
     }
-    if doc_date.is_none() && entry_id.is_none() && match_amount.is_none() {
+    if doc_date.is_none() && ways == 0 {
         return Err("--date を指定してください（例: --date 2026-06-15）。\
-             --entry か --match-amount で仕訳を指定すれば、その仕訳の取引日を使います"
+             --entry / --entry-no / --match-amount のいずれかで仕訳を指定すれば、\
+             その仕訳の取引日を使います"
             .to_string());
     }
     Ok(Command::Attach(AttachArgs {
@@ -798,6 +821,7 @@ fn parse_attach(args: &[String]) -> Result<Command, String> {
         entry_id,
         match_amount,
         match_year,
+        match_entry_no,
         note,
     }))
 }
@@ -1385,11 +1409,15 @@ async fn run_attach(args: AttachArgs) -> Result<Vec<PathBuf>, String> {
         );
     }
 
-    let entry = match (&args.entry_id, args.match_amount) {
-        (Some(text), _) => Some(parse_entry_id(text)?),
+    let entry = match (&args.entry_id, args.match_amount, args.match_entry_no) {
+        (Some(text), _, _) => Some(parse_entry_id(text)?),
         // 金額から引く。**候補が1つに絞れなければ止める。**
-        (None, Some(amount)) => Some(find_entry_by_amount(&store_pg, amount, &args).await?),
-        (None, None) => None,
+        (None, Some(amount), _) => Some(find_entry_by_amount(&store_pg, amount, &args).await?),
+        // 仕訳番号から引く。`invoices_to_collect.csv` が出すのはこれである。
+        (None, None, Some(entry_no)) => {
+            Some(find_entry_by_number(&store_pg, entry_no, &args).await?)
+        }
+        (None, None, None) => None,
     };
 
     // **検索要件を仕訳から埋める。** 指定があればそちらを優先する
@@ -3481,6 +3509,54 @@ const MAX_ENTRY_CANDIDATES: usize = 10;
 /// 同じ額の取引は普通にある（毎月同額のサブスクリプションなど）。**勝手に
 /// 1つ選ぶと、意図しない仕訳に証憑が付く**——しかも紐付けは追記のみなので
 /// 消せない。候補を並べて止め、`--entry` で選んでもらう。
+/// 仕訳番号から仕訳を引く。
+///
+/// # なぜ要るのか
+///
+/// `invoices_to_collect.csv`（適格請求書を揃えるべき取引の一覧）が出すのは
+/// **仕訳番号**である。`--entry` が UUID しか受けないと、一覧の行ごとに
+/// 帳簿を引き直して UUID を調べることになる。32件でそれをやらせない。
+///
+/// # 金額で引くのとの違い
+///
+/// 仕訳番号は**年度の中で一意**なので、候補が複数になることがない。
+/// 金額で引く方（[`find_entry_by_amount`]）は同じ額の仕訳が複数あると止まる。
+async fn find_entry_by_number(
+    store: &PgStore,
+    entry_no: u32,
+    args: &AttachArgs,
+) -> Result<kaikei_core::EntryId, String> {
+    use kaikei_app::ports::JournalRepo;
+
+    // 探す年は、指定 → 取引年月日 の順（`find_entry_by_amount` と同じ）。
+    let year = match (args.match_year, args.doc_date) {
+        (Some(year), _) => year,
+        (None, Some(date)) => date.year(),
+        (None, None) => {
+            return Err(
+                "--entry-no で探す年が決まりません。--match-year か --date を指定してください"
+                    .to_string(),
+            )
+        }
+    };
+    let fiscal_year = FiscalYear::calendar_year(year);
+    let (from, to) = (fiscal_year.start(), fiscal_year.end());
+
+    let entries = with_tx_err(store, move |tx| {
+        Box::pin(async move { tx.list_entries_in_period(from, to).await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| format!("仕訳を読めませんでした: {error}"))?;
+
+    entries
+        .iter()
+        .find(|entry| entry.entry_no().as_u32() == entry_no)
+        .map(|entry| entry.id())
+        .ok_or_else(|| {
+            format!("{year}年に仕訳番号 {entry_no} の仕訳がありません。年と番号を確かめてください")
+        })
+}
+
 async fn find_entry_by_amount(
     store: &PgStore,
     amount: i64,

@@ -212,6 +212,77 @@ async fn an_entry_can_be_found_by_its_amount(
     assert_eq!(amount, Some(11_332));
 }
 
+/// **本命。** 仕訳番号だけで紐付けられる。
+///
+/// `invoices_to_collect.csv`（適格請求書を揃えるべき取引の一覧）が出すのは
+/// **仕訳番号**である。UUID しか受けないと、一覧の行ごとに帳簿を引き直して
+/// UUID を調べることになる。実帳簿では32件がその対象である。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_entry_number_is_enough_to_link(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_entry(&app).await;
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-no");
+    let file = temp_file("byno.txt", "仕訳番号で引く");
+
+    let (out, ok) = run_attach(
+        &app,
+        &blob,
+        &file,
+        &["--entry-no", "900", "--match-year", "2026"],
+    );
+
+    assert!(ok, "仕訳番号だけで紐付けられること: {out}");
+    // 取引年月日と取引金額は仕訳から埋まる。
+    let (date, amount, _) = registered(&app).await;
+    assert_eq!(date, "2026-07-14");
+    assert_eq!(amount, Some(11_332));
+}
+
+/// **本命。** 無い仕訳番号は、年と番号を言って止まる。
+///
+/// 黙って何にも紐付けずに登録すると、付けたつもりで付いていない証憑ができる。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_unknown_entry_number_stops(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_entry(&app).await;
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-no2");
+    let file = temp_file("byno2.txt", "無い番号");
+
+    let (out, ok) = run_attach(
+        &app,
+        &blob,
+        &file,
+        &["--entry-no", "99999", "--match-year", "2026"],
+    );
+
+    assert!(!ok, "止まること: {out}");
+    assert!(out.contains("99999"), "番号を出すこと: {out}");
+    assert!(out.contains("2026"), "年を出すこと: {out}");
+}
+
+/// 年が決まらなければ止まる（仕訳番号は年度の中でしか一意でない）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_entry_number_without_a_year_stops(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_entry(&app).await;
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-no3");
+    let file = temp_file("byno3.txt", "年が無い");
+
+    let (out, ok) = run_attach(&app, &blob, &file, &["--entry-no", "900"]);
+
+    assert!(!ok, "止まること: {out}");
+    assert!(
+        out.contains("--match-year"),
+        "何を足せばよいか言うこと: {out}"
+    );
+}
+
 /// **本命。** 同じ額の仕訳が複数あれば止めて候補を出す。
 ///
 /// 勝手に1つ選ぶと意図しない仕訳に証憑が付く。**紐付けは追記のみなので
@@ -363,6 +434,39 @@ async fn a_given_counterparty_is_not_reported(
 
     assert!(ok, "{out}");
     assert!(!out.contains("取引先が空"), "{out}");
+}
+
+/// `--entry-no` と `--entry` も同時には指定できない。
+///
+/// **どちらを使ったのか分からないまま登録されると、意図しない仕訳に紐付いても
+/// 気づけない。** 紐付けは追記のみで消せない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn entry_and_entry_no_cannot_be_combined(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_entry(&app).await;
+    let blob = std::env::temp_dir().join("kaikei-attach-blob-no4");
+    let file = temp_file("byno4.txt", "両方");
+
+    let (out, ok) = run_attach(
+        &app,
+        &blob,
+        &file,
+        &[
+            "--entry",
+            ENTRY_ID,
+            "--entry-no",
+            "900",
+            "--match-year",
+            "2026",
+        ],
+    );
+
+    assert!(!ok, "止まること: {out}");
+    assert!(out.contains("同時に指定できません"), "{out}");
 }
 
 /// `--entry` と `--match-amount` は同時に指定できない。
