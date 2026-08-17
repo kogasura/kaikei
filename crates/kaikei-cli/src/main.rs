@@ -1140,6 +1140,53 @@ fn invoices_to_collect(
     rows
 }
 
+/// 一覧のうち、**請求書・領収書が既に紐付いている**仕訳の番号を返す。
+///
+/// # なぜ種別を見るのか
+///
+/// 契約書（`contract`）が付いていても、その取引の請求書があることには
+/// ならない。**揃えるべきものが揃ったか**を見たいので、`invoice` と
+/// `receipt` だけを数える。
+///
+/// # 取引先までは求めない
+///
+/// 証憑に取引先が入っていなくても、**請求書そのものは揃っている**。
+/// 取引先が空なら `attach` が別に警告する（検索要件の話であって、
+/// 「集める」作業とは段が違う）。
+///
+/// # 一覧に載っている分だけ引く
+///
+/// `documents_of_entry` は仕訳1件ごとの問い合わせである。600件全部に
+/// 投げると重いので、**一覧に残っている数十件だけ**を見る。
+async fn entries_with_an_invoice_document(
+    documents: &PgDocumentQuery,
+    entries: &[kaikei_core::JournalEntry],
+    to_collect: &[kaikei_report::invoices_to_collect::InvoiceToCollect],
+) -> Result<std::collections::BTreeSet<i64>, String> {
+    use kaikei_app::ports::DocumentQueryPort;
+    use std::collections::BTreeSet;
+
+    let wanted: BTreeSet<i64> = to_collect.iter().map(|row| row.entry_no).collect();
+    let mut done = BTreeSet::new();
+    for entry in entries {
+        let entry_no = i64::from(entry.entry_no().as_u32());
+        if !wanted.contains(&entry_no) {
+            continue;
+        }
+        let attached = documents
+            .documents_of_entry(entry.id())
+            .await
+            .map_err(|error| format!("証憑を読めませんでした: {error}"))?;
+        if attached
+            .iter()
+            .any(|doc| doc.doc_type == "invoice" || doc.doc_type == "receipt")
+        {
+            done.insert(entry_no);
+        }
+    }
+    Ok(done)
+}
+
 /// 上の件数を知らせる。
 fn warn_if_qualified_invoice_lacks_a_counterparty(
     entries: &[kaikei_core::JournalEntry],
@@ -4027,7 +4074,18 @@ async fn write_reports(
     // 0 件でも見出しだけのファイルを書く（`blue_return_not_on_form.csv` と同じ）。
     let rule_sets = kaikei_jp::tax::TaxRuleSets::from_embedded()
         .map_err(|error| format!("同梱の消費税区分マスタを読めませんでした: {error}"))?;
-    let to_collect = invoices_to_collect(&entries, &rule_sets, &chart);
+    let mut to_collect = invoices_to_collect(&entries, &rule_sets, &chart);
+    // **済んだ分は落とす。** 減らない一覧は作業リストとして使えない。
+    // 32件を順に片付けても件数が変わらなければ、どこまで進んだか分からない。
+    let done = entries_with_an_invoice_document(&pool_for_documents, &entries, &to_collect).await?;
+    let before = to_collect.len();
+    to_collect.retain(|row| !done.contains(&row.entry_no));
+    if before != to_collect.len() {
+        println!(
+            "  うち {} 件は証憑が登録済みなので一覧から外しました",
+            before - to_collect.len()
+        );
+    }
     let collect_path = out_dir.join("invoices_to_collect.csv");
     std::fs::write(
         &collect_path,
