@@ -55,12 +55,24 @@
 //! 方が単純なので `Option<String>` のままにする。実在確認は、この関数が
 //! 返す明細を仕訳として記帳する際に `TaxPolicy::validate_tag` が行う。
 //!
-//! # 記帳時按分のみを提供する（`docs/08-compliance.md` §9-3 は未解決）
+//! # 記帳時按分と決算時一括按分の両方を提供する
 //!
 //! 家事按分を「記帳時に都度行う」か「決算時に一括で行う」かで帳簿上の表現が
-//! 変わりうるが、どちらが妥当かは `docs/08-compliance.md` §9-3 で
-//! **税理士確認事項として未解決**のままである。この関数は前者（記帳時按分）
-//! のみを実装し、後者（決算時一括按分）は実装しない。
+//! 変わる。どちらが妥当かは `docs/08-compliance.md` §9-3 で
+//! **税理士確認事項として未解決**だが、**どちらを選ぶかは利用者の判断**であり、
+//! 選べないこと自体が実務の妨げになる。
+//!
+//! | 関数 | いつ | 形 |
+//! |---|---|---|
+//! | [`household_split`] | 払った時点 | 3行（事業分・家事分・支払元） |
+//! | [`year_end_household_split`] | 決算 | 2行（事業主貸・対象科目の取消） |
+//!
+//! 決算時一括を後から足したのは、実際の帳簿がそれを必要としたためである。
+//! WeBanana.SP の2026年は8か月分の家賃・電気代を全額計上したまま
+//! 「按分は確定申告時」と摘要に書いて先送りしており、**既に計上した分を
+//! 後から按分する形でなければ処理できなかった**。
+//!
+//! **どちらの関数も、事業割合が妥当かは判断しない。**
 
 use crate::error::JpError;
 use crate::tax::JpSettings;
@@ -192,6 +204,119 @@ fn tax_category_key() -> &'static TagKey {
         TagKey::parse("tax_category")
             .expect("\"tax_category\" は tags.yaml に登録された既知のタグキー")
     })
+}
+
+/// [`year_end_household_split`] への入力。
+#[derive(Debug, Clone)]
+pub struct YearEndHouseholdSplitInput {
+    /// その年に**全額を経費として計上した額**。正の値でなければならない。
+    pub total: Money,
+    /// 事業割合。0以上1以下。
+    pub business_ratio: Ratio,
+    /// 按分対象の科目（地代家賃など）。ここから家事分を差し引く。
+    pub expense_account: AccountCode,
+    /// 家事分の付け替え先科目（事業主貸）。
+    pub owner_account: AccountCode,
+    /// 消費税区分。指定した場合、**対象科目の行**（貸方）に付ける。
+    /// 記帳時按分（[`household_split`]）が事業分の行に付けるのと役割が違う
+    /// （下の doc「税区分をどちらの行に付けるか」を参照）。
+    pub tax_category: Option<String>,
+}
+
+/// 決算時に一括で家事按分する明細（2行）を組み立てる。
+///
+/// # 記帳時按分（[`household_split`]）との違い
+///
+/// あちらは**払った時点**で事業分と家事分に分ける（3行。支払元が貸方）。
+/// こちらは**既に全額を経費に計上した後**で、家事分を経費から抜く。
+///
+/// ```text
+/// 借 事業主貸    1,292,004
+/// 貸 地代家賃            1,292,004  <business_ratio:0.3>
+/// ```
+///
+/// # なぜ両方が要るのか
+///
+/// 記帳時按分は月次の損益が正しくなるが、**払うたびに事業割合が確定して
+/// いる必要がある**。事業割合は決算で決めることが多く、実際 WeBanana.SP の
+/// 2026年の帳簿は、8か月分の家賃・電気代を全額計上したまま
+/// 「按分は確定申告時」と摘要に書いて先送りしていた。既に計上した分を
+/// 後から按分するには、この形しかない。
+///
+/// # 端数の扱いを記帳時按分と揃える
+///
+/// **事業分を先に計算し、家事分は `total - 事業分` で求める**（`DECISIONS.md`
+/// D-063）。同じ総額・同じ割合なら、どちらの方法でも家事分が1円まで一致する。
+/// 揃えておかないと、途中で方法を変えた年に差が出る。
+///
+/// # 税区分をどちらの行に付けるか
+///
+/// 記帳時按分は**事業分の行**に付ける（家事分は仕入税額控除の対象外なので
+/// 税区分を持たせない）。決算時按分は逆で、**経費を減らす行**に付ける。
+/// 元の仕訳が全額に税区分を付けて計上しているため、控除しすぎた分を
+/// 同じ税区分で戻さないと、消費税の計算が合わないからである。
+///
+/// # 振り替えるものが無ければ空を返す
+///
+/// 事業割合が100%なら家事分は0円で、振り替える必要が無い。`JournalLine` は
+/// 0円の明細を拒むので、**空の `Vec` を返す**。呼び出し側は「按分の振替は
+/// 要らない」と伝えること。黙って何もしないと、按分したつもりで
+/// されていない状態になる。
+///
+/// # 断定しないこと（`CLAUDE.md` §10）
+///
+/// この関数は指定された事業割合で2行を組み立てるだけである。**その割合が
+/// 税務上妥当かは判断しない。** どの科目が按分対象かも判断しない
+/// （自宅兼事務所の家賃なのか、事業専用の事務所なのかを知らない）。
+pub fn year_end_household_split(
+    input: YearEndHouseholdSplitInput,
+    settings: &JpSettings,
+) -> Result<Vec<JournalLine>, JpError> {
+    let YearEndHouseholdSplitInput {
+        total,
+        business_ratio,
+        expense_account,
+        owner_account,
+        tax_category,
+    } = input;
+
+    if total.is_zero() || total.is_negative() {
+        return Err(JpError::InvalidHouseholdSplitTotal {
+            total: total.to_display_string(),
+        });
+    }
+
+    let ratio_value = business_ratio.as_decimal();
+    if ratio_value < Decimal::ZERO || ratio_value > Decimal::ONE {
+        return Err(JpError::InvalidBusinessRatio {
+            ratio: ratio_value.to_string(),
+        });
+    }
+
+    // 記帳時按分と同じ順序で計算する（事業分が先、家事分は残り）。
+    let business_amount = total.mul_ratio(business_ratio, settings.rounding)?;
+    let household_amount = total.sub(&business_amount)?;
+
+    if household_amount.is_zero() {
+        return Ok(Vec::new());
+    }
+
+    Ok(vec![
+        JournalLine::new(
+            owner_account,
+            Side::Debit,
+            household_amount,
+            TagSet::new(),
+            None,
+        )?,
+        JournalLine::new(
+            expense_account,
+            Side::Credit,
+            household_amount,
+            business_line_tags(business_ratio, tax_category.as_deref()),
+            None,
+        )?,
+    ])
 }
 
 fn business_line_tags(business_ratio: Ratio, tax_category: Option<&str>) -> TagSet {
@@ -582,5 +707,180 @@ mod tests {
 
             prop_assert!(result.len() == 2 || result.len() == 3);
         }
+    }
+
+    // ---- 決算時一括按分（year_end_household_split） ----
+
+    fn year_end_input(
+        total_minor: i128,
+        ratio_str: &str,
+        tax_category: Option<&str>,
+    ) -> YearEndHouseholdSplitInput {
+        YearEndHouseholdSplitInput {
+            total: Money::from_minor(total_minor, Currency::JPY),
+            business_ratio: Ratio::parse_fraction(ratio_str).unwrap(),
+            expense_account: account("615"),
+            owner_account: account("410"),
+            tax_category: tax_category.map(str::to_string),
+        }
+    }
+
+    /// **本命。** 既に全額を経費に計上した後、家事分を経費から抜く。
+    ///
+    /// WeBanana.SP の2026年の地代家賃 1,845,720円 を事業割合30%で按分する形。
+    #[test]
+    fn year_end_split_moves_the_household_portion_out_of_the_expense() {
+        let settings = settings_with(RoundMode::Floor);
+        let result =
+            year_end_household_split(year_end_input(1_845_720, "0.30", None), &settings).unwrap();
+
+        assert_eq!(result.len(), 2, "決算時按分は2行");
+
+        let owner = result
+            .iter()
+            .find(|l| l.account().as_str() == "410")
+            .unwrap();
+        assert_eq!(owner.side(), Side::Debit, "事業主貸は借方");
+        assert_eq!(owner.amount().minor(), 1_292_004);
+
+        let expense = result
+            .iter()
+            .find(|l| l.account().as_str() == "615")
+            .unwrap();
+        assert_eq!(expense.side(), Side::Credit, "経費を減らすので貸方");
+        assert_eq!(expense.amount().minor(), 1_292_004);
+    }
+
+    /// **本命。** 記帳時按分と家事分が1円まで一致する。
+    ///
+    /// 端数の丸め方を揃えていないと、途中で方法を変えた年に差が出る。
+    /// 3で割り切れない額と、割り切れる額の両方で見る。
+    #[test]
+    fn year_end_split_agrees_with_the_at_entry_split_to_the_yen() {
+        for rounding in [RoundMode::Floor, RoundMode::Ceil, RoundMode::HalfUp] {
+            let settings = settings_with(rounding);
+            for total in [1_845_720_i128, 77_261, 100_000, 1, 3, 7, 999_999] {
+                for ratio in ["0.30", "0.333", "0.5", "0.67"] {
+                    let at_entry = household_split(input(total, ratio, None), &settings).unwrap();
+                    let at_year_end =
+                        year_end_household_split(year_end_input(total, ratio, None), &settings)
+                            .unwrap();
+
+                    let household_at_entry = at_entry
+                        .iter()
+                        .find(|l| l.account().as_str() == "410")
+                        .map(|l| l.amount().minor())
+                        .unwrap_or(0);
+                    let household_at_year_end = at_year_end
+                        .iter()
+                        .find(|l| l.account().as_str() == "410")
+                        .map(|l| l.amount().minor())
+                        .unwrap_or(0);
+
+                    assert_eq!(
+                        household_at_entry, household_at_year_end,
+                        "総額 {total} / 割合 {ratio} / 丸め {rounding:?} で家事分が食い違う"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **本命。** 税区分は経費を減らす行に付ける。
+    ///
+    /// 元の仕訳は全額に税区分を付けて計上している。控除しすぎた分を同じ
+    /// 税区分で戻さないと、消費税の計算が合わない。記帳時按分とは逆の行。
+    #[test]
+    fn year_end_split_puts_the_tax_category_on_the_line_that_reduces_the_expense() {
+        let settings = settings_with(RoundMode::Floor);
+        let result = year_end_household_split(
+            year_end_input(100_000, "0.30", Some("TAXABLE_10")),
+            &settings,
+        )
+        .unwrap();
+
+        let expense = result
+            .iter()
+            .find(|l| l.account().as_str() == "615")
+            .unwrap();
+        assert_eq!(
+            expense.tags().get(tax_category_key()),
+            Some(&TagValue::Code("TAXABLE_10".to_string())),
+            "経費を減らす行に税区分が要る"
+        );
+        assert_eq!(
+            expense.tags().get(business_ratio_key()),
+            Some(&TagValue::Decimal(Decimal::new(30, 2))),
+            "按分率も同じ行に残す"
+        );
+
+        let owner = result
+            .iter()
+            .find(|l| l.account().as_str() == "410")
+            .unwrap();
+        assert!(owner.tags().is_empty(), "事業主貸にはタグを付けない");
+    }
+
+    /// **本命。** 事業割合100%なら振り替えるものが無い。
+    ///
+    /// 空を返す。呼び出し側が「按分の振替は要らない」と伝えるための形。
+    /// 0円の明細を作ろうとして失敗するのではない。
+    #[test]
+    fn year_end_split_returns_nothing_when_the_business_ratio_is_one() {
+        let settings = settings_with(RoundMode::Floor);
+        let result =
+            year_end_household_split(year_end_input(1_845_720, "1", None), &settings).unwrap();
+
+        assert!(result.is_empty(), "振り替えるものが無ければ空");
+    }
+
+    /// 事業割合0%なら全額が家事分。
+    #[test]
+    fn year_end_split_moves_everything_when_the_business_ratio_is_zero() {
+        let settings = settings_with(RoundMode::Floor);
+        let result =
+            year_end_household_split(year_end_input(100_000, "0", None), &settings).unwrap();
+
+        assert_eq!(result.len(), 2);
+        let owner = result
+            .iter()
+            .find(|l| l.account().as_str() == "410")
+            .unwrap();
+        assert_eq!(owner.amount().minor(), 100_000);
+    }
+
+    #[test]
+    fn year_end_split_rejects_a_zero_or_negative_total() {
+        let settings = settings_with(RoundMode::Floor);
+        for total in [0_i128, -100] {
+            let mut input = year_end_input(1000, "0.30", None);
+            input.total = Money::from_minor(total, Currency::JPY);
+            assert!(matches!(
+                year_end_household_split(input, &settings),
+                Err(JpError::InvalidHouseholdSplitTotal { .. })
+            ));
+        }
+    }
+
+    /// 1を超える割合を弾く。
+    ///
+    /// `Ratio::parse_fraction` は0〜1を自分で検査するので、**1超を作るには
+    /// `parse_rate` を使う**（記帳時按分の同じ検査と同じ形）。
+    ///
+    /// **負の割合は検査していない。** `Ratio` を作る手段は `parse_fraction` と
+    /// `parse_rate` の2つだけで、どちらも負を拒む。関数側の下限の検査は
+    /// 現状**到達しない**。`Ratio` に負を作れる構築子が増えたときのために
+    /// 残してある（そのときこの検査を足すこと）。
+    #[test]
+    fn year_end_split_rejects_a_ratio_above_one() {
+        let settings = settings_with(RoundMode::Floor);
+        let over_one = YearEndHouseholdSplitInput {
+            business_ratio: Ratio::parse_rate("1.5").unwrap(),
+            ..year_end_input(1000, "0.30", None)
+        };
+        assert!(matches!(
+            year_end_household_split(over_one, &settings),
+            Err(JpError::InvalidBusinessRatio { .. })
+        ));
     }
 }

@@ -401,7 +401,9 @@ pub fn household_split(
 
 - 青色申告特別控除（65万/55万/10万）は**帳簿科目ではない**。申告書上の控除
   → `kaikei-report` の決算書出力で扱う。仕訳を作らない
-- 減価償却費、家事按分の年次調整、棚卸は Phase 5 の検討事項
+- 棚卸は Phase 5 の検討事項。**減価償却費と家事按分の年次調整は実装済み**
+  （`kaikei depreciation` / `kaikei household`。どちらも金額を出すだけで
+  記帳はしない。D-103 / D-111）
 - `ClosingPolicy::closing_entries` / `opening_entries` は `kaikei-policy::TaxContext`
   を引数に取らない（`kaikei-policy` の trait 定義を参照）。元入金・事業主貸・
   事業主借の**科目コードは `JpSoleProprietorClosingPolicy` が構築時に保持する**。
