@@ -63,6 +63,7 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei fixedasset list [--year <西暦>]
     kaikei fixedasset dispose --id <UUID> --on <YYYY-MM-DD> [--commit]
     kaikei depreciation --year <西暦>
+    kaikei household --year <西暦> --account <科目> --ratio <事業割合>
 
 report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
@@ -73,6 +74,7 @@ fixedasset add は固定資産を台帳に入れます（既定は下見）。
 fixedasset list は台帳の中身を並べます（--year でその年度の償却費も出ます）。
 fixedasset dispose は資産を除却します（既定は下見。行は消しません）。
 depreciation は固定資産台帳から減価償却費を出します（記帳はしません）。
+household は決算時の家事按分の振替仕訳を出します（記帳はしません）。
 
 引数:
     --year <西暦>       会計年度（暦年）。例: 2026
@@ -242,6 +244,11 @@ fn run() -> Result<Vec<PathBuf>, String> {
         Command::Journalize(args) => runtime.block_on(run_journalize(args)),
         Command::Counterparty(args) => runtime.block_on(run_counterparty_import(args)),
         Command::Depreciation { fiscal_year } => runtime.block_on(run_depreciation(fiscal_year)),
+        Command::Household {
+            fiscal_year,
+            account,
+            ratio,
+        } => runtime.block_on(run_household(fiscal_year, &account, &ratio)),
         Command::FixedAsset(args) => runtime.block_on(run_fixed_asset_add(args)),
         Command::FixedAssetList { fiscal_year } => {
             runtime.block_on(run_fixed_asset_list(fiscal_year))
@@ -280,6 +287,14 @@ enum Command {
     Counterparty(CounterpartyArgs),
     /// 固定資産台帳から、その年度の減価償却費を出す。
     Depreciation { fiscal_year: i32 },
+    /// 決算時の家事按分の振替仕訳を出す。
+    Household {
+        fiscal_year: i32,
+        /// 按分対象の科目コード（地代家賃など）。
+        account: String,
+        /// 事業割合（0〜1の小数）。
+        ratio: String,
+    },
     /// 固定資産を台帳に入れる。
     FixedAsset(FixedAssetArgs),
     /// 固定資産台帳の中身を並べる。
@@ -386,6 +401,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     if subcommand == "depreciation" {
         return parse_depreciation(&args[1..]);
+    }
+    if subcommand == "household" {
+        return parse_household(&args[1..]);
     }
     if subcommand == "fixedasset" {
         return parse_fixed_asset(&args[1..]);
@@ -1768,6 +1786,215 @@ fn parse_depreciation(args: &[String]) -> Result<Command, String> {
     Ok(Command::Depreciation {
         fiscal_year: fiscal_year.ok_or("--year を指定してください（例: --year 2026）")?,
     })
+}
+
+/// 家事按分の計算に使う設定。
+///
+/// # 丸め方だけを読む
+///
+/// `year_end_household_split` が `JpSettings` から読むのは `rounding` だけで
+/// ある（事業分を `Money::mul_ratio` で計算し、家事分は引き算で求める）。
+/// 消費税の課税方式（`tax_mode` / `simplified_taxation` 等）は按分の金額に
+/// 影響しない。**それでも `JpSettings` を組み立てる必要はある**ので、
+/// 影響しない項目には見て分かる値を置く。
+///
+/// 丸め方は MCP と同じ `KAIKEI_ROUNDING` から読み、**既定値を持たない**。
+/// 帳簿ごとに違う値を、黙って決め打ちしないためである（`docs/04-jp-tax.md`）。
+fn jp_settings() -> Result<kaikei_jp::tax::JpSettings, String> {
+    let code = env_var("KAIKEI_ROUNDING")?;
+    let rounding = kaikei_jp::tax::round_mode_from_code(&code)
+        .map_err(|error| format!("KAIKEI_ROUNDING を読めません: {error}"))?;
+    Ok(kaikei_jp::tax::JpSettings {
+        rounding,
+        // 以下は按分の金額に影響しない（上の doc を参照）。
+        tax_mode: kaikei_jp::tax::TaxMode::Exclusive,
+        rounding_unit: kaikei_jp::tax::RoundingUnit::Line,
+        is_taxable_business: true,
+        simplified_taxation: false,
+    })
+}
+
+fn parse_household(args: &[String]) -> Result<Command, String> {
+    let mut fiscal_year = None;
+    let mut account = None;
+    let mut ratio = None;
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?;
+        match key {
+            "--year" => {
+                fiscal_year = Some(value.parse::<i32>().map_err(|_| {
+                    format!("--year は西暦の数字で指定してください（受け取った値: {value}）")
+                })?)
+            }
+            "--account" => account = Some(value.clone()),
+            "--ratio" => ratio = Some(value.clone()),
+            other => return Err(format!("不明な引数です: {other}\n\n{USAGE}")),
+        }
+        index += 2;
+    }
+    Ok(Command::Household {
+        fiscal_year: fiscal_year.ok_or("--year を指定してください（例: --year 2026）")?,
+        account: account.ok_or("--account を指定してください（例: --account 615）")?,
+        ratio: ratio.ok_or("--ratio を指定してください（例: --ratio 0.3）")?,
+    })
+}
+
+/// 決算時の家事按分の振替仕訳を出す。
+///
+/// # 記帳はしない
+///
+/// **事業割合が妥当かはこのソフトには分からない。** 自宅の面積のうち仕事に
+/// 使っている割合や、使用時間の記録を持っていないからである。出すだけにして、
+/// 記帳するかどうかは人が決める（`depreciation` と同じ立場）。
+///
+/// # なぜ要るのか
+///
+/// 家事按分を忘れると**所得が過少になる**。減価償却の忘れ（所得が過大）と
+/// 向きが逆で、こちらは税務上のほうが不利になる。しかも `verify` では
+/// 拾えない——どの科目が按分対象かはソフトには分からず、按分していない帳簿と
+/// 事業専用の帳簿は見分けがつかないからである。**人が年に一度打つ**しかない。
+///
+/// 実際 WeBanana.SP の2026年の帳簿は、自宅の家賃と電気代を全額そのまま
+/// 経費に計上したまま「按分は確定申告時」と摘要に書いて先送りしていた。
+async fn run_household(
+    fiscal_year: i32,
+    account: &str,
+    ratio: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let expense_account = kaikei_core::AccountCode::parse(account)
+        .map_err(|error| format!("科目コードを読めません: {account}（{error}）"))?;
+    let business_ratio = kaikei_core::Ratio::parse_fraction(ratio)
+        .map_err(|error| format!("事業割合を読めません: {ratio}（{error}）"))?;
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool);
+
+    let catalog = TagCatalog::from_embedded(kaikei_jp_data::TAGS)
+        .map_err(|error| format!("同梱のタグ定義を読めませんでした: {error}"))?;
+    let schema = catalog.schema().clone();
+    let year = FiscalYear::calendar_year(fiscal_year);
+    let (from, to) = (year.start(), year.end());
+
+    let wanted = expense_account.clone();
+    let (income_statement, is_in_the_chart) = with_tx_err(&store, move |tx| {
+        let schema = schema.clone();
+        let wanted = wanted.clone();
+        Box::pin(async move {
+            let chart = tx.load_chart().await?;
+            // **科目表にあるかを先に見る。** 無いコードを打ったときに
+            // 「計上がありません」とだけ出ると、打ち間違いなのか本当に
+            // 0円なのか分からない。
+            let is_in_the_chart = chart.get(&wanted).is_some();
+            let policy = JpStatementPolicy::new(chart);
+            let statements = statements::execute(
+                tx,
+                &policy,
+                &schema,
+                StatementsInput {
+                    from,
+                    to,
+                    // **決算振替を外す。** 外さないと、決算振替を記帳した後に
+                    // 打ったとき経費が0に見えて「按分するものが無い」と出る。
+                    exclude_closing_on: Some(year.end()),
+                    only_opening_on: None,
+                },
+            )
+            .await?;
+            Ok::<_, kaikei_app::error::AppError>((statements.income_statement, is_in_the_chart))
+        })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::AppError| format!("帳簿を読めませんでした: {error}"))?;
+
+    let total_minor = income_statement
+        .sections
+        .iter()
+        .flat_map(|section| section.lines.iter())
+        .find(|line| line.account == expense_account)
+        .map(|line| line.amount.minor())
+        .unwrap_or(0);
+
+    let account_name = income_statement
+        .sections
+        .iter()
+        .flat_map(|section| section.lines.iter())
+        .find(|line| line.account == expense_account)
+        .map(|line| line.label.clone())
+        .unwrap_or_else(|| expense_account.as_str().to_string());
+
+    if !is_in_the_chart {
+        return Err(format!(
+            "{} という科目は勘定科目表にありません。
+kaikei report を出すと科目の一覧が見られます。",
+            expense_account.as_str()
+        ));
+    }
+
+    if total_minor <= 0 {
+        println!(
+            "{} には {fiscal_year} 年の計上がありません（残高 {total_minor} 円）。",
+            expense_account.as_str()
+        );
+        println!("年度を確かめてください。按分するものがありません。");
+        return Ok(Vec::new());
+    }
+
+    println!("{fiscal_year} 年の家事按分（{account_name}・事業割合 {ratio}）");
+    println!();
+
+    let total = kaikei_core::Money::from_minor(total_minor, kaikei_core::Currency::JPY);
+    let settings = jp_settings()?;
+    let lines = kaikei_jp::household_split::year_end_household_split(
+        kaikei_jp::household_split::YearEndHouseholdSplitInput {
+            total,
+            business_ratio,
+            expense_account: expense_account.clone(),
+            owner_account: kaikei_core::AccountCode::parse("410")
+                .expect("\"410\"（事業主貸）は勘定科目表にある固定のコード"),
+            tax_category: None,
+        },
+        &settings,
+    )
+    .map_err(|error| format!("按分を計算できませんでした: {error}"))?;
+
+    println!("  計上額 {} 円", total.to_display_string());
+    if lines.is_empty() {
+        println!();
+        println!("事業割合が100%なので、振り替えるものはありません。");
+        return Ok(Vec::new());
+    }
+
+    println!();
+    println!(
+        "  {} 決算整理（家事按分・{account_name}）",
+        year.end().to_iso_string()
+    );
+    for line in &lines {
+        let side = if line.side() == kaikei_core::Side::Debit {
+            "借"
+        } else {
+            "貸"
+        };
+        println!(
+            "    {side} {:<8} {} 円",
+            line.account().as_str(),
+            line.amount().to_display_string()
+        );
+    }
+
+    println!();
+    println!("記帳はしていません。仕訳にするには post_journal_entry を使います。");
+    println!();
+    println!("**事業割合が妥当かは、このソフトでは判定していません。**");
+    println!("面積や使用時間など、割合の根拠になる記録を残してください。");
+    Ok(Vec::new())
 }
 
 /// 台帳の1件を、償却計算の入力に翻訳する。
@@ -5535,5 +5762,91 @@ abc,
         ] {
             assert!(USAGE.contains(expected), "使い方に無い: {expected}");
         }
+    }
+
+    // ---- kaikei household（決算時の家事按分） ----
+
+    fn household_args(rest: &[&str]) -> Vec<String> {
+        let mut v = vec!["household".to_string()];
+        v.extend(rest.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn household_takes_the_year_account_and_ratio() {
+        match parse_args(&household_args(&[
+            "--year",
+            "2026",
+            "--account",
+            "615",
+            "--ratio",
+            "0.3",
+        ]))
+        .unwrap()
+        {
+            Command::Household {
+                fiscal_year,
+                account,
+                ratio,
+            } => {
+                assert_eq!(fiscal_year, 2026);
+                assert_eq!(account, "615");
+                assert_eq!(ratio, "0.3");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // **本命。** 3つとも必須。どれが足りないかを言う。
+    //
+    // 事業割合を省いたまま通すと、既定値（何%？）を勝手に決めることになる。
+    // 按分率は帳簿ごとに違い、決め打ちできる値ではない。
+    #[test]
+    fn household_requires_all_three_arguments() {
+        for (given, missing) in [
+            (vec!["--account", "615", "--ratio", "0.3"], "--year"),
+            (vec!["--year", "2026", "--ratio", "0.3"], "--account"),
+            (vec!["--year", "2026", "--account", "615"], "--ratio"),
+        ] {
+            let error = parse_args(&household_args(&given)).unwrap_err();
+            assert!(error.contains(missing), "{missing} を要求すること: {error}");
+        }
+    }
+
+    #[test]
+    fn household_rejects_an_unknown_argument() {
+        let error = parse_args(&household_args(&[
+            "--year",
+            "2026",
+            "--account",
+            "615",
+            "--ratio",
+            "0.3",
+            "--commit",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("--commit"), "{error}");
+    }
+
+    // **本命。** 記帳する手段を持たない。
+    //
+    // 事業割合が妥当かはソフトには分からないので、出すだけにしてある
+    // （`depreciation` と同じ立場）。`--commit` を足したくなったら、
+    // まず「割合の妥当性を誰が保証するのか」を決めること。
+    #[test]
+    fn household_has_no_way_to_post_the_entry() {
+        let command = parse_args(&household_args(&[
+            "--year",
+            "2026",
+            "--account",
+            "615",
+            "--ratio",
+            "0.3",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(command, Command::Household { .. }),
+            "記帳を伴う型に変わっていないこと"
+        );
     }
 }
