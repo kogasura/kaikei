@@ -70,6 +70,15 @@ pub enum FindingKind {
     /// 重複は普通にある。一方で、同じ取引を2回取り込むと帳簿が静かに膨らみ、
     /// 決算まで気づけない。疑いとして知らせ、判断は人間に返す。
     SuspectedDuplicate,
+    /// 毎月同じ日に同じ額で繰り返される支出が、月によって違う科目に
+    /// 入っている（科目の当て間違いの疑い）。
+    ///
+    /// **所得は変わらないが、決算書の欄が変わる。** 同じサブスクリプションが
+    /// ある月は通信費、ある月は新聞図書費、という状態は帳簿の質の問題であり、
+    /// 税務調査で理由を問われうる。
+    ///
+    /// **誤りとは言わない。** 同じ額の別の取引が偶然並ぶことはある。
+    InconsistentAccount,
 }
 
 impl FindingKind {
@@ -77,6 +86,7 @@ impl FindingKind {
     pub fn as_code(&self) -> &'static str {
         match self {
             FindingKind::BalanceMismatch => "balance_mismatch",
+            FindingKind::InconsistentAccount => "inconsistent_account",
             FindingKind::AccountSetMismatch => "account_set_mismatch",
             FindingKind::DanglingReversal => "dangling_reversal",
             FindingKind::DuplicateEntryNumber => "duplicate_entry_number",
@@ -160,6 +170,7 @@ where
     findings.extend(check_reversals(&entries));
     findings.extend(check_entry_numbers(&entries));
     findings.extend(check_suspected_duplicates(&entries));
+    findings.extend(check_inconsistent_accounts(&entries, &chart));
 
     // 2. ★2つの経路で計算した試算表を突き合わせる★
     let domain = TrialBalance::from_entries(entries.iter(), &chart, tag_schema, &[])?;
@@ -252,6 +263,138 @@ fn check_entry_numbers(entries: &[kaikei_core::JournalEntry]) -> Vec<Finding> {
 ///
 /// 逆仕訳は貸借が逆なので明細の並びが一致せず、この検査には引っかからない。
 /// 念のため、訂正（`is_reversal`）は比較から外す。
+/// 繰り返しと見なすのに要る回数。
+///
+/// 2回では偶然と区別できない。3回同じ額・同じ日に出るなら定期的な支出である
+/// 可能性が高い。
+const RECURRING_TIMES: usize = 3;
+
+/// 「同じ日」と見なす幅（日にちの種類の数）。
+///
+/// 引落日は土日祝でずれるので1日に固定しない。ただし3種類以上になると
+/// 「たまたま同額」を拾い始める（実帳簿で試したところ、この幅を広げると
+/// 1,000円 の交通費・新聞図書費・会議費が混ざった）。
+const RECURRING_DAY_KINDS: usize = 2;
+
+/// 毎月同じ日に同じ額で繰り返される支出が、違う科目に入っていないか。
+///
+/// # 実際に見つけたもの
+///
+/// 実帳簿（2026年）で2件見つかった。
+///
+/// | 取引 | 額 | 割れ方 |
+/// |---|---|---|
+/// | YouTube Premium（毎月2日） | 2,280 | 1・2・3・5月は通信費、4・6・7・8月は新聞図書費 |
+/// | noteプレミアム（毎月1日） | 1,980 | 3月は通信費、2・4月は新聞図書費 |
+///
+/// **手で SQL を書かないと見つからなかった。**
+///
+/// # 所得は変わらない
+///
+/// どちらも経費なので所得は動かない。変わるのは**決算書のどの欄に載るか**
+/// である。同じサブスクリプションが月によって違う欄に載る状態は帳簿の質の
+/// 問題であり、税務調査で理由を問われうる。
+///
+/// # 条件を絞る理由
+///
+/// 「同じ額で科目が違う」だけでは足りない。実帳簿で試したところ、
+/// 1,000円 の支出が旅費交通費・新聞図書費・会議費の3科目に分かれて拾われた
+/// ——**別々の取引が偶然同じ額だっただけ**である。
+///
+/// 「**毎月・ほぼ同じ日**」を足すと、この誤検出が消えて狙った2件だけが
+/// 残った。定期的な支出（サブスクリプション・家賃・保険料）は日付が揃う。
+///
+/// # 費用の科目だけを見る
+///
+/// 資産・負債・資本の科目は対象外。同じ額の入出金が違う科目に入るのは
+/// 普通である（振替・立替・カードの引落しなど）。**絞る前は 2,280円 の
+/// 指摘に 325 未払金（カードの引落し）が混ざっていた。**
+fn check_inconsistent_accounts(
+    entries: &[kaikei_core::JournalEntry],
+    chart: &kaikei_core::ChartOfAccounts,
+) -> Vec<Finding> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    struct Group {
+        times: usize,
+        months: BTreeSet<String>,
+        days: BTreeSet<u8>,
+        accounts: BTreeSet<String>,
+    }
+
+    let mut by_amount: BTreeMap<i128, Group> = BTreeMap::new();
+    for entry in entries {
+        for line in entry.lines() {
+            if line.side() != kaikei_core::Side::Debit {
+                continue;
+            }
+            // **費用の科目だけを見る。** 資産・負債・資本は対象外——同じ額の
+            // 入出金が違う科目に入るのは普通である（振替・立替・カードの
+            // 引落しなど）。実際、絞る前は 2,280円 の指摘に 325 未払金
+            // （カード引落し）が混ざっていた。
+            let is_expense = chart
+                .get(line.account())
+                .is_some_and(|def| def.account_type == kaikei_core::AccountType::Expense);
+            if !is_expense {
+                continue;
+            }
+            let group = by_amount.entry(line.amount().minor()).or_insert(Group {
+                times: 0,
+                months: BTreeSet::new(),
+                days: BTreeSet::new(),
+                accounts: BTreeSet::new(),
+            });
+            group.times += 1;
+            group.months.insert(format!(
+                "{:04}-{:02}",
+                entry.entry_date().year(),
+                entry.entry_date().month()
+            ));
+            group.days.insert(entry.entry_date().day());
+            group.accounts.insert(line.account().as_str().to_string());
+        }
+    }
+
+    let mut findings: Vec<(i128, Finding)> = by_amount
+        .into_iter()
+        .filter(|(_, group)| {
+            group.times >= RECURRING_TIMES
+                && group.months.len() >= RECURRING_TIMES
+                && group.days.len() <= RECURRING_DAY_KINDS
+                && group.accounts.len() > 1
+        })
+        .map(|(amount, group)| {
+            (
+                amount * group.times as i128,
+                Finding {
+                    kind: FindingKind::InconsistentAccount,
+                    detail: format!(
+                        concat!(
+                            "毎月ほぼ同じ日に {} 円の支出が {} 件ありますが、",
+                            "科目が {} に分かれています（{}）。",
+                            "同じ取引なら科目を揃えてください。",
+                            "別々の取引が偶然同じ額なら、そのままで構いません"
+                        ),
+                        amount,
+                        group.times,
+                        group.accounts.len(),
+                        group
+                            .accounts
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    ),
+                },
+            )
+        })
+        .collect();
+
+    // 金額の大きい順（`check_suspected_duplicates` と同じ理由）。
+    findings.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.detail.cmp(&b.1.detail)));
+    findings.into_iter().map(|(_, finding)| finding).collect()
+}
+
 fn check_suspected_duplicates(entries: &[kaikei_core::JournalEntry]) -> Vec<Finding> {
     // 明細は並び順が違っても同じ仕訳なので、揃えてから比べる。
     let fingerprint = |entry: &kaikei_core::JournalEntry| {
@@ -870,5 +1013,153 @@ mod tests {
             5,
             "FindingKind に種別を足したら、この一覧と件数も更新すること"
         );
+    }
+
+    // ---- 科目の一貫性（check_inconsistent_accounts） ----
+
+    /// 費用の明細を持つ仕訳を、月と日を指定して作る。
+    fn expense_on(
+        id: u128,
+        no: u32,
+        month: u8,
+        day: u8,
+        account: &str,
+        amount: i128,
+    ) -> JournalEntry {
+        JournalEntry::new(
+            NewEntry {
+                id: EntryId::new(id),
+                entry_no: EntryNumber::new(no),
+                entry_date: AccountingDate::new(2026, month, day).unwrap(),
+                description: "サブスクリプション".to_string(),
+                lines: vec![
+                    line(account, Side::Debit, amount),
+                    line("100", Side::Credit, amount),
+                ],
+                document_refs: Vec::new(),
+            },
+            &FiscalYear::calendar_year(2026),
+            &sample_chart_with_tax_account(),
+            &TagSchema::empty(),
+            &AllOpen,
+            &fixed_clock(),
+        )
+        .unwrap()
+    }
+
+    /// **本命。** 毎月同じ日の同額が違う科目に入っていれば拾う。
+    ///
+    /// 実帳簿の YouTube Premium がこれ（2,280円・毎月2日・通信費と新聞図書費に
+    /// 4件ずつ）。**手で SQL を書かないと見つからなかった。**
+    #[test]
+    fn a_subscription_split_across_accounts_is_reported() {
+        let entries = vec![
+            expense_on(1, 1, 1, 2, "604", 2_280),
+            expense_on(2, 2, 2, 2, "604", 2_280),
+            expense_on(3, 3, 3, 2, "621", 2_280),
+        ];
+
+        let findings = check_inconsistent_accounts(&entries, &sample_chart_with_tax_account());
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].kind, FindingKind::InconsistentAccount);
+        assert!(findings[0].detail.contains("2280"), "{findings:?}");
+        assert!(findings[0].detail.contains("604"), "{findings:?}");
+        assert!(findings[0].detail.contains("621"), "{findings:?}");
+    }
+
+    /// 科目が揃っていれば言わない。
+    #[test]
+    fn a_subscription_on_one_account_is_quiet() {
+        let entries = vec![
+            expense_on(1, 1, 1, 2, "604", 2_280),
+            expense_on(2, 2, 2, 2, "604", 2_280),
+            expense_on(3, 3, 3, 2, "604", 2_280),
+        ];
+        assert!(check_inconsistent_accounts(&entries, &sample_chart_with_tax_account()).is_empty());
+    }
+
+    /// **本命。** 日付が散らばっていれば拾わない。
+    ///
+    /// 「同じ額で科目が違う」だけでは足りない。実帳簿で試したところ、
+    /// 1,000円 の支出が旅費交通費・新聞図書費・会議費の3科目に分かれて拾われた
+    /// ——**別々の取引が偶然同じ額だっただけ**である。
+    #[test]
+    fn the_same_amount_on_scattered_days_is_not_reported() {
+        let entries = vec![
+            expense_on(1, 1, 1, 5, "604", 1_000),
+            expense_on(2, 2, 2, 17, "621", 1_000),
+            expense_on(3, 3, 3, 28, "604", 1_000),
+        ];
+        assert!(
+            check_inconsistent_accounts(&entries, &sample_chart_with_tax_account()).is_empty(),
+            "日が3種類あるので定期的な支出ではない"
+        );
+    }
+
+    /// 引落日は土日でずれるので、2種類までは同じ日と見なす。
+    #[test]
+    fn two_kinds_of_day_still_count_as_the_same_day() {
+        let entries = vec![
+            expense_on(1, 1, 1, 2, "604", 2_280),
+            expense_on(2, 2, 2, 3, "604", 2_280),
+            expense_on(3, 3, 3, 2, "621", 2_280),
+        ];
+        assert_eq!(
+            check_inconsistent_accounts(&entries, &sample_chart_with_tax_account()).len(),
+            1,
+            "土日でずれた分を見逃さない"
+        );
+    }
+
+    /// 2回では拾わない（偶然と区別できない）。
+    #[test]
+    fn twice_is_not_enough() {
+        let entries = vec![
+            expense_on(1, 1, 1, 2, "604", 2_280),
+            expense_on(2, 2, 2, 2, "621", 2_280),
+        ];
+        assert!(check_inconsistent_accounts(&entries, &sample_chart_with_tax_account()).is_empty());
+    }
+
+    /// 同じ月に3回でも拾わない（毎月の支出ではない）。
+    #[test]
+    fn three_times_in_one_month_is_not_a_subscription() {
+        let entries = vec![
+            expense_on(1, 1, 6, 2, "604", 2_280),
+            expense_on(2, 2, 6, 2, "621", 2_280),
+            expense_on(3, 3, 6, 2, "604", 2_280),
+        ];
+        assert!(check_inconsistent_accounts(&entries, &sample_chart_with_tax_account()).is_empty());
+    }
+
+    /// **本命。** 費用でない科目は見ない。
+    ///
+    /// 絞る前は 2,280円 の指摘に 325 未払金（カードの引落し）が混ざっていた。
+    /// 同じ額の入出金が違う科目に入るのは普通である。
+    #[test]
+    fn accounts_that_are_not_expenses_are_ignored() {
+        // 100 は資産（現金）。借方に立つが費用ではない。
+        let entries = vec![
+            expense_on(1, 1, 1, 2, "100", 2_280),
+            expense_on(2, 2, 2, 2, "100", 2_280),
+            expense_on(3, 3, 3, 2, "604", 2_280),
+        ];
+        assert!(
+            check_inconsistent_accounts(&entries, &sample_chart_with_tax_account()).is_empty(),
+            "費用の科目は1つしか無い"
+        );
+    }
+
+    /// 科目表に無いコードは見ない（落ちない）。
+    #[test]
+    fn an_unknown_account_code_is_skipped() {
+        let entries = vec![
+            expense_on(1, 1, 1, 2, "604", 2_280),
+            expense_on(2, 2, 2, 2, "604", 2_280),
+            expense_on(3, 3, 3, 2, "604", 2_280),
+        ];
+        let empty = kaikei_core::ChartOfAccounts::new(vec![]).unwrap();
+        assert!(check_inconsistent_accounts(&entries, &empty).is_empty());
     }
 }

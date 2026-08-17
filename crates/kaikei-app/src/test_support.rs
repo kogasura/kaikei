@@ -60,6 +60,22 @@ pub(crate) fn sample_chart_with_tax_account() -> ChartOfAccounts {
             parent: None,
             postable: true,
         },
+        // 費用を2つ。**科目の一貫性の検査（`check_inconsistent_accounts`）は
+        // 費用の科目だけを見る**ので、これが無いと何も拾えない。
+        AccountDef {
+            code: AccountCode::parse("604").unwrap(),
+            name: "通信費".to_string(),
+            account_type: AccountType::Expense,
+            parent: None,
+            postable: true,
+        },
+        AccountDef {
+            code: AccountCode::parse("621").unwrap(),
+            name: "新聞図書費".to_string(),
+            account_type: AccountType::Expense,
+            parent: None,
+            postable: true,
+        },
     ])
     .unwrap()
 }
