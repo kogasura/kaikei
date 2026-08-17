@@ -1748,10 +1748,13 @@ async fn run_fixed_asset_add(args: FixedAssetArgs) -> Result<Vec<PathBuf>, Strin
     // 帳簿は何も言わない。50万円に少額特例を当てれば初年度に50万円が経費に
     // なり、貸借は一致したまま所得だけが減る。`verify` でも拾えない
     // （台帳の方法で計算した結果と帳簿は一致してしまう）。
+    // **経理方式は任意で読む。** 帯の検査（所令138/139・措法28の2）に経理方式は
+    // 要らない。設定が無いことを理由に本体の検査まで止めるのは筋が悪いので、
+    // 読めなければ `None` を渡し、「確かめられなかった」と言わせる。
     let concerns = kaikei_jp::depreciation::cost_concerns(
         &row.acquisition_cost,
         asset.method,
-        jp_settings()?.tax_mode,
+        optional_tax_mode(),
     );
     if !concerns.is_empty() {
         println!();
@@ -1829,6 +1832,19 @@ fn parse_depreciation(args: &[String]) -> Result<Command, String> {
 ///
 /// `rounding_unit` / `is_taxable_business` / `simplified_taxation` は
 /// **まだどの計算にも効いていない**。効かせるときに読むこと。
+/// 経理方式。**読めなければ `None`。**
+///
+/// 取得価額の帯の検査（`cost_concerns`）は経理方式が無くても動くので、
+/// この設定が無いことを理由に検査そのものを止めない。読めなかったことは
+/// 指摘の文面に出る（`kaikei_jp::depreciation::cost_concerns`）。
+///
+/// 値が壊れている場合も `None` にする。**ここで止めると、設定を直すまで
+/// 資産を台帳に入れられなくなる**——それはこの検査が背負う責任ではない。
+fn optional_tax_mode() -> Option<kaikei_jp::tax::TaxMode> {
+    let code = std::env::var("KAIKEI_TAX_MODE").ok()?;
+    kaikei_jp::tax::TaxMode::from_code(&code).ok()
+}
+
 fn jp_settings() -> Result<kaikei_jp::tax::JpSettings, String> {
     let code = env_var("KAIKEI_ROUNDING")?;
     let rounding = kaikei_jp::tax::round_mode_from_code(&code)

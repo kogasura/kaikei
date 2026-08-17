@@ -315,7 +315,7 @@ const NOT_DEPRECIABLE_LIMIT: i128 = 100_000;
 pub fn cost_concerns(
     cost: &Money,
     method: DepreciationMethod,
-    tax_mode: crate::tax::TaxMode,
+    tax_mode: Option<crate::tax::TaxMode>,
 ) -> Vec<CostConcern> {
     let amount = cost.minor();
     let mut concerns = Vec::new();
@@ -352,20 +352,45 @@ pub fn cost_concerns(
     }
 
     // 税込経理で、税抜にすると帯が変わる場合。
-    if tax_mode == crate::tax::TaxMode::Inclusive {
-        if let Some(note) = the_band_changes_without_tax(amount) {
-            concerns.push(note);
+    //
+    // **経理方式が分からないときは「分からない」と言う。** 黙って片方だと
+    // 決めると、帯が変わることに気づけないまま選択が固まる。
+    if let Some(exclusive) = the_amount_without_tax_if_it_crosses_a_band(amount) {
+        match tax_mode {
+            Some(crate::tax::TaxMode::Inclusive) => concerns.push(CostConcern {
+                message: format!(
+                    "この帳簿は税込経理です。取得価額 {amount} 円は{}以上ですが、税抜なら {} 円で{}を下回ります。
+      **経理方式によって選べる扱いが変わります。**",
+                    exclusive.label, exclusive.amount, exclusive.label
+                ),
+                basis: "タックスアンサー No.2100（取得価額の判定は経理方式による）",
+            }),
+            Some(crate::tax::TaxMode::Exclusive) => {}
+            None => concerns.push(CostConcern {
+                message: format!(
+                    "取得価額 {amount} 円は{}の境目に近い額です（税込なら税抜 {} 円で{}を下回ります）。
+      **経理方式が分からないので確かめられませんでした**（KAIKEI_TAX_MODE が未設定）。",
+                    exclusive.label, exclusive.amount, exclusive.label
+                ),
+                basis: "タックスアンサー No.2100（取得価額の判定は経理方式による）",
+            }),
         }
     }
 
     concerns
 }
 
+/// 帯をまたぐ場合の、税抜額とその境目。
+struct AcrossABand {
+    amount: i128,
+    label: &'static str,
+}
+
 /// 税込の額から税抜（10%）に直すと帯が変わるか。
 ///
 /// **10%で見る。** 軽減税率8%の資産（固定資産で該当することはまず無い）を
 /// 網羅するより、境目をまたぐことに気づける方が大事である。
-fn the_band_changes_without_tax(inclusive: i128) -> Option<CostConcern> {
+fn the_amount_without_tax_if_it_crosses_a_band(inclusive: i128) -> Option<AcrossABand> {
     // 税抜額 = 税込 ÷ 1.1 の切り捨て。整数で計算する。
     let exclusive = inclusive * 10 / 11;
     for (limit, label) in [
@@ -374,12 +399,9 @@ fn the_band_changes_without_tax(inclusive: i128) -> Option<CostConcern> {
         (IMMEDIATE_LIMIT_BEFORE_R8_APRIL, "30万円"),
     ] {
         if inclusive >= limit && exclusive < limit {
-            return Some(CostConcern {
-                message: format!(
-                    "この帳簿は税込経理です。取得価額 {inclusive} 円は{label}以上ですが、税抜なら {exclusive} 円で{label}を下回ります。
-      **経理方式によって選べる扱いが変わります。**"
-                ),
-                basis: "タックスアンサー No.2100（取得価額の判定は経理方式による）",
+            return Some(AcrossABand {
+                amount: exclusive,
+                label,
             });
         }
     }
@@ -728,7 +750,7 @@ mod tests {
         let concerns = cost_concerns(
             &yen(280_717),
             DepreciationMethod::LumpSumOverThreeYears,
-            TaxMode::Exclusive,
+            Some(TaxMode::Exclusive),
         );
         assert_eq!(concerns.len(), 1, "{concerns:?}");
         assert!(concerns[0].message.contains("20万円未満"), "{concerns:?}");
@@ -741,7 +763,7 @@ mod tests {
         let concerns = cost_concerns(
             &yen(200_000),
             DepreciationMethod::LumpSumOverThreeYears,
-            TaxMode::Exclusive,
+            Some(TaxMode::Exclusive),
         );
         assert_eq!(concerns.len(), 1, "20万円ちょうどは帯の外: {concerns:?}");
     }
@@ -751,7 +773,7 @@ mod tests {
         let concerns = cost_concerns(
             &yen(199_999),
             DepreciationMethod::LumpSumOverThreeYears,
-            TaxMode::Exclusive,
+            Some(TaxMode::Exclusive),
         );
         assert!(concerns.is_empty(), "{concerns:?}");
     }
@@ -762,7 +784,7 @@ mod tests {
         let concerns = cost_concerns(
             &yen(500_000),
             DepreciationMethod::ImmediateExpense,
-            TaxMode::Exclusive,
+            Some(TaxMode::Exclusive),
         );
         assert_eq!(concerns.len(), 1, "{concerns:?}");
         assert!(concerns[0].message.contains("30万円未満"), "{concerns:?}");
@@ -775,7 +797,7 @@ mod tests {
         let concerns = cost_concerns(
             &yen(280_717),
             DepreciationMethod::ImmediateExpense,
-            TaxMode::Exclusive,
+            Some(TaxMode::Exclusive),
         );
         assert!(concerns.is_empty(), "{concerns:?}");
     }
@@ -786,7 +808,7 @@ mod tests {
         let concerns = cost_concerns(
             &yen(98_181),
             DepreciationMethod::LumpSumOverThreeYears,
-            TaxMode::Exclusive,
+            Some(TaxMode::Exclusive),
         );
         assert_eq!(concerns.len(), 1, "{concerns:?}");
         assert_eq!(concerns[0].basis, "所得税法施行令138条");
@@ -800,7 +822,7 @@ mod tests {
         let concerns = cost_concerns(
             &yen(98_181),
             DepreciationMethod::ImmediateExpense,
-            TaxMode::Exclusive,
+            Some(TaxMode::Exclusive),
         );
         assert!(concerns.is_empty(), "{concerns:?}");
     }
@@ -815,7 +837,7 @@ mod tests {
         let concerns = cost_concerns(
             &yen(108_000),
             DepreciationMethod::LumpSumOverThreeYears,
-            TaxMode::Inclusive,
+            Some(TaxMode::Inclusive),
         );
         assert_eq!(concerns.len(), 1, "{concerns:?}");
         assert!(
@@ -831,7 +853,7 @@ mod tests {
         let concerns = cost_concerns(
             &yen(108_000),
             DepreciationMethod::LumpSumOverThreeYears,
-            TaxMode::Exclusive,
+            Some(TaxMode::Exclusive),
         );
         assert!(concerns.is_empty(), "{concerns:?}");
     }
@@ -842,7 +864,49 @@ mod tests {
         let concerns = cost_concerns(
             &yen(150_000),
             DepreciationMethod::LumpSumOverThreeYears,
-            TaxMode::Inclusive,
+            Some(TaxMode::Inclusive),
+        );
+        assert!(concerns.is_empty(), "{concerns:?}");
+    }
+
+    /// **本命。** 経理方式が分からないときは「分からない」と言う。
+    ///
+    /// 黙って片方だと決めると、帯が変わることに気づけないまま選択が固まる。
+    /// なお帯の検査（所令138/139・措法28の2）は経理方式なしでも動く——
+    /// **設定が無いことを理由に、本体の検査まで止めない。**
+    #[test]
+    fn an_unknown_tax_mode_is_said_out_loud() {
+        let concerns = cost_concerns(
+            &yen(108_000),
+            DepreciationMethod::LumpSumOverThreeYears,
+            None,
+        );
+        assert_eq!(concerns.len(), 1, "{concerns:?}");
+        assert!(
+            concerns[0].message.contains("確かめられませんでした"),
+            "{concerns:?}"
+        );
+        assert!(
+            concerns[0].message.contains("KAIKEI_TAX_MODE"),
+            "何を設定すればよいか言うこと: {concerns:?}"
+        );
+    }
+
+    /// 経理方式が分からなくても、帯の検査そのものは動く。
+    #[test]
+    fn the_band_check_works_without_a_tax_mode() {
+        let concerns = cost_concerns(&yen(500_000), DepreciationMethod::ImmediateExpense, None);
+        assert_eq!(concerns.len(), 1, "{concerns:?}");
+        assert_eq!(concerns[0].basis, "租税特別措置法28条の2");
+    }
+
+    /// 境目から離れていれば、経理方式が分からなくても黙る。
+    #[test]
+    fn an_unknown_tax_mode_says_nothing_far_from_a_band() {
+        let concerns = cost_concerns(
+            &yen(150_000),
+            DepreciationMethod::LumpSumOverThreeYears,
+            None,
         );
         assert!(concerns.is_empty(), "{concerns:?}");
     }
@@ -856,7 +920,7 @@ mod tests {
                 DepreciationMethod::StraightLine {
                     useful_life_years: 4,
                 },
-                TaxMode::Exclusive,
+                Some(TaxMode::Exclusive),
             );
             assert!(concerns.is_empty(), "{amount}: {concerns:?}");
         }
@@ -869,22 +933,22 @@ mod tests {
             (
                 280_717_i128,
                 DepreciationMethod::LumpSumOverThreeYears,
-                TaxMode::Exclusive,
+                Some(TaxMode::Exclusive),
             ),
             (
                 500_000,
                 DepreciationMethod::ImmediateExpense,
-                TaxMode::Exclusive,
+                Some(TaxMode::Exclusive),
             ),
             (
                 98_181,
                 DepreciationMethod::LumpSumOverThreeYears,
-                TaxMode::Exclusive,
+                Some(TaxMode::Exclusive),
             ),
             (
                 108_000,
                 DepreciationMethod::LumpSumOverThreeYears,
-                TaxMode::Inclusive,
+                Some(TaxMode::Inclusive),
             ),
         ];
         for (amount, method, mode) in cases {
