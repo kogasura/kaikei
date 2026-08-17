@@ -79,6 +79,14 @@ pub enum FindingKind {
     ///
     /// **誤りとは言わない。** 同じ額の別の取引が偶然並ぶことはある。
     InconsistentAccount,
+    /// 同じ費用科目の中で、消費税の区分が割れている。
+    ///
+    /// **こちらは消費税額に効く。** 科目の割れ（[`Self::InconsistentAccount`]）
+    /// は所得を動かさないが、税区分の割れは仕入税額控除の額を変える。
+    ///
+    /// **誤りとは言わない。** 同じ科目に課税と非課税が混ざるのは正当にある
+    /// （国内と海外の旅費、課税と非課税の手数料など）。
+    InconsistentTaxCategory,
 }
 
 impl FindingKind {
@@ -87,6 +95,7 @@ impl FindingKind {
         match self {
             FindingKind::BalanceMismatch => "balance_mismatch",
             FindingKind::InconsistentAccount => "inconsistent_account",
+            FindingKind::InconsistentTaxCategory => "inconsistent_tax_category",
             FindingKind::AccountSetMismatch => "account_set_mismatch",
             FindingKind::DanglingReversal => "dangling_reversal",
             FindingKind::DuplicateEntryNumber => "duplicate_entry_number",
@@ -171,6 +180,7 @@ where
     findings.extend(check_entry_numbers(&entries));
     findings.extend(check_suspected_duplicates(&entries));
     findings.extend(check_inconsistent_accounts(&entries, &chart));
+    findings.extend(check_inconsistent_tax_categories(&entries, &chart));
 
     // 2. ★2つの経路で計算した試算表を突き合わせる★
     let domain = TrialBalance::from_entries(entries.iter(), &chart, tag_schema, &[])?;
@@ -393,6 +403,92 @@ fn check_inconsistent_accounts(
     // 金額の大きい順（`check_suspected_duplicates` と同じ理由）。
     findings.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.detail.cmp(&b.1.detail)));
     findings.into_iter().map(|(_, finding)| finding).collect()
+}
+
+/// 同じ費用科目の中で、消費税の区分が割れていないか。
+///
+/// # 科目の割れより重い
+///
+/// [`check_inconsistent_accounts`] が見るのは所得を動かさない誤りだが、
+/// **税区分の割れは仕入税額控除の額を変える。**
+///
+/// # 実際に見つけたもの
+///
+/// 実帳簿（2026年）の地代家賃6件のうち、**5件が課税仕入10%、1件が非課税**
+/// だった。住宅の貸付けは非課税（消費税法別表第二13号）なので、自宅の家賃を
+/// 課税仕入として控除していれば控除のとりすぎになる。逆に事務所であれば
+/// 課税が正しく、非課税の1件が誤りになる。**どちらが正しいかはこのソフトには
+/// 分からない**——契約の中身を知らないからである。
+///
+/// # 少数派を「誤り」と呼ばない
+///
+/// 上の例では、5件と1件のどちらが誤りかが決まらない。**多数決で決めない。**
+/// 件数を並べて、判断は人間に返す。
+///
+/// # 閾値を足していない
+///
+/// 「少数派が全体の N% 未満なら」のような絞りを入れたくなるが、**実帳簿で
+/// 誤検出が出ていない**（割れている科目は1つだけ）ので、確かめようのない
+/// 条件を先回りで足さない。旅費交通費のように課税と対象外が正当に混ざる
+/// 科目が出てきたら、そのとき実物を見て決めること。
+fn check_inconsistent_tax_categories(
+    entries: &[kaikei_core::JournalEntry],
+    chart: &kaikei_core::ChartOfAccounts,
+) -> Vec<Finding> {
+    use std::collections::BTreeMap;
+
+    let Ok(tax_key) = kaikei_core::TagKey::parse("tax_category") else {
+        return Vec::new();
+    };
+
+    // 科目 → 税区分 → 件数
+    let mut by_account: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for entry in entries {
+        for line in entry.lines() {
+            if line.side() != kaikei_core::Side::Debit {
+                continue;
+            }
+            let is_expense = chart
+                .get(line.account())
+                .is_some_and(|def| def.account_type == kaikei_core::AccountType::Expense);
+            if !is_expense {
+                continue;
+            }
+            let Some(kaikei_core::TagValue::Code(code)) = line.tags().get(&tax_key) else {
+                continue;
+            };
+            *by_account
+                .entry(line.account().as_str().to_string())
+                .or_default()
+                .entry(code.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
+    by_account
+        .into_iter()
+        .filter(|(_, categories)| {
+            categories.len() > 1 && categories.values().sum::<usize>() >= RECURRING_TIMES
+        })
+        .map(|(account, categories)| Finding {
+            kind: FindingKind::InconsistentTaxCategory,
+            detail: format!(
+                concat!(
+                    "科目 {} の消費税の区分が {} 種類に分かれています（{}）。",
+                    "**仕入税額控除の額が変わります。** ",
+                    "同じ性質の取引なら区分を揃えてください。",
+                    "課税と非課税が正当に混ざる科目であれば、そのままで構いません"
+                ),
+                account,
+                categories.len(),
+                categories
+                    .iter()
+                    .map(|(code, times)| format!("{code} {times}件"))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            ),
+        })
+        .collect()
 }
 
 fn check_suspected_duplicates(entries: &[kaikei_core::JournalEntry]) -> Vec<Finding> {
@@ -1161,5 +1257,171 @@ mod tests {
         ];
         let empty = kaikei_core::ChartOfAccounts::new(vec![]).unwrap();
         assert!(check_inconsistent_accounts(&entries, &empty).is_empty());
+    }
+
+    // ---- 税区分の一貫性（check_inconsistent_tax_categories） ----
+
+    /// `tax_category` を受け付けるスキーマ。
+    ///
+    /// **`TagSchema::empty()` はタグを一切拒む。** 税区分の検査は税区分タグが
+    /// 付いた明細を見るので、空のスキーマでは仕訳を作る時点で落ちる。
+    fn schema_with_tax_category() -> TagSchema {
+        TagSchema::new(vec![(
+            kaikei_core::TagKey::parse("tax_category").unwrap(),
+            kaikei_core::TagDef {
+                value_type: kaikei_core::TagValueType::Code,
+                aggregatable: true,
+                required_for: Vec::new(),
+            },
+        )])
+    }
+
+    fn taxed_line(account: &str, amount: i128, tax_category: &str) -> JournalLine {
+        let mut tags = TagSet::new();
+        tags.insert(
+            kaikei_core::TagKey::parse("tax_category").unwrap(),
+            kaikei_core::TagValue::Code(tax_category.to_string()),
+        );
+        JournalLine::new(
+            AccountCode::parse(account).unwrap(),
+            Side::Debit,
+            yen(amount),
+            tags,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn taxed_entry(id: u128, no: u32, day: u8, account: &str, tax_category: &str) -> JournalEntry {
+        JournalEntry::new(
+            NewEntry {
+                id: EntryId::new(id),
+                entry_no: EntryNumber::new(no),
+                entry_date: AccountingDate::new(2026, 6, day).unwrap(),
+                description: "家賃".to_string(),
+                lines: vec![
+                    taxed_line(account, 100_000, tax_category),
+                    line("100", Side::Credit, 100_000),
+                ],
+                document_refs: Vec::new(),
+            },
+            &FiscalYear::calendar_year(2026),
+            &sample_chart_with_tax_account(),
+            &schema_with_tax_category(),
+            &AllOpen,
+            &fixed_clock(),
+        )
+        .unwrap()
+    }
+
+    /// **本命。** 同じ費用科目の中で税区分が割れていれば知らせる。
+    ///
+    /// 実帳簿の地代家賃がこれ（6件のうち5件が課税仕入10%、1件が非課税）。
+    /// **仕入税額控除の額が変わる。**
+    #[test]
+    fn a_split_tax_category_within_one_account_is_reported() {
+        let entries = vec![
+            taxed_entry(1, 1, 1, "604", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(2, 2, 2, "604", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(3, 3, 3, "604", "TAX_FREE"),
+        ];
+
+        let findings =
+            check_inconsistent_tax_categories(&entries, &sample_chart_with_tax_account());
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].kind, FindingKind::InconsistentTaxCategory);
+        assert!(findings[0].detail.contains("604"), "{findings:?}");
+        // **件数を両方出す。** どちらが誤りかは決められないので、
+        // 多数派を「正しい」と読ませない。
+        assert!(
+            findings[0].detail.contains("PURCHASE_10_QUALIFIED 2件"),
+            "{findings:?}"
+        );
+        assert!(findings[0].detail.contains("TAX_FREE 1件"), "{findings:?}");
+    }
+
+    /// 揃っていれば言わない。
+    #[test]
+    fn one_tax_category_per_account_is_quiet() {
+        let entries = vec![
+            taxed_entry(1, 1, 1, "604", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(2, 2, 2, "604", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(3, 3, 3, "604", "PURCHASE_10_QUALIFIED"),
+        ];
+        assert!(
+            check_inconsistent_tax_categories(&entries, &sample_chart_with_tax_account())
+                .is_empty()
+        );
+    }
+
+    /// **本命。** 科目が違えば別々に見る（混ぜない）。
+    #[test]
+    fn different_accounts_are_judged_separately() {
+        let entries = vec![
+            taxed_entry(1, 1, 1, "604", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(2, 2, 2, "604", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(3, 3, 3, "604", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(4, 4, 4, "621", "TAX_FREE"),
+            taxed_entry(5, 5, 5, "621", "TAX_FREE"),
+            taxed_entry(6, 6, 6, "621", "TAX_FREE"),
+        ];
+        assert!(
+            check_inconsistent_tax_categories(&entries, &sample_chart_with_tax_account())
+                .is_empty(),
+            "科目ごとには揃っている"
+        );
+    }
+
+    /// 2件では拾わない（`check_inconsistent_accounts` と同じ閾値）。
+    #[test]
+    fn two_entries_are_not_enough_for_a_tax_split() {
+        let entries = vec![
+            taxed_entry(1, 1, 1, "604", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(2, 2, 2, "604", "TAX_FREE"),
+        ];
+        assert!(
+            check_inconsistent_tax_categories(&entries, &sample_chart_with_tax_account())
+                .is_empty()
+        );
+    }
+
+    /// **本命。** 費用でない科目は見ない。
+    #[test]
+    fn non_expense_accounts_are_ignored_for_tax_categories() {
+        let entries = vec![
+            taxed_entry(1, 1, 1, "100", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(2, 2, 2, "100", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(3, 3, 3, "100", "TAX_FREE"),
+        ];
+        assert!(
+            check_inconsistent_tax_categories(&entries, &sample_chart_with_tax_account())
+                .is_empty()
+        );
+    }
+
+    /// 税区分が付いていない明細は数えない。
+    #[test]
+    fn lines_without_a_tax_category_are_not_counted() {
+        let entries = vec![
+            taxed_entry(1, 1, 1, "604", "PURCHASE_10_QUALIFIED"),
+            taxed_entry(2, 2, 2, "604", "TAX_FREE"),
+            // タグ無しの明細を持つ仕訳。数に入れば3件になって拾われる。
+            entry_on(
+                3,
+                3,
+                3,
+                "タグ無し",
+                vec![
+                    line("604", Side::Debit, 100_000),
+                    line("100", Side::Credit, 100_000),
+                ],
+            ),
+        ];
+        assert!(
+            check_inconsistent_tax_categories(&entries, &sample_chart_with_tax_account())
+                .is_empty(),
+            "タグ無しを数えると2件が3件になってしまう"
+        );
     }
 }
