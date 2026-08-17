@@ -109,8 +109,28 @@ impl FindingKind {
     /// 同額の交通費が2件、など）は普通にあるので、疑いを不整合と同じ扱いに
     /// すると、正しい帳簿でも検査が失敗する。失敗が当たり前になると、
     /// 本当の不整合を見落とす。
+    ///
+    /// # 種別を足したら、ここも直す
+    ///
+    /// **実際に忘れた。** `InconsistentAccount` と `InconsistentTaxCategory`
+    /// を足したとき（D-120 / D-121）にここを更新せず、**実帳簿の `verify` が
+    /// 終了コード1で失敗するようになっていた**——どちらの doc にも
+    /// 「誤りとは限らない」と書いておきながらである。
+    ///
+    /// 網羅的な `match` にして、種別を足したらコンパイルが通らないようにした。
+    /// **`matches!` は足し忘れを黙って通す。**
     pub fn is_suspicion(&self) -> bool {
-        matches!(self, FindingKind::SuspectedDuplicate)
+        match self {
+            // 帳簿が内部で食い違っているもの。**直すまで申告に進めない。**
+            FindingKind::BalanceMismatch
+            | FindingKind::AccountSetMismatch
+            | FindingKind::DanglingReversal
+            | FindingKind::DuplicateEntryNumber => false,
+            // 誤りとは限らないもの。**正当な形が普通にある。**
+            FindingKind::SuspectedDuplicate
+            | FindingKind::InconsistentAccount
+            | FindingKind::InconsistentTaxCategory => true,
+        }
     }
 }
 
@@ -1422,6 +1442,95 @@ mod tests {
             check_inconsistent_tax_categories(&entries, &sample_chart_with_tax_account())
                 .is_empty(),
             "タグ無しを数えると2件が3件になってしまう"
+        );
+    }
+
+    // ---- 種別の分類（is_suspicion） ----
+
+    /// **本命。** 「誤りとは限らない」種別は検査を失敗させない。
+    ///
+    /// **実際に忘れた。** `InconsistentAccount` と `InconsistentTaxCategory` を
+    /// 足したときに `is_suspicion` を更新せず、実帳簿の `verify` が終了コード1で
+    /// 失敗するようになっていた——どちらの doc にも「誤りとは限らない」と
+    /// 書いておきながらである。
+    ///
+    /// **この形の抜けは、正しい帳簿でしか露見しない。** 不整合が別にある帳簿で
+    /// 試すと、どちらにせよ失敗するので気づけない。
+    #[test]
+    fn advisory_findings_do_not_fail_the_check() {
+        for kind in [
+            FindingKind::SuspectedDuplicate,
+            FindingKind::InconsistentAccount,
+            FindingKind::InconsistentTaxCategory,
+        ] {
+            assert!(kind.is_suspicion(), "{kind:?} は疑いであるべき");
+            let output = VerifyOutput {
+                entry_count: 1,
+                findings: vec![Finding {
+                    kind,
+                    detail: String::new(),
+                }],
+            };
+            assert!(output.is_clean(), "{kind:?} だけで失敗しないこと");
+        }
+    }
+
+    /// 帳簿が内部で食い違っている種別は検査を失敗させる。
+    #[test]
+    fn real_inconsistencies_fail_the_check() {
+        for kind in [
+            FindingKind::BalanceMismatch,
+            FindingKind::AccountSetMismatch,
+            FindingKind::DanglingReversal,
+            FindingKind::DuplicateEntryNumber,
+        ] {
+            assert!(!kind.is_suspicion(), "{kind:?} は不整合であるべき");
+            let output = VerifyOutput {
+                entry_count: 1,
+                findings: vec![Finding {
+                    kind,
+                    detail: String::new(),
+                }],
+            };
+            assert!(!output.is_clean(), "{kind:?} で失敗すること");
+        }
+    }
+
+    /// **本命。** すべての種別が、どちらかに分類されている。
+    ///
+    /// 上の2つのテストが数えた種別の合計が、`as_code` が知っている種別の数と
+    /// 一致することを見る。**種別を足してテストに書き忘れたら、ここで落ちる。**
+    #[test]
+    fn every_kind_is_classified_in_the_tests_above() {
+        let advisory = [
+            FindingKind::SuspectedDuplicate,
+            FindingKind::InconsistentAccount,
+            FindingKind::InconsistentTaxCategory,
+        ];
+        let hard = [
+            FindingKind::BalanceMismatch,
+            FindingKind::AccountSetMismatch,
+            FindingKind::DanglingReversal,
+            FindingKind::DuplicateEntryNumber,
+        ];
+        let mut codes: Vec<&str> = advisory
+            .iter()
+            .chain(hard.iter())
+            .map(|kind| kind.as_code())
+            .collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            advisory.len() + hard.len(),
+            "同じ種別を2度数えている"
+        );
+        // **種別を足したら `is_suspicion` の match が落ちる**（網羅的なので）。
+        // ここは「テストにも足したか」を見る。
+        assert_eq!(
+            codes.len(),
+            7,
+            "種別を足したら、上の2つのテストにも足すこと"
         );
     }
 }
