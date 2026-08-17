@@ -954,6 +954,57 @@ fn count_qualified_without_counterparty(
         .count()
 }
 
+/// 取引先が無い課税仕入れの取引を、少額特例の金額の境目で分ける。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SplitBySmallAmount {
+    /// 1万円未満・期間内の取引数（少額特例の対象になりうる）。
+    small: usize,
+    /// それ以外の取引数（適格請求書の保存が要る）。
+    large: usize,
+    /// `large` の合計額。
+    large_total_minor: i128,
+}
+
+/// **取引ごとに**数える（明細ごとではない）。
+///
+/// 少額特例の1万円未満は「一回の取引の税込金額」で見る（国税庁「少額特例に
+/// おける1万円未満の判定単位」）。**明細で分けると数が変わる**——1件の
+/// 取引を複数の明細に分けている帳簿では、どれも1万円未満に見えてしまう。
+///
+/// 取引の額は借方の合計を使う。**貸方の合計でも同じ数になる**——仕訳は
+/// 貸借が一致しているからである。借方にするのは、費用の側から見た「取引額」
+/// として読みやすいというだけで、計算上の意味は無い。
+/// （借方を貸方に変える変異を入れても、どのテストも落ちない。当然である。）
+fn split_by_small_amount(
+    entries: &[kaikei_core::JournalEntry],
+    rule_sets: &kaikei_jp::tax::TaxRuleSets,
+) -> SplitBySmallAmount {
+    let mut split = SplitBySmallAmount::default();
+    for entry in entries {
+        if !entry
+            .lines()
+            .iter()
+            .any(|line| line_needs_a_counterparty(line.tags(), rule_sets))
+        {
+            continue;
+        }
+        let total: i128 = entry
+            .lines()
+            .iter()
+            .filter(|line| line.side() == kaikei_core::Side::Debit)
+            .map(|line| line.amount().minor())
+            .sum();
+        let total = kaikei_core::Money::from_minor(total, kaikei_core::Currency::JPY);
+        if kaikei_jp::invoice::is_within_the_small_amount_special(&total, entry.entry_date()) {
+            split.small += 1;
+        } else {
+            split.large += 1;
+            split.large_total_minor += total.minor();
+        }
+    }
+    split
+}
+
 /// 明細1行の判定。**表示から切り離してある**（`accounts_on_the_wrong_side`
 /// と同じ理由。何を拾うかをテストで固定できないと、呼び出しごと消えても
 /// 気づけない）。
@@ -1000,6 +1051,28 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
     eprintln!(
         "  仕入税額控除が認められるかどうかは、証憑の保存状況と相手方の登録状況で決まります。"
     );
+
+    // **件数だけでは動けない。** 603件と言われても手の付けようがないが、
+    // 少額特例（税込1万円未満は適格請求書の保存が不要）で分ければ、
+    // 実際に請求書を揃える必要がある取引はずっと少ないことがある。
+    let split = split_by_small_amount(entries, &rule_sets);
+    if split.small > 0 {
+        eprintln!();
+        eprintln!(
+            "  このうち取引単位で見ると、{} 件が税込1万円未満です（少額特例の対象になりうる）。",
+            split.small
+        );
+        eprintln!(
+            "  1万円以上は {} 件・{} 円で、こちらは適格請求書の保存が要ります。",
+            split.large,
+            kaikei_core::Money::from_minor(split.large_total_minor, kaikei_core::Currency::JPY)
+                .to_display_string()
+        );
+        eprintln!("  ※ 少額特例には基準期間の課税売上高1億円以下などの要件があり、");
+        eprintln!("    このソフトでは判定していません（前々年の帳簿が無いことがあるため）。");
+        eprintln!("    免除されるのは適格請求書の保存だけで、帳簿の記載事項は免除されません。");
+        eprintln!("    令和11年9月30日で終わる特例です（28年改正法附則53の2）。");
+    }
     Ok(())
 }
 

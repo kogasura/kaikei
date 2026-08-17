@@ -319,3 +319,115 @@ mod tests {
         }
     }
 }
+
+// ─── 少額特例（1万円未満） ──────────────────────────────────
+
+/// 少額特例の金額の境目。**税込1万円未満。**
+pub const SMALL_AMOUNT_LIMIT_MINOR: i128 = 10_000;
+
+/// 少額特例が終わる日（令和11年9月30日）。
+///
+/// **延長・恒久化されていない。** この日以後の課税仕入れは対象外になる
+/// （国税庁パンフレット「…令和11年10月1日以後に行う課税仕入れについては、
+/// 少額特例の対象とはなりません」）。
+pub const SMALL_AMOUNT_SPECIAL_ENDS_ON: (i32, u8, u8) = (2029, 9, 30);
+
+/// 少額特例が始まった日（令和5年10月1日）。
+pub const SMALL_AMOUNT_SPECIAL_BEGINS_ON: (i32, u8, u8) = (2023, 10, 1);
+
+/// その取引が、少額特例の**金額と期間**の条件に当てはまるか。
+///
+/// # これだけでは「適用できる」と言えない
+///
+/// 少額特例には金額・期間のほかに**事業者の規模**の要件がある——基準期間
+/// （個人は前々年）の課税売上高が1億円以下、または特定期間（前年1〜6月）の
+/// 課税売上高が5千万円以下（28年改正法附則53の2、30年改正令附則24の2）。
+///
+/// **この関数はそれを判定しない。** 前々年の帳簿がこのシステムに無いことが
+/// 普通にあるからである（実際 weBanana.SP の帳簿は2026年から始まっている）。
+/// 呼び出し側は「対象になりうる」までしか言わないこと。
+///
+/// # 判定は取引単位（明細ごとではない）
+///
+/// 1万円未満かどうかは**一回の取引の税込金額**で見る。商品ごと・明細ごとでは
+/// ない（国税庁「少額特例における1万円未満の判定単位」）。だから引数は
+/// 取引の合計額である。
+///
+/// # 何が免除されるのか
+///
+/// **適格請求書の保存だけ**である。帳簿の保存とその記載事項（消法30条8項）は
+/// 免除されない。「請求書が無くてもよい」と「帳簿に何も書かなくてよい」は
+/// 別のことである。
+pub fn is_within_the_small_amount_special(
+    transaction_total: &kaikei_core::Money,
+    on: kaikei_core::AccountingDate,
+) -> bool {
+    if transaction_total.minor() >= SMALL_AMOUNT_LIMIT_MINOR {
+        return false;
+    }
+    let (by, bm, bd) = SMALL_AMOUNT_SPECIAL_BEGINS_ON;
+    let (ey, em, ed) = SMALL_AMOUNT_SPECIAL_ENDS_ON;
+    let ymd = (on.year(), on.month(), on.day());
+    ymd >= (by, bm, bd) && ymd <= (ey, em, ed)
+}
+
+#[cfg(test)]
+mod small_amount_special_tests {
+    use super::*;
+    use kaikei_core::{AccountingDate, Currency, Money};
+
+    fn yen(v: i128) -> Money {
+        Money::from_minor(v, Currency::JPY)
+    }
+    fn day(y: i32, m: u8, d: u8) -> AccountingDate {
+        AccountingDate::new(y, m, d).unwrap()
+    }
+
+    /// **本命。** 1万円未満・期間内なら当てはまる。
+    ///
+    /// 実帳簿の2026年は、取引先が付いていない課税仕入 603件のうち
+    /// **570件が1万円未満**である。ここが効くかどうかで、確かめるべき件数が
+    /// 603件から33件に変わる。
+    #[test]
+    fn a_small_transaction_inside_the_period_qualifies() {
+        assert!(is_within_the_small_amount_special(
+            &yen(9_999),
+            day(2026, 8, 17)
+        ));
+    }
+
+    /// 1万円ちょうどは対象外（「1万円未満」）。
+    #[test]
+    fn exactly_ten_thousand_is_out() {
+        assert!(!is_within_the_small_amount_special(
+            &yen(10_000),
+            day(2026, 8, 17)
+        ));
+    }
+
+    /// **本命。** 令和11年9月30日で終わる。延長・恒久化されていない。
+    #[test]
+    fn the_special_ends_on_the_last_day_of_september_2029() {
+        assert!(
+            is_within_the_small_amount_special(&yen(1_000), day(2029, 9, 30)),
+            "9月30日はまだ対象"
+        );
+        assert!(
+            !is_within_the_small_amount_special(&yen(1_000), day(2029, 10, 1)),
+            "10月1日以後は対象外"
+        );
+    }
+
+    /// 始まりは令和5年10月1日。
+    #[test]
+    fn the_special_begins_on_the_first_of_october_2023() {
+        assert!(!is_within_the_small_amount_special(
+            &yen(1_000),
+            day(2023, 9, 30)
+        ));
+        assert!(is_within_the_small_amount_special(
+            &yen(1_000),
+            day(2023, 10, 1)
+        ));
+    }
+}
