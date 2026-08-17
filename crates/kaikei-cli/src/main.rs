@@ -914,6 +914,70 @@ fn warn_if_the_search_fields_are_incomplete(counterparty: &Option<String>, amoun
 /// 当年度末と翌年期首のどちらで振り替えるか、振替仕訳を起こすか期首残高と
 /// して設定するかが決まっていない（`DECISIONS.md` D-065）。**判断を先取り
 /// しない代わりに、持ち越されていることを知らせる。**
+/// 期首振替を**年内に**記帳していないかを知らせる。
+///
+/// # 何が起きるか
+///
+/// 期首振替（事業主貸・事業主借 → 元入金）は**翌年1月1日**に記帳する
+/// （D-102）。年内（12月31日など）に入れると、**決算書の貸借対照表から
+/// 事業主貸・事業主借が消える。**
+///
+/// 青色申告決算書の様式にはこの2欄があり、期末残高をそのまま書く。
+/// 0 で提出することになる。
+///
+/// **実際に試したら再現した。** 実帳簿の複製で12月31日に期首振替を入れたところ、
+/// 事業主貸 9,923,381円 と事業主借 1,012,434円 が決算書から消え、
+/// `verify` は終了コード0のままだった。
+///
+/// # 判定
+///
+/// **期中に動きがあったのに期末が0**なら疑う。動きが無ければ0が正しい
+/// （その年に事業主貸を1度も使っていない、ということはありうる）。
+///
+/// 動きには**期首振替そのものも数える**。最初は「原因だから除く」と考えて
+/// 外していたが、**それだと見逃す場面がある**——期首振替は前年からの繰越を
+/// 振り替えるので、その年に事業主貸を1度も使っていなくても振替は起きる。
+/// 除くと「何も動いていない」ことになり、黙って通る（E2E で確かめた）。
+///
+/// 正しく翌年1月1日に記帳された期首振替は、そもそもこの年度の仕訳に入って
+/// こない（日付で外れる）。**この年度に居る期首振替は、それ自体が誤りである。**
+///
+/// # 断定しない
+///
+/// 期中に立てた事業主貸を、年内に別の理由で相殺することはありうる。
+/// 「確かめてください」と言うにとどめる。
+fn warn_if_the_opening_transfer_was_posted_too_early(
+    entries: &[kaikei_core::JournalEntry],
+    balance_sheet: &kaikei_app::policy::Statement,
+) -> Result<(), String> {
+    let owner = kaikei_jp::chart::load_owner_accounts(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+        .map_err(|error| format!("科目表の owner_accounts を読めませんでした: {error}"))?;
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+
+    for (code, name) in [
+        (&owner.drawings, "事業主貸"),
+        (&owner.contributions, "事業主借"),
+    ] {
+        // 期末が0でなければ、消えていない。
+        if !amount_of(balance_sheet, code).is_zero() {
+            continue;
+        }
+        let moved = entries
+            .iter()
+            .any(|entry| entry.lines().iter().any(|line| line.account() == code));
+        if !moved {
+            continue;
+        }
+        eprintln!("注意: {name} は期中に動いているのに、期末残高が 0 です。");
+        eprintln!("  期首振替（事業主貸・事業主借 → 元入金）を年内に記帳していないか");
+        eprintln!("  確かめてください。**翌年1月1日**に記帳するものです。");
+        eprintln!("  年内に入れると、決算書の貸借対照表からこの欄が消えます。");
+    }
+    Ok(())
+}
+
 fn warn_if_owner_accounts_carried_over(
     opening_balance_sheet: &kaikei_app::policy::Statement,
     fiscal_year: i32,
@@ -4243,6 +4307,11 @@ async fn write_reports(
     // **前年の事業主貸・事業主借が持ち越されていないか。** 翌期首に元入金へ
     // 振り替えないと、年を追うごとに膨らむ。
     warn_if_owner_accounts_carried_over(&opening_balance_sheet.balance_sheet, fiscal_year_label)?;
+
+    // **期首振替を年内に入れていないか。** 入れると決算書から事業主貸・
+    // 事業主借が消える（D-102）。上の検査は「忘れた」を見るが、こちらは
+    // 「早すぎた」を見る。
+    warn_if_the_opening_transfer_was_posted_too_early(&entries, &cumulative.balance_sheet)?;
 
     written.extend(write_blue_return_balance_sheet(
         &out_dir,
