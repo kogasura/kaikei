@@ -122,6 +122,45 @@ async fn seed_entry(pool: &PgPool, entry_no: i32, debit: &str, credit: &str, amo
     tx.commit().await.expect("コミット");
 }
 
+/// 取引日を指定して仕訳を1本入れる。
+///
+/// **科目の一貫性の検査（`inconsistent_account`）は日付を見る**ので、
+/// 日付を固定した `seed_entry` では試せない。
+async fn seed_entry_on(
+    pool: &PgPool,
+    entry_no: i32,
+    debit: &str,
+    credit: &str,
+    amount: i64,
+    date: &str,
+) {
+    let mut tx = pool.begin().await.expect("トランザクション");
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, 2026, $2, $3::date, 'テスト', now())",
+    )
+    .bind(&id)
+    .bind(entry_no)
+    .bind(date)
+    .execute(&mut *tx)
+    .await
+    .expect("仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ($1::uuid, 1, $2, 1, $4, 'JPY', 0), ($1::uuid, 2, $3, 2, $4, 'JPY', 0)",
+    )
+    .bind(&id)
+    .bind(debit)
+    .bind(credit)
+    .bind(amount)
+    .execute(&mut *tx)
+    .await
+    .expect("明細");
+    tx.commit().await.expect("コミット");
+}
+
 /// 税区分・取引先のタグを付けた仕訳を1本入れる。
 async fn seed_entry_with_tags(
     pool: &PgPool,
@@ -572,6 +611,123 @@ async fn two_documents_on_one_entry_still_count_as_one_entry(
 /// **本命。** 正常な帳簿では指摘が出ない。
 ///
 /// 正しい帳簿で毎回出る指摘は、当たり前になって本当の異常を覆い隠す。
+
+/// **本命。** 「確認する価値のある点」だけなら検査は失敗しない。
+///
+/// # この穴で実際に壊れた
+///
+/// `inconsistent_account` と `inconsistent_tax_category` を足したとき、
+/// `FindingKind::is_suspicion` を更新し忘れて**実帳簿の verify が終了コード1で
+/// 失敗するようになっていた**（D-124）。どちらも「誤りとは限らない」と
+/// 言いながら、である。
+///
+/// **正しい帳簿でしか露見しない。** 不整合が別にある帳簿で試すとどちらにせよ
+/// 失敗するので気づけない。だから**疑いだけがある帳簿**を作って見る。
+///
+/// ここで作るのは「毎月ほぼ同じ日に同額の支出が、違う科目に入っている」形
+/// （`inconsistent_account`）。帳簿としては何も壊れていない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn advisory_findings_alone_do_not_fail_the_check(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "604", "通信費", 5).await;
+    seed_account(&app, "621", "新聞図書費", 5).await;
+    // 毎月2日に 2,280円。科目が2つに分かれている（実帳簿の YouTube Premium）。
+    seed_entry_on(&app, 1, "604", "110", 2_280, "2026-01-02").await;
+    seed_entry_on(&app, 2, "604", "110", 2_280, "2026-02-02").await;
+    seed_entry_on(&app, 3, "621", "110", 2_280, "2026-03-02").await;
+
+    let (stdout, stderr, ok) = run_verify(&app);
+
+    assert!(
+        ok,
+        "疑いだけで検査を失敗させないこと（終了コードを見ている）: {stderr}"
+    );
+    assert!(
+        stdout.contains("確認する価値のある点"),
+        "疑いとして出すこと: {stdout}"
+    );
+    assert!(
+        stdout.contains("不整合は見つかりませんでした"),
+        "不整合ではないと言うこと: {stdout}"
+    );
+    assert!(
+        !stderr.contains("不整合が"),
+        "不整合として数えないこと: {stderr}"
+    );
+}
+
+/// **本命。** 本物の不整合なら失敗する（上のテストが緩すぎないことの裏取り）。
+///
+/// 訂正元が見当たらない赤伝は帳簿が内部で食い違っている状態で、直すまで
+/// 申告に進めない。
+///
+/// # 仕訳番号の重複では試せない
+///
+/// **DB が拒む**（`journal_entries_fiscal_year_entry_no_key`）。
+/// `duplicate_entry_number` の検査は、制約が無かった頃の帳簿や、
+/// 制約をすり抜ける経路が生まれたときのための保険である。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_real_inconsistency_fails_the_check(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "500", "売上高", 4).await;
+    // **前年の仕訳を訂正した赤伝**を作る。`dangling_reversal` は検査する年度の
+    // 中に訂正元が居るかを見るので、前年を指していれば「見当たらない」になる。
+    // 存在しない UUID は外部キーが拒む（`reverses` は自己参照の FK）。
+    let original: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, 2025, 1, DATE '2025-12-05', '前年の仕訳', now())",
+    )
+    .bind(&original)
+    .execute(&app)
+    .await
+    .expect("前年の仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ($1::uuid, 1, '110', 1, 1000, 'JPY', 0),                 ($1::uuid, 2, '500', 2, 1000, 'JPY', 0)",
+    )
+    .bind(&original)
+    .execute(&app)
+    .await
+    .expect("前年の明細");
+
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at, reverses, reverse_reason)          VALUES ($1::uuid, 2026, 2, DATE '2026-02-05', '【訂正】', now(), $2::uuid, '前年分の訂正')",
+    )
+    .bind(&id)
+    .bind(&original)
+    .execute(&app)
+    .await
+    .expect("赤伝");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ($1::uuid, 1, '500', 1, 1000, 'JPY', 0),                 ($1::uuid, 2, '110', 2, 1000, 'JPY', 0)",
+    )
+    .bind(&id)
+    .execute(&app)
+    .await
+    .expect("明細");
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(!ok, "本物の不整合なら失敗すること: {stderr}");
+    assert!(stderr.contains("不整合が"), "{stderr}");
+}
+
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn verify_is_quiet_on_a_healthy_book(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
     let app = common::app_pool(conn_opts).await;
