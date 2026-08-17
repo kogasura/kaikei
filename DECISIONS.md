@@ -6007,3 +6007,13 @@ CLI が終了コードをどう決めるかは別の場所にあるからであ�
 
 これらの検査が制約と重なっていること自体は悪くない。**制約が無かった頃の帳簿や、
 制約をすり抜ける経路が生まれたときの保険**である。
+
+### clippy は feature 付きで走らせる
+
+**`cargo clippy --workspace --all-targets` では pg-tests のコードを見ない。**
+このPRで実際に CI だけが落ちた（`empty_line_after_outer_attr`——doc コメントと
+`#[sqlx::test]` の間に空行が入っていた）。
+
+手元で確かめるときは `--all-features` を付けるか、
+`cargo clippy -p kaikei-e2e --all-targets --features pg-tests` を打つこと。
+CI の `database` ジョブがこれを見ている。

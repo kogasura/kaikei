@@ -608,10 +608,6 @@ async fn two_documents_on_one_entry_still_count_as_one_entry(
     );
 }
 
-/// **本命。** 正常な帳簿では指摘が出ない。
-///
-/// 正しい帳簿で毎回出る指摘は、当たり前になって本当の異常を覆い隠す。
-
 /// **本命。** 「確認する価値のある点」だけなら検査は失敗しない。
 ///
 /// # この穴で実際に壊れた
@@ -728,6 +724,9 @@ async fn a_real_inconsistency_fails_the_check(
     assert!(stderr.contains("不整合が"), "{stderr}");
 }
 
+/// **本命。** 正常な帳簿では指摘が出ない。
+///
+/// 正しい帳簿で毎回出る指摘は、当たり前になって本当の異常を覆い隠す。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn verify_is_quiet_on_a_healthy_book(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
     let app = common::app_pool(conn_opts).await;
