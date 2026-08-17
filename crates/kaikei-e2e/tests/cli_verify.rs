@@ -193,6 +193,72 @@ async fn verify_reports_a_qualified_purchase_without_a_counterparty(
     );
 }
 
+/// **本命。** 少額特例の境目で分けて数える。
+///
+/// 件数だけでは動けない。実帳簿は 603件 だが、取引単位で1万円未満と1万円以上に
+/// 分けると **570件 / 33件** になる。請求書を実際に揃える必要があるのは後者だけ
+/// かもしれず、**手を付けられる大きさかどうかが変わる**。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn verify_splits_the_count_at_the_small_amount_threshold(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    let qualified = r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#;
+    // 1万円未満が2件、1万円以上が1件。
+    seed_entry_with_tags(&app, 1, "609", "110", 9_999, qualified).await;
+    seed_entry_with_tags(&app, 2, "609", "110", 220, qualified).await;
+    seed_entry_with_tags(&app, 3, "609", "110", 35_829, qualified).await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("2 件が税込1万円未満"),
+        "1万円未満の件数: {stderr}"
+    );
+    assert!(
+        stderr.contains("1万円以上は 1 件・35,829 円"),
+        "1万円以上は件数と金額の両方: {stderr}"
+    );
+    // **免除されるのは請求書の保存だけ**であることを必ず添える。
+    assert!(
+        stderr.contains("帳簿の記載事項は免除されません"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("令和11年9月30日"),
+        "期限を出すこと: {stderr}"
+    );
+}
+
+/// **本命。** 1万円ちょうどは1万円以上として数える。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn exactly_ten_thousand_counts_as_large(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    let qualified = r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#;
+    seed_entry_with_tags(&app, 1, "609", "110", 9_999, qualified).await;
+    seed_entry_with_tags(&app, 2, "609", "110", 10_000, qualified).await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(stderr.contains("1 件が税込1万円未満"), "{stderr}");
+    assert!(
+        stderr.contains("1万円以上は 1 件・10,000 円"),
+        "1万円ちょうどは対象外: {stderr}"
+    );
+}
+
 /// 取引先が付いていれば指摘しない。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn a_qualified_purchase_with_a_counterparty_is_not_reported(
