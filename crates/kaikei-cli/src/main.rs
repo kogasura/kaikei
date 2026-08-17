@@ -63,7 +63,7 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei fixedasset list [--year <西暦>]
     kaikei fixedasset dispose --id <UUID> --on <YYYY-MM-DD> [--commit]
     kaikei depreciation --year <西暦>
-    kaikei household --year <西暦> --account <科目> --ratio <事業割合>
+    kaikei household --year <西暦> --account <科目> --ratio <事業割合> [--amount <円>]
 
 report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
@@ -75,6 +75,8 @@ fixedasset list は台帳の中身を並べます（--year でその年度の償
 fixedasset dispose は資産を除却します（既定は下見。行は消しません）。
 depreciation は固定資産台帳から減価償却費を出します（記帳はしません）。
 household は決算時の家事按分の振替仕訳を出します（記帳はしません）。
+    科目の一部だけが按分対象なら --amount でその額を指定します
+    （例: 通信費のうち携帯代だけ。指定した額は計上額を超えられません）。
 
 引数:
     --year <西暦>       会計年度（暦年）。例: 2026
@@ -248,7 +250,8 @@ fn run() -> Result<Vec<PathBuf>, String> {
             fiscal_year,
             account,
             ratio,
-        } => runtime.block_on(run_household(fiscal_year, &account, &ratio)),
+            amount,
+        } => runtime.block_on(run_household(fiscal_year, &account, &ratio, amount)),
         Command::FixedAsset(args) => runtime.block_on(run_fixed_asset_add(args)),
         Command::FixedAssetList { fiscal_year } => {
             runtime.block_on(run_fixed_asset_list(fiscal_year))
@@ -294,6 +297,9 @@ enum Command {
         account: String,
         /// 事業割合（0〜1の小数）。
         ratio: String,
+        /// 按分する額。省略すると科目の年間計上額の全額。
+        /// **科目の一部だけが按分対象のときに使う。**
+        amount: Option<i64>,
     },
     /// 固定資産を台帳に入れる。
     FixedAsset(FixedAssetArgs),
@@ -1818,6 +1824,7 @@ fn parse_household(args: &[String]) -> Result<Command, String> {
     let mut fiscal_year = None;
     let mut account = None;
     let mut ratio = None;
+    let mut amount = None;
     let mut index = 0;
     while index < args.len() {
         let key = args[index].as_str();
@@ -1832,6 +1839,13 @@ fn parse_household(args: &[String]) -> Result<Command, String> {
             }
             "--account" => account = Some(value.clone()),
             "--ratio" => ratio = Some(value.clone()),
+            "--amount" => {
+                amount = Some(
+                    kaikei_app::amount::strip_thousands_separators(value)
+                        .parse::<i64>()
+                        .map_err(|_| format!("--amount は数字で指定してください: {value}"))?,
+                )
+            }
             other => return Err(format!("不明な引数です: {other}\n\n{USAGE}")),
         }
         index += 2;
@@ -1840,6 +1854,7 @@ fn parse_household(args: &[String]) -> Result<Command, String> {
         fiscal_year: fiscal_year.ok_or("--year を指定してください（例: --year 2026）")?,
         account: account.ok_or("--account を指定してください（例: --account 615）")?,
         ratio: ratio.ok_or("--ratio を指定してください（例: --ratio 0.3）")?,
+        amount,
     })
 }
 
@@ -1864,6 +1879,7 @@ async fn run_household(
     fiscal_year: i32,
     account: &str,
     ratio: &str,
+    amount: Option<i64>,
 ) -> Result<Vec<PathBuf>, String> {
     let expense_account = kaikei_core::AccountCode::parse(account)
         .map_err(|error| format!("科目コードを読めません: {account}（{error}）"))?;
@@ -1946,10 +1962,33 @@ kaikei report を出すと科目の一覧が見られます。",
         return Ok(Vec::new());
     }
 
+    // 按分する額。`--amount` が無ければ科目の年間計上額の全額。
+    //
+    // **計上額を超える額は受け付けない。** 帳簿に無い額を按分すると、経費が
+    // マイナスになる仕訳ができあがる。貸借は一致するので決算書を見ても
+    // 気づけない。
+    let subject_minor = match amount {
+        Some(given) => {
+            if given <= 0 {
+                return Err(format!("--amount は正の値で指定してください: {given}"));
+            }
+            let given = i128::from(given);
+            if given > total_minor {
+                return Err(format!(
+                    "--amount が {} の計上額を超えています（指定 {given} 円 / 計上額 {total_minor} 円）。\n\
+                    帳簿に無い額は按分できません。",
+                    expense_account.as_str()
+                ));
+            }
+            given
+        }
+        None => total_minor,
+    };
+
     println!("{fiscal_year} 年の家事按分（{account_name}・事業割合 {ratio}）");
     println!();
 
-    let total = kaikei_core::Money::from_minor(total_minor, kaikei_core::Currency::JPY);
+    let total = kaikei_core::Money::from_minor(subject_minor, kaikei_core::Currency::JPY);
     let settings = jp_settings()?;
     let lines = kaikei_jp::household_split::year_end_household_split(
         kaikei_jp::household_split::YearEndHouseholdSplitInput {
@@ -1964,7 +2003,23 @@ kaikei report を出すと科目の一覧が見られます。",
     )
     .map_err(|error| format!("按分を計算できませんでした: {error}"))?;
 
-    println!("  計上額 {} 円", total.to_display_string());
+    // **両方を出す。** 一部だけを按分したとき、どちらの額なのかが
+    // 分からないと、後から見て正しいか確かめられない。
+    println!(
+        "  計上額 {} 円",
+        kaikei_core::Money::from_minor(total_minor, kaikei_core::Currency::JPY).to_display_string()
+    );
+    if subject_minor != total_minor {
+        println!(
+            "  うち按分対象 {} 円（--amount で指定）",
+            total.to_display_string()
+        );
+        println!(
+            "  残り {} 円は事業専用として按分しません",
+            kaikei_core::Money::from_minor(total_minor - subject_minor, kaikei_core::Currency::JPY)
+                .to_display_string()
+        );
+    }
     if lines.is_empty() {
         println!();
         println!("事業割合が100%なので、振り替えるものはありません。");
@@ -5788,6 +5843,7 @@ abc,
                 fiscal_year,
                 account,
                 ratio,
+                ..
             } => {
                 assert_eq!(fiscal_year, 2026);
                 assert_eq!(account, "615");
@@ -5811,6 +5867,84 @@ abc,
             let error = parse_args(&household_args(&given)).unwrap_err();
             assert!(error.contains(missing), "{missing} を要求すること: {error}");
         }
+    }
+
+    // **本命。** 科目の一部だけを按分できる。
+    //
+    // 実帳簿の通信費 476,631円 のうち、按分対象は携帯の 105,991円 だけで、
+    // 残りはドメイン・サーバー・AI で事業専用である。科目まるごとしか
+    // 按分できないと、この科目は手計算に落ちる。
+    #[test]
+    fn household_takes_an_amount_for_part_of_the_account() {
+        match parse_args(&household_args(&[
+            "--year",
+            "2026",
+            "--account",
+            "604",
+            "--ratio",
+            "0.3",
+            "--amount",
+            "105991",
+        ]))
+        .unwrap()
+        {
+            Command::Household { amount, .. } => assert_eq!(amount, Some(105_991)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // 額は3桁区切りでも読める（`fixedasset add --cost` と同じ）。
+    #[test]
+    fn the_household_amount_accepts_thousands_separators() {
+        match parse_args(&household_args(&[
+            "--year",
+            "2026",
+            "--account",
+            "604",
+            "--ratio",
+            "0.3",
+            "--amount",
+            "105,991",
+        ]))
+        .unwrap()
+        {
+            Command::Household { amount, .. } => assert_eq!(amount, Some(105_991)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // 省略すれば科目の全額。
+    #[test]
+    fn household_without_an_amount_means_the_whole_account() {
+        match parse_args(&household_args(&[
+            "--year",
+            "2026",
+            "--account",
+            "615",
+            "--ratio",
+            "0.3",
+        ]))
+        .unwrap()
+        {
+            Command::Household { amount, .. } => assert_eq!(amount, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn household_rejects_an_amount_that_is_not_a_number() {
+        let error = parse_args(&household_args(&[
+            "--year",
+            "2026",
+            "--account",
+            "604",
+            "--ratio",
+            "0.3",
+            "--amount",
+            "いくらか",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("--amount"), "{error}");
     }
 
     #[test]
