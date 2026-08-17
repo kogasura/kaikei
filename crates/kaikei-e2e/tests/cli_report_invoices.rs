@@ -289,3 +289,126 @@ async fn a_receipt_also_takes_it_off_the_list(
     assert!(log.contains("揃えるべき取引が 0 件") || !log.contains("揃えるべき取引"));
     assert!(!read_list(&out).contains("43967"), "消えること");
 }
+
+/// 決算振替の仕訳を1本入れる（`entry_kind: closing` タグ付き）。
+///
+/// **タグが目印である。** 日付だけでは、12月31日の普通の取引と区別できない。
+async fn seed_closing_entry(pool: &PgPool, entry_no: i32, amount: i64) {
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries \
+         (id, fiscal_year, entry_no, entry_date, description, recorded_at) \
+         VALUES ($1::uuid, 2026, $2, DATE '2026-12-31', '決算振替', now())",
+    )
+    .bind(&id)
+    .bind(entry_no)
+    .execute(pool)
+    .await
+    .expect("決算振替の仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines \
+         (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit, tags) \
+         VALUES ($1::uuid, 1, '609', 2, $2, 'JPY', 0, \
+                 '{\"entry_kind\":{\"t\":\"code\",\"v\":\"closing\"}}'), \
+                ($1::uuid, 2, '400', 1, $2, 'JPY', 0, \
+                 '{\"entry_kind\":{\"t\":\"code\",\"v\":\"closing\"}}')",
+    )
+    .bind(&id)
+    .bind(amount)
+    .execute(pool)
+    .await
+    .expect("決算振替の明細");
+}
+
+/// **本命。** 決算振替を記帳しても、青色申告決算書は1バイトも変わらない。
+///
+/// # なぜ大事か
+///
+/// 決算振替は収益・費用を元入金へ振り替える。**そのまま集計すると売上0・
+/// 所得0の決算書ができる**（D-101）。集計から外しているのはそのためで、
+/// 外し方を壊すと**決算書が静かに空になる**——貸借は一致したままなので、
+/// 見ても気づけない。
+///
+/// 手順書（`/kaikei-year-end` の 4）は「前後で diff を取れ」と書いているが、
+/// **人がやるので忘れる。** ここで固定する。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_blue_return_does_not_change_when_the_closing_entry_is_posted(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    sqlx::query(
+        "INSERT INTO accounts (code, name, account_type, postable) \
+         VALUES ('400','元入金',3,true) ON CONFLICT (code) DO NOTHING",
+    )
+    .execute(&app)
+    .await
+    .expect("元入金");
+    seed(&app, 1, 43_967).await;
+    let blob = temp_dir("closing-blob");
+
+    let before_dir = temp_dir("closing-before");
+    let (log, ok) = run_report(&app, &before_dir, &blob);
+    assert!(ok, "{log}");
+    let before = std::fs::read_to_string(before_dir.join("blue_return.csv")).unwrap();
+
+    seed_closing_entry(&app, 900, 43_967).await;
+
+    let after_dir = temp_dir("closing-after");
+    let (log, ok) = run_report(&app, &after_dir, &blob);
+    assert!(ok, "{log}");
+    let after = std::fs::read_to_string(after_dir.join("blue_return.csv")).unwrap();
+
+    assert_eq!(
+        before, after,
+        "決算振替を記帳しても決算書は変わらないこと（D-101）"
+    );
+    // **空になっていないことも見る。** 両方とも空なら「同じ」は成り立つ。
+    assert!(
+        before.contains("43967"),
+        "そもそも決算書に金額が載っていること: {before}"
+    );
+}
+
+/// **本命。** 仕訳日記帳のほうは決算振替のぶんだけ増える。
+///
+/// 決算振替は帳簿に実在する仕訳なので、**帳簿そのものを見る出力には載る**。
+/// 上のテストだけだと「どの出力も変わらない」実装でも通ってしまう。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_journal_book_does_grow_when_the_closing_entry_is_posted(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    sqlx::query(
+        "INSERT INTO accounts (code, name, account_type, postable) \
+         VALUES ('400','元入金',3,true) ON CONFLICT (code) DO NOTHING",
+    )
+    .execute(&app)
+    .await
+    .expect("元入金");
+    seed(&app, 1, 43_967).await;
+    let blob = temp_dir("journal-blob");
+
+    let before_dir = temp_dir("journal-before");
+    run_report(&app, &before_dir, &blob);
+    let before = std::fs::read_to_string(before_dir.join("journal_book.csv")).unwrap();
+
+    seed_closing_entry(&app, 900, 43_967).await;
+
+    let after_dir = temp_dir("journal-after");
+    run_report(&app, &after_dir, &blob);
+    let after = std::fs::read_to_string(after_dir.join("journal_book.csv")).unwrap();
+
+    assert!(
+        after.lines().count() > before.lines().count(),
+        "仕訳日記帳は決算振替のぶん増えること（{} → {}）",
+        before.lines().count(),
+        after.lines().count()
+    );
+}
