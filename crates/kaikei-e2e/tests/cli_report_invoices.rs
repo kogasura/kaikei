@@ -412,3 +412,194 @@ async fn the_journal_book_does_grow_when_the_closing_entry_is_posted(
         after.lines().count()
     );
 }
+
+/// 期首振替の仕訳を、指定した日付で入れる（`entry_kind: opening` タグ付き）。
+async fn seed_opening_transfer(pool: &PgPool, entry_no: i32, amount: i64, date: &str) {
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, 2026, $2, $3::date, '期首振替', now())",
+    )
+    .bind(&id)
+    .bind(entry_no)
+    .bind(date)
+    .execute(pool)
+    .await
+    .expect("期首振替の仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit, tags)          VALUES ($1::uuid, 1, '410', 2, $2, 'JPY', 0,                  '{\"entry_kind\":{\"t\":\"code\",\"v\":\"opening\"}}'),                 ($1::uuid, 2, '400', 1, $2, 'JPY', 0,                  '{\"entry_kind\":{\"t\":\"code\",\"v\":\"opening\"}}')",
+    )
+    .bind(&id)
+    .bind(amount)
+    .execute(pool)
+    .await
+    .expect("期首振替の明細");
+}
+
+/// 事業主貸を動かす仕訳を、年度を指定して1本入れる。
+async fn seed_drawing_in(pool: &PgPool, fiscal_year: i32, entry_no: i32, amount: i64, date: &str) {
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, $4, $2, $3::date, '事業主貸', now())",
+    )
+    .bind(&id)
+    .bind(entry_no)
+    .bind(date)
+    .bind(fiscal_year)
+    .execute(pool)
+    .await
+    .expect("事業主貸の仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ($1::uuid, 1, '410', 1, $2, 'JPY', 0), ($1::uuid, 2, '110', 2, $2, 'JPY', 0)",
+    )
+    .bind(&id)
+    .bind(amount)
+    .execute(pool)
+    .await
+    .expect("事業主貸の明細");
+}
+
+/// 事業主貸を動かす仕訳を1本入れる。
+async fn seed_drawing(pool: &PgPool, entry_no: i32, amount: i64, date: &str) {
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, 2026, $2, $3::date, '事業主貸', now())",
+    )
+    .bind(&id)
+    .bind(entry_no)
+    .bind(date)
+    .execute(pool)
+    .await
+    .expect("事業主貸の仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ($1::uuid, 1, '410', 1, $2, 'JPY', 0), ($1::uuid, 2, '110', 2, $2, 'JPY', 0)",
+    )
+    .bind(&id)
+    .bind(amount)
+    .execute(pool)
+    .await
+    .expect("事業主貸の明細");
+}
+
+async fn seed_owner_accounts(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO accounts (code, name, account_type, postable)          VALUES ('400','元入金',3,true), ('410','事業主貸',3,true),                 ('420','事業主借',3,true), ('110','普通預金',1,true)          ON CONFLICT (code) DO NOTHING",
+    )
+    .execute(pool)
+    .await
+    .expect("科目");
+}
+
+/// **本命。** 期首振替を年内に記帳したら知らせる。
+///
+/// **決算書の貸借対照表から事業主貸が消える。** 青色申告決算書の様式には
+/// この欄があり、期末残高をそのまま書く。0 で提出することになる。
+///
+/// 実帳簿の複製で試したら再現した——事業主貸 9,923,381円 と
+/// 事業主借 1,012,434円 が消え、`verify` は終了コード0のままだった。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_opening_transfer_posted_within_the_year_is_reported(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_owner_accounts(&app).await;
+    seed_drawing(&app, 1, 500_000, "2026-03-10").await;
+    // **年内**（12月31日）に期首振替を入れる。翌年1月1日が正しい。
+    seed_opening_transfer(&app, 900, 500_000, "2026-12-31").await;
+    let out = temp_dir("early-out");
+    let blob = temp_dir("early-blob");
+
+    let (log, ok) = run_report(&app, &out, &blob);
+
+    assert!(ok, "指摘があっても書き出しは成功すること: {log}");
+    assert!(
+        log.contains("事業主貸 は期中に動いているのに、期末残高が 0 です"),
+        "{log}"
+    );
+    assert!(log.contains("翌年1月1日"), "何が正しいかを言うこと: {log}");
+}
+
+/// **本命。** 翌年1月1日に記帳していれば言わない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_opening_transfer_on_the_first_of_january_is_quiet(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_owner_accounts(&app).await;
+    seed_drawing(&app, 1, 500_000, "2026-03-10").await;
+    // 2026年度の決算書には入らない日付（翌年）。
+    let out = temp_dir("ontime-out");
+    let blob = temp_dir("ontime-blob");
+
+    let (log, ok) = run_report(&app, &out, &blob);
+
+    assert!(ok, "{log}");
+    assert!(!log.contains("期中に動いているのに"), "{log}");
+}
+
+/// 期中に動いていなければ言わない（0のままが正しい年はある）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_year_without_any_drawing_is_quiet(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_owner_accounts(&app).await;
+    seed(&app, 1, 43_967).await;
+    let out = temp_dir("nodraw-out");
+    let blob = temp_dir("nodraw-blob");
+
+    let (log, ok) = run_report(&app, &out, &blob);
+
+    assert!(ok, "{log}");
+    assert!(!log.contains("期中に動いているのに"), "{log}");
+}
+
+/// **本命。** その年に事業主貸を使っていなくても、年内の期首振替は拾う。
+///
+/// # なぜ要るか
+///
+/// 期首振替は**前年からの繰越**を元入金へ振り替える。当年に事業主貸を1度も
+/// 使っていなくても、繰越があれば振替は起きる。
+///
+/// 「期中に動いたか」を見るとき**期首振替そのものを除いてしまうと、この場合に
+/// 何も動いていないことになり、見逃す。** 実際、除く分岐を入れたときに
+/// 変異テストで気づいた（除いても他のテストが落ちなかった）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_early_opening_transfer_is_reported_even_without_other_drawings(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_owner_accounts(&app).await;
+    seed(&app, 1, 43_967).await;
+    // **前年からの繰越**を作る。貸借対照表は帳簿の最初からの累計なので、
+    // 前年の事業主貸が残高として乗る。
+    seed_drawing_in(&app, 2025, 1, 500_000, "2025-06-10").await;
+    // 当年は事業主貸を1度も使わず、年内の期首振替だけを入れる。
+    seed_opening_transfer(&app, 900, 500_000, "2026-12-31").await;
+    let out = temp_dir("earlyonly-out");
+    let blob = temp_dir("earlyonly-blob");
+
+    let (log, ok) = run_report(&app, &out, &blob);
+
+    assert!(ok, "{log}");
+    assert!(
+        log.contains("事業主貸 は期中に動いているのに、期末残高が 0 です"),
+        "他に動きが無くても拾うこと: {log}"
+    );
+}
