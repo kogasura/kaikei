@@ -29,6 +29,7 @@ pub mod csv;
 pub mod documents;
 pub mod export;
 pub mod html;
+pub mod invoices_to_collect;
 pub mod journal_book;
 pub mod ledger;
 pub mod statement;
