@@ -20,7 +20,7 @@
 use crate::error::JpError;
 use kaikei_jp_data::EmbeddedYaml;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// この crate が読める唯一のスキーマ版。
@@ -86,6 +86,40 @@ impl YayoiTaxMap {
             .values()
             .filter(|mapping| !mapping.verified)
             .count()
+    }
+
+    /// **実際に使われている**区分のうち、未確認のものを返す。
+    ///
+    /// 返すのは `(kaikei の区分, 弥生の区分)` の組で、kaikei の区分の順。
+    ///
+    /// # なぜ「使われているもの」に絞るのか
+    ///
+    /// 「未確認 8 件」とだけ言われても、**そのうちどれが自分の帳簿に効くのか
+    /// 分からない**。表に載っているだけで一度も使っていない区分まで数えて
+    /// いるからである。実帳簿（weBanana.SP・2026年）が使っているのは
+    /// 5区分で、残り3つは確かめても意味が無い。
+    ///
+    /// 確認を求める相手は税理士である。**確かめる対象を絞れないと、
+    /// 依頼そのものが重くなる。**
+    ///
+    /// # 仕入向けの別名も一緒に出す
+    ///
+    /// 売上と仕入で名前が変わる区分（[`TaxCategoryMapping::yayoi_purchase`]）は
+    /// **両方を確かめてもらう必要がある**ので、`売上名 / 仕入名` の形で返す。
+    pub fn unverified_among(&self, used: &BTreeSet<String>) -> Vec<(String, String)> {
+        used.iter()
+            .filter_map(|code| {
+                let mapping = self.categories.get(code)?;
+                if mapping.verified {
+                    return None;
+                }
+                let label = match &mapping.yayoi_purchase {
+                    Some(purchase) => format!("{} / {}", mapping.yayoi, purchase),
+                    None => mapping.yayoi.clone(),
+                };
+                Some((code.clone(), label))
+            })
+            .collect()
     }
 }
 
@@ -244,5 +278,121 @@ categories: []
 "#;
         let err = load_from_str(source, "test").expect_err("拒否されるはず");
         assert!(format!("{err}").contains("バージョン"), "{err}");
+    }
+
+    // ---- 使われている区分に絞る ----
+
+    fn used(codes: &[&str]) -> BTreeSet<String> {
+        codes.iter().map(|c| c.to_string()).collect()
+    }
+
+    /// **本命。** 使っている区分だけを返す。
+    ///
+    /// 実帳簿（weBanana.SP・2026年）が使うのは4区分で、表は全8件が未確認。
+    /// 「未確認 8 件」と言われても、**どれが自分に効くのか分からない**。
+    #[test]
+    fn only_the_categories_in_use_are_reported() {
+        let map = embedded();
+        let unverified = map.unverified_among(&used(&[
+            "SALES_10",
+            "PURCHASE_10_QUALIFIED",
+            "OUT_OF_SCOPE",
+            "TAX_FREE",
+        ]));
+
+        assert_eq!(unverified.len(), 4, "{unverified:?}");
+        assert!(unverified.len() < map.unverified_count(), "絞れていること");
+        let codes: Vec<&str> = unverified.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(codes.contains(&"SALES_10"), "{codes:?}");
+        assert!(
+            !codes.contains(&"SALES_EXPORT"),
+            "使っていない区分: {codes:?}"
+        );
+    }
+
+    /// **本命。** 売上と仕入で名前が変わる区分は、両方を出す。
+    ///
+    /// 片方だけ確かめてもらっても、もう片方が誤っていれば取り込みで壊れる。
+    #[test]
+    fn a_category_with_a_separate_purchase_name_shows_both() {
+        let map = embedded();
+        let unverified = map.unverified_among(&used(&["TAX_FREE"]));
+
+        assert_eq!(unverified.len(), 1);
+        assert!(
+            unverified[0].1.contains(" / "),
+            "売上名と仕入名の両方: {unverified:?}"
+        );
+    }
+
+    /// 何も使っていなければ空。
+    #[test]
+    fn an_empty_book_reports_nothing() {
+        assert!(embedded().unverified_among(&BTreeSet::new()).is_empty());
+    }
+
+    /// 表に無い区分は黙って飛ばす（ここは写像の検査をする場所ではない）。
+    #[test]
+    fn an_unmapped_category_is_skipped() {
+        let map = embedded();
+        let unverified = map.unverified_among(&used(&["PURCHASE_10_NON_QUALIFIED", "SALES_10"]));
+
+        assert_eq!(unverified.len(), 1, "{unverified:?}");
+        assert_eq!(unverified[0].0, "SALES_10");
+    }
+
+    /// **本命。** 確認済みの区分は返さない。
+    ///
+    /// **同梱の表は今すべて未確認なので、この分岐は同梱の表では検査できない**
+    /// （`verified` を無視する変異を入れても、同梱の表を使うテストは1件も
+    /// 落ちなかった）。確認が進むほど効いてくる分岐なので、手で組んだ表で
+    /// 固定する。
+    #[test]
+    fn a_verified_category_is_not_reported() {
+        let source = r#"
+version: 1
+tax_mode: inclusive
+taxation_method: "原則課税"
+source: "test"
+categories:
+  - { kaikei: SALES_10, yayoi: "課税売上込10%", verified: true }
+  - { kaikei: OUT_OF_SCOPE, yayoi: "対象外", verified: false }
+"#;
+        let map = load_from_str(source, "test").unwrap();
+
+        let unverified = map.unverified_among(&used(&["SALES_10", "OUT_OF_SCOPE"]));
+
+        assert_eq!(unverified.len(), 1, "確認済みは落とすこと: {unverified:?}");
+        assert_eq!(unverified[0].0, "OUT_OF_SCOPE");
+    }
+
+    /// 全部が確認済みなら空を返す（そのとき呼び出し側の文面が変わる）。
+    #[test]
+    fn everything_verified_reports_nothing() {
+        let source = r#"
+version: 1
+tax_mode: inclusive
+taxation_method: "原則課税"
+source: "test"
+categories:
+  - { kaikei: SALES_10, yayoi: "課税売上込10%", verified: true }
+"#;
+        let map = load_from_str(source, "test").unwrap();
+
+        assert!(map.unverified_among(&used(&["SALES_10"])).is_empty());
+    }
+
+    /// kaikei の区分の順で返す（実行のたびに並びが変わらない）。
+    #[test]
+    fn the_order_is_deterministic() {
+        let map = embedded();
+        let codes: Vec<String> = map
+            .unverified_among(&used(&["SALES_10", "OUT_OF_SCOPE", "TAX_FREE"]))
+            .into_iter()
+            .map(|(code, _)| code)
+            .collect();
+        let mut sorted = codes.clone();
+        sorted.sort();
+        assert_eq!(codes, sorted, "{codes:?}");
     }
 }
