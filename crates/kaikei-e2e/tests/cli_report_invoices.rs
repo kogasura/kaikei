@@ -52,16 +52,41 @@ fn app_url(pool: &PgPool) -> String {
 }
 
 fn run_report(pool: &PgPool, out_dir: &Path, blob_root: &Path) -> (String, bool) {
-    let output = Command::new(cli_binary())
+    run_report_with(pool, out_dir, blob_root, &[])
+}
+
+/// `report` を、環境変数を足して走らせる。
+///
+/// **既定では税制の設定を渡さない。** `report` は帳簿を書き出すコマンドで
+/// あって、税制の設定が無くても動かなければならない。渡してしまうと、
+/// 「設定が要る処理」を足したときに気づけない（実際、消費税の集計を足した
+/// ときに `report` 全体が落ちるようになり、CI で10件落ちて気づいた）。
+fn run_report_with(
+    pool: &PgPool,
+    out_dir: &Path,
+    blob_root: &Path,
+    extra_env: &[(&str, &str)],
+) -> (String, bool) {
+    let mut command = Command::new(cli_binary());
+    // **親の環境変数を引き継がせない。** 手元では `.env` を読んだシェルから
+    // 走らせることがあり、渡していないつもりの設定が子プロセスに届く。
+    // それだと「設定が無くても動く」を検査したつもりで検査できていない。
+    command.env_remove("KAIKEI_TAX_MODE");
+    command.env_remove("KAIKEI_ROUNDING");
+    command.env_remove("KAIKEI_ROUNDING_UNIT");
+    command.env_remove("KAIKEI_IS_TAXABLE_BUSINESS");
+    command
         .arg("report")
         .args(["--year", "2026"])
         .args(["--out", &out_dir.display().to_string()])
         .env("APP_DATABASE_URL", app_url(pool))
         .env("KAIKEI_BLOB_ROOT", blob_root.display().to_string())
         .env("KAIKEI_BOOK_CURRENCY", "JPY")
-        .env("KAIKEI_FISCAL_YEAR_RULE", "calendar_year")
-        .output()
-        .expect("kaikei report を起動できること");
+        .env("KAIKEI_FISCAL_YEAR_RULE", "calendar_year");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("kaikei report を起動できること");
     (
         format!(
             "{}{}",
@@ -601,5 +626,71 @@ async fn an_early_opening_transfer_is_reported_even_without_other_drawings(
     assert!(
         log.contains("事業主貸 は期中に動いているのに、期末残高が 0 です"),
         "他に動きが無くても拾うこと: {log}"
+    );
+}
+
+/// **本命。** 消費税の集計が決算書と一緒に出る。
+///
+/// 確定申告には消費税の申告も含まれる。**画面で読む人と、ファイルを受け取る
+/// 人は別である**——税理士に渡すのはファイルの方なので、`report` の一式に
+/// 入っていなければ届かない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_report_includes_the_consumption_tax_summary(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed(&app, 1, 43_967).await;
+    let out = temp_dir("ctax-out");
+    let blob = temp_dir("ctax-blob");
+
+    let (log, ok) = run_report_with(&app, &out, &blob, &[("KAIKEI_TAX_MODE", "inclusive")]);
+
+    assert!(ok, "{log}");
+    let csv = std::fs::read_to_string(out.join("consumption_tax.csv"))
+        .expect("consumption_tax.csv が出ていること");
+    assert!(csv.contains("PURCHASE_10_QUALIFIED"), "{csv}");
+    assert!(csv.contains("43967"), "{csv}");
+    // 43,967 × 10/110 = 3,997
+    assert!(csv.contains("3997"), "税額を出すこと: {csv}");
+
+    // **注意書きも一緒に出す。** 数字だけ渡すと申告書の金額と読まれる。
+    let notes = std::fs::read_to_string(out.join("consumption_tax_notes.txt"))
+        .expect("consumption_tax_notes.txt が出ていること");
+    assert!(notes.contains("申告書の金額ではありません"), "{notes}");
+}
+
+/// **本命。** 税制の設定が無くても `report` は成功する。
+///
+/// # この穴で実際に壊れた
+///
+/// 消費税の集計を足したとき、`jp_settings()?` を呼んだために
+/// `KAIKEI_ROUNDING` / `KAIKEI_TAX_MODE` が無い環境で **`report` 全体が
+/// 落ちるようになった**。手元では `.env` を読んでいたので気づかず、
+/// CI の E2E が10件落ちて分かった。
+///
+/// **設定が無いことを理由に、本体の出力まで止めない**（D-113 と同じ）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_report_works_without_any_tax_settings(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed(&app, 1, 43_967).await;
+    let out = temp_dir("noenv-out");
+    let blob = temp_dir("noenv-blob");
+
+    // 税制の設定を1つも渡さない。
+    let (log, ok) = run_report(&app, &out, &blob);
+
+    assert!(ok, "設定が無くても書き出せること: {log}");
+    assert!(out.join("blue_return.csv").is_file(), "決算書は出ること");
+    // 消費税の集計は出ない（経理方式が分からないので）。**黙って空の集計を
+    // 出すよりよい。**
+    assert!(
+        !out.join("consumption_tax.csv").is_file(),
+        "経理方式が分からなければ消費税の集計は出さない"
     );
 }

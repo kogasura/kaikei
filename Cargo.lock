@@ -904,6 +904,7 @@ dependencies = [
  "encoding_rs",
  "kaikei-app",
  "kaikei-core",
+ "kaikei-jp",
  "kaikei-policy",
  "serde_json",
 ]

@@ -18,6 +18,9 @@ license.workspace = true
 kaikei-core = { path = "../kaikei-core", version = "0.0.1" }
 kaikei-policy = { path = "../kaikei-policy", version = "0.0.1" }
 kaikei-app = { path = "../kaikei-app", version = "0.0.1" }
+# 消費税の集計（Summary / CategoryTotal）を CSV にする。kaikei-jp は I/O を
+# 持たない層なので、この crate の性質（データ → 文字列）を壊さない。
+kaikei-jp = { path = "../kaikei-jp", version = "0.0.1" }
 # 弥生向けの出力は Shift-JIS でなければ取り込めない（docs/10-report.md §6-3）。
 # I/O ではなく文字コード変換なので、この層に置いてよい。
 encoding_rs = { workspace = true }

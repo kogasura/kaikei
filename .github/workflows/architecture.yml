@@ -17,6 +17,8 @@ on:
 jobs:
   dependency-direction:
     runs-on: ubuntu-latest
+    # 止まったまま6時間待たないための上限。
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -436,6 +438,8 @@ jobs:
 
   quality:
     runs-on: ubuntu-latest
+    # 止まったまま6時間待たないための上限。
+    timeout-minutes: 20
     env:
       # kaikei-store が DB 不在でもコンパイルできるようにする。
       # これが無いと sqlx マクロが接続を要求し、後続 PR で必須チェックが赤のままマージ不能になる。
