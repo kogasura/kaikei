@@ -1219,8 +1219,10 @@ fn line_requires_a_qualified_invoice(
 /// 食い違うと、どちらが正しいのか分からなくなる。数える側と並べる側で条件を
 /// 二重に書かないよう、判定そのもの（`needs_an_invoice`）を共有する。
 ///
-/// 並び順は**金額の大きい順**。先頭しか読まれないことがあるので、並び順が
-/// 「何を見せるか」になる（`check_suspected_duplicates` と同じ理由）。
+/// 並び順は**金額の大きい順**。ただし CSV に書き出す段で相手先ごとに
+/// まとめ直される（`kaikei_report::invoices_to_collect::to_csv`）。請求書を
+/// 集めるのは相手先ごとの作業だからである。**かたまりの並びは合計額の
+/// 大きい順**なので、「大きいものを先に見せる」という意図は保たれている。
 fn invoices_to_collect(
     entries: &[kaikei_core::JournalEntry],
     rule_sets: &kaikei_jp::tax::TaxRuleSets,
