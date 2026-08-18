@@ -5283,6 +5283,27 @@ fn write_blue_return(
     // **適用した控除額を必ず出す。** 出力ファイルを見ない人にも伝わるように。
     println!("青色申告特別控除額 {deduction} 円を適用しました（要件の判定はしていません）");
 
+    // **上限で抑えたなら黙っていない。** 指定した額と違う額が決算書に
+    // 載るので、言わないと「なぜこの数字なのか」が分からない。
+    for capped in &filled.capped {
+        println!(
+            "  ただし欄 {} は、欄 {}（{}）が限度のため {} 円で計上しました。",
+            capped.no,
+            capped.limit_no,
+            filled
+                .fields
+                .iter()
+                .find(|field| field.no == capped.limit_no)
+                .and_then(|field| field.label.clone())
+                .unwrap_or_default(),
+            capped.applied.to_display_string()
+        );
+        println!(
+            "    青色申告特別控除額は青色申告特別控除前の所得金額を限度とします（措置法25条の2）。"
+        );
+        println!("    赤字の年は控除できません（損失はないものとして計算します）。");
+    }
+
     if !not_on_form.is_empty() {
         eprintln!(
             "注意: 決算書のどの欄にも載らなかった科目が {} 件あります。\

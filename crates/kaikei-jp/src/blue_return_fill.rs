@@ -67,6 +67,24 @@ pub struct FilledForm {
     /// ここに出る。黙って捨てると、決算書に載らない金額があることに決算まで
     /// 気づけない。
     pub not_on_form: Vec<NotOnForm>,
+    /// 上限で抑えた欄。
+    ///
+    /// **呼び出し側はこれを利用者に見せること。** 指定した額と違う額が
+    /// 決算書に載るので、黙って変えると「なぜこの数字なのか」が分からない。
+    pub capped: Vec<CappedField>,
+}
+
+/// 上限で抑えた欄の記録。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedField {
+    /// 抑えられた欄の番号。
+    pub no: u32,
+    /// 指定された額。
+    pub requested: Money,
+    /// 実際に載せた額。
+    pub applied: Money,
+    /// 上限になった欄の番号。
+    pub limit_no: u32,
 }
 
 /// 決算書に載らなかった科目1件。
@@ -127,6 +145,7 @@ pub fn fill(
     let mut amounts: BTreeMap<u32, Money> = BTreeMap::new();
     let mut fields = Vec::with_capacity(form.fields().len());
     let mut used: Vec<&AccountCode> = Vec::new();
+    let mut capped: Vec<CappedField> = Vec::new();
 
     for field in form.fields() {
         let (amount, label) = if let Some(expr) = &field.computed {
@@ -166,6 +185,41 @@ pub fn fill(
             (total, label)
         };
 
+        // **上限のある欄を上限で抑える。** 青色申告特別控除額は青色申告
+        // 特別控除前の所得金額を限度とする（措置法25条の2）。抑えないと、
+        // 所得が −550円 の帳簿で控除 650,000円 が引かれて所得金額が
+        // −650,550円 になる。損失が実際より大きく出て繰越控除まで狂う。
+        //
+        // **黙って変えない。** 何を何に抑えたかを `capped` に残し、
+        // 呼び出し側が画面に出せるようにする。
+        let amount = if let Some(limit_no) = field.capped_by {
+            let limit = amounts.get(&limit_no).copied().ok_or_else(|| {
+                invalid(format!(
+                    "欄 {} の上限として欄 {} を指すよう書かれていますが、                     欄 {} はまだ計算されていません（上限は先に出る欄を指してください）",
+                    field.no, limit_no, limit_no
+                ))
+            })?;
+            // 赤字なら控除は0（損失はないものとして計算する）。
+            let ceiling = if limit.minor() < 0 {
+                Money::from_minor(0, limit.currency())
+            } else {
+                limit
+            };
+            if amount.minor() > ceiling.minor() {
+                capped.push(CappedField {
+                    no: field.no,
+                    requested: amount,
+                    applied: ceiling,
+                    limit_no,
+                });
+                ceiling
+            } else {
+                amount
+            }
+        } else {
+            amount
+        };
+
         amounts.insert(field.no, amount);
         fields.push(FilledField {
             no: field.no,
@@ -179,6 +233,7 @@ pub fn fill(
         part: form.part().to_string(),
         fields,
         not_on_form: collect_not_on_form(form, &by_account, &used),
+        capped,
     })
 }
 
@@ -592,5 +647,135 @@ fields:
 
         assert_eq!(amount_of(&with_650k, 45), yen(7_718_714));
         assert_eq!(amount_of(&with_100k, 45), yen(8_268_714));
+    }
+    // ─── 上限のある欄（青色申告特別控除額） ─────────────
+
+    /// 上限付きの欄を持つ最小の様式。欄1が金額、欄2が上限付きの入力。
+    fn capped_form() -> blue_return::BlueReturnForm {
+        let source = r#"
+version: 1
+form: "test"
+part: "test"
+source: "test"
+fields:
+  - no: 1
+    label: "控除前の所得金額"
+    accounts: ["500"]
+  - no: 2
+    label: "控除額"
+    from_input: "deduction"
+    capped_by: 1
+  - no: 3
+    label: "所得金額"
+    computed: "1-2"
+"#;
+        blue_return::load_from_str(source, "test").unwrap()
+    }
+
+    fn statement_with_revenue(amount: i128) -> Statement {
+        Statement {
+            title: "損益計算書".to_string(),
+            sections: vec![StatementSection {
+                title: "収益".to_string(),
+                lines: vec![line("500", "売上高", amount)],
+                subtotal: yen(amount),
+            }],
+            total: yen(amount),
+        }
+    }
+
+    fn filled_with(revenue: i128, deduction: i128) -> FilledForm {
+        let mut inputs = BTreeMap::new();
+        inputs.insert("deduction".to_string(), yen(deduction));
+        fill(&capped_form(), &statement_with_revenue(revenue), &inputs).unwrap()
+    }
+
+    // **本命。** 所得より大きい控除は所得までしか引かない。
+    //
+    // 措置法25条の2。タックスアンサー No.2072「不動産所得の金額または
+    // 事業所得の金額の合計額が55万円より少ない場合には、その合計額が
+    // 限度になります」。
+    #[test]
+    fn a_deduction_larger_than_the_income_is_capped() {
+        let filled = filled_with(300_000, 650_000);
+
+        assert_eq!(
+            amount_of(&filled, 2).minor(),
+            300_000,
+            "所得までしか引かない"
+        );
+        assert_eq!(amount_of(&filled, 3).minor(), 0, "所得金額は0になる");
+    }
+
+    // **本命。** 赤字の年は控除できない。
+    //
+    // 「その損失をないものとして合計額を計算します」（No.2072）。上限を
+    // 掛けないと、所得 −550円 の帳簿で控除 650,000円 が引かれて所得金額が
+    // −650,550円 になる。**損失が実際より大きく出て繰越控除まで狂う。**
+    #[test]
+    fn a_loss_year_gets_no_deduction() {
+        let filled = filled_with(-550, 650_000);
+
+        assert_eq!(amount_of(&filled, 2).minor(), 0, "控除は0");
+        assert_eq!(amount_of(&filled, 3).minor(), -550, "損失はそのまま");
+    }
+
+    // **本命。** 所得が足りていれば指定どおり引く。
+    #[test]
+    fn a_deduction_within_the_income_is_left_alone() {
+        let filled = filled_with(8_938_199, 650_000);
+
+        assert_eq!(amount_of(&filled, 2).minor(), 650_000);
+        assert_eq!(amount_of(&filled, 3).minor(), 8_288_199);
+        assert!(filled.capped.is_empty(), "抑えていないので記録も無い");
+    }
+
+    // **本命。** 抑えたことを記録する。黙って数字を変えない。
+    #[test]
+    fn capping_is_recorded_so_the_caller_can_say_so() {
+        let filled = filled_with(300_000, 650_000);
+
+        assert_eq!(filled.capped.len(), 1);
+        let capped = &filled.capped[0];
+        assert_eq!(capped.no, 2);
+        assert_eq!(capped.limit_no, 1);
+        assert_eq!(capped.requested.minor(), 650_000, "指定された額");
+        assert_eq!(capped.applied.minor(), 300_000, "実際に載せた額");
+    }
+
+    // ちょうど同額なら抑えない。
+    #[test]
+    fn an_exact_match_is_not_capped() {
+        let filled = filled_with(650_000, 650_000);
+
+        assert_eq!(amount_of(&filled, 2).minor(), 650_000);
+        assert!(filled.capped.is_empty());
+    }
+
+    // 上限に指す欄がまだ計算されていなければ拒否する。
+    //
+    // 前方参照を通すと、表の並び順で結果が変わる。
+    #[test]
+    fn a_cap_pointing_forward_is_rejected() {
+        let source = r#"
+version: 1
+form: "test"
+part: "test"
+source: "test"
+fields:
+  - no: 1
+    label: "控除額"
+    from_input: "deduction"
+    capped_by: 2
+  - no: 2
+    label: "所得金額"
+    accounts: ["500"]
+"#;
+        let form = blue_return::load_from_str(source, "test").unwrap();
+        let mut inputs = BTreeMap::new();
+        inputs.insert("deduction".to_string(), yen(1));
+
+        let err = fill(&form, &statement_with_revenue(100), &inputs).expect_err("拒否されるはず");
+        assert!(format!("{err}").contains("まだ計算されていません"), "{err}");
     }
 }

@@ -57,6 +57,18 @@ pub struct FormField {
     /// 青色申告特別控除額がこれにあたる。控除の要件（複式簿記・e-Tax申告・
     /// 優良な電子帳簿保存）を満たすかは**ソフトが判定しない**。
     pub from_input: Option<String>,
+    /// この欄の金額の上限になる欄の番号。
+    ///
+    /// 青色申告特別控除額がこれにあたる。**控除額は青色申告特別控除前の
+    /// 所得金額を限度とする**（措置法25条の2、タックスアンサー No.2072
+    /// 「不動産所得の金額または事業所得の金額の合計額が55万円より少ない
+    /// 場合には、その合計額が限度になります」）。赤字なら控除は0である
+    /// （同「その損失をないものとして合計額を計算します」）。
+    ///
+    /// 上限を掛けないと、所得が −550円 の帳簿で控除 650,000円 が引かれて
+    /// 所得金額が **−650,550円** になる。損失が実際より大きく出て、
+    /// 繰越控除まで狂う。
+    pub capped_by: Option<u32>,
 }
 
 /// 意図して決算書に載せない科目。
@@ -219,6 +231,7 @@ fn from_raw(label: &str, raw: FormRaw) -> Result<BlueReturnForm, JpError> {
             accounts,
             computed: field.computed,
             from_input: field.from_input,
+            capped_by: field.capped_by,
         });
     }
 
@@ -292,6 +305,8 @@ struct FieldRaw {
     computed: Option<String>,
     #[serde(default)]
     from_input: Option<String>,
+    #[serde(default)]
+    capped_by: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -504,5 +519,36 @@ fields: []
 
         let err = load_from_str(source, "test").expect_err("未知のバージョンは拒否");
         assert!(format!("{err}").contains("バージョン"), "{err}");
+    }
+    // **本命。** 同梱の様式で、青色申告特別控除額に上限が付いている。
+    //
+    // 上限が外れると、赤字の帳簿で控除 650,000円 が引かれて所得金額が
+    // −650,550円 になる（実際に踏んだ）。損失が実際より大きく出て、
+    // 繰越控除まで狂う。
+    //
+    // **上限の仕組み自体は別のテストが見ているが、それは合成した様式を
+    // 使う。** 同梱の様式から `capped_by` を外しても、そちらは通って
+    // しまった。実際に使う定義を直に押さえる必要がある。
+    #[test]
+    fn the_embedded_form_caps_the_blue_return_deduction() {
+        let form = embedded_form();
+
+        let deduction = form
+            .fields()
+            .iter()
+            .find(|field| field.from_input.as_deref() == Some("blue_return_deduction"))
+            .expect("青色申告特別控除額の欄");
+
+        assert_eq!(
+            deduction.capped_by,
+            Some(43),
+            "控除額は青色申告特別控除前の所得金額（欄43）を限度とすること"
+        );
+        // 上限は先に出る欄でなければならない（前方参照は fill が拒否する）。
+        assert!(
+            deduction.no > 43,
+            "欄 {} は 43 より後にあること",
+            deduction.no
+        );
     }
 }
