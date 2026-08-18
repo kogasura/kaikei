@@ -54,6 +54,22 @@ fn app_url(pool: &PgPool) -> String {
 /// `kaikei attach` を走らせる。
 fn run_attach(pool: &PgPool, blob_root: &Path, file: &Path, extra: &[&str]) -> (String, bool) {
     let mut command = Command::new(cli_binary());
+    // **親の環境変数を引き継がせない。** `Command` は既定で引き継ぐので、
+    // `.env` を読んだシェルから走らせると**渡していないつもりの設定が
+    // 子プロセスに届く**。それだと「設定が無くても動く」を検査したつもりで
+    // 検査できていない。
+    //
+    // 実際に2度踏んだ（D-113 / D-132）。どちらも「設定が要る処理」を足して
+    // 手元では通り、CI で落ちた。**手元と CI で条件を揃える。**
+    for key in [
+        "KAIKEI_TAX_MODE",
+        "KAIKEI_ROUNDING",
+        "KAIKEI_ROUNDING_UNIT",
+        "KAIKEI_IS_TAXABLE_BUSINESS",
+        "KAIKEI_SIMPLIFIED_TAXATION",
+    ] {
+        command.env_remove(key);
+    }
     command
         .arg("attach")
         .args(["--file", &file.display().to_string()])

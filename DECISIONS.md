@@ -6300,3 +6300,44 @@ D-130 で消費税の集計を `report` に足したとき、`jp_settings()?` �
 
 `env_remove` で明示的に消す。**実際、これを入れるまで新しいテストは
 通ってしまっていた。**
+
+---
+
+## D-133 E2E は親の環境変数を子に引き継がせない（全コマンド）
+
+D-132 で `report` のテストに `env_remove` を入れた。**同じ罠が
+`verify` / `attach` / `counterparty` にも残っていた。**
+
+`std::process::Command` は既定で親の環境を引き継ぐ。手元では `.env` を読んだ
+シェルから走らせるので、**渡していないつもりの設定が子プロセスに届く。**
+CI にはその設定が無いので、手元で通って CI で落ちる。
+
+### 実際に2度踏んだ
+
+| いつ | 何をした | どこで気づいた |
+|---|---|---|
+| D-113 | `fixedasset add` に `jp_settings()?` を足した | CI の E2E が2件落ちた |
+| D-132 | `report` に `jp_settings()?` を足した | CI の E2E が10件落ちた |
+
+**3度目を待たずに、全部のテストに仕掛けを入れた。**
+
+### 効くことを確かめた
+
+`run_verify` / `run_attach` / `run_counterparty_import` のそれぞれに
+`jp_settings()?` を足す変異を入れた。
+
+| コマンド | 落ちたテスト |
+|---|---:|
+| verify | 14 |
+| attach | 11 |
+| counterparty | 4 |
+
+**仕掛けを入れる前は、同じ変異が手元で14件とも通っていた**（`.env` を読んだ
+シェルから走らせたため）。これが「手元で通って CI で落ちる」の正体である。
+
+### 消すのは税制の設定だけ
+
+`APP_DATABASE_URL` や `KAIKEI_BLOB_ROOT` は各テストが明示的に渡している。
+消すのは**渡していないのに届きうるもの**——`KAIKEI_TAX_MODE` /
+`KAIKEI_ROUNDING` / `KAIKEI_ROUNDING_UNIT` / `KAIKEI_IS_TAXABLE_BUSINESS` /
+`KAIKEI_SIMPLIFIED_TAXATION`。
