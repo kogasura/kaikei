@@ -4567,11 +4567,16 @@ async fn write_reports(
     //
     // 前提（原則課税・税込経理）に合わない帳簿では出さない。**黙って誤った
     // 数字を渡すより、無い方がよい。**
-    let settings = jp_settings()?;
-    if settings.tax_mode == kaikei_jp::tax::TaxMode::Inclusive
-        && settings.is_taxable_business
-        && !settings.simplified_taxation
-    {
+    //
+    // **設定は任意で読む。** ここで `jp_settings()?` を呼ぶと、
+    // `KAIKEI_ROUNDING` / `KAIKEI_TAX_MODE` が無い環境で **`report` 全体が
+    // 落ちる**。実際 CI の E2E が10件落ちた（手元では `.env` を読んでいたので
+    // 気づかなかった）。D-113 と同じ形——**設定が無いことを理由に、本体の
+    // 出力まで止めない。**
+    //
+    // 消費税の集計に丸め方は要らない（税込から割り戻すだけ）ので、
+    // 経理方式だけを見る。
+    if optional_tax_mode() == Some(kaikei_jp::tax::TaxMode::Inclusive) {
         let lines = tagged_lines_for_consumption_tax(&entries)?;
         let table = rule_sets
             .iter()
