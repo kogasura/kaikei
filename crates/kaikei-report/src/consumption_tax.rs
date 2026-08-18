@@ -11,6 +11,7 @@
 //! ファイルの方なので、注意書きが画面にしか無いと届かない。
 
 use crate::csv::{CsvBuilder, UTF8_BOM};
+use kaikei_core::Money;
 use kaikei_jp::consumption_tax::Summary;
 use kaikei_jp::tax::TaxDirection;
 
@@ -59,11 +60,70 @@ pub fn to_csv(summary: &Summary) -> String {
     format!("{UTF8_BOM}{}", csv.finish())
 }
 
+/// 売上の税額だけで決まる特例（2割特例・3割特例）の試算を、行の並びとして組む。
+///
+/// # なぜ出すのか
+///
+/// 実帳簿（2026年）では、一般課税 832,382円 に対して2割特例なら 219,456円。
+/// **差は 612,926円。** しかも2026年分は2割特例が使える最後の年である。
+/// 集計表に一般課税しか出さないと、この選択肢が見えない。
+///
+/// # 勧めない
+///
+/// どちらが有利かの判断も、適用できるかどうかの判定も、このソフトはしない
+/// （`docs/09-tax-research.md`）。免税事業者がインボイス登録で課税事業者に
+/// なった場合の特例で、基準期間の課税売上高が1,000万円を超えるなどの除外
+/// 要件がある。**帳簿には2年前が入っていないことがある。**
+///
+/// # 表示から切り離してある
+///
+/// **金額だけが独り歩きすると危ない。** 「2割特例なら 219,456円」だけを
+/// 読んで、使えるかどうかを確かめずに申告されると困る。金額と但し書きが
+/// 必ず一緒に出ることをテストで固定したいので、組み立てを分けている。
+pub fn special_rule_estimate_lines(year: i32, summary: &Summary) -> Vec<String> {
+    use kaikei_jp::consumption_tax::{special_rule_for, tax_under, SpecialRule};
+
+    let Some(rule) = special_rule_for(year) else {
+        return Vec::new();
+    };
+    let general = summary.tax_on_sales().minor() - summary.tax_on_purchases().minor();
+    let special = tax_under(rule, summary.tax_on_sales());
+    let yen =
+        |minor: i128| Money::from_minor(minor, kaikei_core::Currency::JPY).to_display_string();
+
+    let mut lines = vec![
+        String::new(),
+        "納付税額の試算".to_string(),
+        String::new(),
+        format!("  一般課税  {} 円（売上の税額 − 仕入の税額）", yen(general)),
+        format!(
+            "  {}  {} 円（売上の税額の{}%）",
+            rule.name(),
+            special.to_display_string(),
+            rule.percent()
+        ),
+        format!("  差        {} 円", yen(general - special.minor())),
+        String::new(),
+        "どちらが有利かも、使えるかどうかも、このソフトは判定しません。".to_string(),
+        "  ・免税事業者がインボイス登録で課税事業者になった場合の特例です".to_string(),
+        "  ・基準期間（2年前）の課税売上高が1,000万円を超えるなどの除外要件があり、".to_string(),
+        "    2年前が帳簿に入っていないことがあるため判定していません".to_string(),
+        "  ・事前の届出は要らず、申告書への付記だけで使えます（年ごとに選べます）".to_string(),
+    ];
+    if rule == SpecialRule::TwentyPercent && year == 2026 {
+        lines.push(String::new());
+        lines.push("2026年分（令和8年分）が2割特例の最後の年です。".to_string());
+        lines.push("  2027・2028年分は3割特例、2029年分以降はどちらも使えません。".to_string());
+    }
+    lines
+}
+
 /// CSV に添える注意書き。**別ファイルにする。**
 ///
 /// 1つの CSV に表と注記を混ぜると表計算で読めなくなる
 /// （`blue_return_not_on_form.csv` と同じ理由）。
-pub fn notes_to_text(summary: &Summary) -> String {
+/// `year` は特例（2割・3割）が使える年かを決めるために要る。
+pub fn notes_to_text(summary: &Summary, year: i32) -> String {
     let mut lines = vec![
         "消費税の集計についての注意".to_string(),
         String::new(),
@@ -77,6 +137,11 @@ pub fn notes_to_text(summary: &Summary) -> String {
         "原則課税・税込経理を前提にしています。".to_string(),
         "税額は税込金額から割り戻しています（税込 × 税率 ÷ (1 + 税率)、端数切捨て）。".to_string(),
     ];
+
+    // **特例の試算は、この注記と同じファイルに置く。** 画面には出るのに
+    // 渡すファイルに無いと、税理士まで届かない。実帳簿では差が 612,926円 で、
+    // しかも2026年分が2割特例の最後の年である。
+    lines.extend(special_rule_estimate_lines(year, summary));
     if summary.lines_without_a_category > 0 {
         lines.push(String::new());
         lines.push(format!(
@@ -172,7 +237,7 @@ mod tests {
     /// ファイルの方なので、注記が画面にしか無いと届かない。
     #[test]
     fn the_notes_say_it_is_not_a_tax_return() {
-        let notes = notes_to_text(&summary());
+        let notes = notes_to_text(&summary(), 2029);
         assert!(notes.contains("申告書の金額ではありません"), "{notes}");
         assert!(notes.contains("家事按分"), "{notes}");
         assert!(notes.contains("端数処理"), "{notes}");
@@ -185,7 +250,7 @@ mod tests {
         s.lines_without_a_category = 774;
         s.lines_with_an_unknown_category = 3;
 
-        let notes = notes_to_text(&s);
+        let notes = notes_to_text(&s, 2029);
 
         assert!(notes.contains("774 件"), "{notes}");
         assert!(notes.contains("3 件"), "{notes}");
@@ -194,7 +259,125 @@ mod tests {
     /// 集計できなかった明細が無ければ、その段は出さない。
     #[test]
     fn the_notes_stay_short_when_nothing_was_skipped() {
-        let notes = notes_to_text(&summary());
+        let notes = notes_to_text(&summary(), 2029);
         assert!(!notes.contains("税区分が付いていない明細"), "{notes}");
+    }
+    // ─── 消費税の特例の試算 ─────────────────────────
+
+    fn summary_with(sales_tax: i128, purchase_tax: i128) -> Summary {
+        use kaikei_jp::consumption_tax::CategoryTotal;
+        use kaikei_jp::tax::TaxDirection;
+        let yen = |v: i128| Money::from_minor(v, kaikei_core::Currency::JPY);
+        Summary {
+            categories: vec![
+                CategoryTotal {
+                    code: "SALE_10".to_string(),
+                    label: "課税売上 10%".to_string(),
+                    direction: TaxDirection::Sales,
+                    amount: yen(sales_tax * 11),
+                    tax: Some(yen(sales_tax)),
+                },
+                CategoryTotal {
+                    code: "PURCHASE_10_QUALIFIED".to_string(),
+                    label: "課税仕入 10%（適格）".to_string(),
+                    direction: TaxDirection::Purchase,
+                    amount: yen(purchase_tax * 11),
+                    tax: Some(yen(purchase_tax)),
+                },
+            ],
+            lines_without_a_category: 0,
+            lines_with_an_unknown_category: 0,
+        }
+    }
+
+    // **本命。** 金額を出すなら、判定していないことも必ず出す。
+    //
+    // 「2割特例なら 219,456円」だけが独り歩きして、使えるかどうかを
+    // 確かめずに申告されると困る。**数字と但し書きは切り離せない。**
+    #[test]
+    fn the_estimate_never_appears_without_the_caveat() {
+        let lines = special_rule_estimate_lines(2026, &summary_with(1_097_280, 264_898));
+
+        let text = lines.join(
+            "
+",
+        );
+        assert!(text.contains("219,456"), "試算を出すこと: {text}");
+        assert!(
+            text.contains("このソフトは判定しません"),
+            "判定していないことを言うこと: {text}"
+        );
+        assert!(text.contains("1,000万円"), "除外要件に触れること: {text}");
+    }
+
+    // **本命。** 一般課税との差を出す。実帳簿の値で確かめる。
+    #[test]
+    fn the_estimate_shows_the_difference() {
+        let text = special_rule_estimate_lines(2026, &summary_with(1_097_280, 264_898)).join(
+            "
+",
+        );
+
+        assert!(text.contains("832,382"), "一般課税: {text}");
+        assert!(text.contains("612,926"), "差: {text}");
+    }
+
+    // **本命。** 2026年分が最後であることを言う。
+    //
+    // 見逃すと 612,926円 の選択肢を1年分まるごと失う。
+    #[test]
+    fn the_last_year_of_the_twenty_percent_rule_is_called_out() {
+        let text = special_rule_estimate_lines(2026, &summary_with(1_000, 0)).join(
+            "
+",
+        );
+
+        assert!(text.contains("最後の年"), "{text}");
+    }
+
+    // 2027年分は3割特例なので、「最後の年」は言わない。
+    #[test]
+    fn the_last_year_notice_is_only_for_2026() {
+        let text = special_rule_estimate_lines(2027, &summary_with(1_000, 0)).join(
+            "
+",
+        );
+
+        assert!(text.contains("3割特例"), "{text}");
+        assert!(
+            !text.contains("最後の年"),
+            "2027年に出してはいけない: {text}"
+        );
+    }
+
+    // **本命。** 特例が無い年は何も出さない。
+    #[test]
+    fn no_special_rule_means_no_output() {
+        assert!(special_rule_estimate_lines(2029, &summary_with(1_000, 0)).is_empty());
+    }
+    // **本命。** 試算は注記ファイルにも載る。
+    //
+    // 画面には出るのに渡すファイルに無いと、税理士まで届かない。実帳簿では
+    // 差が 612,926円 で、しかも2026年分が2割特例の最後の年である。
+    // **届かなければ選択肢が無かったのと同じ。**
+    #[test]
+    fn the_notes_carry_the_special_rule_estimate() {
+        let notes = notes_to_text(&summary_with(1_097_280, 264_898), 2026);
+
+        assert!(notes.contains("219,456"), "試算を載せること: {notes}");
+        assert!(notes.contains("612,926"), "差を載せること: {notes}");
+        assert!(
+            notes.contains("このソフトは判定しません"),
+            "但し書きも一緒に載せること: {notes}"
+        );
+        assert!(notes.contains("最後の年"), "{notes}");
+    }
+
+    // 特例の無い年には載せない。
+    #[test]
+    fn the_notes_say_nothing_when_there_is_no_special_rule() {
+        let notes = notes_to_text(&summary_with(1_000, 0), 2029);
+
+        assert!(!notes.contains("納付税額の試算"), "{notes}");
     }
 }
