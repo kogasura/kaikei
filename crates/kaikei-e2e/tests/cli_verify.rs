@@ -1076,3 +1076,44 @@ async fn an_empty_ledger_is_fine_when_there_are_no_depreciable_assets(
         "償却対象が無ければ黙ること: {stderr}"
     );
 }
+
+/// 台帳にある資産と無い資産を分けて言う。
+///
+/// **持っているものまで「持っていない」と言わない。** 以前は一律に
+/// 「取得年月日・耐用年数・事業専用割合を持っていません」と出しており、
+/// 台帳に入れた資産についても同じことを言っていた。何を足せばよいかが
+/// 分からない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_depreciation_warning_separates_what_is_in_the_ledger(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "205", "機械装置", 1).await;
+    seed_account(&app, "210", "工具器具備品", 1).await;
+    seed_account(&app, "400", "元入金", 3).await;
+    seed_entry(&app, 1, "205", "400", 118_800).await;
+    seed_entry(&app, 2, "210", "400", 161_917).await;
+    sqlx::query(
+        "INSERT INTO fixed_assets (id, name, account_code, acquired_on, acquisition_cost,          currency, currency_minor_unit, method)          VALUES (gen_random_uuid(), 'パソコン', '205', DATE '2022-08-05', 118800,          'JPY', 0, $1)",
+    )
+    // 2 = 一括償却資産（kaikei-store の method の符号化）。
+    .bind(2_i16)
+    .execute(&app)
+    .await
+    .expect("台帳に入れられること");
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(stderr.contains("205 118,800（台帳にあります）"), "{stderr}");
+    assert!(
+        stderr.contains("210 は台帳にありません"),
+        "足すべきものだけを名指しすること: {stderr}"
+    );
+    assert!(
+        !stderr.contains("205 は台帳にありません"),
+        "台帳にあるものを挙げないこと: {stderr}"
+    );
+}

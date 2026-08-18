@@ -4081,6 +4081,7 @@ fn receivables_are_never_used(
 fn warn_if_depreciation_is_missing(
     income_statement: &kaikei_app::policy::Statement,
     balance_sheet: &kaikei_app::policy::Statement,
+    fixed_assets: &[kaikei_app::ports::FixedAssetRow],
 ) -> Result<(), String> {
     let hint = kaikei_jp::chart::load_depreciation_hint(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
         .map_err(|error| format!("科目表の depreciation 節を読めませんでした: {error}"))?;
@@ -4108,17 +4109,40 @@ fn warn_if_depreciation_is_missing(
          1円も計上されていません。",
         hint.expense_account.as_str()
     );
+    // **台帳にある科目と無い科目を分ける。** 以前は一律に「取得年月日を
+    // 持っていません」と言っていたが、台帳に入れた資産については持って
+    // いる。持っているものまで「持っていない」と言うと、何を足せばよいか
+    // が分からない。
+    let in_ledger: std::collections::BTreeSet<&str> =
+        fixed_assets.iter().map(|a| a.account.as_str()).collect();
+    let mut missing = Vec::new();
     for (code, amount) in &assets {
-        eprintln!("  {} {}", code.as_str(), amount.to_display_string());
+        let known = in_ledger.contains(code.as_str());
+        eprintln!(
+            "  {} {}{}",
+            code.as_str(),
+            amount.to_display_string(),
+            if known {
+                "（台帳にあります）"
+            } else {
+                ""
+            }
+        );
+        if !known {
+            missing.push(code.as_str());
+        }
     }
     eprintln!(
-        "  計上漏れであれば、所得がその分だけ過大になります（貸借は一致した\
-         ままなので決算書を見ても分かりません）。"
+        "  計上漏れであれば、所得がその分だけ過大になります（貸借は一致したままなので決算書を見ても分かりません）。"
     );
-    eprintln!(
-        "  いくら償却するかはこのソフトでは決められません（取得年月日・\
-         耐用年数・事業専用割合を持っていません）。"
-    );
+    if missing.is_empty() {
+        eprintln!("  資産はすべて台帳にあります。償却費は kaikei depreciation で出せます。");
+    } else {
+        eprintln!(
+            "  {} は台帳にありません。取得年月日・取得価額・償却方法・耐用年数を入れると計算できます（kaikei fixedasset add）。",
+            missing.join(" / ")
+        );
+    }
     Ok(())
 }
 
@@ -4281,7 +4305,7 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
             format!("財務諸表を組み立てられませんでした: {error}")
         })?;
 
-    warn_if_depreciation_is_missing(&income_statement, &balance_sheet)?;
+    warn_if_depreciation_is_missing(&income_statement, &balance_sheet, &fixed_assets)?;
     warn_if_receivables_are_never_used(&income_statement, &balance_sheet, &chart)?;
     warn_if_a_balance_sits_on_the_wrong_side(&balance_sheet, &chart)?;
     warn_if_qualified_invoice_lacks_a_counterparty(&entries, &counterparties, &chart)?;
@@ -5021,7 +5045,11 @@ async fn write_reports(
 
     // **減価償却の計上漏れを指摘する。** 貸借は一致したままで所得だけが
     // 過大になる誤りで、決算書を見ても分からない。
-    warn_if_depreciation_is_missing(&statements.income_statement, &cumulative.balance_sheet)?;
+    warn_if_depreciation_is_missing(
+        &statements.income_statement,
+        &cumulative.balance_sheet,
+        &fixed_assets,
+    )?;
 
     // **貸借が自然な向きと逆の科目を指摘する。** 貸借は一致したままなので
     // 決算書を見ても気づけない。
