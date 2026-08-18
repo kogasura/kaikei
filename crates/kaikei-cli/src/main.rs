@@ -1434,9 +1434,121 @@ fn lines_with_a_known_non_qualified_counterparty(
 }
 
 /// 上の件数を知らせる。
+/// 取引先が付いていない課税仕入れの、科目ごとの内訳。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MissingCounterpartyByAccount {
+    code: String,
+    name: String,
+    count: usize,
+    total_minor: i128,
+    /// 税込3万円未満の件数。公共交通機関特例の目安になる。
+    under_thirty_thousand: usize,
+}
+
+/// 取引先が付いていない課税仕入れ（借方）を科目ごとにまとめる。
+///
+/// # なぜ件数だけでは足りないのか
+///
+/// 実帳簿では 603 件と出る。**そのうち 433 件が旅費交通費**で、合計
+/// 98,093円（平均 226円）——交通系ICの入出場である。件数だけを見せると
+/// 「603件ぶんの請求書を集めなければ」と読めるが、**そちらの手当ては
+/// 適格請求書ではない**（下の [`public_transport_note`] を参照）。
+fn missing_counterparty_by_account(
+    entries: &[kaikei_core::JournalEntry],
+    rule_sets: &kaikei_jp::tax::TaxRuleSets,
+    chart: &kaikei_core::ChartOfAccounts,
+) -> Vec<MissingCounterpartyByAccount> {
+    use std::collections::BTreeMap;
+
+    let mut by_account: BTreeMap<String, (usize, i128, usize)> = BTreeMap::new();
+    for entry in entries {
+        for line in entry.lines() {
+            if line.side() != kaikei_core::Side::Debit {
+                continue;
+            }
+            // `line_needs_a_counterparty` が「適格請求書が要る」と
+            // 「取引先が無い」の両方を見る。
+            if !line_needs_a_counterparty(line.tags(), rule_sets) {
+                continue;
+            }
+            let slot = by_account
+                .entry(line.account().as_str().to_string())
+                .or_insert((0, 0, 0));
+            slot.0 += 1;
+            slot.1 += line.amount().minor();
+            if line.amount().minor() < 30_000 {
+                slot.2 += 1;
+            }
+        }
+    }
+
+    let mut rows: Vec<MissingCounterpartyByAccount> = by_account
+        .into_iter()
+        .map(|(code, (count, total_minor, under))| {
+            let name = kaikei_core::AccountCode::parse(&code)
+                .ok()
+                .and_then(|parsed| chart.get(&parsed).map(|def| def.name.clone()))
+                .unwrap_or_else(|| code.clone());
+            MissingCounterpartyByAccount {
+                code,
+                name,
+                count,
+                total_minor,
+                under_thirty_thousand: under,
+            }
+        })
+        .collect();
+    // 件数の多い順。同数なら科目コード順で安定させる。
+    rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.code.cmp(&b.code)));
+    rows
+}
+
+/// 公共交通機関特例の案内。**該当しそうな科目があるときだけ返す。**
+///
+/// # 根拠
+///
+/// 3万円未満の公共交通機関による旅客の運送は、適格請求書の交付義務が
+/// 免除され、**一定の事項を書いた帳簿のみの保存**で仕入税額控除が認め
+/// られる（タックスアンサー No.6496 / No.6497）。
+///
+/// 帳簿には通常の4項目（相手方の氏名又は名称・年月日・内容・対価の額）に
+/// 加えて、**この特例に該当する旨**の記載が要る。相手方の住所又は所在地の
+/// 記載は、公共交通機関特例では**不要**である（No.6497）。
+///
+/// # 判定しない
+///
+/// **タクシーと航空機は対象外。** 3万円未満なのは船舶・バス・鉄道である。
+/// 科目名から機械的に拾っているだけなので、当てはまるかどうかは利用者が
+/// 決める。少額特例で「判定していません」と書いたのと同じ姿勢である。
+fn public_transport_note(rows: &[MissingCounterpartyByAccount]) -> Vec<String> {
+    // **科目コードを決め打ちしない。** 勘定科目表は帳簿ごとに違いうるので、
+    // 帳簿自身が持っている科目名で拾う。
+    let Some(row) = rows
+        .iter()
+        .find(|row| row.name.contains("旅費交通費") && row.under_thirty_thousand > 0)
+    else {
+        return Vec::new();
+    };
+
+    vec![
+        String::new(),
+        format!(
+            "  うち {} の {} 件（税込3万円未満）は、公共交通機関特例に当たるかもしれません。",
+            row.name, row.under_thirty_thousand
+        ),
+        "    当たれば適格請求書は要りません（交付義務が免除されます）。".to_string(),
+        "    代わりに帳簿へ、相手方の名称（鉄道会社名など）と".to_string(),
+        "    「3万円未満の公共交通機関による旅客の運送」に該当する旨を書きます。".to_string(),
+        "    相手方の住所又は所在地の記載は要りません。".to_string(),
+        "    **タクシーと航空機は対象外です。** 対象は船舶・バス・鉄道です。".to_string(),
+        "    このソフトは科目名から拾っているだけで、判定はしていません。".to_string(),
+    ]
+}
+
 fn warn_if_qualified_invoice_lacks_a_counterparty(
     entries: &[kaikei_core::JournalEntry],
     counterparties: &kaikei_app::policy::CounterpartyIndex,
+    chart: &kaikei_core::ChartOfAccounts,
 ) -> Result<(), String> {
     let rule_sets = kaikei_jp::tax::TaxRuleSets::from_embedded()
         .map_err(|error| format!("同梱の消費税区分マスタを読めませんでした: {error}"))?;
@@ -1514,6 +1626,27 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
             eprintln!("    返金・値引きに要るのは適格請求書ではなく適格返還請求書です。");
             eprintln!("    内部の振替には相手方が無いので、取引先を付けようがありません。");
         }
+        // **件数だけでは動けない。** 603件と言われても手の付けようがないが、
+        // 科目で割ると 433件が旅費交通費（交通系ICの入出場）で、そちらの
+        // 手当ては適格請求書ではない。
+        let rows = missing_counterparty_by_account(entries, &rule_sets, chart);
+        if !rows.is_empty() {
+            eprintln!("  科目ごとの内訳:");
+            for row in &rows {
+                eprintln!(
+                    "    {} {} — {} 件 / {} 円",
+                    row.code,
+                    row.name,
+                    row.count,
+                    kaikei_core::Money::from_minor(row.total_minor, kaikei_core::Currency::JPY)
+                        .to_display_string()
+                );
+            }
+        }
+        for line in public_transport_note(&rows) {
+            eprintln!("{line}");
+        }
+
         eprintln!(
             "  仕入税額控除が認められるかどうかは、証憑の保存状況と相手方の登録状況で決まります。"
         );
@@ -4144,7 +4277,7 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
     warn_if_depreciation_is_missing(&income_statement, &balance_sheet)?;
     warn_if_receivables_are_never_used(&income_statement, &balance_sheet, &chart)?;
     warn_if_a_balance_sits_on_the_wrong_side(&balance_sheet, &chart)?;
-    warn_if_qualified_invoice_lacks_a_counterparty(&entries, &counterparties)?;
+    warn_if_qualified_invoice_lacks_a_counterparty(&entries, &counterparties, &chart)?;
     warn_if_the_fixed_asset_ledger_does_not_match_the_book(
         &fixed_assets,
         fiscal_year,
@@ -4829,7 +4962,7 @@ async fn write_reports(
 
     // **適格請求書ありの税区分に取引先が付いているか。** 取引先が無いと、
     // 適格請求書発行事業者かどうかの検証がすり抜ける。
-    warn_if_qualified_invoice_lacks_a_counterparty(&entries, &counterparties)?;
+    warn_if_qualified_invoice_lacks_a_counterparty(&entries, &counterparties, &chart)?;
 
     // **前年の事業主貸・事業主借が持ち越されていないか。** 翌期首に元入金へ
     // 振り替えないと、年を追うごとに膨らむ。
@@ -5771,6 +5904,97 @@ abc,A,7123456789012
         )
         .unwrap_err();
         assert!(error.contains("登録番号"), "{error}");
+    }
+
+    // ─── 公共交通機関特例の案内 ─────────────────────
+
+    fn row(name: &str, count: usize, under: usize) -> MissingCounterpartyByAccount {
+        MissingCounterpartyByAccount {
+            code: "603".to_string(),
+            name: name.to_string(),
+            count,
+            total_minor: 98_093,
+            under_thirty_thousand: under,
+        }
+    }
+
+    // **本命。** 旅費交通費があれば案内を出す。
+    //
+    // 実帳簿では「取引先が無い 603 件」のうち 433 件が旅費交通費で、
+    // 合計 98,093円（平均 226円）＝交通系ICの入出場である。件数だけを
+    // 見せると「603件ぶんの請求書を集めなければ」と読めるが、**そちらの
+    // 手当ては適格請求書ではない。**
+    #[test]
+    fn travel_expenses_get_the_public_transport_note() {
+        let text = public_transport_note(&[row("旅費交通費", 433, 433)]).join(
+            "
+",
+        );
+
+        assert!(text.contains("433"), "件数を出すこと: {text}");
+        assert!(text.contains("公共交通機関特例"), "{text}");
+        assert!(
+            text.contains("適格請求書は要りません"),
+            "請求書が不要になることを言うこと: {text}"
+        );
+    }
+
+    // **本命。** 帳簿に何を書くかまで言う。
+    //
+    // 「請求書は要らない」だけで終わると、帳簿の記載事項まで免除されたと
+    // 読める。特例に該当する旨の記載は**要る**（タックスアンサー No.6497）。
+    #[test]
+    fn the_note_says_what_the_book_must_record() {
+        let text = public_transport_note(&[row("旅費交通費", 433, 433)]).join(
+            "
+",
+        );
+
+        assert!(
+            text.contains("該当する旨"),
+            "帳簿への記載が要ること: {text}"
+        );
+        assert!(text.contains("相手方の名称"), "{text}");
+        assert!(
+            text.contains("住所又は所在地の記載は要りません"),
+            "住所は不要であること: {text}"
+        );
+    }
+
+    // **本命。** タクシーと航空機が対象外であることを必ず言う。
+    //
+    // 3万円未満で対象になるのは船舶・バス・鉄道だけ。**言わないと、
+    // タクシー代まで特例で通してしまう。**
+    #[test]
+    fn the_note_always_excludes_taxis_and_planes() {
+        let text = public_transport_note(&[row("旅費交通費", 433, 433)]).join(
+            "
+",
+        );
+
+        assert!(text.contains("タクシー"), "{text}");
+        assert!(text.contains("航空機"), "{text}");
+        assert!(text.contains("判定はしていません"), "{text}");
+    }
+
+    // 旅費交通費が無ければ何も出さない。
+    #[test]
+    fn other_accounts_do_not_get_the_note() {
+        assert!(public_transport_note(&[row("通信費", 82, 78)]).is_empty());
+    }
+
+    // **本命。** 3万円未満が1件も無ければ出さない。
+    //
+    // 特例は3万円未満に限られる。全部が3万円以上なら案内は的外れになる。
+    #[test]
+    fn nothing_under_thirty_thousand_means_no_note() {
+        assert!(public_transport_note(&[row("旅費交通費", 5, 0)]).is_empty());
+    }
+
+    // 何も無ければ何も出さない。
+    #[test]
+    fn an_empty_breakdown_produces_no_note() {
+        assert!(public_transport_note(&[]).is_empty());
     }
 
     // code / name が無いCSVは受け取らない。
