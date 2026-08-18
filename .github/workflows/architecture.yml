@@ -436,6 +436,26 @@ jobs:
           fi
           echo "OK"
 
+      - name: コードが読む環境変数が .env.example に載っている
+        run: |
+          set -euo pipefail
+          # 未設定のときのエラーは「.env.example を参照してください」と案内する。
+          # **載っていなければ、その案内は行き止まりになる。** 実際に
+          # KAIKEI_BLOB_ROOT が載っておらず、証憑を1件も登録できないまま
+          # 「.env.example を見ろ」とだけ言う状態になっていた。
+          #
+          # 逆向き（.env.example にあってコードに無い）は検査しない。
+          # docker-compose だけが使う変数（KAIKEI_MIGRATOR_PASSWORD）がある。
+          grep -rhoE '"KAIKEI_[A-Z_]+"' crates/ --include='*.rs' | tr -d '"' | sort -u > /tmp/used.txt
+          grep -oE '^#?[[:space:]]*KAIKEI_[A-Z_]+' .env.example | grep -oE 'KAIKEI_[A-Z_]+' | sort -u > /tmp/documented.txt
+          MISSING=$(comm -23 /tmp/used.txt /tmp/documented.txt)
+          if [ -n "$MISSING" ]; then
+            echo "$MISSING"
+            echo "::error::上記の環境変数が .env.example にありません"
+            exit 1
+          fi
+          echo "OK: $(wc -l < /tmp/used.txt) 件すべて載っています"
+
   quality:
     runs-on: ubuntu-latest
     # 止まったまま6時間待たないための上限。
