@@ -4109,40 +4109,26 @@ fn warn_if_depreciation_is_missing(
          1円も計上されていません。",
         hint.expense_account.as_str()
     );
-    // **台帳にある科目と無い科目を分ける。** 以前は一律に「取得年月日を
-    // 持っていません」と言っていたが、台帳に入れた資産については持って
-    // いる。持っているものまで「持っていない」と言うと、何を足せばよいか
-    // が分からない。
+    // **台帳にある科目には印を付ける。** 「台帳に無い資産」の指摘は別に
+    // あるので（`warn_if_assets_are_missing_from_the_ledger`）、ここでは
+    // 重ねて言わない。
     let in_ledger: std::collections::BTreeSet<&str> =
         fixed_assets.iter().map(|a| a.account.as_str()).collect();
-    let mut missing = Vec::new();
     for (code, amount) in &assets {
-        let known = in_ledger.contains(code.as_str());
         eprintln!(
             "  {} {}{}",
             code.as_str(),
             amount.to_display_string(),
-            if known {
+            if in_ledger.contains(code.as_str()) {
                 "（台帳にあります）"
             } else {
                 ""
             }
         );
-        if !known {
-            missing.push(code.as_str());
-        }
     }
     eprintln!(
         "  計上漏れであれば、所得がその分だけ過大になります（貸借は一致したままなので決算書を見ても分かりません）。"
     );
-    if missing.is_empty() {
-        eprintln!("  資産はすべて台帳にあります。償却費は kaikei depreciation で出せます。");
-    } else {
-        eprintln!(
-            "  {} は台帳にありません。取得年月日・取得価額・償却方法・耐用年数を入れると計算できます（kaikei fixedasset add）。",
-            missing.join(" / ")
-        );
-    }
     Ok(())
 }
 
@@ -4306,6 +4292,7 @@ async fn warn_from_statements(store: &PgStore, fiscal_year: i32) -> Result<(), S
         })?;
 
     warn_if_depreciation_is_missing(&income_statement, &balance_sheet, &fixed_assets)?;
+    warn_if_assets_are_missing_from_the_ledger(&balance_sheet, &fixed_assets)?;
     warn_if_receivables_are_never_used(&income_statement, &balance_sheet, &chart)?;
     warn_if_a_balance_sits_on_the_wrong_side(&balance_sheet, &chart)?;
     warn_if_qualified_invoice_lacks_a_counterparty(&entries, &counterparties, &chart)?;
@@ -4406,11 +4393,10 @@ fn warn_if_the_fixed_asset_ledger_does_not_match_the_book(
     balance_sheet: &kaikei_app::policy::Statement,
 ) -> Result<(), String> {
     if assets.is_empty() {
-        // **空の台帳を「ずれ無し」と読まない。** 帳簿に償却対象の資産が
-        // あるのに台帳が空なら、それは考えうる最大のずれである。以前は
-        // ここで黙って戻っており、実帳簿（資産 388,717円・台帳0件）で
-        // 何も出なかった。
-        return warn_if_the_fixed_asset_ledger_is_empty(balance_sheet);
+        // 台帳が空なら突き合わせるものが無い。**台帳に無い資産の指摘は
+        // `warn_if_assets_are_missing_from_the_ledger` が別に出す**ので、
+        // ここで戻ってよい。
+        return Ok(());
     }
     let ledger = fixed_asset_book_values(assets, fiscal_year)?;
     let mismatches = fixed_asset_accounts_that_do_not_match(&ledger, balance_sheet);
@@ -4435,21 +4421,25 @@ fn warn_if_the_fixed_asset_ledger_does_not_match_the_book(
     Ok(())
 }
 
-/// 帳簿に償却対象の資産があるのに、固定資産台帳が空であることを知らせる。
+/// 帳簿に償却対象の資産があるのに、固定資産台帳に無いものを知らせる。
 ///
-/// # なぜ別の指摘にするのか
+/// # なぜ償却費の指摘と分けるのか
 ///
-/// 「償却費が1円も計上されていません」という指摘は既にあるが、その文面は
-/// **「いくら償却するかはこのソフトでは決められません（取得年月日・耐用
-/// 年数・事業専用割合を持っていません）」**で終わっている。持っていない
-/// のは台帳が空だからであり、**台帳に入れれば計算できる。** 行き止まりの
-/// ように読める文面を、次の一手に変える。
+/// 償却費の指摘（`warn_if_depreciation_is_missing`）は**償却費が0のときしか
+/// 出ない**。1円でも計上されていれば黙る。そこに「台帳に無い」という話を
+/// 混ぜていたため、**償却を1件でも記帳した途端に、残りの資産が台帳に無い
+/// ことを誰も言わなくなった**（実帳簿の複製で確かめた。1円入れただけで
+/// 指摘が消えた）。
 ///
-/// # 資産が無ければ黙る
+/// 「償却しているか」と「台帳に載っているか」は別の話である。
 ///
-/// 空の台帳そのものは異常ではない。償却対象の資産を持たない帳簿もある。
-fn warn_if_the_fixed_asset_ledger_is_empty(
+/// # 台帳が空でも、一部だけ入っていても同じ検査で拾う
+///
+/// 以前は「台帳が空」だけを見ていた。1件入れた途端に、残りが抜けている
+/// ことを言わなくなる。
+fn warn_if_assets_are_missing_from_the_ledger(
     balance_sheet: &kaikei_app::policy::Statement,
+    fixed_assets: &[kaikei_app::ports::FixedAssetRow],
 ) -> Result<(), String> {
     let hint = kaikei_jp::chart::load_depreciation_hint(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
         .map_err(|error| format!("科目表の depreciation 節を読めませんでした: {error}"))?;
@@ -4457,27 +4447,29 @@ fn warn_if_the_fixed_asset_ledger_is_empty(
         return Ok(());
     };
 
-    let assets: Vec<(&kaikei_core::AccountCode, kaikei_core::Money)> = hint
+    let in_ledger: std::collections::BTreeSet<&str> =
+        fixed_assets.iter().map(|a| a.account.as_str()).collect();
+    let missing: Vec<(&kaikei_core::AccountCode, kaikei_core::Money)> = hint
         .depreciable_accounts
         .iter()
         .map(|code| (code, amount_of(balance_sheet, code)))
-        .filter(|(_, amount)| !amount.is_zero())
+        .filter(|(code, amount)| !amount.is_zero() && !in_ledger.contains(code.as_str()))
         .collect();
-    if assets.is_empty() {
+    if missing.is_empty() {
         return Ok(());
     }
 
-    let total: i128 = assets.iter().map(|(_, amount)| amount.minor()).sum();
+    let total: i128 = missing.iter().map(|(_, amount)| amount.minor()).sum();
     eprintln!();
     eprintln!(
-        "注意: 帳簿に償却対象の資産が {} 件（{} 円）ありますが、固定資産台帳は空です。",
-        assets.len(),
+        "注意: 帳簿にある償却対象の資産 {} 件（{} 円）が、固定資産台帳にありません。",
+        missing.len(),
         kaikei_core::Money::from_minor(total, kaikei_core::Currency::JPY).to_display_string()
     );
-    for (code, amount) in &assets {
+    for (code, amount) in &missing {
         eprintln!("  {} {} 円", code.as_str(), amount.to_display_string());
     }
-    eprintln!("  台帳が空なので、償却費を計算できず、台帳と帳簿の突き合わせもできません。");
+    eprintln!("  台帳に無い資産は、償却費を計算できず、台帳との突き合わせもできません。");
     eprintln!("  取得年月日・取得価額・償却方法・耐用年数を入れると計算できます:");
     eprintln!(
         "    kaikei fixedasset add --name <名前> --account <科目> --acquired <YYYY-MM-DD> \\"
@@ -5050,6 +5042,7 @@ async fn write_reports(
         &cumulative.balance_sheet,
         &fixed_assets,
     )?;
+    warn_if_assets_are_missing_from_the_ledger(&cumulative.balance_sheet, &fixed_assets)?;
 
     // **貸借が自然な向きと逆の科目を指摘する。** 貸借は一致したままなので
     // 決算書を見ても気づけない。
