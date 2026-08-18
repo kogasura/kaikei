@@ -914,3 +914,113 @@ async fn switching_to_the_non_qualified_category_clears_the_finding(
     assert!(ok, "{stderr}");
     assert!(!stderr.contains("非適格と確認済み"), "{stderr}");
 }
+
+/// 取引先が無い課税仕入れを、科目ごとに分けて出す。
+///
+/// **件数だけでは動けない。** 実帳簿は 603 件と出るが、うち 433 件が
+/// 旅費交通費（交通系ICの入出場、合計 98,093円）で、そちらの手当ては
+/// 適格請求書ではない。科目で割らないとそれが見えない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_missing_counterparties_are_broken_down_by_account(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "603", "旅費交通費", 5).await;
+    seed_account(&app, "604", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    let taxable = r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#;
+    for entry_no in 1..=3 {
+        seed_entry_with_tags(&app, entry_no, "603", "110", 170, taxable).await;
+    }
+    seed_entry_with_tags(&app, 4, "604", "110", 5_000, taxable).await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "指摘があっても検査は失敗しないこと: {stderr}");
+    assert!(stderr.contains("科目ごとの内訳"), "{stderr}");
+    assert!(
+        stderr.contains("603 旅費交通費 — 3 件 / 510 円"),
+        "件数と金額を科目ごとに出すこと: {stderr}"
+    );
+    assert!(stderr.contains("604 通信費 — 1 件 / 5,000 円"), "{stderr}");
+    // 件数の多い順。
+    let travel = stderr.find("603 旅費交通費").expect("旅費交通費の行");
+    let phone = stderr.find("604 通信費").expect("通信費の行");
+    assert!(travel < phone, "件数の多い順に並べること: {stderr}");
+}
+
+/// 旅費交通費には公共交通機関特例の案内を添える。
+///
+/// **「請求書を集めろ」は的外れになりうる。** 3万円未満の公共交通機関に
+/// よる旅客の運送は交付義務が免除され、帳簿のみの保存で控除できる
+/// （タックスアンサー No.6496 / No.6497）。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn travel_expenses_carry_the_public_transport_note(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "603", "旅費交通費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_entry_with_tags(
+        &app,
+        1,
+        "603",
+        "110",
+        170,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(stderr.contains("公共交通機関特例"), "{stderr}");
+    assert!(stderr.contains("適格請求書は要りません"), "{stderr}");
+    assert!(
+        stderr.contains("該当する旨"),
+        "帳簿への記載が要ること: {stderr}"
+    );
+    assert!(
+        stderr.contains("タクシーと航空機は対象外"),
+        "対象外を必ず言うこと: {stderr}"
+    );
+}
+
+/// 3万円以上の旅費交通費には案内を出さない。
+///
+/// 特例は3万円未満に限られる。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_large_travel_expense_does_not_get_the_note(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "603", "旅費交通費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_entry_with_tags(
+        &app,
+        1,
+        "603",
+        "110",
+        30_000,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("603 旅費交通費"),
+        "内訳には出ること: {stderr}"
+    );
+    assert!(
+        !stderr.contains("公共交通機関特例"),
+        "3万円ちょうどは未満ではない: {stderr}"
+    );
+}
