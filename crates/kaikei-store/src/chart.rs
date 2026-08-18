@@ -76,6 +76,11 @@ impl CounterpartyWriteRepo for PgTx<'_> {
     /// **`is_qualified` は「ユーザーが確認した」という記録**であり、
     /// 投入経路が上書きすると、確認していないものを確認済みに見せる
     /// （`kaikei_app::ports::CounterpartyWriteRepo` の契約）。
+    ///
+    /// 後から登録番号を入れたいときは
+    /// [`Self::set_counterparty_invoice_status`] を使う。**一括投入と
+    /// 1件ずつの確認は別の操作である**——前者は「まとめて取り込む」、
+    /// 後者は「調べた結果を記録する」であり、後者だけが上書きしてよい。
     async fn insert_counterparties(&mut self, list: &[Counterparty]) -> Result<usize, RepoError> {
         if list.is_empty() {
             return Ok(0);
@@ -97,6 +102,44 @@ impl CounterpartyWriteRepo for PgTx<'_> {
         .bind(&names)
         .bind(&reg_nos)
         .bind(&qualified)
+        .execute(self.conn())
+        .await
+        .map_err(from_sqlx_error)?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
+    /// # ここだけが上書きしてよい
+    ///
+    /// 更新するのは `invoice_reg_no` / `is_qualified` / `verified_at` の3つ
+    /// だけ。**`name` は `SET` に入れない**——名前を変えられると、過去の
+    /// 仕訳が指している相手が静かに別物になる。
+    ///
+    /// `WHERE code = $1` で1件に限る。まとめて更新する経路は作らない
+    /// （`kaikei_app::ports::CounterpartyWriteRepo` の契約）。
+    async fn set_counterparty_invoice_status(
+        &mut self,
+        code: &str,
+        registration_no: Option<&str>,
+        is_qualified: Option<bool>,
+        verified_on: kaikei_core::AccountingDate,
+    ) -> Result<usize, RepoError> {
+        let date = chrono::NaiveDate::from_ymd_opt(
+            verified_on.year(),
+            u32::from(verified_on.month()),
+            u32::from(verified_on.day()),
+        )
+        .ok_or_else(|| RepoError::Backend {
+            reason: format!("確認日が不正です: {}", verified_on.to_iso_string()),
+        })?;
+
+        let result = sqlx::query(
+            "UPDATE counterparties              SET invoice_reg_no = $2, is_qualified = $3, verified_at = $4              WHERE code = $1",
+        )
+        .bind(code)
+        .bind(registration_no)
+        .bind(is_qualified)
+        .bind(date)
         .execute(self.conn())
         .await
         .map_err(from_sqlx_error)?;

@@ -271,6 +271,38 @@ pub trait CounterpartyWriteRepo: Send {
     ///
     /// 挿入に失敗した場合は [`RepoError`]。
     async fn insert_counterparties(&mut self, list: &[Counterparty]) -> Result<usize, RepoError>;
+
+    /// 既存の取引先の**適格請求書発行事業者の情報だけ**を更新する。
+    ///
+    /// # なぜ追加ではなく更新なのか
+    ///
+    /// `insert_counterparties` は `ON CONFLICT DO NOTHING` なので、既存の
+    /// 取引先に登録番号を後から入れられない。**実帳簿の取引先31件はすべて
+    /// 登録番号が空**で、CSV から入れ直そうとしても「既存を優先」で無視される
+    /// （警告は出るが書き込まれない）。
+    ///
+    /// 相手が適格請求書発行事業者かどうかは**後から分かる**情報である。
+    /// 取引を記帳した時点では未確認で、あとで先方に伺って埋める。
+    /// 追加しかできないと、その運用が成り立たない。
+    ///
+    /// # 名前とコードは変えない
+    ///
+    /// 更新するのは `invoice_reg_no` / `is_qualified` / `verified_at` だけ。
+    /// **名前を変えられると、過去の仕訳が指している相手が静かに別物になる。**
+    /// 名前を直したいなら、それは別の操作として設計すること。
+    ///
+    /// 実際に更新された行数を返す（コードが存在しなければ 0）。
+    ///
+    /// # Errors
+    ///
+    /// 更新に失敗した場合は [`RepoError`]。
+    async fn set_counterparty_invoice_status(
+        &mut self,
+        code: &str,
+        registration_no: Option<&str>,
+        is_qualified: Option<bool>,
+        verified_on: AccountingDate,
+    ) -> Result<usize, RepoError>;
 }
 
 /// 固定資産台帳の1件（`DECISIONS.md` D-103）。

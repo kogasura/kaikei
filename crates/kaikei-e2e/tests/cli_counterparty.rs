@@ -210,3 +210,226 @@ async fn a_duplicate_code_within_one_file_does_not_fail(
     );
     assert_eq!(codes_in_db(&app).await.len(), 1);
 }
+
+/// `kaikei counterparty verify` を走らせる。
+fn run_verify(pool: &PgPool, args: &[&str]) -> (String, String, bool) {
+    let mut command = Command::new(cli_binary());
+    for key in [
+        "KAIKEI_TAX_MODE",
+        "KAIKEI_ROUNDING",
+        "KAIKEI_ROUNDING_UNIT",
+        "KAIKEI_IS_TAXABLE_BUSINESS",
+        "KAIKEI_SIMPLIFIED_TAXATION",
+    ] {
+        command.env_remove(key);
+    }
+    command
+        .args(["counterparty", "verify"])
+        .args(args)
+        .env("APP_DATABASE_URL", app_url(pool));
+    let output = command.output().expect("kaikei を起動できること");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.success(),
+    )
+}
+
+/// 取引先を1件、登録番号なしで入れる。
+async fn seed_counterparty(pool: &PgPool, code: &str, name: &str) {
+    sqlx::query(
+        "INSERT INTO counterparties (code, name) VALUES ($1, $2) \
+         ON CONFLICT (code) DO NOTHING",
+    )
+    .bind(code)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("取引先");
+}
+
+/// **本命。** 既存の取引先に登録番号を後から入れられる。
+///
+/// # この経路が無いと詰む
+///
+/// `counterparty import` は `ON CONFLICT DO NOTHING` なので、既存行に登録番号を
+/// 入れられない。**実帳簿の取引先31件はすべて登録番号が空**で、CSV から入れ
+/// 直そうとしても「既存を優先」で無視されていた（警告は出るが書き込まれない）。
+///
+/// 相手が適格請求書発行事業者かどうかは**後から分かる**情報なので、追加しか
+/// できないと運用が成り立たない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_registration_number_can_be_recorded_later(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_counterparty(&app, "jdf", "JDF株式会社").await;
+
+    let (stdout, stderr, ok) = run_verify(
+        &app,
+        &[
+            "--code",
+            "jdf",
+            "--registration-no",
+            "T7123456789012",
+            "--qualified",
+            "true",
+            "--on",
+            "2026-08-18",
+            "--commit",
+        ],
+    );
+
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("1 件を更新しました"), "{stdout}");
+
+    // 日付は文字列で受ける（この crate は chrono を直接持たない）。
+    let row: (String, Option<String>, Option<bool>, Option<String>) = sqlx::query_as(
+        "SELECT name, invoice_reg_no, is_qualified, verified_at::text          FROM counterparties WHERE code = 'jdf'",
+    )
+    .fetch_one(&app)
+    .await
+    .expect("取引先");
+
+    assert_eq!(row.0, "JDF株式会社", "**名前は変えない**");
+    assert_eq!(row.1.as_deref(), Some("T7123456789012"));
+    assert_eq!(row.2, Some(true));
+    assert_eq!(row.3.as_deref(), Some("2026-08-18"));
+}
+
+/// **本命。** 下見では書き込まない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_dry_run_does_not_write(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_counterparty(&app, "jdf", "JDF株式会社").await;
+
+    let (stdout, stderr, ok) = run_verify(
+        &app,
+        &["--code", "jdf", "--registration-no", "T7123456789012"],
+    );
+
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("下見"), "{stdout}");
+
+    let reg: Option<String> =
+        sqlx::query_scalar("SELECT invoice_reg_no FROM counterparties WHERE code = 'jdf'")
+            .fetch_one(&app)
+            .await
+            .expect("取引先");
+    assert_eq!(reg, None, "書き込んでいないこと");
+}
+
+/// **本命。** 「非適格と確認した」を記録できる。
+///
+/// 非適格と分かっていれば経過措置で処理できる。**「未確認」とは別物**である
+/// （D-122）。登録番号が無くても記録できなければならない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_non_qualified_issuer_can_be_recorded(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_counterparty(&app, "povo", "povo").await;
+
+    let (_stdout, stderr, ok) = run_verify(
+        &app,
+        &["--code", "povo", "--qualified", "false", "--commit"],
+    );
+
+    assert!(ok, "{stderr}");
+    let is_qualified: Option<bool> =
+        sqlx::query_scalar("SELECT is_qualified FROM counterparties WHERE code = 'povo'")
+            .fetch_one(&app)
+            .await
+            .expect("取引先");
+    assert_eq!(is_qualified, Some(false), "**未確認(NULL)と区別すること**");
+}
+
+/// **本命。** 省略した項目は既存の値を残す。
+///
+/// `None` をそのまま渡すと消える。登録番号を入れた後に `--qualified` だけを
+/// 直したとき、番号が消えてはいけない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_omitted_field_keeps_its_existing_value(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_counterparty(&app, "jdf", "JDF株式会社").await;
+    run_verify(
+        &app,
+        &[
+            "--code",
+            "jdf",
+            "--registration-no",
+            "T7123456789012",
+            "--commit",
+        ],
+    );
+
+    // 登録番号は指定せず、適格の判定だけ変える。
+    let (_stdout, stderr, ok) =
+        run_verify(&app, &["--code", "jdf", "--qualified", "true", "--commit"]);
+
+    assert!(ok, "{stderr}");
+    let reg: Option<String> =
+        sqlx::query_scalar("SELECT invoice_reg_no FROM counterparties WHERE code = 'jdf'")
+            .fetch_one(&app)
+            .await
+            .expect("取引先");
+    assert_eq!(
+        reg.as_deref(),
+        Some("T7123456789012"),
+        "省略した登録番号が消えないこと"
+    );
+}
+
+/// 登録番号の形（チェックデジット）が違えば、書き込む前に止める。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_bad_registration_number_is_rejected_before_writing(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_counterparty(&app, "jdf", "JDF株式会社").await;
+
+    let (_stdout, stderr, ok) = run_verify(
+        &app,
+        &[
+            "--code",
+            "jdf",
+            "--registration-no",
+            "T1234567890123",
+            "--commit",
+        ],
+    );
+
+    assert!(!ok, "止まること");
+    assert!(stderr.contains("チェックデジット"), "{stderr}");
+}
+
+/// 居ない取引先は、追加せずに止める。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_unknown_counterparty_stops(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+
+    let (_stdout, stderr, ok) = run_verify(
+        &app,
+        &["--code", "nosuch", "--qualified", "true", "--commit"],
+    );
+
+    assert!(!ok, "止まること");
+    assert!(stderr.contains("見つかりません"), "{stderr}");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM counterparties")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "**勝手に作らないこと**");
+}

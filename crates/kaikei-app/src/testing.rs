@@ -289,6 +289,25 @@ impl CounterpartyWriteRepo for InMemoryTx {
         }
         Ok(inserted)
     }
+
+    /// **この fake は更新を行わない。**
+    ///
+    /// 更新の効き目（既存行の3項目だけが変わり、名前が変わらないこと）は
+    /// **本物の DB でしか確かめられない**——ここで実装しても、検査するのは
+    /// この fake の挙動であって PostgreSQL の `UPDATE` ではない。
+    /// 検証は `kaikei-e2e` の pg-tests に置く（`PROGRESS.md`「fake では
+    /// 検証できないものがある」）。
+    ///
+    /// 呼ばれたことが分かるよう、更新した件数として 0 を返す。
+    async fn set_counterparty_invoice_status(
+        &mut self,
+        _code: &str,
+        _registration_no: Option<&str>,
+        _is_qualified: Option<bool>,
+        _verified_on: kaikei_core::AccountingDate,
+    ) -> Result<usize, RepoError> {
+        Ok(0)
+    }
 }
 
 #[async_trait]
