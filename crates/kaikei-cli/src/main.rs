@@ -64,6 +64,7 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei fixedasset dispose --id <UUID> --on <YYYY-MM-DD> [--commit]
     kaikei depreciation --year <西暦>
     kaikei household --year <西暦> --account <科目> --ratio <事業割合> [--amount <円>]
+    kaikei consumptiontax --year <西暦>
 
 report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
@@ -75,6 +76,7 @@ fixedasset list は台帳の中身を並べます（--year でその年度の償
 fixedasset dispose は資産を除却します（既定は下見。行は消しません）。
 depreciation は固定資産台帳から減価償却費を出します（記帳はしません）。
 household は決算時の家事按分の振替仕訳を出します（記帳はしません）。
+consumptiontax は消費税の申告に向けた集計を出します（申告書ではありません）。
     科目の一部だけが按分対象なら --amount でその額を指定します
     （例: 通信費のうち携帯代だけ。指定した額は計上額を超えられません）。
 
@@ -262,6 +264,9 @@ fn run() -> Result<Vec<PathBuf>, String> {
             ratio,
             amount,
         } => runtime.block_on(run_household(fiscal_year, &account, &ratio, amount)),
+        Command::ConsumptionTax { fiscal_year } => {
+            runtime.block_on(run_consumption_tax(fiscal_year))
+        }
         Command::FixedAsset(args) => runtime.block_on(run_fixed_asset_add(args)),
         Command::FixedAssetList { fiscal_year } => {
             runtime.block_on(run_fixed_asset_list(fiscal_year))
@@ -300,6 +305,8 @@ enum Command {
     Counterparty(CounterpartyArgs),
     /// 固定資産台帳から、その年度の減価償却費を出す。
     Depreciation { fiscal_year: i32 },
+    /// 消費税の申告に向けた集計を出す。
+    ConsumptionTax { fiscal_year: i32 },
     /// 決算時の家事按分の振替仕訳を出す。
     Household {
         fiscal_year: i32,
@@ -425,6 +432,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     if subcommand == "household" {
         return parse_household(&args[1..]);
+    }
+    if subcommand == "consumptiontax" {
+        return parse_consumption_tax(&args[1..]);
     }
     if subcommand == "fixedasset" {
         return parse_fixed_asset(&args[1..]);
@@ -2280,6 +2290,164 @@ fn jp_settings() -> Result<kaikei_jp::tax::JpSettings, String> {
         is_taxable_business: true,
         simplified_taxation: false,
     })
+}
+
+fn parse_consumption_tax(args: &[String]) -> Result<Command, String> {
+    let mut fiscal_year = None;
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?;
+        match key {
+            "--year" => {
+                fiscal_year = Some(value.parse::<i32>().map_err(|_| {
+                    format!("--year は西暦の数字で指定してください（受け取った値: {value}）")
+                })?)
+            }
+            other => {
+                return Err(format!(
+                    "不明な引数です: {other}
+
+{USAGE}"
+                ))
+            }
+        }
+        index += 2;
+    }
+    Ok(Command::ConsumptionTax {
+        fiscal_year: fiscal_year.ok_or("--year を指定してください（例: --year 2026）")?,
+    })
+}
+
+/// 消費税の申告に向けた集計を出す。
+///
+/// # 申告書ではない
+///
+/// 出すのは集計値だけである。**家事按分・適格の確認・端数処理の規定・
+/// 課税売上割合は反映していない**（`kaikei_jp::consumption_tax` の doc）。
+/// 何をどの欄に書くかは申告上の判断であり、このソフトは決めない。
+///
+/// # 税込経理でなければ止める
+///
+/// 税額は税込金額から割り戻す。税抜経理の帳簿でこれをやると**税額を二重に
+/// 数える**。黙って誤った数字を出すより止める。
+async fn run_consumption_tax(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
+    let settings = jp_settings()?;
+    if settings.tax_mode != kaikei_jp::tax::TaxMode::Exclusive {
+        // 税込経理。これが前提。
+    } else {
+        return Err(
+            "この集計は税込経理（KAIKEI_TAX_MODE=inclusive）の帳簿を前提にしています。
+             税抜経理では仮払・仮受消費税の明細から集計する必要があり、まだ作っていません。"
+                .to_string(),
+        );
+    }
+    if !settings.is_taxable_business {
+        println!(
+            "免税事業者の設定です（KAIKEI_IS_TAXABLE_BUSINESS=false）。消費税の申告はありません。"
+        );
+        return Ok(Vec::new());
+    }
+    if settings.simplified_taxation {
+        return Err("簡易課税の設定です。この集計は原則課税を前提にしています。
+             簡易課税では事業区分ごとのみなし仕入率が要り、まだ作っていません。"
+            .to_string());
+    }
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool);
+
+    let year = FiscalYear::calendar_year(fiscal_year);
+    let (from, to) = (year.start(), year.end());
+    let entries = with_tx_err(&store, move |tx| {
+        Box::pin(async move { tx.list_entries_in_period(from, to).await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| format!("帳簿を読めませんでした: {error}"))?;
+
+    let rule_sets = kaikei_jp::tax::TaxRuleSets::from_embedded()
+        .map_err(|error| format!("同梱の消費税区分マスタを読めませんでした: {error}"))?;
+    let table = rule_sets
+        .iter()
+        .next()
+        .ok_or("同梱の消費税区分マスタが空です")?;
+
+    let tax_key = kaikei_core::TagKey::parse("tax_category")
+        .map_err(|error| format!("タグキーを読めません: {error}"))?;
+    let lines: Vec<kaikei_jp::consumption_tax::TaggedLine> = entries
+        .iter()
+        .flat_map(|entry| entry.lines().iter())
+        .map(|line| kaikei_jp::consumption_tax::TaggedLine {
+            tax_category: match line.tags().get(&tax_key) {
+                Some(kaikei_core::TagValue::Code(code)) => Some(code.clone()),
+                _ => None,
+            },
+            side: line.side(),
+            amount: *line.amount(),
+        })
+        .collect();
+
+    let summary = kaikei_jp::consumption_tax::summarize(&lines, table)
+        .map_err(|error| format!("集計できませんでした: {error}"))?;
+
+    println!("{fiscal_year} 年の消費税の集計（原則課税・税込経理）");
+    println!();
+    for category in &summary.categories {
+        let tax = match &category.tax {
+            Some(tax) => format!("うち消費税相当額 {} 円", tax.to_display_string()),
+            None => "税額の計算対象外".to_string(),
+        };
+        // **全角の桁揃えは当てにしない。** Rust の `{:<28}` はバイト数でも
+        // 文字数でもなく char 数で数えるので、全角混じりでは揃わない。
+        // 揃えようとして崩れるより、区切り記号で読ませる。
+        println!(
+            "  {} … {} 円（{tax}）",
+            category.label,
+            category.amount.to_display_string()
+        );
+    }
+    println!();
+    println!(
+        "  課税売上（税込）  {} 円 / 消費税相当額 {} 円",
+        summary.taxable_sales().to_display_string(),
+        summary.tax_on_sales().to_display_string()
+    );
+    println!(
+        "  課税仕入（税込）  {} 円 / 消費税相当額 {} 円",
+        summary.taxable_purchases().to_display_string(),
+        summary.tax_on_purchases().to_display_string()
+    );
+
+    // **集計が不完全なら、必ず言う。** 数字だけ見せると揃っていると読める。
+    if summary.lines_without_a_category > 0 {
+        println!();
+        println!(
+            "注意: 税区分が付いていない明細が {} 件あります。",
+            summary.lines_without_a_category
+        );
+        println!("  口座や事業主貸のように税区分を持たない明細も含まれます。");
+        println!("  課税取引なのに付いていないものがあれば、その分は集計から抜けています。");
+    }
+    if summary.lines_with_an_unknown_category > 0 {
+        eprintln!();
+        eprintln!(
+            "注意: 同梱の税区分マスタに無いコードの明細が {} 件あります。",
+            summary.lines_with_an_unknown_category
+        );
+        eprintln!("  この分は集計に入っていません。");
+    }
+
+    println!();
+    println!("**これは申告書の金額ではありません。**");
+    println!("  家事按分・適格請求書発行事業者かどうかの確認・経過措置の控除割合・");
+    println!("  端数処理の規定・課税売上割合による按分は、いずれも反映していません。");
+    println!("  申告に使う前に税理士に確認してください。");
+    Ok(Vec::new())
 }
 
 fn parse_household(args: &[String]) -> Result<Command, String> {
@@ -6921,5 +7089,55 @@ abc,
                 "勘定科目表に「{name}」がありません。検査が効かなくなります"
             );
         }
+    }
+
+    // ---- kaikei consumptiontax ----
+
+    #[test]
+    fn consumption_tax_takes_a_year() {
+        match parse_args(&[
+            "consumptiontax".to_string(),
+            "--year".to_string(),
+            "2026".to_string(),
+        ])
+        .unwrap()
+        {
+            Command::ConsumptionTax { fiscal_year } => assert_eq!(fiscal_year, 2026),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn consumption_tax_requires_a_year() {
+        let error = parse_args(&["consumptiontax".to_string()]).unwrap_err();
+        assert!(error.contains("--year"), "{error}");
+    }
+
+    #[test]
+    fn consumption_tax_rejects_an_unknown_argument() {
+        let error = parse_args(&[
+            "consumptiontax".to_string(),
+            "--year".to_string(),
+            "2026".to_string(),
+            "--commit".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("--commit"), "{error}");
+    }
+
+    /// **本命。** 記帳する手段を持たない。
+    ///
+    /// 集計を出すだけで、仕訳は作らない（`depreciation` / `household` と
+    /// 同じ立場）。`--commit` を足したくなったら、まず「申告書の金額を
+    /// 誰が保証するのか」を決めること。
+    #[test]
+    fn consumption_tax_has_no_way_to_post_anything() {
+        let command = parse_args(&[
+            "consumptiontax".to_string(),
+            "--year".to_string(),
+            "2026".to_string(),
+        ])
+        .unwrap();
+        assert!(matches!(command, Command::ConsumptionTax { .. }));
     }
 }
