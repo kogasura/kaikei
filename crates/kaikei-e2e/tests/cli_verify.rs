@@ -1024,3 +1024,55 @@ async fn a_large_travel_expense_does_not_get_the_note(
         "3万円ちょうどは未満ではない: {stderr}"
     );
 }
+
+/// **本命。** 帳簿に償却対象の資産があるのに台帳が空なら指摘する。
+///
+/// **空の台帳を「ずれ無し」と読まない。** 台帳と帳簿を突き合わせる検査は
+/// 以前、台帳が空だと黙って戻っていた。実帳簿（資産 388,717円・台帳0件）で
+/// 何も出なかった。**考えうる最大のずれである。**
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_empty_fixed_asset_ledger_is_reported(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "210", "工具器具備品", 1).await;
+    seed_account(&app, "400", "元入金", 3).await;
+    seed_entry(&app, 1, "210", "400", 161_917).await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "指摘があっても検査は失敗しないこと: {stderr}");
+    assert!(stderr.contains("固定資産台帳は空です"), "{stderr}");
+    assert!(stderr.contains("161,917"), "金額を出すこと: {stderr}");
+    // **行き止まりにしない。** 台帳に入れれば計算できることを言う。
+    assert!(
+        stderr.contains("fixedasset add"),
+        "次の一手を示すこと: {stderr}"
+    );
+}
+
+/// 償却対象の資産が無ければ、台帳が空でも黙る。
+///
+/// 空の台帳そのものは異常ではない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_empty_ledger_is_fine_when_there_are_no_depreciable_assets(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    // 1=Asset。普通預金は償却対象ではない。
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "400", "元入金", 3).await;
+    seed_entry(&app, 1, "110", "400", 100_000).await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        !stderr.contains("固定資産台帳は空です"),
+        "償却対象が無ければ黙ること: {stderr}"
+    );
+}

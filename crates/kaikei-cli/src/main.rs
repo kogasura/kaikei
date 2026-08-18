@@ -4382,7 +4382,11 @@ fn warn_if_the_fixed_asset_ledger_does_not_match_the_book(
     balance_sheet: &kaikei_app::policy::Statement,
 ) -> Result<(), String> {
     if assets.is_empty() {
-        return Ok(());
+        // **空の台帳を「ずれ無し」と読まない。** 帳簿に償却対象の資産が
+        // あるのに台帳が空なら、それは考えうる最大のずれである。以前は
+        // ここで黙って戻っており、実帳簿（資産 388,717円・台帳0件）で
+        // 何も出なかった。
+        return warn_if_the_fixed_asset_ledger_is_empty(balance_sheet);
     }
     let ledger = fixed_asset_book_values(assets, fiscal_year)?;
     let mismatches = fixed_asset_accounts_that_do_not_match(&ledger, balance_sheet);
@@ -4404,6 +4408,57 @@ fn warn_if_the_fixed_asset_ledger_does_not_match_the_book(
         "  償却の記帳漏れ、記帳先の科目の取り違え、台帳の入力誤りのいずれかを疑ってください。"
     );
     eprintln!("  貸借は一致したままなので、決算書を見ても分かりません。");
+    Ok(())
+}
+
+/// 帳簿に償却対象の資産があるのに、固定資産台帳が空であることを知らせる。
+///
+/// # なぜ別の指摘にするのか
+///
+/// 「償却費が1円も計上されていません」という指摘は既にあるが、その文面は
+/// **「いくら償却するかはこのソフトでは決められません（取得年月日・耐用
+/// 年数・事業専用割合を持っていません）」**で終わっている。持っていない
+/// のは台帳が空だからであり、**台帳に入れれば計算できる。** 行き止まりの
+/// ように読める文面を、次の一手に変える。
+///
+/// # 資産が無ければ黙る
+///
+/// 空の台帳そのものは異常ではない。償却対象の資産を持たない帳簿もある。
+fn warn_if_the_fixed_asset_ledger_is_empty(
+    balance_sheet: &kaikei_app::policy::Statement,
+) -> Result<(), String> {
+    let hint = kaikei_jp::chart::load_depreciation_hint(kaikei_jp_data::CHART_SOLE_PROPRIETOR)
+        .map_err(|error| format!("科目表の depreciation 節を読めませんでした: {error}"))?;
+    let Some(hint) = hint else {
+        return Ok(());
+    };
+
+    let assets: Vec<(&kaikei_core::AccountCode, kaikei_core::Money)> = hint
+        .depreciable_accounts
+        .iter()
+        .map(|code| (code, amount_of(balance_sheet, code)))
+        .filter(|(_, amount)| !amount.is_zero())
+        .collect();
+    if assets.is_empty() {
+        return Ok(());
+    }
+
+    let total: i128 = assets.iter().map(|(_, amount)| amount.minor()).sum();
+    eprintln!();
+    eprintln!(
+        "注意: 帳簿に償却対象の資産が {} 件（{} 円）ありますが、固定資産台帳は空です。",
+        assets.len(),
+        kaikei_core::Money::from_minor(total, kaikei_core::Currency::JPY).to_display_string()
+    );
+    for (code, amount) in &assets {
+        eprintln!("  {} {} 円", code.as_str(), amount.to_display_string());
+    }
+    eprintln!("  台帳が空なので、償却費を計算できず、台帳と帳簿の突き合わせもできません。");
+    eprintln!("  取得年月日・取得価額・償却方法・耐用年数を入れると計算できます:");
+    eprintln!(
+        "    kaikei fixedasset add --name <名前> --account <科目> --acquired <YYYY-MM-DD> \\"
+    );
+    eprintln!("      --cost <円> --method <方法> [--life <年>] --commit");
     Ok(())
 }
 
