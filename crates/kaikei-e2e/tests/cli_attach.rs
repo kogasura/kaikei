@@ -26,18 +26,19 @@ use std::process::Command;
 const ENTRY_ID: &str = "11111111-1111-1111-1111-111111111111";
 
 fn cli_binary() -> PathBuf {
-    let test_exe = std::env::current_exe().expect("テスト実行ファイルの場所を取れること");
-    let profile_dir = test_exe
+    // **ソースの場所はここで決める。** CARGO_MANIFEST_DIR は kaikei-e2e を
+    // 指すので、CLI とその依存の位置を相対で辿る。
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .and_then(Path::parent)
-        .expect("<target>/<profile>/deps/ の2つ上");
-    let binary = profile_dir.join(format!("kaikei{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        binary.is_file(),
-        "kaikei の実行ファイルがありません: {}\n先に cargo build -p kaikei-cli を実行してください。",
-        binary.display()
-    );
-    binary
+        .expect("crates/ ディレクトリ");
+    kaikei_e2e::cli_binary_or_panic(&[
+        &crates.join("kaikei-cli"),
+        &crates.join("kaikei-app"),
+        &crates.join("kaikei-jp"),
+        &crates.join("kaikei-store"),
+        &crates.join("kaikei-report"),
+        &crates.join("kaikei-core"),
+    ])
 }
 
 fn app_url(pool: &PgPool) -> String {
