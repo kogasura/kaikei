@@ -1376,6 +1376,62 @@ fn unverified_counterparty_name(
     }
 }
 
+/// 非適格と**確認済み**の取引先なのに、適格請求書を前提とした税区分に
+/// なっている明細を挙げる。
+///
+/// # 控除しすぎになる
+///
+/// 相手が適格請求書発行事業者でないなら、その課税仕入れは経過措置の対象で
+/// あって全額控除できない（2026年9月まで80%、10月以降70%）。適格の区分の
+/// ままだと**全額控除しているのと同じ**になる。
+///
+/// 実帳簿で言えば、外注工賃 385,000円 の相手は個人で、適格かどうかを
+/// 確かめていない。**非適格と分かった場合、税額にして約7,000円の差**が出る。
+///
+/// # 「未確認」は対象にしない
+///
+/// `is_qualified_invoice_issuer` が `None` の相手は別の指摘で挙げている
+/// （D-122）。ここで挙げると、**確認が進んでいない帳簿では全部が二重に
+/// 出る**。ここは「調べた結果、非適格だと分かっている」相手だけを見る。
+///
+/// # 断定しない
+///
+/// 適格の区分を使うこと自体が誤りとは限らない——**確認より前に記帳した分**は
+/// 当然そうなる。「区分を見直してください」と言うにとどめる。
+fn lines_with_a_known_non_qualified_counterparty(
+    entries: &[kaikei_core::JournalEntry],
+    rule_sets: &kaikei_jp::tax::TaxRuleSets,
+    counterparties: &kaikei_app::policy::CounterpartyIndex,
+) -> (usize, i128, std::collections::BTreeSet<String>) {
+    let Ok(key) = kaikei_core::TagKey::parse("counterparty") else {
+        return (0, 0, std::collections::BTreeSet::new());
+    };
+    let mut count = 0usize;
+    let mut total = 0i128;
+    let mut names = std::collections::BTreeSet::new();
+    for line in entries.iter().flat_map(|entry| entry.lines().iter()) {
+        if line.side() != kaikei_core::Side::Debit {
+            continue;
+        }
+        if !line_requires_a_qualified_invoice(line.tags(), rule_sets) {
+            continue;
+        }
+        let Some(kaikei_core::TagValue::Code(code)) = line.tags().get(&key) else {
+            continue;
+        };
+        let Some(party) = counterparties.get(code) else {
+            continue;
+        };
+        // **確認済みで「非適格」の相手だけ。** 未確認（None）は別の指摘。
+        if party.is_qualified_invoice_issuer == Some(false) {
+            count += 1;
+            total += line.amount().minor();
+            names.insert(party.name.clone());
+        }
+    }
+    (count, total, names)
+}
+
 /// 上の件数を知らせる。
 fn warn_if_qualified_invoice_lacks_a_counterparty(
     entries: &[kaikei_core::JournalEntry],
@@ -1384,47 +1440,23 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
     let rule_sets = kaikei_jp::tax::TaxRuleSets::from_embedded()
         .map_err(|error| format!("同梱の消費税区分マスタを読めませんでした: {error}"))?;
 
-    let (debit, credit) = count_qualified_without_counterparty(entries, &rule_sets);
-    if debit + credit == 0 {
-        return Ok(());
-    }
-
-    eprintln!(
-        "注意: 課税仕入れの明細 {} 件に取引先が記録されていません。",
-        debit + credit
-    );
-    eprintln!("  誰との取引なのかを、帳簿から辿れません。");
-    eprintln!("  記帳するときに counterparty タグを付けると記録されます。");
-    // **借方と貸方を分けて言う。** 貸方に立つものは「仕入れ」ではなく返還
-    // （返金・値引き）か、家事按分のような**内部の振替**である。後者には
-    // そもそも相手方が存在しないので、「請求書を揃えてください」は的外れに
-    // なる。実際、家事按分を記帳したら3件増えた。
-    if credit > 0 {
-        eprintln!(
-            "  うち {credit} 件は貸方に立っています（返金・値引き、または家事按分などの内部の振替）。"
-        );
-        eprintln!("    返金・値引きに要るのは適格請求書ではなく適格返還請求書です。");
-        eprintln!("    内部の振替には相手方が無いので、取引先を付けようがありません。");
-    }
-    eprintln!(
-        "  仕入税額控除が認められるかどうかは、証憑の保存状況と相手方の登録状況で決まります。"
-    );
-
-    // **取引先が付いていれば済む話ではない。** 相手が適格請求書発行事業者か
-    // どうかを確かめていなければ、控除の根拠にならない。
-    let (unverified, names) =
-        count_counterparties_without_a_registration_number(entries, &rule_sets, counterparties);
-    if unverified > 0 {
+    // **非適格と確認済みの相手に、適格の税区分が付いていないか。**
+    // 控除しすぎになる（経過措置の対象なので全額は控除できない）。
+    let (non_qualified, amount, party_names) =
+        lines_with_a_known_non_qualified_counterparty(entries, &rule_sets, counterparties);
+    if non_qualified > 0 {
         eprintln!();
         eprintln!(
-            "  取引先が付いている明細のうち {unverified} 件は、相手の登録番号が分かりません。"
+            "注意: 非適格と確認済みの取引先に、適格請求書を前提とした税区分が付いた明細が {non_qualified} 件あります（{} 円）。",
+            kaikei_core::Money::from_minor(amount, kaikei_core::Currency::JPY).to_display_string()
         );
         eprintln!(
             "    {}",
-            names.iter().cloned().collect::<Vec<_>>().join(" / ")
+            party_names.iter().cloned().collect::<Vec<_>>().join(" / ")
         );
-        eprintln!("    「未確認」であって「非適格」ではありません。非適格と確認できれば");
-        eprintln!("    経過措置で処理できますが、未確認のままではどちらの扱いもできません。");
+        eprintln!("  経過措置の対象なので全額は控除できません（2026年9月まで80%、10月以降70%）。");
+        eprintln!("  税区分を非適格のものに見直してください。");
+        eprintln!("  ※ 確認より前に記帳した分は当然こうなります。誤りとは限りません。");
     }
 
     // **件数だけでは動けない。** 603件と言われても手の付けようがないが、
@@ -1454,6 +1486,53 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
         eprintln!("    このソフトでは判定していません（前々年の帳簿が無いことがあるため）。");
         eprintln!("    免除されるのは適格請求書の保存だけで、帳簿の記載事項は免除されません。");
         eprintln!("    令和11年9月30日で終わる特例です（28年改正法附則53の2）。");
+    }
+
+    // **3つの指摘は互いに独立している。**
+    //
+    // 以前はここで `debit + credit == 0` なら早期 return していた。すると
+    // 取引先が全部付いている帳簿では、下の「登録番号が分かりません」が
+    // **永久に出なかった**。取引先が付いていることと、その相手の登録状況を
+    // 確かめてあることは別の話である。
+    let (debit, credit) = count_qualified_without_counterparty(entries, &rule_sets);
+    if debit + credit > 0 {
+        eprintln!(
+            "注意: 課税仕入れの明細 {} 件に取引先が記録されていません。",
+            debit + credit
+        );
+        eprintln!("  誰との取引なのかを、帳簿から辿れません。");
+        eprintln!("  記帳するときに counterparty タグを付けると記録されます。");
+        // **借方と貸方を分けて言う。** 貸方に立つものは「仕入れ」ではなく返還
+        // （返金・値引き）か、家事按分のような**内部の振替**である。後者には
+        // そもそも相手方が存在しないので、「請求書を揃えてください」は的外れに
+        // なる。実際、家事按分を記帳したら3件増えた。
+        if credit > 0 {
+            eprintln!(
+                "  うち {credit} 件は貸方に立っています（返金・値引き、または家事按分などの内部の振替）。"
+            );
+            eprintln!("    返金・値引きに要るのは適格請求書ではなく適格返還請求書です。");
+            eprintln!("    内部の振替には相手方が無いので、取引先を付けようがありません。");
+        }
+        eprintln!(
+            "  仕入税額控除が認められるかどうかは、証憑の保存状況と相手方の登録状況で決まります。"
+        );
+    }
+
+    // **取引先が付いていれば済む話ではない。** 相手が適格請求書発行事業者か
+    // どうかを確かめていなければ、控除の根拠にならない。
+    let (unverified, names) =
+        count_counterparties_without_a_registration_number(entries, &rule_sets, counterparties);
+    if unverified > 0 {
+        eprintln!();
+        eprintln!(
+            "  取引先が付いている明細のうち {unverified} 件は、相手の登録番号が分かりません。"
+        );
+        eprintln!(
+            "    {}",
+            names.iter().cloned().collect::<Vec<_>>().join(" / ")
+        );
+        eprintln!("    「未確認」であって「非適格」ではありません。非適格と確認できれば");
+        eprintln!("    経過措置で処理できますが、未確認のままではどちらの扱いもできません。");
     }
     Ok(())
 }
@@ -7517,5 +7596,75 @@ abc,
         let error = parse_args(&["counterparty".to_string(), "unknown".to_string()]).unwrap_err();
         assert!(error.contains("import"), "{error}");
         assert!(error.contains("verify"), "{error}");
+    }
+    // ---- 非適格と確認済みの相手に適格の税区分（lines_with_a_known_non_qualified_counterparty） ----
+
+    /// タグ付きの明細を1本だけ持つ仕訳を作る代わりに、判定を明細のタグで見る。
+    /// **`JournalEntry` を組み立てるには chart / schema / guard / clock が要る**
+    /// ので、CLI のテストはタグ集合を組み立てる形に揃えている。
+    ///
+    /// ここでは集計まで見たいので、判定の中身（どの相手を拾うか）を
+    /// `unverified_counterparty_name` と同じ粒度で確かめる。
+    #[test]
+    fn a_confirmed_non_qualified_issuer_is_distinguished_from_an_unverified_one() {
+        let rule_sets = embedded_tax_rule_sets();
+        let parties = index(vec![
+            party("unknown", "未確認の相手", None, None),
+            party("not_qualified", "非適格と確認済み", None, Some(false)),
+            party(
+                "qualified",
+                "適格と確認済み",
+                Some("T7123456789012"),
+                Some(true),
+            ),
+        ]);
+
+        // 未確認だけが「登録番号が分からない」に挙がる。
+        assert_eq!(
+            unverified_counterparty_name(
+                &tags_of(Some("PURCHASE_10_QUALIFIED"), Some("not_qualified")),
+                &rule_sets,
+                &parties
+            ),
+            None,
+            "**非適格と確認済みは「未確認」ではない**"
+        );
+        assert_eq!(
+            unverified_counterparty_name(
+                &tags_of(Some("PURCHASE_10_QUALIFIED"), Some("unknown")),
+                &rule_sets,
+                &parties
+            ),
+            Some("未確認の相手".to_string())
+        );
+    }
+
+    /// **本命。** 非適格に対応する税区分が存在する。
+    ///
+    /// 「非適格のものに見直してください」と言う以上、見直す先が無いと
+    /// 案内にならない。
+    #[test]
+    fn a_non_qualified_tax_category_exists_to_switch_to() {
+        let rule_sets = embedded_tax_rule_sets();
+        for code in [
+            "PURCHASE_10_NON_QUALIFIED",
+            "PURCHASE_8_REDUCED_NON_QUALIFIED",
+        ] {
+            let found = rule_sets.iter().any(|table| table.category(code).is_ok());
+            assert!(found, "{code} が税区分マスタにありません");
+        }
+    }
+
+    /// 非適格の区分は適格請求書を要求しない（要求すると指摘が止まらなくなる）。
+    #[test]
+    fn the_non_qualified_category_does_not_require_an_invoice() {
+        let rule_sets = embedded_tax_rule_sets();
+        assert!(
+            !line_requires_a_qualified_invoice(
+                &tags_of(Some("PURCHASE_10_NON_QUALIFIED"), Some("x")),
+                &rule_sets
+            ),
+            "見直した先でまた指摘されては直しようがない"
+        );
     }
 }

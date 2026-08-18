@@ -57,3 +57,70 @@
 // 組み立て本体は `kaikei-jp` にある（`DECISIONS.md` D-068）。
 // この crate は「実 DB に繋ぐ E2E テスト」だけを持ち、組み立ての実装は持たない。
 pub use kaikei_jp::compose::{compose, ComposeError, ComposeOptions, Composition};
+
+/// CLI（`kaikei`）の実行ファイルの場所。**古ければ落とす。**
+///
+/// # なぜ「在るかどうか」だけでは足りないのか
+///
+/// E2E は `cargo` が組み立てたものではなく、`target/<profile>/kaikei` を
+/// **そのまま起動する**（`kaikei-e2e` は `kaikei-cli` に依存していない。
+/// 依存させると「誰からも依存されない」という architecture.yml の検査に
+/// 引っかかる）。つまり `cargo test -p kaikei-e2e` は CLI を組み直さない。
+///
+/// これで実際に騙された。`main.rs` に変異を入れて E2E が落ちるかを確かめた
+/// ところ、18件すべてが通った。**テストが弱いのではなく、古い実行ファイルを
+/// 起動していた**だけだった。変異を入れたつもりで何も変えていない、という
+/// のはいちばん質の悪い誤りである（テストが強いという誤った確信が残る）。
+///
+/// そこで、実行ファイルより新しい `.rs` があれば落とす。
+pub fn cli_binary_or_panic(source_roots: &[&std::path::Path]) -> std::path::PathBuf {
+    let test_exe = std::env::current_exe().expect("テスト実行ファイルの場所を取れること");
+    let profile_dir = test_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("<target>/<profile>/deps/ の2つ上");
+    let binary = profile_dir.join(format!("kaikei{}", std::env::consts::EXE_SUFFIX));
+    let built_at = std::fs::metadata(&binary).and_then(|m| m.modified()).unwrap_or_else(|error| {
+        panic!(
+            "kaikei の実行ファイルを読めません: {}（{error}）\n先に cargo build -p kaikei-cli を実行してください。",
+            binary.display()
+        )
+    });
+
+    if let Some(newer) = source_roots
+        .iter()
+        .find_map(|root| newest_source_after(root, built_at))
+    {
+        panic!(
+            "kaikei の実行ファイルが古いままです。\n  実行ファイル: {}\n  これより新しいソース: {}\n\
+             cargo test -p kaikei-e2e は CLI を組み直しません。\n先に cargo build -p kaikei-cli を実行してください。",
+            binary.display(),
+            newer.display()
+        );
+    }
+    binary
+}
+
+/// `root` 以下で `built_at` より新しい `.rs` を1つ返す。
+fn newest_source_after(
+    root: &std::path::Path,
+    built_at: std::time::SystemTime,
+) -> Option<std::path::PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|at| at > built_at)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}

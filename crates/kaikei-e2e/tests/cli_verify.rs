@@ -30,21 +30,19 @@ use std::process::Command;
 /// テスト実行ファイルは `<target>/<profile>/deps/` に置かれるので、その2つ上
 /// が `cargo build` の成果物ディレクトリである。
 fn cli_binary() -> PathBuf {
-    let test_exe = std::env::current_exe().expect("テスト実行ファイルの場所を取れること");
-    let profile_dir = test_exe
+    // **ソースの場所はここで決める。** CARGO_MANIFEST_DIR は kaikei-e2e を
+    // 指すので、CLI とその依存の位置を相対で辿る。
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .and_then(Path::parent)
-        .expect("<target>/<profile>/deps/ の2つ上を取れること");
-    let binary = profile_dir.join(format!("kaikei{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        binary.is_file(),
-        "kaikei の実行ファイルがありません: {}\n\
-         この検査は**実バイナリ**を起動します。先に\n\
-         \x20 cargo build -p kaikei-cli\n\
-         を実行してください。",
-        binary.display()
-    );
-    binary
+        .expect("crates/ ディレクトリ");
+    kaikei_e2e::cli_binary_or_panic(&[
+        &crates.join("kaikei-cli"),
+        &crates.join("kaikei-app"),
+        &crates.join("kaikei-jp"),
+        &crates.join("kaikei-store"),
+        &crates.join("kaikei-report"),
+        &crates.join("kaikei-core"),
+    ])
 }
 
 /// 使い捨てDBへの接続文字列（`kaikei_app` ロール）。
@@ -758,4 +756,157 @@ async fn verify_is_quiet_on_a_healthy_book(pool_opts: PgPoolOptions, conn_opts: 
     assert!(!stderr.contains("減価償却費"), "固定資産が無い: {stderr}");
     assert!(!stderr.contains("逆になっている"), "{stderr}");
     assert!(stdout.contains("不整合は見つかりませんでした"), "{stdout}");
+}
+
+/// **本命。** 非適格と確認済みの相手に、適格の税区分が付いていたら知らせる。
+///
+/// # 控除しすぎになる
+///
+/// 相手が適格請求書発行事業者でないなら経過措置の対象で、全額は控除できない
+/// （2026年9月まで80%、10月以降70%）。適格の区分のままだと全額控除している
+/// のと同じになる。
+///
+/// # `counterparty verify` で記録した結果が、その場で効く
+///
+/// 記録する経路（D-134）を作っても、使う側が無ければ意味がない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_confirmed_non_qualified_counterparty_with_a_qualified_category_is_reported(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    sqlx::query(
+        "INSERT INTO counterparties (code, name, is_qualified) VALUES ('povo','povo',false)",
+    )
+    .execute(&app)
+    .await
+    .expect("取引先");
+    seed_entry_with_tags(
+        &app,
+        1,
+        "609",
+        "110",
+        550,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}, "counterparty": {"t": "code", "v": "povo"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "指摘があっても検査は失敗しないこと: {stderr}");
+    assert!(stderr.contains("非適格と確認済み"), "{stderr}");
+    assert!(stderr.contains("povo"), "相手の名前を出すこと: {stderr}");
+    assert!(stderr.contains("550"), "金額を出すこと: {stderr}");
+    assert!(stderr.contains("経過措置"), "{stderr}");
+}
+
+/// **本命。** 未確認の相手はこの指摘に出さない。
+///
+/// 未確認は別の指摘（「登録番号が分かりません」）で挙げている。**両方に出すと、
+/// 確認が進んでいない帳簿では全部が二重に出る。**
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn an_unverified_counterparty_is_not_in_this_finding(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    sqlx::query("INSERT INTO counterparties (code, name) VALUES ('apple','Apple')")
+        .execute(&app)
+        .await
+        .expect("取引先");
+    seed_entry_with_tags(
+        &app,
+        1,
+        "609",
+        "110",
+        150,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}, "counterparty": {"t": "code", "v": "apple"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("登録番号が分かりません"),
+        "未確認の指摘には出ること: {stderr}"
+    );
+    assert!(
+        !stderr.contains("非適格と確認済み"),
+        "非適格の指摘には出さないこと: {stderr}"
+    );
+}
+
+/// 適格と確認済みなら、どちらの指摘にも出ない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_confirmed_qualified_counterparty_is_quiet(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    sqlx::query(
+        "INSERT INTO counterparties (code, name, invoice_reg_no, is_qualified) \
+         VALUES ('jdf','JDF株式会社','T7123456789012',true)",
+    )
+    .execute(&app)
+    .await
+    .expect("取引先");
+    seed_entry_with_tags(
+        &app,
+        1,
+        "609",
+        "110",
+        1_000,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}, "counterparty": {"t": "code", "v": "jdf"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("非適格と確認済み"), "{stderr}");
+    assert!(!stderr.contains("登録番号が分かりません"), "{stderr}");
+}
+
+/// 非適格の税区分に直したら、指摘は消える。
+///
+/// **見直した先でまた指摘されては直しようがない。**
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn switching_to_the_non_qualified_category_clears_the_finding(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "609", "通信費", 5).await;
+    seed_account(&app, "110", "普通預金", 1).await;
+    sqlx::query(
+        "INSERT INTO counterparties (code, name, is_qualified) VALUES ('povo','povo',false)",
+    )
+    .execute(&app)
+    .await
+    .expect("取引先");
+    seed_entry_with_tags(
+        &app,
+        1,
+        "609",
+        "110",
+        550,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_NON_QUALIFIED"}, "counterparty": {"t": "code", "v": "povo"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("非適格と確認済み"), "{stderr}");
 }
