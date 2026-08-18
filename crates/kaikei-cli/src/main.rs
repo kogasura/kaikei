@@ -7412,7 +7412,7 @@ abc,
 
         // 指摘は stderr に出るので、ここで見るのは「落ちないこと」と
         // 「呼び出しが成功すること」である。中身の判定は下の2つが持つ。
-        assert!(warn_if_depreciation_is_missing(&pl, &bs).is_ok());
+        assert!(warn_if_depreciation_is_missing(&pl, &bs, &[]).is_ok());
     }
 
     /// **本命。** 対象になる資産が無ければ指摘しない。
@@ -7422,7 +7422,7 @@ abc,
         // 現金しかない帳簿。
         let bs = statement("貸借対照表", vec![("100", 552_542)]);
 
-        assert!(warn_if_depreciation_is_missing(&pl, &bs).is_ok());
+        assert!(warn_if_depreciation_is_missing(&pl, &bs, &[]).is_ok());
     }
 
     /// 指摘の対象になる帳簿でも、出力そのものは止めない。
@@ -7435,7 +7435,7 @@ abc,
         let bs = statement("貸借対照表", vec![("210", 161_917)]);
 
         assert!(
-            warn_if_depreciation_is_missing(&pl, &bs).is_ok(),
+            warn_if_depreciation_is_missing(&pl, &bs, &[]).is_ok(),
             "指摘しても出力は続けること"
         );
     }
