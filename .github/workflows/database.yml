@@ -10,7 +10,12 @@
 name: database
 
 on:
+  # **PR ブランチへの push では走らせない。** `pull_request` 側と二重に
+  # 起動し、同じコミットに対して同じジョブが2回走る。CI の時間が倍に
+  # なるうえ、片方がキューに滞留すると必須チェックが揃わずマージできない
+  # （実際に27分滞留して止まった）。main への push はマージ後の確認として残す。
   push:
+    branches: [main]
   pull_request:
 
 jobs:
