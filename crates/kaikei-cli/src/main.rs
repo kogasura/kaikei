@@ -58,6 +58,8 @@ kaikei — 帳簿を CSV と印刷用 HTML で書き出します
     kaikei import --profile <プロファイル.yaml> --file <明細.csv> [--commit]
     kaikei journalize --rules <ルール.yaml> [--year <西暦>]
     kaikei counterparty import --file <取引先.csv> [--commit]
+    kaikei counterparty verify --code <取引先> [--registration-no <T+13桁>]
+                               [--qualified true|false] [--on <YYYY-MM-DD>] [--commit]
     kaikei fixedasset add --name <名前> --account <科目> --acquired <YYYY-MM-DD>
                           --cost <円> --method <方法> [--life <年>] [--commit]
     kaikei fixedasset list [--year <西暦>]
@@ -70,7 +72,9 @@ report は帳簿をファイルに書き出します。
 verify は帳簿の整合性を検査します（書き出しません）。
 import は銀行・カードの明細 CSV を取り込みます。
 journalize は取り込んだ明細にルールを当てて、仕訳の案を見せます。
-counterparty import は取引先マスタを CSV から投入します。
+counterparty import は取引先マスタを CSV から投入します（既存は上書きしません）。
+counterparty verify は既存の取引先に適格請求書発行事業者の登録番号と
+    確認結果を記録します。**名前とコードは変えません。**
 fixedasset add は固定資産を台帳に入れます（既定は下見）。
 fixedasset list は台帳の中身を並べます（--year でその年度の償却費も出ます）。
 fixedasset dispose は資産を除却します（既定は下見。行は消しません）。
@@ -261,6 +265,19 @@ fn run() -> Result<Vec<PathBuf>, String> {
         Command::Import(args) => runtime.block_on(run_import(args)),
         Command::Journalize(args) => runtime.block_on(run_journalize(args)),
         Command::Counterparty(args) => runtime.block_on(run_counterparty_import(args)),
+        Command::CounterpartyVerify {
+            code,
+            registration_no,
+            is_qualified,
+            verified_on,
+            commit,
+        } => runtime.block_on(run_counterparty_verify(
+            code,
+            registration_no,
+            is_qualified,
+            verified_on,
+            commit,
+        )),
         Command::Depreciation { fiscal_year } => runtime.block_on(run_depreciation(fiscal_year)),
         Command::Household {
             fiscal_year,
@@ -307,6 +324,14 @@ enum Command {
     Journalize(JournalizeArgs),
     /// 取引先マスタを CSV から投入する。
     Counterparty(CounterpartyArgs),
+    /// 既存の取引先に適格請求書発行事業者の情報を記録する。
+    CounterpartyVerify {
+        code: String,
+        registration_no: Option<String>,
+        is_qualified: Option<bool>,
+        verified_on: Option<AccountingDate>,
+        commit: bool,
+    },
     /// 固定資産台帳から、その年度の減価償却費を出す。
     Depreciation { fiscal_year: i32 },
     /// 消費税の申告に向けた集計を出す。
@@ -2827,15 +2852,202 @@ fn method_label(method: i16) -> &'static str {
     }
 }
 
+/// 既存の取引先に、適格請求書発行事業者の登録番号と確認結果を記録する。
+///
+/// # なぜ要るのか
+///
+/// 相手が適格請求書発行事業者かどうかは**後から分かる**情報である。取引を
+/// 記帳した時点では未確認で、あとで先方に伺って埋める。`counterparty import`
+/// は既存を上書きしないので、この経路が無いと**一度作った取引先には
+/// 二度と登録番号を入れられない**（実帳簿の31件がその状態だった）。
+///
+/// # 名前は変えない
+///
+/// 変えるのは登録番号・適格の確認結果・確認日だけ。**名前を変えられると、
+/// 過去の仕訳が指している相手が静かに別物になる。**
+///
+/// # 既定は下見
+///
+/// 何がどう変わるかを見せてから、`--commit` で書き込む。
+async fn run_counterparty_verify(
+    code: String,
+    registration_no: Option<String>,
+    is_qualified: Option<bool>,
+    verified_on: Option<AccountingDate>,
+    commit: bool,
+) -> Result<Vec<PathBuf>, String> {
+    use kaikei_app::ports::{ChartRepo, CounterpartyWriteRepo};
+
+    // 登録番号の形を先に見る。**書き込んでから気づいても遅い**
+    // （帳簿ではないので直せるが、誤った番号は「確認済み」に見える）。
+    if let Some(number) = &registration_no {
+        kaikei_jp::invoice::InvoiceRegistrationNo::parse(number)
+            .map_err(|error| format!("登録番号の形が正しくありません: {error}"))?;
+    }
+
+    // **確認日は省略できる。** 省略時は今日（JST）。日付を打たせると、
+    // 「いつ確認したか」を記録する目的なのに打ち間違いが入りうる。
+    let on = match verified_on {
+        Some(date) => date,
+        None => {
+            use chrono::Datelike;
+            let now = chrono::Local::now().date_naive();
+            AccountingDate::new(now.year(), now.month() as u8, now.day() as u8)
+                .map_err(|error| format!("今日の日付を作れませんでした: {error}"))?
+        }
+    };
+
+    let database_url = env_var("APP_DATABASE_URL")?;
+    let pool = connect_app(&database_url)
+        .await
+        .map_err(|error| format!("PostgreSQL に接続できませんでした: {error}"))?;
+    let store = PgStore::new(pool);
+
+    let counterparties = with_tx_err(&store, |tx| {
+        Box::pin(async move { tx.load_counterparties().await })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| {
+        format!("取引先マスタを読めませんでした: {error}")
+    })?;
+
+    let before = counterparties.get(&code).ok_or_else(|| {
+        format!("取引先 {code} が見つかりません。kaikei counterparty import で先に登録してください")
+    })?;
+
+    println!("{}（{}）", before.name, before.code);
+    println!(
+        "  登録番号  {} → {}",
+        before
+            .invoice_registration_no
+            .clone()
+            .unwrap_or_else(|| "（なし）".to_string()),
+        registration_no
+            .clone()
+            .unwrap_or_else(|| "（変えません）".to_string())
+    );
+    println!(
+        "  適格      {} → {}",
+        match before.is_qualified_invoice_issuer {
+            Some(true) => "適格",
+            Some(false) => "非適格",
+            None => "（未確認）",
+        },
+        match is_qualified {
+            Some(true) => "適格".to_string(),
+            Some(false) => "非適格".to_string(),
+            None => "（変えません）".to_string(),
+        }
+    );
+    println!("  確認日    {}", on.to_iso_string());
+
+    if !commit {
+        println!();
+        println!("下見です。まだ書き込んでいません。");
+        println!("この内容でよければ --commit を付けて実行してください。");
+        return Ok(Vec::new());
+    }
+
+    // **省略した項目は既存の値を残す。** `None` をそのまま渡すと消える。
+    let reg = registration_no.or_else(|| before.invoice_registration_no.clone());
+    let qualified = is_qualified.or(before.is_qualified_invoice_issuer);
+
+    let updated = with_tx_err(&store, move |tx| {
+        let code = code.clone();
+        let reg = reg.clone();
+        Box::pin(async move {
+            tx.set_counterparty_invoice_status(&code, reg.as_deref(), qualified, on)
+                .await
+        })
+    })
+    .await
+    .map_err(|error: kaikei_app::error::RepoError| format!("記録できませんでした: {error}"))?;
+
+    println!();
+    println!("{updated} 件を更新しました。");
+    Ok(Vec::new())
+}
+
+/// `kaikei counterparty verify` の引数を解析する。
+///
+/// # なぜ `import` と分けるのか
+///
+/// **一括投入と1件ずつの確認は別の操作である。** 前者は「まとめて取り込む」
+/// で既存を上書きしない。後者は「調べた結果を記録する」で、上書きするのが
+/// 目的である。同じコマンドにすると、取り込みのつもりが上書きになる。
+fn parse_counterparty_verify(args: &[String]) -> Result<Command, String> {
+    let mut code = None;
+    let mut registration_no = None;
+    let mut is_qualified = None;
+    let mut verified_on = None;
+    let mut commit = false;
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index].as_str();
+        if key == "--commit" {
+            commit = true;
+            index += 1;
+            continue;
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{key} の値がありません"))?;
+        match key {
+            "--code" => code = Some(value.clone()),
+            "--registration-no" => registration_no = Some(value.clone()),
+            "--qualified" => {
+                is_qualified = Some(match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!(
+                            "--qualified は true か false で指定してください（受け取った値: {other}）。「未確認」を表したいなら、この引数を付けないでください。"
+                        ))
+                    }
+                })
+            }
+            "--on" => {
+                verified_on = Some(
+                    AccountingDate::parse(value)
+                        .map_err(|error| format!("--on は YYYY-MM-DD で指定してください: {error}"))?,
+                )
+            }
+            other => return Err(format!("不明な引数です: {other}")),
+        }
+        index += 2;
+    }
+
+    // **何も変えない呼び出しを黙って通さない。** 打ち間違いで
+    // `--registration-no` を落とすと、確認日だけが更新されて
+    // 「確認したのに何も分からなかった」状態になる。
+    if registration_no.is_none() && is_qualified.is_none() {
+        return Err(
+            "--registration-no か --qualified のどちらかを指定してください。どちらも無いと、確認日だけが変わって中身は変わりません。"
+                .to_string(),
+        );
+    }
+
+    Ok(Command::CounterpartyVerify {
+        code: code.ok_or("--code を指定してください（例: --code jdf）")?,
+        registration_no,
+        is_qualified,
+        verified_on,
+        commit,
+    })
+}
+
 fn parse_counterparty(args: &[String]) -> Result<Command, String> {
     let Some(action) = args.first() else {
         return Err(format!(
             "counterparty の後に import を指定してください\n\n{USAGE}"
         ));
     };
+    if action == "verify" {
+        return parse_counterparty_verify(&args[1..]);
+    }
     if action != "import" {
         return Err(format!(
-            "counterparty のサブコマンドは import だけです（受け取った値: {action}）\n\n{USAGE}"
+            "counterparty のサブコマンドは import と verify です（受け取った値: {action}）\n\n{USAGE}"
         ));
     }
 
@@ -7202,5 +7414,108 @@ abc,
         ])
         .unwrap();
         assert!(matches!(command, Command::ConsumptionTax { .. }));
+    }
+    // ---- kaikei counterparty verify ----
+
+    fn verify_args(rest: &[&str]) -> Vec<String> {
+        let mut v = vec!["counterparty".to_string(), "verify".to_string()];
+        v.extend(rest.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn counterparty_verify_takes_a_registration_number() {
+        match parse_args(&verify_args(&[
+            "--code",
+            "jdf",
+            "--registration-no",
+            "T7123456789012",
+        ]))
+        .unwrap()
+        {
+            Command::CounterpartyVerify {
+                code,
+                registration_no,
+                is_qualified,
+                commit,
+                ..
+            } => {
+                assert_eq!(code, "jdf");
+                assert_eq!(registration_no.as_deref(), Some("T7123456789012"));
+                assert_eq!(is_qualified, None, "指定しなければ変えない");
+                assert!(!commit, "既定は下見");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // **本命。** 「非適格と確認した」を記録できる。
+    //
+    // 非適格と分かっていれば経過措置で処理できる。**「未確認」とは別物**
+    // なので、false を記録する手段が要る（D-122）。
+    #[test]
+    fn counterparty_verify_can_record_a_non_qualified_issuer() {
+        match parse_args(&verify_args(&["--code", "povo", "--qualified", "false"])).unwrap() {
+            Command::CounterpartyVerify { is_qualified, .. } => {
+                assert_eq!(is_qualified, Some(false));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // **本命。** 何も変えない呼び出しを断る。
+    //
+    // 打ち間違いで `--registration-no` を落とすと、確認日だけが更新されて
+    // 「確認したのに何も分からなかった」状態になる。
+    #[test]
+    fn counterparty_verify_refuses_a_call_that_changes_nothing() {
+        let error = parse_args(&verify_args(&["--code", "jdf"])).unwrap_err();
+        assert!(error.contains("--registration-no"), "{error}");
+        assert!(error.contains("--qualified"), "{error}");
+    }
+
+    // **本命。** 「未確認」を true/false で表さない。
+    #[test]
+    fn counterparty_verify_rejects_a_qualified_value_that_is_not_a_boolean() {
+        let error =
+            parse_args(&verify_args(&["--code", "jdf", "--qualified", "maybe"])).unwrap_err();
+        assert!(error.contains("true"), "{error}");
+        assert!(
+            error.contains("未確認"),
+            "付けなければ未確認だと言うこと: {error}"
+        );
+    }
+
+    #[test]
+    fn counterparty_verify_requires_a_code() {
+        let error = parse_args(&verify_args(&["--qualified", "true"])).unwrap_err();
+        assert!(error.contains("--code"), "{error}");
+    }
+
+    #[test]
+    fn counterparty_verify_takes_a_verification_date() {
+        match parse_args(&verify_args(&[
+            "--code",
+            "jdf",
+            "--qualified",
+            "true",
+            "--on",
+            "2026-08-18",
+        ]))
+        .unwrap()
+        {
+            Command::CounterpartyVerify { verified_on, .. } => {
+                assert_eq!(verified_on.unwrap().to_iso_string(), "2026-08-18");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // import は verify を巻き込まない（別の操作である）。
+    #[test]
+    fn counterparty_import_is_still_its_own_subcommand() {
+        let error = parse_args(&["counterparty".to_string(), "unknown".to_string()]).unwrap_err();
+        assert!(error.contains("import"), "{error}");
+        assert!(error.contains("verify"), "{error}");
     }
 }
