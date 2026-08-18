@@ -62,15 +62,24 @@ jobs:
         with:
           components: clippy
 
-      - name: postgresql-client をインストール
-        # **時間の上限を置く。** `apt-get update` がミラーの応答待ちで無限に
-        # 止まることがある（2026-08-18 に16分以上ハングし、必須チェックが
-        # 揃わずマージできなくなった）。GitHub Actions の既定は6時間なので、
-        # 放っておくと気づくまで詰まり続ける。
+      - name: psql を用意する
+        # **入っていれば apt を触らない。** GitHub のランナー画像には
+        # postgresql-client が含まれている。それでも毎回 `apt-get update` を
+        # 走らせていたため、ミラー（azure.archive.ubuntu.com）が落ちた日に
+        # 16分ハングし、必須チェックが揃わずマージできなくなった
+        # （2026-08-18）。**要らない仕事が、一番弱い依存を毎回踏んでいた。**
+        #
+        # 上限も置く。`timeout-minutes` は「諦める」だけで「やり直す」ことは
+        # しないが、6時間待つよりはよい（既定は6時間）。
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          # ミラーが落ちていても待ち続けない。取得できなければ次へ進む。
+          if command -v psql >/dev/null 2>&1; then
+            echo "psql は既にあります: $(psql --version)"
+            exit 0
+          fi
+          echo "psql が無いので入れます"
+          # ミラーが落ちていても待ち続けない。
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
           sudo apt-get install --yes --no-install-recommends postgresql-client
 
