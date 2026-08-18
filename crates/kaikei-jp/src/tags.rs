@@ -647,7 +647,7 @@ tags:
         let tags = catalog
             .parse_tag_set([
                 ("tax_category", "SALES_10"),
-                ("invoice_reg_no", "T1234567890123"),
+                ("invoice_reg_no", "T7123456789012"),
                 ("business_ratio", "0.30"),
                 ("delivered_on", "2026-04-15"),
             ])
@@ -659,7 +659,7 @@ tags:
         );
         assert_eq!(
             tags.get(&TagKey::parse("invoice_reg_no").unwrap()),
-            Some(&TagValue::Text("T1234567890123".to_string()))
+            Some(&TagValue::Text("T7123456789012".to_string()))
         );
         assert_eq!(
             tags.get(&TagKey::parse("business_ratio").unwrap()),
@@ -684,7 +684,7 @@ tags:
         let catalog = all_types_catalog();
         for (key, text) in [
             ("tax_category", "SALES_10"),
-            ("invoice_reg_no", "T1234567890123"),
+            ("invoice_reg_no", "T7123456789012"),
             ("business_ratio", "0.30"),
             ("delivered_on", "2026-04-15"),
         ] {

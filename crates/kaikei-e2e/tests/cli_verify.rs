@@ -74,6 +74,10 @@ fn run_verify(pool: &PgPool) -> (String, String, bool) {
         "KAIKEI_ROUNDING_UNIT",
         "KAIKEI_IS_TAXABLE_BUSINESS",
         "KAIKEI_SIMPLIFIED_TAXATION",
+        // **手元の .env が漏れると、CIと違う結果になる。** 2026-08-18 に
+        // KAIKEI_BLOB_ROOT を .env へ入れたところ、verify が証憑の中身を
+        // 検証しようとして手元だけ落ちた（CIには無いので通る）。
+        "KAIKEI_BLOB_ROOT",
     ] {
         command.env_remove(key);
     }

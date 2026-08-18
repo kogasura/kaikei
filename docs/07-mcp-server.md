@@ -394,7 +394,7 @@ DB 所有者権限での手動操作以外に手段は無い。
   | `value_type` | 線上の文字列 | 例 |
   |---|---|---|
   | `Code` | そのまま | `"tax_category": "SALES_10"` |
-  | `Text` | そのまま | `"invoice_reg_no": "T1234567890123"` |
+  | `Text` | そのまま | `"invoice_reg_no": "T7123456789012"` |
   | `Decimal` | 小数の文字列（number にしない。D-013） | `"business_ratio": "0.30"` |
   | `Date` | ISO 8601（`YYYY-MM-DD`） | `"delivered_on": "2026-04-15"` |
 

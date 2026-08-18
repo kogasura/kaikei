@@ -365,7 +365,7 @@ mod tests {
                 input: "T123456789012A".to_string(),
             },
             JpError::InvoiceRegNoCheckDigit {
-                input: "T1234567890123".to_string(),
+                input: "T7123456789012".to_string(),
                 expected: 5,
                 actual: 1,
             },
