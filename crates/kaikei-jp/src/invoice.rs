@@ -76,7 +76,7 @@ impl InvoiceRegistrationNo {
         Ok(InvoiceRegistrationNo(s.to_string()))
     }
 
-    /// 登録番号の文字列表現を返す（例: `"T1234567890123"`）。
+    /// 登録番号の文字列表現を返す（例: `"T7123456789012"`）。
     pub fn as_str(&self) -> &str {
         &self.0
     }

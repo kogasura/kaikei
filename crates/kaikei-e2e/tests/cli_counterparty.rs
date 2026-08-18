@@ -55,6 +55,10 @@ fn run_import(pool: &PgPool, csv: &Path, commit: bool) -> (String, String, bool)
         "KAIKEI_ROUNDING_UNIT",
         "KAIKEI_IS_TAXABLE_BUSINESS",
         "KAIKEI_SIMPLIFIED_TAXATION",
+        // **手元の .env が漏れると、CIと違う結果になる。** 2026-08-18 に
+        // KAIKEI_BLOB_ROOT を .env へ入れたところ、verify が証憑の中身を
+        // 検証しようとして手元だけ落ちた（CIには無いので通る）。
+        "KAIKEI_BLOB_ROOT",
     ] {
         command.env_remove(key);
     }
@@ -118,7 +122,7 @@ async fn commit_actually_inserts_rows(pool_opts: PgPoolOptions, conn_opts: PgCon
         "kaikei_cp_commit.csv",
         "code,name,invoice_registration_no,is_qualified\n\
          anthropic,Anthropic,,\n\
-         bitech,株式会社ビーテック,T1234567890123,true\n",
+         bitech,株式会社ビーテック,T7123456789012,true\n",
     );
 
     let (stdout, stderr, ok) = run_import(&app, &csv, true);
@@ -218,6 +222,10 @@ fn run_verify(pool: &PgPool, args: &[&str]) -> (String, String, bool) {
         "KAIKEI_ROUNDING_UNIT",
         "KAIKEI_IS_TAXABLE_BUSINESS",
         "KAIKEI_SIMPLIFIED_TAXATION",
+        // **手元の .env が漏れると、CIと違う結果になる。** 2026-08-18 に
+        // KAIKEI_BLOB_ROOT を .env へ入れたところ、verify が証憑の中身を
+        // 検証しようとして手元だけ落ちた（CIには無いので通る）。
+        "KAIKEI_BLOB_ROOT",
     ] {
         command.env_remove(key);
     }
@@ -403,7 +411,11 @@ async fn a_bad_registration_number_is_rejected_before_writing(
             "--code",
             "jdf",
             "--registration-no",
-            "T1234567890123",
+            // **わざと検査用数字を誤らせた番号。** 基礎番号 123456789012 の
+            // 検査用数字は 7 なので、先頭の 1 は誤りである。
+            // 一括置換でここまで正しい番号にしないこと（実際にやって、
+            // 「弾かれること」を確かめるテストが弾かれなくなった）。
+            "T1123456789012",
             "--commit",
         ],
     );

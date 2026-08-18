@@ -3255,6 +3255,19 @@ fn parse_counterparty_csv(text: &str) -> Result<Vec<CounterpartyRow>, String> {
         }
 
         let invoice_registration_no = cell(reg_at).filter(|text| !text.is_empty());
+        // **登録番号の形をここで見る。** is_qualified は厳しく見ているのに
+        // 登録番号は素通しだった。打ち間違えた番号がそのまま入り、あとから
+        // 見ると「確認済み」に見える——控除の根拠が静かに崩れる。
+        //
+        // チェックデジットは法人番号のアルゴリズムだが、**法人番号を持たない
+        // 個人事業者の登録番号でも成り立つ**（実在の個人事業者の番号1件で
+        // 確かめた。基礎番号12桁から計算した検査用数字が先頭桁と一致した）。
+        // 個人事業者だからと素通しにする必要はない。
+        if let Some(number) = &invoice_registration_no {
+            kaikei_jp::invoice::InvoiceRegistrationNo::parse(number).map_err(|error| {
+                format!("{line_no} 行目: 登録番号の形が正しくありません（{code}）: {error}")
+            })?;
+        }
         let is_qualified_invoice_issuer = match cell(qualified_at).unwrap_or_default().as_str() {
             "" => None,
             "true" => Some(true),
@@ -5633,7 +5646,7 @@ mod tests {
         let rows = parse_counterparty_csv(
             "code,name,invoice_registration_no,is_qualified
              anthropic,Anthropic,,
-             bitech,ビーテック,T1234567890123,true
+             bitech,ビーテック,T7123456789012,true
              kojin,個人商店,,false
 ",
         )
@@ -5650,7 +5663,7 @@ mod tests {
         );
         assert_eq!(
             rows[1].counterparty.invoice_registration_no.as_deref(),
-            Some("T1234567890123")
+            Some("T7123456789012")
         );
         assert_eq!(rows[0].counterparty.invoice_registration_no, None);
     }
@@ -5692,6 +5705,67 @@ abc,A,yes
         .unwrap_err();
         assert!(error.contains("1 行目"), "{error}");
         assert!(error.contains("yes"), "受け取った値を見せること: {error}");
+    }
+
+    // **本命。** 登録番号の打ち間違いを受け取らない。
+    //
+    // is_qualified は厳しく見ているのに登録番号は素通しだった。誤った番号は
+    // あとから見ると「確認済み」に見えるので、**控除の根拠が静かに崩れる。**
+    #[test]
+    fn a_registration_number_with_a_bad_check_digit_is_an_error() {
+        // 基礎番号 123456789012 の検査用数字は 7。1 は誤り。
+        let error = parse_counterparty_csv(
+            "code,name,invoice_registration_no
+abc,A,T1123456789012
+",
+        )
+        .unwrap_err();
+        assert!(error.contains("1 行目"), "{error}");
+        assert!(error.contains("abc"), "どの取引先かを見せること: {error}");
+        assert!(error.contains("登録番号"), "{error}");
+    }
+
+    // **本命。** 正しい番号は通る。
+    //
+    // チェックデジットは法人番号のアルゴリズムだが、法人番号を持たない
+    // 個人事業者の登録番号でも成り立つ（実在の番号1件で確認済み）。
+    // **弾きすぎると、個人事業主の取引先を登録できなくなる。**
+    #[test]
+    fn a_valid_registration_number_passes() {
+        let rows = parse_counterparty_csv(
+            "code,name,invoice_registration_no
+abc,A,T7123456789012
+",
+        )
+        .unwrap();
+        assert_eq!(
+            rows[0].counterparty.invoice_registration_no.as_deref(),
+            Some("T7123456789012")
+        );
+    }
+
+    // 空欄は「まだ確認していない」なので通す。
+    #[test]
+    fn an_empty_registration_number_is_not_an_error() {
+        let rows = parse_counterparty_csv(
+            "code,name,invoice_registration_no
+abc,A,
+",
+        )
+        .unwrap();
+        assert_eq!(rows[0].counterparty.invoice_registration_no, None);
+    }
+
+    // T を付け忘れた番号も弾く。**13桁だけ書き写す間違いは起きやすい。**
+    #[test]
+    fn a_registration_number_without_the_t_prefix_is_an_error() {
+        let error = parse_counterparty_csv(
+            "code,name,invoice_registration_no
+abc,A,7123456789012
+",
+        )
+        .unwrap_err();
+        assert!(error.contains("登録番号"), "{error}");
     }
 
     // code / name が無いCSVは受け取らない。
@@ -6234,7 +6308,7 @@ abc,
             party(
                 "qualified",
                 "適格と確認済み",
-                Some("T1234567890123"),
+                Some("T7123456789012"),
                 Some(true),
             ),
         ]);
