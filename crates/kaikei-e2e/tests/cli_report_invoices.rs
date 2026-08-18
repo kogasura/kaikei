@@ -688,6 +688,12 @@ async fn the_report_works_without_any_tax_settings(
 
     assert!(ok, "設定が無くても書き出せること: {log}");
     assert!(out.join("blue_return.csv").is_file(), "決算書は出ること");
+    // **月別も出る。** 決算書2ページ目の月別欄は、税制の設定が無くても
+    // 帳簿だけで埋まる（消費税と違い経理方式に依らない）。
+    assert!(
+        out.join("monthly_sales.csv").is_file(),
+        "月別売上は出ること"
+    );
     // 消費税の集計は出ない（経理方式が分からないので）。**黙って空の集計を
     // 出すよりよい。**
     assert!(

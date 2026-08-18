@@ -110,6 +110,7 @@ pub mod depreciation;
 pub mod error;
 pub mod household_split;
 pub mod invoice;
+pub mod monthly_sales;
 pub mod statement;
 pub mod tags;
 pub mod tax;
