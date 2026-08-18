@@ -108,6 +108,11 @@ consumptiontax は消費税の申告に向けた集計を出します（申告�
     このほか blue_return_not_on_form.csv に、決算書のどの欄にも
     載らなかった科目を理由付きで書き出します。
 
+    monthly_sales.csv には、決算書2ページ目の「月別売上（収入）金額及び
+    仕入金額」へ**書き写すための数字**を出します。様式そのものではありません。
+    科目ごとに分けてあるので、様式の行がどう分かれていても写せます。
+    年計が決算書の欄①・欄③と一致するかも確かめます。
+
     consumption_tax.csv には消費税の申告に向けた集計を出します（原則課税・
     税込経理の帳簿のみ）。**申告書の金額ではありません。** 反映していない
     ものは consumption_tax_notes.txt に書き出します。
@@ -4950,6 +4955,15 @@ async fn write_reports(
     )?;
     written.extend(blue_return_paths);
 
+    // 決算書2ページ目の月別欄へ書き写すための数字。
+    written.extend(write_monthly_sales(
+        &out_dir,
+        &entries,
+        &chart,
+        &blue_return_fields,
+        book_currency,
+    )?);
+
     // **減価償却の計上漏れを指摘する。** 貸借は一致したままで所得だけが
     // 過大になる誤りで、決算書を見ても分からない。
     warn_if_depreciation_is_missing(&statements.income_statement, &cumulative.balance_sheet)?;
@@ -5125,6 +5139,70 @@ async fn write_reports(
 /// （`docs/10-report.md` §5）。呼び出し側が渡した額をそのまま使い、**何円を
 /// 適用したかを必ず画面に出す**——黙って既定値が入ると、要件を満たさない
 /// 控除額のまま決算書が出る。
+/// 月別売上（収入）金額及び仕入金額を書き出す。
+///
+/// # どの科目を売上・仕入とするか
+///
+/// **決算書の定義から取る。** 欄①（売上（収入）金額）と欄③（仕入金額）に
+/// 足す科目がそのまま月別の対象になる。ここで別に決めると、月別の合計と
+/// 決算書の欄が食い違いうる。
+///
+/// # 合計が決算書と合うかを確かめる
+///
+/// 月ごとに足した年計は、決算書の欄①・欄③と一致するはずである。
+/// **合わなければどちらかの集計が間違っている**ので、その場で言う。
+fn write_monthly_sales(
+    out_dir: &Path,
+    entries: &[kaikei_core::JournalEntry],
+    chart: &kaikei_core::ChartOfAccounts,
+    amounts: &std::collections::BTreeMap<u32, kaikei_core::Money>,
+    currency: kaikei_core::Currency,
+) -> Result<Vec<PathBuf>, String> {
+    let form = kaikei_jp::blue_return::load_embedded(kaikei_jp_data::STATEMENT_BLUE_RETURN_GENERAL)
+        .map_err(|error| format!("青色申告決算書の定義を読めませんでした: {error}"))?;
+    let accounts_of = |no: u32| {
+        form.fields()
+            .iter()
+            .find(|field| field.no == no)
+            .map(|field| field.accounts.clone())
+            .unwrap_or_default()
+    };
+
+    let summary = kaikei_jp::monthly_sales::summarize(
+        entries,
+        chart,
+        &accounts_of(1),
+        &accounts_of(3),
+        currency,
+    );
+
+    let path = out_dir.join("monthly_sales.csv");
+    std::fs::write(&path, kaikei_report::monthly_sales::to_csv(&summary))
+        .map_err(|error| format!("書き出せませんでした: {}（{error}）", path.display()))?;
+
+    // 決算書の欄と突き合わせる。
+    for (no, label) in [(1_u32, "売上（収入）金額"), (3, "仕入金額")] {
+        let rows = if no == 1 {
+            &summary.revenue
+        } else {
+            &summary.purchases
+        };
+        let monthly: i128 = rows.iter().map(|row| row.total.minor()).sum();
+        let Some(on_form) = amounts.get(&no) else {
+            continue;
+        };
+        if monthly != on_form.minor() {
+            eprintln!(
+                "注意: 月別の{label}の年計（{}）が決算書の欄 {no}（{}）と一致しません。",
+                kaikei_core::Money::from_minor(monthly, currency).to_display_string(),
+                on_form.to_display_string()
+            );
+            eprintln!("  どちらかの集計が間違っています。monthly_sales.csv を確認してください。");
+        }
+    }
+    Ok(vec![path])
+}
+
 fn write_blue_return(
     out_dir: &Path,
     income_statement: &kaikei_app::policy::Statement,
