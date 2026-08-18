@@ -21,6 +21,10 @@ on:
 jobs:
   database:
     runs-on: ubuntu-latest
+    # **ジョブ全体の上限。** GitHub Actions の既定は6時間で、どこかで止まると
+    # 必須チェックが揃わないままそれだけ待つことになる。このジョブは通常
+    # 4分半で終わるので、25分あれば遅い日でも足りる。
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:17
@@ -59,8 +63,15 @@ jobs:
           components: clippy
 
       - name: postgresql-client をインストール
+        # **時間の上限を置く。** `apt-get update` がミラーの応答待ちで無限に
+        # 止まることがある（2026-08-18 に16分以上ハングし、必須チェックが
+        # 揃わずマージできなくなった）。GitHub Actions の既定は6時間なので、
+        # 放っておくと気づくまで詰まり続ける。
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
+          set -euo pipefail
+          # ミラーが落ちていても待ち続けない。取得できなければ次へ進む。
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
           sudo apt-get install --yes --no-install-recommends postgresql-client
 
       - name: ロール作成と権限付与（docker-compose と同じファイルを流す）

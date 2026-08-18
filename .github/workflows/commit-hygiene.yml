@@ -12,6 +12,8 @@ on:
 jobs:
   no-ai-attribution:
     runs-on: ubuntu-latest
+    # 止まったまま6時間待たないための上限。
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
