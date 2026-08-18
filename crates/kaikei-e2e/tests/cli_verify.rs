@@ -62,7 +62,24 @@ fn app_url(pool: &PgPool) -> String {
 
 /// `kaikei verify` を走らせて、標準出力と標準エラーを返す。
 fn run_verify(pool: &PgPool) -> (String, String, bool) {
-    let output = Command::new(cli_binary())
+    let mut command = Command::new(cli_binary());
+    // **親の環境変数を引き継がせない。** `Command` は既定で引き継ぐので、
+    // `.env` を読んだシェルから走らせると**渡していないつもりの設定が
+    // 子プロセスに届く**。それだと「設定が無くても動く」を検査したつもりで
+    // 検査できていない。
+    //
+    // 実際に2度踏んだ（D-113 / D-132）。どちらも「設定が要る処理」を足して
+    // 手元では通り、CI で落ちた。**手元と CI で条件を揃える。**
+    for key in [
+        "KAIKEI_TAX_MODE",
+        "KAIKEI_ROUNDING",
+        "KAIKEI_ROUNDING_UNIT",
+        "KAIKEI_IS_TAXABLE_BUSINESS",
+        "KAIKEI_SIMPLIFIED_TAXATION",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
         .args(["verify", "--year", "2026"])
         .env("APP_DATABASE_URL", app_url(pool))
         .env("KAIKEI_BOOK_CURRENCY", "JPY")
