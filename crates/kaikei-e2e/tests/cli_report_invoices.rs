@@ -700,4 +700,15 @@ async fn the_report_works_without_any_tax_settings(
         !out.join("consumption_tax.csv").is_file(),
         "経理方式が分からなければ消費税の集計は出さない"
     );
+    // **出さなかったことを言う。** 書き出したファイルの一覧しか出さないと、
+    // 受け取った側は「これで全部」と読む。確定申告には消費税の申告も
+    // 含まれるので、黙って落とすと痛い。
+    assert!(
+        log.contains("消費税の集計は出していません"),
+        "出さなかったことを言うこと: {log}"
+    );
+    assert!(
+        log.contains("KAIKEI_TAX_MODE"),
+        "理由（設定が無い）を言うこと: {log}"
+    );
 }

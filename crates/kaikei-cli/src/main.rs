@@ -5174,6 +5174,22 @@ async fn write_reports(
             summary.taxable_sales().to_display_string(),
             summary.taxable_purchases().to_display_string()
         );
+    } else {
+        // **出さなかったことを言う。** 書き出したファイルの一覧しか出さないと、
+        // 受け取った側は「これで全部」と読む。**無いことに気づけない。**
+        // 確定申告には消費税の申告も含まれるので、黙って落とすと痛い。
+        eprintln!();
+        eprintln!("注意: 消費税の集計は出していません（consumption_tax.csv はありません）。");
+        match optional_tax_mode() {
+            None => {
+                eprintln!("  経理方式（KAIKEI_TAX_MODE）が設定されていないためです。");
+            }
+            Some(mode) => {
+                eprintln!("  この集計は税込経理の帳簿だけを前提にしていますが、");
+                eprintln!("  経理方式が {mode:?} になっているためです。");
+            }
+        }
+        eprintln!("  前提に合わない帳簿で数字を出すと、黙って誤った額を渡すことになります。");
     }
 
     // 全件 JSON。**この出力はこのソフトが消えてもデータが残るためのもの**
