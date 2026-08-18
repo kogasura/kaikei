@@ -1044,7 +1044,7 @@ async fn an_empty_fixed_asset_ledger_is_reported(
     let (_stdout, stderr, ok) = run_verify(&app);
 
     assert!(ok, "指摘があっても検査は失敗しないこと: {stderr}");
-    assert!(stderr.contains("固定資産台帳は空です"), "{stderr}");
+    assert!(stderr.contains("固定資産台帳にありません"), "{stderr}");
     assert!(stderr.contains("161,917"), "金額を出すこと: {stderr}");
     // **行き止まりにしない。** 台帳に入れれば計算できることを言う。
     assert!(
@@ -1072,7 +1072,7 @@ async fn an_empty_ledger_is_fine_when_there_are_no_depreciable_assets(
 
     assert!(ok, "{stderr}");
     assert!(
-        !stderr.contains("固定資産台帳は空です"),
+        !stderr.contains("固定資産台帳にありません"),
         "償却対象が無ければ黙ること: {stderr}"
     );
 }
@@ -1109,11 +1109,52 @@ async fn the_depreciation_warning_separates_what_is_in_the_ledger(
     assert!(ok, "{stderr}");
     assert!(stderr.contains("205 118,800（台帳にあります）"), "{stderr}");
     assert!(
-        stderr.contains("210 は台帳にありません"),
+        stderr.contains("210 161,917 円"),
         "足すべきものだけを名指しすること: {stderr}"
     );
+}
+
+/// **本命。** 償却費が計上されていても、台帳に無い資産は指摘する。
+///
+/// 以前は「台帳に無い」という指摘が償却費の指摘の中にあった。償却費の
+/// 指摘は**償却費が0のときしか出ない**ので、**1円でも記帳した途端に、
+/// 残りの資産が台帳に無いことを誰も言わなくなった**（実帳簿の複製で
+/// 確かめた。1円入れただけで消えた）。
+///
+/// 「償却しているか」と「台帳に載っているか」は別の話である。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn assets_missing_from_the_ledger_are_reported_even_when_depreciation_exists(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    // 1=Asset, 3=Equity, 5=Expense。
+    seed_account(&app, "210", "工具器具備品", 1).await;
+    seed_account(&app, "400", "元入金", 3).await;
+    seed_account(&app, "610", "減価償却費", 5).await;
+    seed_entry(&app, 1, "210", "400", 161_917).await;
+    // 償却費を1円だけ計上する。**これで償却費の指摘は出なくなる。**
+    seed_entry_with_tags(
+        &app,
+        2,
+        "610",
+        "210",
+        1,
+        r#"{"tax_category": {"t": "code", "v": "OUT_OF_SCOPE"}}"#,
+    )
+    .await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
     assert!(
-        !stderr.contains("205 は台帳にありません"),
-        "台帳にあるものを挙げないこと: {stderr}"
+        !stderr.contains("1円も計上されていません"),
+        "償却費はあるので、そちらの指摘は出ない: {stderr}"
     );
+    assert!(
+        stderr.contains("固定資産台帳にありません"),
+        "台帳に無いことは、償却費があっても言うこと: {stderr}"
+    );
+    assert!(stderr.contains("210"), "{stderr}");
 }
