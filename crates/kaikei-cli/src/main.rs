@@ -598,6 +598,7 @@ async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
                 suspicions.len() - SUSPICIONS_TO_SHOW
             );
         }
+        print_duplicate_summary(&output.duplicate_summary);
     }
 
     // 証憑の検証。**保存先が設定されていなければ、検証したふりをしない。**
@@ -1535,6 +1536,40 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
         eprintln!("    経過措置で処理できますが、未確認のままではどちらの扱いもできません。");
     }
     Ok(())
+}
+
+/// 重複の疑いの内訳を出す。
+///
+/// **件数だけでは、所得に効くものと効かないものが混ざる。** 実帳簿の
+/// 62件は、余分な額の大半（1,030,000円）が事業主貸——引出しなので全部が
+/// 誤りでも所得は1円も動かない。所得に効くのは 12,963円 しかなかった。
+/// この差は件数を見ても分からない。
+fn print_duplicate_summary(summary: &kaikei_app::usecase::verify::DuplicateSummary) {
+    if summary.is_empty() {
+        return;
+    }
+    let yen = |minor: i128| {
+        kaikei_core::Money::from_minor(minor, kaikei_core::Currency::JPY).to_display_string()
+    };
+    println!("  科目ごとの内訳（余分な分＝2件なら1件、3件なら2件）:");
+    for group in &summary.by_account {
+        println!(
+            "    {} {} — {} 組 / {} 円{}",
+            group.account,
+            group.name,
+            group.groups,
+            yen(group.at_risk_minor),
+            if group.affects_income {
+                ""
+            } else {
+                "（所得に効きません）"
+            }
+        );
+    }
+    println!(
+        "  全部が誤りだったとして、所得が動きうるのは {} 円です。",
+        yen(summary.at_risk_affecting_income())
+    );
 }
 
 /// 収益も費用も残っていない年度か（＝決算振替済みに見えるか）。

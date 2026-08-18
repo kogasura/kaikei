@@ -144,6 +144,11 @@ pub struct VerifyOutput {
     pub entry_count: usize,
     /// 見つかった不整合。空なら異常なし。
     pub findings: Vec<Finding>,
+    /// 重複の疑いを科目ごとにまとめたもの。
+    ///
+    /// **件数だけでは、所得に効くものと効かないものが混ざる。**
+    /// 詳しくは [`DuplicateSummary`] を参照。
+    pub duplicate_summary: DuplicateSummary,
 }
 
 impl VerifyOutput {
@@ -199,6 +204,7 @@ where
     findings.extend(check_reversals(&entries));
     findings.extend(check_entry_numbers(&entries));
     findings.extend(check_suspected_duplicates(&entries));
+    let duplicate_summary = summarize_suspected_duplicates(&entries, &chart);
     findings.extend(check_inconsistent_accounts(&entries, &chart));
     findings.extend(check_inconsistent_tax_categories(&entries, &chart));
 
@@ -211,6 +217,7 @@ where
     findings.extend(compare_balances(&domain, &read_model));
 
     Ok(VerifyOutput {
+        duplicate_summary,
         entry_count,
         findings,
     })
@@ -511,29 +518,161 @@ fn check_inconsistent_tax_categories(
         .collect()
 }
 
-fn check_suspected_duplicates(entries: &[kaikei_core::JournalEntry]) -> Vec<Finding> {
-    // 明細は並び順が違っても同じ仕訳なので、揃えてから比べる。
-    let fingerprint = |entry: &kaikei_core::JournalEntry| {
-        let mut lines: Vec<String> = entry
-            .lines()
+/// 重複を見分けるための指紋。取引日・摘要・明細（科目・貸借・金額）で作る。
+///
+/// **明細は並び順が違っても同じ仕訳なので、揃えてから比べる。**
+fn duplicate_fingerprint(entry: &kaikei_core::JournalEntry) -> String {
+    let mut lines: Vec<String> = entry
+        .lines()
+        .iter()
+        .map(|line| {
+            format!(
+                "{}/{:?}/{}",
+                line.account().as_str(),
+                line.side(),
+                line.amount().minor()
+            )
+        })
+        .collect();
+    lines.sort_unstable();
+    format!(
+        "{}|{}|{}",
+        entry.entry_date().to_iso_string(),
+        entry.description(),
+        lines.join(",")
+    )
+}
+
+/// 重複の疑いを科目ごとにまとめたもの。
+///
+/// # なぜ件数だけでは足りないのか
+///
+/// 実帳簿で 62 件と言われても手の付けようがない。**しかも件数は、所得に
+/// 効くものと効かないものを混ぜている。** 実際の内訳はこうだった。
+///
+/// | 科目 | 余分な額 | 所得に効くか |
+/// |---|---:|---|
+/// | 事業主貸 | 1,030,000円 | **効かない**（引出し） |
+/// | 旅費交通費 | 12,238円 | 効く |
+/// | 支払手数料 | 725円 | 効く |
+///
+/// 目立つのは 103万円だが、**全部が誤りでも所得は1円も動かない**。逆に
+/// 所得に効くのは 12,963円 しかない。この差は件数を見ても分からない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateSummary {
+    /// 科目ごとの内訳。余分な額の大きい順。
+    pub by_account: Vec<DuplicateGroup>,
+}
+
+impl DuplicateSummary {
+    /// 全部が誤りだったときに所得が動きうる額（費用・収益のぶんだけ）。
+    #[must_use]
+    pub fn at_risk_affecting_income(&self) -> i128 {
+        self.by_account
             .iter()
-            .map(|line| {
-                format!(
-                    "{}/{:?}/{}",
-                    line.account().as_str(),
-                    line.side(),
-                    line.amount().minor()
-                )
-            })
-            .collect();
-        lines.sort_unstable();
-        format!(
-            "{}|{}|{}",
-            entry.entry_date().to_iso_string(),
-            entry.description(),
-            lines.join(",")
-        )
-    };
+            .filter(|group| group.affects_income)
+            .map(|group| group.at_risk_minor)
+            .sum()
+    }
+
+    /// 内訳が1件も無いか。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_account.is_empty()
+    }
+}
+
+/// [`DuplicateSummary`] の1科目分。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateGroup {
+    /// 科目コード。
+    pub account: String,
+    /// 科目名。
+    pub name: String,
+    /// 費用または収益か（＝所得に効くか）。
+    pub affects_income: bool,
+    /// この科目に触れている重複の組数。
+    pub groups: usize,
+    /// 余分な分（2件なら1件、3件なら2件）の合計。
+    pub at_risk_minor: i128,
+}
+
+/// 重複の疑いを科目ごとにまとめる。
+///
+/// **金額は明細ごとに割り当てる。** 1つの仕訳に借方が複数あるとき、
+/// 全額をどれか1つの科目に寄せると内訳が嘘になる。
+fn summarize_suspected_duplicates(
+    entries: &[kaikei_core::JournalEntry],
+    chart: &kaikei_core::ChartOfAccounts,
+) -> DuplicateSummary {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut seen: BTreeMap<String, Vec<&kaikei_core::JournalEntry>> = BTreeMap::new();
+    for entry in entries.iter().filter(|entry| !entry.is_reversal()) {
+        seen.entry(duplicate_fingerprint(entry))
+            .or_default()
+            .push(entry);
+    }
+
+    struct Acc {
+        groups: BTreeSet<String>,
+        at_risk: i128,
+    }
+    let mut by_account: BTreeMap<String, Acc> = BTreeMap::new();
+    for (key, group) in &seen {
+        if group.len() < 2 {
+            continue;
+        }
+        // 余分な分は (件数 − 1) 組ぶん。
+        let extra = group.len() as i128 - 1;
+        for line in group[0].lines() {
+            if line.side() != kaikei_core::Side::Debit {
+                continue;
+            }
+            let slot = by_account
+                .entry(line.account().as_str().to_string())
+                .or_insert(Acc {
+                    groups: BTreeSet::new(),
+                    at_risk: 0,
+                });
+            slot.groups.insert(key.clone());
+            slot.at_risk += line.amount().minor() * extra;
+        }
+    }
+
+    let mut rows: Vec<DuplicateGroup> = by_account
+        .into_iter()
+        .map(|(code, acc)| {
+            let def = kaikei_core::AccountCode::parse(&code)
+                .ok()
+                .and_then(|parsed| chart.get(&parsed).cloned());
+            DuplicateGroup {
+                name: def
+                    .as_ref()
+                    .map_or_else(|| code.clone(), |def| def.name.clone()),
+                affects_income: def.as_ref().is_some_and(|def| {
+                    matches!(
+                        def.account_type,
+                        kaikei_core::AccountType::Expense | kaikei_core::AccountType::Revenue
+                    )
+                }),
+                account: code,
+                groups: acc.groups.len(),
+                at_risk_minor: acc.at_risk,
+            }
+        })
+        .collect();
+    // 余分な額の大きい順。同額なら科目コード順で安定させる。
+    rows.sort_by(|a, b| {
+        b.at_risk_minor
+            .cmp(&a.at_risk_minor)
+            .then_with(|| a.account.cmp(&b.account))
+    });
+    DuplicateSummary { by_account: rows }
+}
+
+fn check_suspected_duplicates(entries: &[kaikei_core::JournalEntry]) -> Vec<Finding> {
+    let fingerprint = duplicate_fingerprint;
 
     // 金額も持つ。**金額が無いと 145円 の重複と 300,000円 の重複が
     // 同じに見える。** 実際に freee 側で見つかった二重計上は
@@ -1072,6 +1211,9 @@ mod tests {
     #[test]
     fn suspicions_alone_do_not_make_the_check_fail() {
         let output = VerifyOutput {
+            duplicate_summary: DuplicateSummary {
+                by_account: Vec::new(),
+            },
             entry_count: 2,
             findings: vec![Finding {
                 kind: FindingKind::SuspectedDuplicate,
@@ -1088,6 +1230,9 @@ mod tests {
     #[test]
     fn a_real_inconsistency_makes_the_check_fail() {
         let output = VerifyOutput {
+            duplicate_summary: DuplicateSummary {
+                by_account: Vec::new(),
+            },
             entry_count: 2,
             findings: vec![
                 Finding {
@@ -1465,6 +1610,9 @@ mod tests {
         ] {
             assert!(kind.is_suspicion(), "{kind:?} は疑いであるべき");
             let output = VerifyOutput {
+                duplicate_summary: DuplicateSummary {
+                    by_account: Vec::new(),
+                },
                 entry_count: 1,
                 findings: vec![Finding {
                     kind,
@@ -1486,6 +1634,9 @@ mod tests {
         ] {
             assert!(!kind.is_suspicion(), "{kind:?} は不整合であるべき");
             let output = VerifyOutput {
+                duplicate_summary: DuplicateSummary {
+                    by_account: Vec::new(),
+                },
                 entry_count: 1,
                 findings: vec![Finding {
                     kind,
@@ -1531,6 +1682,169 @@ mod tests {
             codes.len(),
             7,
             "種別を足したら、上の2つのテストにも足すこと"
+        );
+    }
+    // ─── 重複の内訳（DuplicateSummary） ─────────────────
+
+    fn expense(id: u128, no: u32, amount: i128) -> JournalEntry {
+        entry(
+            id,
+            no,
+            vec![
+                line("604", Side::Debit, amount),
+                line("100", Side::Credit, amount),
+            ],
+        )
+    }
+
+    // **本命。** 費用の重複は所得に効く。
+    #[test]
+    fn duplicated_expense_counts_toward_income() {
+        let entries = vec![expense(1, 1, 1_000), expense(2, 2, 1_000)];
+
+        let summary = summarize_suspected_duplicates(&entries, &sample_chart_with_tax_account());
+
+        assert_eq!(summary.by_account.len(), 1);
+        let group = &summary.by_account[0];
+        assert_eq!(group.account, "604");
+        assert_eq!(group.name, "通信費");
+        assert!(group.affects_income);
+        assert_eq!(group.groups, 1);
+        // 2件なら余分は1件ぶん。
+        assert_eq!(group.at_risk_minor, 1_000);
+        assert_eq!(summary.at_risk_affecting_income(), 1_000);
+    }
+
+    // **本命。** 資産の重複は所得に効かない。
+    //
+    // 実帳簿では事業主貸の 1,030,000円 がこれだった。額はいちばん大きいが、
+    // 全部が誤りでも所得は1円も動かない。**混ぜて数えると読み違える。**
+    #[test]
+    fn duplicated_asset_does_not_count_toward_income() {
+        let entries = vec![balanced(1, 1, 500_000), balanced(2, 2, 500_000)];
+
+        let summary = summarize_suspected_duplicates(&entries, &sample_chart_with_tax_account());
+
+        assert_eq!(summary.by_account.len(), 1);
+        assert!(
+            !summary.by_account[0].affects_income,
+            "資産は所得に効かない"
+        );
+        assert_eq!(summary.by_account[0].at_risk_minor, 500_000);
+        assert_eq!(
+            summary.at_risk_affecting_income(),
+            0,
+            "額は大きいが所得は動かない"
+        );
+    }
+
+    // **本命。** 3件なら余分は2件ぶん。
+    #[test]
+    fn three_copies_put_two_at_risk() {
+        let entries = vec![
+            expense(1, 1, 1_000),
+            expense(2, 2, 1_000),
+            expense(3, 3, 1_000),
+        ];
+
+        let summary = summarize_suspected_duplicates(&entries, &sample_chart_with_tax_account());
+
+        assert_eq!(summary.by_account[0].at_risk_minor, 2_000);
+        assert_eq!(summary.by_account[0].groups, 1, "組は1つ");
+    }
+
+    // **本命。** 借方が複数なら、明細ごとに割り当てる。
+    //
+    // 全額をどれか1つの科目に寄せると内訳が嘘になる。
+    #[test]
+    fn multiple_debit_lines_are_split_by_line() {
+        let two_debits = |id: u128, no: u32| {
+            entry(
+                id,
+                no,
+                vec![
+                    line("604", Side::Debit, 300),
+                    line("621", Side::Debit, 700),
+                    line("100", Side::Credit, 1_000),
+                ],
+            )
+        };
+        let entries = vec![two_debits(1, 1), two_debits(2, 2)];
+
+        let summary = summarize_suspected_duplicates(&entries, &sample_chart_with_tax_account());
+
+        assert_eq!(summary.by_account.len(), 2);
+        // 大きい順なので新聞図書費が先。
+        assert_eq!(summary.by_account[0].account, "621");
+        assert_eq!(summary.by_account[0].at_risk_minor, 700);
+        assert_eq!(summary.by_account[1].account, "604");
+        assert_eq!(summary.by_account[1].at_risk_minor, 300);
+        assert_eq!(summary.at_risk_affecting_income(), 1_000);
+    }
+
+    // **本命。** 余分な額の大きい順に並べる。
+    #[test]
+    fn groups_are_sorted_by_amount() {
+        let entries = vec![
+            expense(1, 1, 100),
+            expense(2, 2, 100),
+            balanced(3, 3, 900),
+            balanced(4, 4, 900),
+        ];
+
+        let summary = summarize_suspected_duplicates(&entries, &sample_chart_with_tax_account());
+
+        assert_eq!(summary.by_account[0].account, "100", "大きいほうが先");
+        assert_eq!(summary.by_account[1].account, "604");
+    }
+
+    // 重複が無ければ空。
+    #[test]
+    fn no_duplicates_means_empty_summary() {
+        let entries = vec![expense(1, 1, 100), expense(2, 2, 200)];
+
+        let summary = summarize_suspected_duplicates(&entries, &sample_chart_with_tax_account());
+
+        assert!(summary.is_empty());
+        assert_eq!(summary.at_risk_affecting_income(), 0);
+    }
+
+    // **本命。** 逆仕訳は数えない。
+    //
+    // 危ないのは「重複を見つけて、2件とも逆仕訳した」ときである。逆仕訳
+    // どうしも互いに同じ形になるので、**除外しないと訂正した瞬間に新しい
+    // 重複として挙がる**。訂正するほど指摘が増えるなら使い物にならない。
+    //
+    // 逆仕訳を1件だけ入れても効かない（借貸が入れ替わって指紋が変わるので、
+    // 元の仕訳とは組にならず、1件では重複にならない）。**2件入れて初めて
+    // この除外が効いているかを確かめられる。**
+    #[test]
+    fn reversals_are_not_counted() {
+        let mut entries = vec![expense(1, 1, 1_000), expense(2, 2, 1_000)];
+        for (index, id) in [3_u128, 4].into_iter().enumerate() {
+            entries.push(
+                entries[index]
+                    .reverse(
+                        EntryId::new(id),
+                        EntryNumber::new(id as u32),
+                        AccountingDate::new(2026, 6, 1).unwrap(),
+                        "訂正".to_string(),
+                        &FiscalYear::calendar_year(2026),
+                        &sample_chart_with_tax_account(),
+                        &TagSchema::empty(),
+                        &AllOpen,
+                        &fixed_clock(),
+                    )
+                    .unwrap(),
+            );
+        }
+
+        let summary = summarize_suspected_duplicates(&entries, &sample_chart_with_tax_account());
+
+        assert_eq!(summary.by_account.len(), 1, "逆仕訳の組を作らないこと");
+        assert_eq!(
+            summary.by_account[0].at_risk_minor, 1_000,
+            "訂正しても指摘が増えないこと"
         );
     }
 }
