@@ -104,6 +104,10 @@ consumptiontax は消費税の申告に向けた集計を出します（申告�
     このほか blue_return_not_on_form.csv に、決算書のどの欄にも
     載らなかった科目を理由付きで書き出します。
 
+    consumption_tax.csv には消費税の申告に向けた集計を出します（原則課税・
+    税込経理の帳簿のみ）。**申告書の金額ではありません。** 反映していない
+    ものは consumption_tax_notes.txt に書き出します。
+
     invoices_to_collect.csv には、適格請求書を揃えるべき取引を並べます
     （取引先が記録されていない課税仕入れのうち、税込1万円以上のもの）。
     日付・金額・摘要・科目が入っているので、そのまま作業リストに使えます。
@@ -2333,6 +2337,28 @@ fn parse_consumption_tax(args: &[String]) -> Result<Command, String> {
 ///
 /// 税額は税込金額から割り戻す。税抜経理の帳簿でこれをやると**税額を二重に
 /// 数える**。黙って誤った数字を出すより止める。
+/// 仕訳の明細を、消費税の集計に渡す形へ翻訳する。
+///
+/// **`kaikei-jp` は帳簿の読み方を知らない。** タグの取り出しはこの端が持つ。
+fn tagged_lines_for_consumption_tax(
+    entries: &[kaikei_core::JournalEntry],
+) -> Result<Vec<kaikei_jp::consumption_tax::TaggedLine>, String> {
+    let tax_key = kaikei_core::TagKey::parse("tax_category")
+        .map_err(|error| format!("タグキーを読めません: {error}"))?;
+    Ok(entries
+        .iter()
+        .flat_map(|entry| entry.lines().iter())
+        .map(|line| kaikei_jp::consumption_tax::TaggedLine {
+            tax_category: match line.tags().get(&tax_key) {
+                Some(kaikei_core::TagValue::Code(code)) => Some(code.clone()),
+                _ => None,
+            },
+            side: line.side(),
+            amount: *line.amount(),
+        })
+        .collect())
+}
+
 async fn run_consumption_tax(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
     let settings = jp_settings()?;
     if settings.tax_mode != kaikei_jp::tax::TaxMode::Exclusive {
@@ -2377,20 +2403,9 @@ async fn run_consumption_tax(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
         .next()
         .ok_or("同梱の消費税区分マスタが空です")?;
 
-    let tax_key = kaikei_core::TagKey::parse("tax_category")
-        .map_err(|error| format!("タグキーを読めません: {error}"))?;
-    let lines: Vec<kaikei_jp::consumption_tax::TaggedLine> = entries
-        .iter()
-        .flat_map(|entry| entry.lines().iter())
-        .map(|line| kaikei_jp::consumption_tax::TaggedLine {
-            tax_category: match line.tags().get(&tax_key) {
-                Some(kaikei_core::TagValue::Code(code)) => Some(code.clone()),
-                _ => None,
-            },
-            side: line.side(),
-            amount: *line.amount(),
-        })
-        .collect();
+    // **`report` と同じ関数で翻訳する。** 2箇所に書くと、片方だけ直したときに
+    // 画面とファイルで数字が食い違う。
+    let lines = tagged_lines_for_consumption_tax(&entries)?;
 
     let summary = kaikei_jp::consumption_tax::summarize(&lines, table)
         .map_err(|error| format!("集計できませんでした: {error}"))?;
@@ -4541,6 +4556,49 @@ async fn write_reports(
         println!(
             "適格請求書を揃えるべき取引が {} 件あります（invoices_to_collect.csv）",
             to_collect.len()
+        );
+    }
+
+    // 消費税の集計。**税理士へ渡す一式に入れる。**
+    //
+    // CLI（`kaikei consumptiontax`）でも見られるが、**画面で読む人と
+    // ファイルを受け取る人は別である。** 確定申告には消費税の申告も含まれる
+    // ので、決算書と一緒に出す。
+    //
+    // 前提（原則課税・税込経理）に合わない帳簿では出さない。**黙って誤った
+    // 数字を渡すより、無い方がよい。**
+    let settings = jp_settings()?;
+    if settings.tax_mode == kaikei_jp::tax::TaxMode::Inclusive
+        && settings.is_taxable_business
+        && !settings.simplified_taxation
+    {
+        let lines = tagged_lines_for_consumption_tax(&entries)?;
+        let table = rule_sets
+            .iter()
+            .next()
+            .ok_or("同梱の消費税区分マスタが空です")?;
+        let summary = kaikei_jp::consumption_tax::summarize(&lines, table)
+            .map_err(|error| format!("消費税を集計できませんでした: {error}"))?;
+
+        let path = out_dir.join("consumption_tax.csv");
+        std::fs::write(&path, kaikei_report::consumption_tax::to_csv(&summary))
+            .map_err(|error| format!("書き出せませんでした: {}（{error}）", path.display()))?;
+        written.push(path);
+
+        // 注記は別ファイルにする（1つの CSV に表と注記を混ぜると表計算で
+        // 読めなくなる。`blue_return_not_on_form.csv` と同じ理由）。
+        let notes_path = out_dir.join("consumption_tax_notes.txt");
+        std::fs::write(
+            &notes_path,
+            kaikei_report::consumption_tax::notes_to_text(&summary),
+        )
+        .map_err(|error| format!("書き出せませんでした: {}（{error}）", notes_path.display()))?;
+        written.push(notes_path);
+
+        println!(
+            "消費税の集計: 課税売上 {} 円 / 課税仕入 {} 円（consumption_tax.csv）",
+            summary.taxable_sales().to_display_string(),
+            summary.taxable_purchases().to_display_string()
         );
     }
 

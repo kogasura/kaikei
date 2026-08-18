@@ -603,3 +603,35 @@ async fn an_early_opening_transfer_is_reported_even_without_other_drawings(
         "他に動きが無くても拾うこと: {log}"
     );
 }
+
+/// **本命。** 消費税の集計が決算書と一緒に出る。
+///
+/// 確定申告には消費税の申告も含まれる。**画面で読む人と、ファイルを受け取る
+/// 人は別である**——税理士に渡すのはファイルの方なので、`report` の一式に
+/// 入っていなければ届かない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_report_includes_the_consumption_tax_summary(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed(&app, 1, 43_967).await;
+    let out = temp_dir("ctax-out");
+    let blob = temp_dir("ctax-blob");
+
+    let (log, ok) = run_report(&app, &out, &blob);
+
+    assert!(ok, "{log}");
+    let csv = std::fs::read_to_string(out.join("consumption_tax.csv"))
+        .expect("consumption_tax.csv が出ていること");
+    assert!(csv.contains("PURCHASE_10_QUALIFIED"), "{csv}");
+    assert!(csv.contains("43967"), "{csv}");
+    // 43,967 × 10/110 = 3,997
+    assert!(csv.contains("3997"), "税額を出すこと: {csv}");
+
+    // **注意書きも一緒に出す。** 数字だけ渡すと申告書の金額と読まれる。
+    let notes = std::fs::read_to_string(out.join("consumption_tax_notes.txt"))
+        .expect("consumption_tax_notes.txt が出ていること");
+    assert!(notes.contains("申告書の金額ではありません"), "{notes}");
+}
