@@ -106,6 +106,82 @@ impl Summary {
     }
 }
 
+/// 納付税額を売上の税額だけから求める特例。
+///
+/// # 適用できる年（個人事業者・暦年）
+///
+/// | 年 | 特例 | 根拠 |
+/// |---|---|---|
+/// | 令和5〜8年分（2023〜2026） | 2割特例 | 28年改正法附則51の2 |
+/// | 令和9・10年分（2027・2028） | 3割特例 | 令和8年度改正・28年改正法附則51の3 |
+/// | 令和11年分（2029）以降 | なし | |
+///
+/// 2割特例は「令和8年9月30日までの日の属する課税期間」で終わる。個人事業者の
+/// 課税期間は暦年なので、令和8年分（1/1〜12/31）はその日を含む。**つまり
+/// 2026年分が最後である。**
+///
+/// # このソフトは適用できるかを判定しない
+///
+/// どちらも**免税事業者がインボイス登録で課税事業者になった場合**の特例で、
+/// 基準期間（2年前）の課税売上高が1,000万円を超えるなど、除外要件がいくつも
+/// ある。帳簿には2年前が入っていないことがあるので、**判定はしない。**
+/// 出すのは試算だけである。
+///
+/// 事前の届出も継続適用の義務もなく、申告書への付記だけで使える
+/// （28年改正法附則51の2③）。だから**年ごとに選べる**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialRule {
+    /// 2割特例。納付税額は売上の税額の20%。
+    TwentyPercent,
+    /// 3割特例。納付税額は売上の税額の30%。
+    ThirtyPercent,
+}
+
+impl SpecialRule {
+    /// 納付税額に掛ける割合（百分率）。
+    #[must_use]
+    pub fn percent(self) -> i128 {
+        match self {
+            SpecialRule::TwentyPercent => 20,
+            SpecialRule::ThirtyPercent => 30,
+        }
+    }
+
+    /// 画面に出す名前。
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            SpecialRule::TwentyPercent => "2割特例",
+            SpecialRule::ThirtyPercent => "3割特例",
+        }
+    }
+}
+
+/// その年（個人事業者・暦年）に使える特例。
+#[must_use]
+pub fn special_rule_for(year: i32) -> Option<SpecialRule> {
+    match year {
+        2023..=2026 => Some(SpecialRule::TwentyPercent),
+        2027 | 2028 => Some(SpecialRule::ThirtyPercent),
+        _ => None,
+    }
+}
+
+/// 特例を使ったときの納付税額の試算。
+///
+/// **売上の税額だけで決まる。** 仕入の税額は関係しない（だから
+/// 適格請求書が揃わなくても額が変わらない）。
+///
+/// 端数は切り捨てる。申告書では課税標準額の1,000円未満切捨てと納付税額の
+/// 100円未満切捨てが別にあるので、**この値は申告書の金額ではない。**
+#[must_use]
+pub fn tax_under(rule: SpecialRule, tax_on_sales: Money) -> Money {
+    Money::from_minor(
+        tax_on_sales.minor() * rule.percent() / 100,
+        kaikei_core::Currency::JPY,
+    )
+}
+
 /// 集計に渡す明細1行。
 ///
 /// **`kaikei-core` の `JournalLine` を直接受け取らない。** この crate は
@@ -405,5 +481,72 @@ mod tests {
         assert_eq!(summary.tax_on_sales().minor(), 1_097_280);
         assert_eq!(summary.taxable_purchases().minor(), 2_913_881);
         assert_eq!(summary.tax_on_purchases().minor(), 264_898);
+    }
+    // ─── 売上の税額だけで決まる特例 ─────────────────
+
+    // **本命。** 2026年分（令和8年分）は2割特例の最後の年。
+    //
+    // 「令和8年9月30日までの日の属する課税期間」で終わる。個人事業者の
+    // 課税期間は暦年なので、令和8年分（1/1〜12/31）はその日を含む。
+    // **9月30日で切ってしまうと、最後の1年を丸ごと落とす。**
+    #[test]
+    fn two_thousand_twenty_six_is_the_last_year_of_the_twenty_percent_rule() {
+        assert_eq!(special_rule_for(2026), Some(SpecialRule::TwentyPercent));
+    }
+
+    // **本命。** 2027・2028年分は3割特例。
+    #[test]
+    fn the_two_years_after_that_use_the_thirty_percent_rule() {
+        assert_eq!(special_rule_for(2027), Some(SpecialRule::ThirtyPercent));
+        assert_eq!(special_rule_for(2028), Some(SpecialRule::ThirtyPercent));
+    }
+
+    // **本命。** 2029年分以降はどちらも使えない。
+    #[test]
+    fn from_two_thousand_twenty_nine_there_is_no_special_rule() {
+        assert_eq!(special_rule_for(2029), None);
+        assert_eq!(special_rule_for(2030), None);
+    }
+
+    // 制度が始まる前の年には無い。
+    #[test]
+    fn before_the_invoice_system_there_is_no_special_rule() {
+        assert_eq!(special_rule_for(2022), None);
+        assert_eq!(special_rule_for(2023), Some(SpecialRule::TwentyPercent));
+    }
+
+    // **本命。** 納付税額は売上の税額だけで決まる。
+    //
+    // 実帳簿（2026年）の売上税額 1,097,280円 で、2割なら 219,456円。
+    // 一般課税は 1,097,280 − 264,898 = 832,382円 なので、差は 612,926円。
+    #[test]
+    fn the_twenty_percent_rule_uses_only_the_sales_tax() {
+        assert_eq!(
+            tax_under(SpecialRule::TwentyPercent, yen(1_097_280)).minor(),
+            219_456
+        );
+    }
+
+    #[test]
+    fn the_thirty_percent_rule_takes_three_tenths() {
+        assert_eq!(
+            tax_under(SpecialRule::ThirtyPercent, yen(1_097_280)).minor(),
+            329_184
+        );
+    }
+
+    // **本命。** 端数は切り捨てる。切り上げると納めすぎになる。
+    #[test]
+    fn the_remainder_of_the_special_rule_is_dropped() {
+        // 999 × 20 / 100 = 199.8
+        assert_eq!(tax_under(SpecialRule::TwentyPercent, yen(999)).minor(), 199);
+        // 1 × 20 / 100 = 0.2
+        assert_eq!(tax_under(SpecialRule::TwentyPercent, yen(1)).minor(), 0);
+    }
+
+    // 売上が無ければ0。
+    #[test]
+    fn no_sales_means_no_tax() {
+        assert_eq!(tax_under(SpecialRule::TwentyPercent, yen(0)).minor(), 0);
     }
 }
