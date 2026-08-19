@@ -50,3 +50,30 @@ jobs:
             exit 1
           fi
           echo "OK"
+
+      - name: PR本文に「公開してよい内容か」の確認欄があるか
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # **テンプレートは埋めさせられない。** `gh pr create --body` は
+          # テンプレートを読まないので、CLI から作った PR には確認欄そのものが
+          # 載らない。実際、この規律を入れた後の PR がいくつもその形だった。
+          #
+          # ここで見るのは「欄があるか」と「チェックが入っているか」だけである。
+          # 中身が本当に安全かは人が見るしかないが、**確認したという印すら
+          # 無いまま通るのは塞げる。**
+          if ! printf '%s' "$PR_BODY" | grep -q "公開してよい内容か"; then
+            echo "::error::PR本文に「公開してよい内容か【必須】」の欄がありません。"
+            echo ""
+            echo ".github/pull_request_template.md の該当箇所を貼り、確認してください。"
+            echo "gh pr create --body で作ると、テンプレートは自動では入りません。"
+            exit 1
+          fi
+          # 未チェックの箱が残っていないか。
+          if printf '%s' "$PR_BODY" | grep -qE '^\s*-\s*\[ \]'; then
+            echo "::error::「公開してよい内容か」の確認欄に、未チェックの項目が残っています:"
+            printf '%s' "$PR_BODY" | grep -E '^\s*-\s*\[ \]'
+            exit 1
+          fi
+          echo "OK"

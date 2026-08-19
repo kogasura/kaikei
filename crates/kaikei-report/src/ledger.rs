@@ -437,12 +437,12 @@ mod tests {
     /// 負の残高も読む。
     #[test]
     fn a_negative_balance_is_read() {
-        let csv = [HEADER, "110,普通預金,2026-01-05,1,出金,100,2,900,-282754,"].join(
+        let csv = [HEADER, "110,普通預金,2026-01-05,1,出金,100,2,900,-123456,"].join(
             "
 ",
         );
 
-        assert_eq!(closing_balances(&csv).get("110"), Some(&-282_754));
+        assert_eq!(closing_balances(&csv).get("110"), Some(&-123_456));
     }
 
     /// 見出しだけなら空。
