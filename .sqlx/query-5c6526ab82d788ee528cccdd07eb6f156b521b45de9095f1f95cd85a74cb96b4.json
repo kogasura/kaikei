@@ -6,57 +6,118 @@
       {
         "ordinal": 0,
         "name": "total_matches!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": "Expression"
       },
       {
         "ordinal": 1,
         "name": "id?",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "fiscal_year?",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "fiscal_year"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "entry_no?",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "entry_no"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "entry_date?",
-        "type_info": "Date"
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "entry_date"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "description?",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "description"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "reverses?",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "reverses"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "reverse_reason?",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "reverse_reason"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "reversed_by_id?",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "reversed_by_no?",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "entry_no"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "reversed_by_date?",
-        "type_info": "Date"
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "journal_entries",
+            "name": "entry_date"
+          }
+        }
       }
     ],
     "parameters": {

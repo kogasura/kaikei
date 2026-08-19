@@ -317,7 +317,14 @@ async fn documents_reject_values_that_would_break_search(
         let sql = format!(
             "INSERT INTO documents              (id, blob_hash, original_name, mime_type, byte_size, doc_date,               doc_type, received_via, received_at, created_at)              SELECT gen_random_uuid(), h, n, 'application/pdf', 1, DATE '2026-06-15',                     t, v, now(), now()              FROM (SELECT {values}) AS s(t, v, h, n)"
         );
-        let result = sqlx::query(&sql).execute(&roles.app).await;
+        // **ここは意図して組み立てている。** 差し込むのは上の `cases` に
+        // 書いた固定の文字列だけで、外から来る値は1つも無い。制約が効いて
+        // いることを確かめるテストなので、値ごとに SQL を変える必要がある。
+        //
+        // sqlx 0.9 は実行時に作った SQL に監査を求めるので、その旨を明示する。
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&roles.app)
+            .await;
         assert!(result.is_err(), "{label} は拒否されるはず");
     }
 }
