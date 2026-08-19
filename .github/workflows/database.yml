@@ -10,16 +10,81 @@
 name: database
 
 on:
-  # **PR ブランチへの push では走らせない。** `pull_request` 側と二重に
-  # 起動し、同じコミットに対して同じジョブが2回走る。CI の時間が倍に
-  # なるうえ、片方がキューに滞留すると必須チェックが揃わずマージできない
-  # （実際に27分滞留して止まった）。main への push はマージ後の確認として残す。
+  # **検査は PR でしか走らせない。** main への push で走らせるのは
+  # 下の `warm-sqlx-cli-cache` だけで、あれは検査ではなくキャッシュの補充である。
+  #
+  # PR ブランチへの push で走らせない理由: `pull_request` 側と二重に起動し、
+  # 同じコミットに対して同じジョブが2回走る。CI の時間が倍になるうえ、
+  # 片方がキューに滞留すると必須チェックが揃わずマージできない
+  # （実際に27分滞留して止まった）。
+  #
+  # main への push で検査しない理由: **検査済みの状態をもう一度検査するため。**
+  # `pull_request` イベントが検査するのは PR head そのものではなく、
+  # **base にマージしたコミット**である。ブランチ保護が `strict: true`
+  # （マージ前にブランチを最新に保つ）なので、そのマージ先は必ず最新の main。
+  # つまり**検査した状態がそのままマージ後の状態**になる。直 push も
+  # ブランチ保護（`enforce_admins: true`）で塞がれているため、main への push は
+  # マージによってしか起きない。
+  #
+  # ★この判断は `strict: true` に依存している★
+  # strict を外すと、main が進んだ後の PR を再検査せずにマージできるようになり、
+  # 「一度も検査されていない main」が生まれる。**strict を外すなら、下の
+  # `database` ジョブの `if:` を外すこと。** 現在の設定はこれで確認できる:
+  #
+  #   gh api repos/kogasura/kaikei/branches/main/protection --jq '.required_status_checks.strict'
   push:
     branches: [main]
   pull_request:
 
 jobs:
+  # main のキャッシュを補充するためだけのジョブ。**検査は一切しない。**
+  #
+  # ■ なぜ要るか
+  #
+  # Actions のキャッシュには**ブランチスコープ**がある。ある run が読めるのは
+  # 「自分のブランチで作られたキャッシュ」と「デフォルトブランチのキャッシュ」
+  # だけで、**他の PR が作ったキャッシュは読めない。**
+  #
+  # 下の `database` ジョブは sqlx-cli（ビルドに数分かかる）をキャッシュから
+  # 復元して 0 秒で済ませている。そのキャッシュを書いているのは main の run
+  # だった。main で何も走らせないようにすると、**キーが変わった瞬間に
+  # 補充する経路が消える**——`sqlx-cli-0.8.6` を 0.8.7 に上げた次の日から、
+  # すべての PR が sqlx-cli をビルドし直すことになる（各 PR は自分のブランチの
+  # キャッシュしか作れず、それを他の PR は読めないため）。
+  # **CI を速くするつもりで、恒久的に遅くする**という形で効いてくる。
+  #
+  # キーが一致していれば cache hit で即終了するので、通常の実行は十数秒で終わる。
+  warm-sqlx-cli-cache:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          # ★下の `database` ジョブのキーと必ず一致させること★
+          # ずれると、補充しているつもりで誰も読まないキャッシュを作り続ける
+          # ことになり、しかも**何も壊れないので気づけない**。
+          key: ${{ runner.os }}-sqlx-cli-0.8.6
+      - name: sqlx-cli をインストール（キャッシュに載せるため）
+        run: |
+          set -euo pipefail
+          if command -v sqlx >/dev/null 2>&1 && sqlx --version | grep -q '0\.8\.6'; then
+            echo "キャッシュ済み: $(sqlx --version)"
+          else
+            cargo install sqlx-cli --version 0.8.6 \
+              --no-default-features --features postgres,rustls --locked
+          fi
+
   database:
+    # main への push では走らせない（上の `on:` の説明を参照）。
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     # **ジョブ全体の上限。** GitHub Actions の既定は6時間で、どこかで止まると
     # 必須チェックが揃わないままそれだけ待つことになる。このジョブは通常
