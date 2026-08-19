@@ -180,6 +180,14 @@ impl DocumentQueryPort for PgDocumentQuery {
             .await
             .map_err(crate::error::from_sqlx_error)
     }
+
+    async fn count_documents(&self) -> Result<usize, RepoError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(crate::error::from_sqlx_error)?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
 }
 
 #[derive(sqlx::FromRow)]

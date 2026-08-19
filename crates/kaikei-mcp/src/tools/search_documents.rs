@@ -121,10 +121,9 @@ impl McpTool for SearchDocuments {
         // 「1件も登録されていない」と「条件に合わなかった」を区別できるように、
         // 帳簿全体の件数を添える。
         let total_registered = documents
-            .all_blob_hashes()
+            .count_documents()
             .await
-            .map_err(|error| ToolFailure::from(ToolError::from_app_error(&error.into())))?
-            .len();
+            .map_err(|error| ToolFailure::from(ToolError::from_app_error(&error.into())))?;
 
         let items: Vec<Value> = found.iter().map(to_json).collect();
         let mut body = Map::new();

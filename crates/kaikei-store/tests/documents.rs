@@ -285,3 +285,56 @@ async fn the_search_limit_is_capped(pool_opts: PgPoolOptions, conn_opts: PgConne
     // BIGINT の範囲で問題になる。落ちずに返ることを見る。
     assert_eq!(found.len(), 3);
 }
+
+/// **本命。** 件数は「行の数」であって「内容の種類」ではない。
+///
+/// `all_blob_hashes` は `DISTINCT blob_hash` なので、**同じ内容の証憑が
+/// 別の取引に付いていると少なく出る**（内容は SHA-256 で1つに束ねて保存
+/// するので、同じ請求書を2つの仕訳に紐付けると起きる）。
+///
+/// `search_documents` はこの数を `total_registered` として返し、「1件も
+/// 登録されていない」と「条件に合わなかった」を区別させる。**数が違うと
+/// 区別そのものが狂う。** 実際に4件登録されている帳簿で3と出た。
+#[sqlx::test]
+async fn the_document_count_counts_rows_not_distinct_contents(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = common::app_pool(conn_opts.clone()).await;
+    let _ = pool_opts;
+    let store = PgStore::new(pool.clone());
+    // 同じ内容（同じ blob_hash）を2件、別の内容を1件。
+    // **ID は別にする。** 同じ請求書を2つの仕訳に紐付けた形を作りたいので、
+    // 行としては別だが内容は同じ、という状態を作る。
+    let mut same_content = document("2", date(2026, 7, 20));
+    same_content.blob_hash = document("1", date(2026, 6, 15)).blob_hash;
+    insert(
+        &store,
+        vec![
+            document("1", date(2026, 6, 15)),
+            same_content,
+            document("3", date(2026, 8, 25)),
+        ],
+    )
+    .await;
+
+    let query = PgDocumentQuery::new(pool);
+
+    assert_eq!(query.count_documents().await.unwrap(), 3, "行の数");
+    assert_eq!(
+        query.all_blob_hashes().await.unwrap().len(),
+        2,
+        "内容の種類（こちらを件数に使うと少なく出る）"
+    );
+}
+
+/// 1件も無ければ 0。**「無い」と「読めなかった」を混ぜない。**
+#[sqlx::test]
+async fn an_empty_book_has_no_documents(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let pool = common::app_pool(conn_opts.clone()).await;
+    let _ = pool_opts;
+
+    let query = PgDocumentQuery::new(pool);
+
+    assert_eq!(query.count_documents().await.unwrap(), 0);
+}
