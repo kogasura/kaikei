@@ -9,6 +9,10 @@
 //! 組み立て（`tags_for_preview`）は単体テストで見ているが、**それを表示に
 //! 繋いだかは別**である。実際、繋ぎを外す変異を入れても単体テストは通った。
 
+//! **DB が要るので `pg-tests` でだけ動かす。** これが無いと
+//! `cargo test --workspace`（CI の quality）で `DATABASE_URL` が無くて落ちる。
+#![cfg(feature = "pg-tests")]
+
 mod common;
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
