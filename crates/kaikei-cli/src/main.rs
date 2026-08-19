@@ -1991,6 +1991,38 @@ fn warn_if_yayoi_has_an_unknown_tax_category(
     eprintln!("  金額は帳簿と合っていても、税務上の扱いが変わります。");
 }
 
+/// 下見に出す明細のタグ。
+///
+/// # なぜ金額だけでは足りないのか
+///
+/// ルールは `tax_category` と `counterparty` を指定できるが、**下見に出て
+/// いなかった。** 指定したものが正しく付いているかを、記帳する前に確かめ
+/// られない。
+///
+/// **金額が正しくても税区分が違えば税務上の扱いが変わる**（課税仕入れが
+/// 対象外になれば控除が消える）。取引先が無ければ適格請求書の相手方を
+/// 辿れない。どちらも金額を1円も動かさないので、後から見ても気づけない。
+///
+/// 下見は「記帳する前に確かめる」ためのものである。確かめられないものを
+/// 出さないのでは意味がない。
+fn tags_for_preview(tags: &kaikei_core::TagSet) -> String {
+    // **並べ替えない。** `TagSet` は `BTreeMap` なのでタグキー順で返る。
+    // ここで `sort()` を足しても何も変わらず、「並び順はここで決めている」
+    // という誤解だけが残る（実際に足してみて、外しても結果が変わらなかった）。
+    let parts: Vec<String> = tags
+        .iter()
+        .map(|(key, value)| match value {
+            kaikei_core::TagValue::Code(code) => format!("{}={code}", key.as_str()),
+            kaikei_core::TagValue::Text(text) => format!("{}={text}", key.as_str()),
+            other => format!("{}={other:?}", key.as_str()),
+        })
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("  [{}]", parts.join(" "))
+}
+
 /// 拡張子から MIME タイプを決める。
 ///
 /// **分からなければ推測しない。** 誤った型で保存すると、後から中身が何かを
@@ -4091,14 +4123,15 @@ async fn run_journalize(args: JournalizeArgs) -> Result<Vec<PathBuf>, String> {
                 // 書いたルールは、記帳の段で必ず落ちる。ここで見えるようにする。
                 .unwrap_or("※この科目は勘定科目表にありません");
             println!(
-                "    {} {} {}  {:>12}",
+                "    {} {} {}  {:>12}{}",
                 match line.side() {
                     kaikei_core::Side::Debit => "借",
                     kaikei_core::Side::Credit => "貸",
                 },
                 line.account().as_str(),
                 name,
-                group_digits(i64::try_from(line.amount().minor()).unwrap_or(i64::MAX))
+                group_digits(i64::try_from(line.amount().minor()).unwrap_or(i64::MAX)),
+                tags_for_preview(line.tags())
             );
         }
         println!("    ルール: {}", built.rule_id);
@@ -6378,6 +6411,69 @@ abc,A,7123456789012
     #[test]
     fn an_empty_breakdown_produces_no_note() {
         assert!(public_transport_note(&[]).is_empty());
+    }
+
+    // ─── 下見に出すタグ ─────────────────────────────
+
+    fn tag_set(pairs: &[(&str, kaikei_core::TagValue)]) -> kaikei_core::TagSet {
+        let mut tags = kaikei_core::TagSet::new();
+        for (key, value) in pairs {
+            tags.insert(
+                kaikei_core::TagKey::parse(key).expect("タグキー"),
+                value.clone(),
+            );
+        }
+        tags
+    }
+
+    // **本命。** 税区分と取引先を下見に出す。
+    //
+    // ルールはどちらも指定できるのに、下見に出ていなかった。**指定した
+    // ものが正しく付いているかを、記帳する前に確かめられない。**
+    #[test]
+    fn the_preview_shows_the_tax_category_and_the_counterparty() {
+        let tags = tag_set(&[
+            (
+                "tax_category",
+                kaikei_core::TagValue::Code("PURCHASE_10_QUALIFIED".to_string()),
+            ),
+            (
+                "counterparty",
+                kaikei_core::TagValue::Code("bitech".to_string()),
+            ),
+        ]);
+
+        let shown = tags_for_preview(&tags);
+
+        assert!(
+            shown.contains("tax_category=PURCHASE_10_QUALIFIED"),
+            "{shown}"
+        );
+        assert!(shown.contains("counterparty=bitech"), "{shown}");
+    }
+
+    // タグが無ければ何も足さない。**金額の後ろに空の括弧が出ると読みにくい。**
+    #[test]
+    fn no_tags_means_no_brackets() {
+        assert_eq!(tags_for_preview(&kaikei_core::TagSet::new()), "");
+    }
+
+    // 並びはタグキー順になる（`TagSet` が `BTreeMap` なので）。
+    //
+    // 下見は目で見比べるものなので、実行のたびに並びが変わると読みにくい。
+    // **その性質は `TagSet` が持っている**ので、ここで並べ替えてはいない。
+    #[test]
+    fn the_tags_are_in_a_stable_order() {
+        let tags = tag_set(&[
+            ("tax_category", kaikei_core::TagValue::Code("a".to_string())),
+            ("counterparty", kaikei_core::TagValue::Code("z".to_string())),
+        ]);
+
+        assert_eq!(
+            tags_for_preview(&tags),
+            "  [counterparty=z tax_category=a]",
+            "名前順"
+        );
     }
 
     // code / name が無いCSVは受け取らない。
