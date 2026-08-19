@@ -275,6 +275,34 @@ pub fn sum_by_account(rows: &[Vec<String>]) -> BTreeMap<String, (i128, i128)> {
     totals
 }
 
+/// 弥生の税区分ごとに、借方・貸方の金額を足す。
+///
+/// # なぜ科目の突合だけでは足りないのか
+///
+/// [`sum_by_account`] は科目ごとの借貸を見るので、**金額が正しければ税区分が
+/// 入れ替わっていても気づけない。** ある区分を別の区分として出力すると、
+/// その取引の税務上の扱いが変わる（課税仕入れが対象外になれば控除が消える）。
+/// 金額は1円も動かないので、決算書を見ても分からない。
+///
+/// 列の位置は [`sum_by_account`] と同じく決め打ちで読む。ずれていれば
+/// 集計が帳簿と合わなくなって表面化する。
+pub fn sum_by_tax_category(rows: &[Vec<String>]) -> BTreeMap<String, (i128, i128)> {
+    let mut totals: BTreeMap<String, (i128, i128)> = BTreeMap::new();
+    for row in rows {
+        if row.len() < 25 {
+            continue;
+        }
+        // H=借方税区分(7) I=借方金額(8) N=貸方税区分(13) O=貸方金額(14)
+        if let Ok(amount) = row[8].parse::<i128>() {
+            totals.entry(row[7].clone()).or_default().0 += amount;
+        }
+        if let Ok(amount) = row[14].parse::<i128>() {
+            totals.entry(row[13].clone()).or_default().1 += amount;
+        }
+    }
+    totals
+}
+
 /// 弥生の税区分名。売上側と仕入側で分かれるものがある。
 ///
 /// **文字列1つにしない。** 非課税のように売上にも仕入にも立つ区分があり、
@@ -605,6 +633,61 @@ mod tests {
     #[test]
     fn a_short_row_is_not_counted() {
         let totals = sum_by_account(&[vec!["2000".to_string(), "x".to_string()]]);
+        assert!(totals.is_empty(), "{totals:?}");
+    }
+
+    // ─── 税区分ごとの集計 ─────────────────────────
+
+    /// **本命。** 税区分ごとに借方・貸方を足す。
+    ///
+    /// 科目の突合（`sum_by_account`）は金額しか見ないので、税区分が
+    /// おかしくても気づけない。**金額は1円も動かない。**
+    #[test]
+    fn the_tax_categories_are_summed_per_side() {
+        let entries = vec![entry(
+            1,
+            "通信費",
+            vec![
+                line("604", Side::Debit, 1_000, Some("PURCHASE_10_QUALIFIED")),
+                line("110", Side::Credit, 1_000, None),
+            ],
+        )];
+
+        let totals = sum_by_tax_category(&convert(&entries, &chart(), &tax_map()).rows);
+
+        assert_eq!(totals.get("課対仕入込10%適格"), Some(&(1_000, 0)));
+        // 税区分の無い明細は「対象外」になる。
+        assert_eq!(totals.get("対象外"), Some(&(0, 1_000)));
+    }
+
+    /// **本命。** 借方と貸方を取り違えない。
+    ///
+    /// 借方の区分を貸方に足すと、売上と仕入が入れ替わって見える。
+    #[test]
+    fn the_debit_and_credit_categories_are_kept_apart() {
+        let entries = vec![entry(
+            1,
+            "売上",
+            vec![
+                line("110", Side::Debit, 2_000, None),
+                line("500", Side::Credit, 2_000, Some("SALES_10")),
+            ],
+        )];
+
+        let totals = sum_by_tax_category(&convert(&entries, &chart(), &tax_map()).rows);
+
+        assert_eq!(
+            totals.get("課税売上込10%"),
+            Some(&(0, 2_000)),
+            "貸方に立つこと"
+        );
+        assert_eq!(totals.get("対象外"), Some(&(2_000, 0)));
+    }
+
+    /// 25項目に満たない行は数えない（`sum_by_account` と同じ）。
+    #[test]
+    fn a_short_row_is_not_counted_in_the_tax_summary() {
+        let totals = sum_by_tax_category(&[vec!["2000".to_string(), "x".to_string()]]);
         assert!(totals.is_empty(), "{totals:?}");
     }
 
