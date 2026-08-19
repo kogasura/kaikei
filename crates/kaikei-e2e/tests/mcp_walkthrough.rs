@@ -618,6 +618,32 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
     );
     assert_eq!(docs["documents"], json!([]), "{docs}");
 
+    // **金額は文字列で受ける。** 他のツール（post_journal_entry /
+    // search_entries）と揃える。JSON の number は倍精度浮動小数点なので
+    // 会計金額には使えない（D-013）。
+    let by_amount = server
+        .call_tool(
+            "search_documents",
+            json!({ "amount_min": "550", "amount_max": "550" }),
+        )
+        .await;
+    assert!(!is_error(&by_amount), "文字列は受けること: {by_amount}");
+
+    // **number は断る。** ここだけ i64 を受けていた時期があり、そのときの
+    // エラーには「金額は文字列で渡します」という共通の案内が付いた——
+    // **従うと同じエラーに戻る。**
+    let as_number = server
+        .call_tool("search_documents", json!({ "amount_min": 550 }))
+        .await;
+    assert!(is_error(&as_number), "number は断ること: {as_number}");
+    assert!(
+        body(&as_number)["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("文字列"),
+        "案内どおりに直せること: {as_number}"
+    );
+
     // ── 取り込んだ明細を見る（Phase 4）────────────────────
     //
     // この帳簿には明細を1件も取り込んでいない。**0件は成功**である。
@@ -752,6 +778,10 @@ async fn an_ai_keeps_the_books_end_to_end_through_the_real_binary(
             ("propose_closing_entries".to_string(), "ok".to_string()),
             ("propose_depreciation_entries".to_string(), "ok".to_string()),
             ("search_documents".to_string(), "ok".to_string()),
+            // 金額を文字列で渡した分。
+            ("search_documents".to_string(), "ok".to_string()),
+            // 金額を number で渡して断られた分。
+            ("search_documents".to_string(), "error".to_string()),
             ("list_pending_transactions".to_string(), "ok".to_string()),
             ("list_pending_transactions".to_string(), "error".to_string()),
             ("journalize_transaction".to_string(), "error".to_string()),
