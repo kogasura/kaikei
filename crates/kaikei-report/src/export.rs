@@ -172,7 +172,15 @@ pub fn count_entries(json: &str) -> Result<usize, String> {
 ///
 /// 並びは呼び出し側が渡した順を保つ（`list_entries_in_period` は
 /// `(取引日, 仕訳番号)` 昇順を約束している）。
-pub fn to_json(entries: &[JournalEntry], chart: &ChartOfAccounts) -> String {
+///
+/// `links` は仕訳ID（UUID 文字列）から、その仕訳に紐付いた証憑の内容
+/// ハッシュへの対応。**帳簿と証憑の相互関連性は電子帳簿保存法の要件**
+/// なので、復元用の出口にも残す。
+pub fn to_json(
+    entries: &[JournalEntry],
+    chart: &ChartOfAccounts,
+    links: &BTreeMap<String, Vec<String>>,
+) -> String {
     let mut readme = Map::new();
     for (key, text) in README {
         readme.insert((*key).to_string(), json!(text));
@@ -191,7 +199,10 @@ pub fn to_json(entries: &[JournalEntry], chart: &ChartOfAccounts) -> String {
         })
         .collect();
 
-    let entries: Vec<Value> = entries.iter().map(entry_to_json).collect();
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|entry| entry_to_json(entry, links))
+        .collect();
 
     let document = json!({
         "schema_version": SCHEMA_VERSION,
@@ -213,7 +224,7 @@ pub fn to_json(entries: &[JournalEntry], chart: &ChartOfAccounts) -> String {
     })
 }
 
-fn entry_to_json(entry: &JournalEntry) -> Value {
+fn entry_to_json(entry: &JournalEntry, links: &BTreeMap<String, Vec<String>>) -> Value {
     let lines: Vec<Value> = entry
         .lines()
         .iter()
@@ -233,11 +244,18 @@ fn entry_to_json(entry: &JournalEntry) -> Value {
         })
         .collect();
 
-    let document_refs: Vec<Value> = entry
-        .document_refs()
-        .iter()
-        .map(|reference| json!(format!("{reference:?}")))
-        .collect();
+    // **`document_refs` は使わない。** Phase 1 で保留され（`journal/mod.rs`
+    // の「証憑紐付けは Phase 1 ではサポートしない」）、紐付けは
+    // `entry_documents` へ移った。`JournalEntry` 側は常に空である。
+    //
+    // ここでそれを出していたので、**DB に紐付けが3件あってもエクスポートは
+    // 空だった。** 帳簿と証憑の相互関連性は電子帳簿保存法の要件であり、
+    // この JSON は「このソフトが無くなっても帳簿が残る」ための出口である。
+    // **復元したときに紐付けが消えるのでは、要件を満たさない。**
+    let document_refs: Vec<Value> = links
+        .get(&entry_id_to_uuid(entry.id()))
+        .map(|hashes| hashes.iter().map(|hash| json!(hash)).collect())
+        .unwrap_or_default();
 
     json!({
         "id": entry_id_to_uuid(entry.id()),
@@ -298,7 +316,8 @@ mod tests {
         let chart = chart();
         let entries = vec![sample_entry()];
 
-        let totals = sum_by_account(&to_json(&entries, &chart)).expect("読み直せること");
+        let totals =
+            sum_by_account(&to_json(&entries, &chart, &BTreeMap::new())).expect("読み直せること");
 
         let debit: i128 = totals.values().map(|(d, _)| d).sum();
         let credit: i128 = totals.values().map(|(_, c)| c).sum();
@@ -315,7 +334,8 @@ mod tests {
     fn the_tags_survive_the_round_trip() {
         let entries = vec![sample_entry()];
 
-        let counts = count_tags(&to_json(&entries, &chart())).expect("読み直せること");
+        let counts =
+            count_tags(&to_json(&entries, &chart(), &BTreeMap::new())).expect("読み直せること");
 
         assert!(!counts.is_empty(), "タグが残ること: {counts:?}");
         assert_eq!(
@@ -331,7 +351,7 @@ mod tests {
     /// なる。数え直す意味が無い。
     #[test]
     fn the_entries_are_counted_from_the_array_not_the_field() {
-        let json = to_json(&[sample_entry()], &chart());
+        let json = to_json(&[sample_entry()], &chart(), &BTreeMap::new());
         assert_eq!(count_entries(&json), Ok(1));
 
         // entry_count だけを書き換えても、数え直した件数は変わらない。
@@ -454,7 +474,7 @@ mod tests {
     }
 
     fn parsed() -> Value {
-        serde_json::from_str(&to_json(&[sample_entry()], &chart())).unwrap()
+        serde_json::from_str(&to_json(&[sample_entry()], &chart(), &BTreeMap::new())).unwrap()
     }
 
     // EX-1: スキーマ版と件数が入る（読む側が途中で切れていないか確かめられる）。
@@ -548,8 +568,8 @@ mod tests {
     //       差分を取って「変わっていないこと」を確かめられる。
     #[test]
     fn the_export_is_deterministic() {
-        let first = to_json(&[sample_entry()], &chart());
-        let second = to_json(&[sample_entry()], &chart());
+        let first = to_json(&[sample_entry()], &chart(), &BTreeMap::new());
+        let second = to_json(&[sample_entry()], &chart(), &BTreeMap::new());
 
         assert_eq!(first, second);
     }
@@ -557,10 +577,42 @@ mod tests {
     // EX-8: 仕訳が0件でも、形の揃った出力を返す（空文字にしない）。
     #[test]
     fn an_empty_book_still_produces_a_well_formed_export() {
-        let value: Value = serde_json::from_str(&to_json(&[], &chart())).unwrap();
+        let value: Value = serde_json::from_str(&to_json(&[], &chart(), &BTreeMap::new())).unwrap();
 
         assert_eq!(value["entry_count"], json!(0));
         assert_eq!(value["entries"].as_array().unwrap().len(), 0);
         assert_eq!(value["account_count"], json!(2), "科目表は出す");
+    }
+    /// **本命。** 仕訳と証憑の紐付けを残す。
+    ///
+    /// `JournalEntry::document_refs` は Phase 1 で保留され、紐付けは
+    /// `entry_documents` へ移った。**`JournalEntry` 側は常に空**なので、
+    /// そこから出すと DB に紐付けがあってもエクスポートは空になる。
+    ///
+    /// 帳簿と証憑の相互関連性は電子帳簿保存法の要件で、この JSON は
+    /// 「このソフトが無くなっても帳簿が残る」ための出口である。**復元した
+    /// ときに紐付けが消えるのでは、要件を満たさない。**
+    #[test]
+    fn the_document_links_survive_the_round_trip() {
+        let entry = sample_entry();
+        let id = entry_id_to_uuid(entry.id());
+        let mut links = BTreeMap::new();
+        links.insert(id.clone(), vec!["abc123".to_string(), "def456".to_string()]);
+
+        let json = to_json(&[entry], &chart(), &links);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("読み直せること");
+        let refs = &value["entries"][0]["document_refs"];
+
+        assert_eq!(refs[0], "abc123", "{refs}");
+        assert_eq!(refs[1], "def456", "{refs}");
+    }
+
+    /// 紐付けが無ければ空の配列。**null にしない。**
+    #[test]
+    fn an_entry_without_documents_gets_an_empty_array() {
+        let json = to_json(&[sample_entry()], &chart(), &BTreeMap::new());
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["entries"][0]["document_refs"], serde_json::json!([]));
     }
 }
