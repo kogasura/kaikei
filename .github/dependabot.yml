@@ -1,0 +1,58 @@
+# 依存の更新を Dependabot に任せる。
+#
+# ■ なぜ入れるか
+#
+# このリポジトリは**公開**である。依存に脆弱性が出たとき、こちらが気づく
+# 手立てが `cargo-deny`（supply-chain.yml）の advisories 検査しかない。
+# あれは**手を入れたときにしか走らない**ので、放置している間に出た勧告には
+# 気づけない。Dependabot は定期的に見て PR を作る。
+#
+# ■ まとめて上げる
+#
+# crate 数が多いので、1つずつ PR が来ると CI が詰まる。patch と minor は
+# まとめる。**major は分ける**——壊れる可能性があるものを他と混ぜると、
+# どれが原因か分からなくなる。
+
+version: 2
+updates:
+  # ---- Rust（ワークスペース全体）----
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      # 壊れにくい更新はまとめる。
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+
+  # ---- GitHub Actions ----
+  #
+  # `uses:` のバージョンが古いまま動き続けても誰も困らないので、放って
+  # おくと気づかない。actions/checkout などは**実際に非推奨になる**ので、
+  # 動かなくなる前に上げたい。
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
