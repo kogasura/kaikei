@@ -56,4 +56,14 @@ tags:
     value_type: Text
     aggregatable: false
     required_for: []
-    description: "この明細の元になった取込明細の ID（トレーサビリティ）"
+    # **kaikei の imported_transactions の ID とは限らない。**
+    #
+    # journalize_transaction が付けるのは imported_transactions の UUID だが、
+    # 外部システムから直に記帳する経路（freee からの同期など）は、その
+    # システム側の取引 ID を入れる。実帳簿の 2026 年分は 26 明細が後者で、
+    # imported_transactions は 0 行である——**UUID として解決しようとすると
+    # 必ず失敗する。**
+    #
+    # 値の形で見分けるしかない（UUID か、外部システムの ID か）。辿る側は
+    # どちらでもありうる前提で扱うこと。
+    description: "この明細の元になった取引の ID（kaikei の imported_transactions の UUID か、外部システムの取引 ID）"
