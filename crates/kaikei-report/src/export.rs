@@ -104,6 +104,66 @@ pub fn sum_by_account(json: &str) -> Result<BTreeMap<String, (i128, i128)>, Stri
     Ok(totals)
 }
 
+/// 書き出した JSON を読み直して、タグの数をタグキーごとに数える。
+///
+/// # なぜ金額の突合だけでは足りないのか
+///
+/// [`sum_by_account`] は科目ごとの借貸を見る。**タグが1つ残らず落ちても、
+/// 金額は1円も動かないので一致する。**
+///
+/// タグには税区分と取引先が入っている。前者が無ければ消費税を集計できず、
+/// 後者が無ければ適格請求書の相手方を辿れない。この JSON は**このソフトが
+/// 無くなっても帳簿が残る**ための出口なので、落ちていると気づいたときには
+/// もう元の帳簿が無い。
+///
+/// # Errors
+///
+/// JSON として読めない場合は理由を返す。**読めないことを 0 件として
+/// 扱わない**——空の集計は「一致した」に見える。
+pub fn count_tags(json: &str) -> Result<BTreeMap<String, usize>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| format!("JSON として読めません: {error}"))?;
+    let entries = value
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "entries が配列ではありません".to_string())?;
+
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in entries {
+        let lines = entry
+            .get("lines")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "lines が配列ではありません".to_string())?;
+        for line in lines {
+            let Some(tags) = line.get("tags").and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            for key in tags.keys() {
+                *counts.entry(key.clone()).or_default() += 1;
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// 書き出した JSON の仕訳の件数を読み直す。
+///
+/// **`entry_count` の値ではなく、`entries` 配列の実際の長さを返す。**
+/// 数え直す意味は、書いた側の申告ではなく現物を見ることにある。
+///
+/// # Errors
+///
+/// JSON として読めない場合は理由を返す。
+pub fn count_entries(json: &str) -> Result<usize, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| format!("JSON として読めません: {error}"))?;
+    value
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .ok_or_else(|| "entries が配列ではありません".to_string())
+}
+
 /// 帳簿を JSON にする。
 ///
 /// `entries` は出力したい仕訳、`chart` は勘定科目表。**科目表も一緒に出す**
@@ -244,6 +304,50 @@ mod tests {
         let credit: i128 = totals.values().map(|(_, c)| c).sum();
         assert_eq!(debit, credit, "貸借が一致すること: {totals:?}");
         assert!(!totals.is_empty(), "空にならないこと");
+    }
+
+    /// **本命。** タグの数を読み直せる。
+    ///
+    /// 金額の突合（`sum_by_account`）は**タグが1つ残らず落ちても一致する**。
+    /// タグには税区分と取引先が入っており、前者が無ければ消費税を集計できず、
+    /// 後者が無ければ適格請求書の相手方を辿れない。
+    #[test]
+    fn the_tags_survive_the_round_trip() {
+        let entries = vec![sample_entry()];
+
+        let counts = count_tags(&to_json(&entries, &chart())).expect("読み直せること");
+
+        assert!(!counts.is_empty(), "タグが残ること: {counts:?}");
+        assert_eq!(
+            counts.get("tax_category"),
+            Some(&1),
+            "税区分の数: {counts:?}"
+        );
+    }
+
+    /// **本命。** 仕訳の件数を、申告値ではなく現物から数える。
+    ///
+    /// `entry_count` の値をそのまま返すと、書いた側の申告を信じることに
+    /// なる。数え直す意味が無い。
+    #[test]
+    fn the_entries_are_counted_from_the_array_not_the_field() {
+        let json = to_json(&[sample_entry()], &chart());
+        assert_eq!(count_entries(&json), Ok(1));
+
+        // entry_count だけを書き換えても、数え直した件数は変わらない。
+        let tampered = json.replace("\"entry_count\": 1", "\"entry_count\": 99");
+        assert!(tampered.contains("99"), "書き換わっていること");
+        assert_eq!(count_entries(&tampered), Ok(1), "配列を数えること");
+    }
+
+    /// 読めない JSON を 0 件として扱わない。
+    ///
+    /// **0 件は「タグが無い帳簿」と見分けがつかない。**
+    #[test]
+    fn an_unreadable_json_is_not_zero_tags() {
+        assert!(count_tags("これはJSONではない").is_err());
+        assert!(count_tags("{}").is_err(), "entries が無い");
+        assert!(count_entries("{}").is_err());
     }
 
     /// 読めない JSON を「一致した」にしない。
