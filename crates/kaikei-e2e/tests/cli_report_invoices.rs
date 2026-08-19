@@ -653,8 +653,8 @@ async fn the_report_includes_the_consumption_tax_summary(
         .expect("consumption_tax.csv が出ていること");
     assert!(csv.contains("PURCHASE_10_QUALIFIED"), "{csv}");
     assert!(csv.contains("35480"), "{csv}");
-    // 35,480 × 10/110 = 3,997
-    assert!(csv.contains("3997"), "税額を出すこと: {csv}");
+    // 35,480 × 10/110 = 3,225
+    assert!(csv.contains("3225"), "税額を出すこと: {csv}");
 
     // **注意書きも一緒に出す。** 数字だけ渡すと申告書の金額と読まれる。
     let notes = std::fs::read_to_string(out.join("consumption_tax_notes.txt"))

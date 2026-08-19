@@ -130,15 +130,16 @@ async fn commit_actually_inserts_rows(pool_opts: PgPoolOptions, conn_opts: PgCon
     assert!(ok, "{stderr}");
     assert!(stdout.contains("追加 2 件"), "{stdout}");
 
+    // `codes_in_db` は `ORDER BY code` なので、CSV の並びではなくコード順で返る。
     let rows = codes_in_db(&app).await;
     assert_eq!(rows.len(), 2, "{rows:?}");
-    assert_eq!(rows[0].0, "anthropic");
+    assert_eq!(rows[0].0, "abc");
+    assert_eq!(rows[0].2, Some(true));
+    assert_eq!(rows[1].0, "anthropic");
     assert_eq!(
-        rows[0].2, None,
+        rows[1].2, None,
         "空欄は未確認（NULL）で入ること。false にしてはいけない"
     );
-    assert_eq!(rows[1].0, "abc");
-    assert_eq!(rows[1].2, Some(true));
 }
 
 /// **本命。** 2回流しても増えず、既存の確認結果を上書きしない。
