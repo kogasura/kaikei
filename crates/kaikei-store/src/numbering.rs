@@ -43,3 +43,54 @@ impl NumberingRepo for PgTx<'_> {
         entry_no_from_i32(issued)
     }
 }
+
+/// 採番カウンタと帳簿の食い違いを調べる。
+///
+/// # なぜ要るのか
+///
+/// 仕訳番号は `entry_counters` が払い出す。`journal_entries` を直に触って
+/// 仕訳を入れると、この表が付いてこない。**次に払い出す番号が既にある
+/// 仕訳と衝突し、以降の記帳がすべて失敗する。**
+///
+/// そのときのエラーは「既に存在するデータと重複するため保存できません」で、
+/// **理由が分からない。** 同じ仕訳を二重に入れたのだと読める。
+///
+/// 現実に起きるのは**復元したとき**である。`export.json` は仕訳を仕訳番号
+/// つきで持っているが、カウンタは持っていない。あれは「このソフトが
+/// 無くなっても帳簿が残る」ための出口なので、そこから戻す道は必ず要る。
+///
+/// # Errors
+///
+/// 読み取りに失敗した場合は理由を返す。
+pub async fn counter_drift(pool: &sqlx::PgPool) -> Result<Vec<CounterDrift>, sqlx::Error> {
+    // 年度ごとに「次に払い出す番号」と「帳簿にある最大の番号」を並べる。
+    // カウンタの行が無い年度も拾う（それが最も危ない形である）。
+    let rows: Vec<(i32, Option<i32>, i32)> = sqlx::query_as(
+        "SELECT e.fiscal_year, c.next_no, MAX(e.entry_no)::int \
+         FROM journal_entries e \
+         LEFT JOIN entry_counters c ON c.fiscal_year = e.fiscal_year \
+         GROUP BY e.fiscal_year, c.next_no \
+         ORDER BY e.fiscal_year",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(fiscal_year, next_no, max_entry_no)| CounterDrift {
+            fiscal_year,
+            next_no,
+            max_entry_no,
+        })
+        .collect())
+}
+
+/// 年度ごとの、採番カウンタと帳簿の突き合わせ結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterDrift {
+    /// 会計年度。
+    pub fiscal_year: i32,
+    /// 次に払い出す番号。**カウンタの行が無ければ `None`。**
+    pub next_no: Option<i32>,
+    /// その年度の帳簿にある最大の仕訳番号。
+    pub max_entry_no: i32,
+}

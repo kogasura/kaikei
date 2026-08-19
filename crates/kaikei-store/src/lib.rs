@@ -38,7 +38,7 @@ pub mod error;
 pub mod fixed_assets;
 pub mod imported;
 mod journal;
-mod numbering;
+pub mod numbering;
 mod period;
 pub mod pool;
 pub mod query;
