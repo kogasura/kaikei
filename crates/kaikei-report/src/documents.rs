@@ -209,6 +209,58 @@ fn extension_of(original_name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 書き出せなかった証憑の1件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotExported {
+    /// 置き場所（`index.csv` と同じ）。
+    pub folder: String,
+    /// エクスポート名（`index.csv` と同じ）。
+    pub file_name: String,
+    /// 元のファイル名。
+    pub original_name: String,
+    /// 内容の SHA-256。
+    pub blob_hash: String,
+    /// 書き出せなかった理由。
+    pub reason: String,
+}
+
+/// `not_exported.csv` の見出し。
+const NOT_EXPORTED_HEADERS: &[&str] = &[
+    "置き場所",
+    "エクスポート名",
+    "元のファイル名",
+    "内容のSHA-256",
+    "書き出せなかった理由",
+];
+
+/// 書き出せなかった証憑を CSV にする。**0 件でも見出しだけのファイルを書く。**
+///
+/// # なぜ要るのか
+///
+/// `index.csv` は**書き出せたかどうかに関わらず全件**載せる。`checksums.txt`
+/// には書き出せたものしか載らない。つまり受け取った側は、**2つを突き合わせて
+/// 初めて欠けに気づく。**
+///
+/// 失敗は画面にも出るが、**画面は渡す一式に残らない。** 税理士が受け取る
+/// のはフォルダだけである。
+///
+/// 0 件でもファイルを書くのは、`yayoi_skipped.csv` と同じ理由——無いのと
+/// 「1件も無かった」は違う。前者は「出し忘れたのでは」と疑う余地が残る。
+pub fn not_exported_to_csv(rows: &[NotExported]) -> String {
+    let mut csv = CsvBuilder::new();
+    csv.push_row(NOT_EXPORTED_HEADERS);
+    for row in rows {
+        csv.push_row(vec![
+            row.folder.clone(),
+            row.file_name.clone(),
+            row.original_name.clone(),
+            row.blob_hash.clone(),
+            row.reason.clone(),
+        ]);
+    }
+    csv.finish()
+}
+
 /// 証憑の一覧（`index.csv`）。
 ///
 /// **検索要件の代替として提出できる一覧**である（`docs/06-documents.md` §5）。
@@ -467,5 +519,46 @@ mod tests {
             assert!(!file_name.contains('/'), "{file_name}");
             assert!(!file_name.contains(".."), "{file_name}");
         }
+    }
+    // ─── 書き出せなかった証憑 ───────────────────────
+
+    fn not_exported_row() -> NotExported {
+        NotExported {
+            folder: "電子取引".to_string(),
+            file_name: "2026-03-24_グランデ_515720_invoice.txt".to_string(),
+            original_name: "inv1.txt".to_string(),
+            blob_hash: "9dbaa4f7".to_string(),
+            reason: "中身が保存時から変わっています".to_string(),
+        }
+    }
+
+    /// **本命。** どの証憑がなぜ落ちたかを渡す一式に残す。
+    ///
+    /// `index.csv` は全件を載せ、`checksums.txt` は書き出せたものしか
+    /// 載らない。受け取った側は2つを突き合わせて初めて欠けに気づく。
+    /// **画面の警告は一式に残らない。**
+    #[test]
+    fn the_reason_and_the_document_are_both_recorded() {
+        let csv = not_exported_to_csv(&[not_exported_row()]);
+
+        assert!(csv.contains("inv1.txt"), "元のファイル名: {csv}");
+        assert!(csv.contains("9dbaa4f7"), "ハッシュ: {csv}");
+        assert!(
+            csv.contains("中身が保存時から変わっています"),
+            "理由: {csv}"
+        );
+        assert!(csv.contains("電子取引"), "置き場所: {csv}");
+    }
+
+    /// **本命。** 0 件でも見出しだけのファイルを書く。
+    ///
+    /// 無いのと「1件も無かった」は違う。前者は「出し忘れたのでは」と
+    /// 疑う余地が残る（`yayoi_skipped.csv` と同じ）。
+    #[test]
+    fn an_empty_list_still_has_a_header() {
+        let csv = not_exported_to_csv(&[]);
+
+        assert!(csv.contains("書き出せなかった理由"), "{csv}");
+        assert_eq!(csv.lines().count(), 1, "見出しだけ: {csv}");
     }
 }
