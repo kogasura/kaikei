@@ -22,6 +22,7 @@
 
 use crate::dispatch::{McpTool, ToolContext, ToolFailure, ToolSuccess};
 use crate::error::ToolError;
+use crate::wire::AmountStr;
 use kaikei_app::error::codes;
 use kaikei_app::ports::DocumentQueryPort;
 use kaikei_app::view::DocumentQuery;
@@ -50,12 +51,12 @@ pub struct SearchDocumentsInput {
     /// 取引年月日の上限（この日を含む）。YYYY-MM-DD。
     #[serde(default)]
     pub date_to: Option<String>,
-    /// 取引金額の下限（この額を含む）。円。
+    /// 取引金額の下限（この額を含む）。文字列で渡します（例: "550"）。
     #[serde(default)]
-    pub amount_min: Option<i64>,
-    /// 取引金額の上限（この額を含む）。円。
+    pub amount_min: Option<AmountStr>,
+    /// 取引金額の上限（この額を含む）。文字列で渡します（例: "550"）。
     #[serde(default)]
-    pub amount_max: Option<i64>,
+    pub amount_max: Option<AmountStr>,
     /// 取引先（完全一致）。
     #[serde(default)]
     pub counterparty: Option<String>,
@@ -65,6 +66,32 @@ pub struct SearchDocumentsInput {
     /// 取得件数。既定は 50、最大 200。
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// 文字列の金額を円（最小単位）に直す。
+///
+/// **`DocumentQuery` は `i64` を取る**ので、線の上では文字列で受けて
+/// ここで直す。線の上を文字列にしているのは JSON の number が倍精度
+/// 浮動小数点だからで（D-013）、内側まで文字列にする理由は無い。
+fn to_minor(amount: Option<&AmountStr>, field: &str) -> Result<Option<i64>, ToolFailure> {
+    amount
+        .map(|value| {
+            let money = value
+                .to_money(kaikei_core::Currency::JPY)
+                .map_err(|error| {
+                    ToolFailure::from(crate::tools::in_field(
+                        field,
+                        ToolError::new(codes::REJECTED, error.to_string()),
+                    ))
+                })?;
+            i64::try_from(money.minor()).map_err(|_| {
+                ToolFailure::from(crate::tools::in_field(
+                    field,
+                    ToolError::new(codes::REJECTED, "金額が大きすぎます".to_string()),
+                ))
+            })
+        })
+        .transpose()
 }
 
 impl McpTool for SearchDocuments {
@@ -90,8 +117,16 @@ impl McpTool for SearchDocuments {
         let query = DocumentQuery {
             date_from: parse_date(input.date_from.as_deref(), "date_from")?,
             date_to: parse_date(input.date_to.as_deref(), "date_to")?,
-            amount_min: input.amount_min,
-            amount_max: input.amount_max,
+            // **金額は文字列で受けて、ここで数に直す。** JSON の number は
+            // 倍精度浮動小数点なので会計金額には使えない（D-013）。他の
+            // ツール（post_journal_entry / search_entries）は最初からこの
+            // 形で、ここだけ i64 だった。
+            //
+            // 揃っていないと実害がある。number を渡すと弾かれるが、その
+            // ときのエラーには「金額は文字列で渡します」という共通の案内が
+            // 付く——**従うと同じエラーに戻る。**
+            amount_min: to_minor(input.amount_min.as_ref(), "amount_min")?,
+            amount_max: to_minor(input.amount_max.as_ref(), "amount_max")?,
             counterparty: input.counterparty,
             doc_type: input.doc_type,
         };
