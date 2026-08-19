@@ -6,12 +6,27 @@
 name: architecture
 
 on:
-  # **PR ブランチへの push では走らせない。** `pull_request` 側と二重に
-  # 起動し、同じコミットに対して同じジョブが2回走る。CI の時間が倍に
-  # なるうえ、片方がキューに滞留すると必須チェックが揃わずマージできない
-  # （実際に27分滞留して止まった）。main への push はマージ後の確認として残す。
-  push:
-    branches: [main]
+  # **push では走らせない。PR だけで検査する。**
+  #
+  # PR ブランチへの push で走らせない理由: `pull_request` 側と二重に起動し、
+  # 同じコミットに対して同じジョブが2回走る。CI の時間が倍になるうえ、
+  # 片方がキューに滞留すると必須チェックが揃わずマージできない
+  # （実際に27分滞留して止まった）。
+  #
+  # main への push でも走らせない理由: **検査済みの状態をもう一度検査するため。**
+  # `pull_request` イベントが検査するのは PR head そのものではなく、
+  # **base にマージしたコミット**である。ブランチ保護が `strict: true`
+  # （マージ前にブランチを最新に保つ）なので、そのマージ先は必ず最新の main。
+  # つまり**検査した状態がそのままマージ後の状態**になる。直 push も
+  # ブランチ保護（`enforce_admins: true`）で塞がれているため、main への push は
+  # マージによってしか起きない。
+  #
+  # ★この判断は `strict: true` に依存している★
+  # strict を外すと、main が進んだ後の PR を再検査せずにマージできるようになり、
+  # 「一度も検査されていない main」が生まれる。**strict を外すなら、ここに
+  # `push: branches: [main]` を戻すこと。** 現在の設定はこれで確認できる:
+  #
+  #   gh api repos/kogasura/kaikei/branches/main/protection --jq '.required_status_checks.strict'
   pull_request:
 
 jobs:
