@@ -2,8 +2,8 @@
 //!
 //! # なぜ件数だけでは足りないのか
 //!
-//! `verify` は「取引先が記録されていない課税仕入れが 603 件」と数え、
-//! 少額特例（税込1万円未満）で分けて「1万円以上は 33 件」まで出す（D-114）。
+//! `verify` は「取引先が記録されていない課税仕入れが N 件」と数え、
+//! 少額特例（税込1万円未満）で分けて「1万円以上は M 件」まで出す（D-114）。
 //! **そこから先が進まない。** どの取引なのかが分からないと、請求書を探しに
 //! 行けないからである。
 //!
@@ -12,7 +12,7 @@
 //!
 //! # 1万円未満は載せない
 //!
-//! 570 件を並べても作業リストにならない。少額特例が使えるなら適格請求書の
+//! 1万円未満まで並べても作業リストにならない。少額特例が使えるなら適格請求書の
 //! 保存は要らず、使えないとしても**まず1万円以上から**である。
 //! 件数は末尾の注記で伝える（黙って落とさない）。
 //!
@@ -27,7 +27,7 @@ use crate::csv::{CsvBuilder, UTF8_BOM};
 ///
 /// # なぜ「手がかり」なのか
 ///
-/// **帳簿に記録された相手先ではない。** 実帳簿では32件すべてに取引先タグが
+/// **帳簿に記録された相手先ではない。** 検証帳簿では対象の全件に取引先タグが
 /// 無く、頼れるのは摘要だけである。ここで返すのは推測なので、列の名前も
 /// 「相手先の手がかり」にしてある。
 ///
@@ -36,10 +36,10 @@ use crate::csv::{CsvBuilder, UTF8_BOM};
 /// 1. `摘要 / 取引先名` の形なら `/` の後ろ（freee からの同期がこの形で書く）
 /// 2. 摘要が科目名と同じなら**何も返さない**——「地代家賃」という摘要から
 ///    分かることは無い
-/// 3. それ以外は摘要そのもの（`CLAUDE.AI SUBSCRIPTION` や `AMAZON.CO.JP`）
+/// 3. それ以外は摘要そのもの（`SAMPLE AI SUBSCRIPTION` や `SAMPLE.CO.JP`）
 ///
-/// 実帳簿の32件では、1 が12件・3 が11件・2 が9件だった。**9件は明細を
-/// 見に行くしかない。** それを名指しできるのがこの関数の値打ちである。
+/// 検証帳簿では 1 と 3 で大半が拾えたが、2 に落ちる分は残った。**残りは
+/// 明細を見に行くしかない。** それを名指しできるのがこの関数の値打ちである。
 #[must_use]
 pub fn counterparty_hint(description: &str, account_name: &str) -> Option<String> {
     if let Some((_, party)) = description.rsplit_once(" / ") {
@@ -179,9 +179,9 @@ mod tests {
     /// 金額に桁区切りを入れない（他の CSV と同じ）。
     #[test]
     fn the_amount_has_no_thousands_separator() {
-        let csv = to_csv(&[row("2026-01-23", 1, 1_640_720, "x")]);
-        assert!(csv.contains("1640720"), "{csv}");
-        assert!(!csv.contains("1,640,720"), "{csv}");
+        let csv = to_csv(&[row("2026-01-23", 1, 1_332_600, "x")]);
+        assert!(csv.contains("1332600"), "{csv}");
+        assert!(!csv.contains("1,332,600"), "{csv}");
     }
 
     /// **本命。** 0 件でも見出しだけのファイルを書く。
@@ -214,10 +214,10 @@ mod tests {
     #[test]
     fn the_order_is_preserved() {
         let csv = to_csv(&[
-            row("2026-03-24", 1, 515_720, "初期費用"),
+            row("2026-03-24", 1, 418_900, "初期費用"),
             row("2026-01-23", 2, 410_000, "家賃"),
         ]);
-        let first = csv.find("515720").unwrap();
+        let first = csv.find("418900").unwrap();
         let second = csv.find("410000").unwrap();
         assert!(first < second, "渡した順を変えないこと: {csv}");
     }
@@ -242,15 +242,15 @@ mod tests {
 
     // **本命。** `摘要 / 取引先名` の形なら後ろを取る。
     //
-    // freee からの同期がこの形で書く。実帳簿の32件では12件がこれ。
+    // 外部の会計サービスからの同期がこの形で書く。検証帳簿でも最も多かった。
     #[test]
     fn the_hint_comes_from_the_part_after_the_slash() {
         assert_eq!(
             counterparty_hint(
-                "ムームードメイン byGMOペパボ（ドメイン） / GMOペパボ",
+                "サンプルドメイン（ドメイン） / サンプルホスティング",
                 "通信費"
             ),
-            Some("GMOペパボ".to_string())
+            Some("サンプルホスティング".to_string())
         );
     }
 
@@ -269,8 +269,8 @@ mod tests {
     #[test]
     fn a_plain_description_is_used_as_the_hint() {
         assert_eq!(
-            counterparty_hint("CLAUDE.AI SUBSCRIPTION", "通信費"),
-            Some("CLAUDE.AI SUBSCRIPTION".to_string())
+            counterparty_hint("SAMPLE AI SUBSCRIPTION", "通信費"),
+            Some("SAMPLE AI SUBSCRIPTION".to_string())
         );
     }
 
@@ -285,8 +285,8 @@ mod tests {
     #[test]
     fn an_empty_part_after_the_slash_falls_back() {
         assert_eq!(
-            counterparty_hint("Amazon / ", "消耗品費"),
-            Some("Amazon /".to_string())
+            counterparty_hint("サンプル商会 / ", "消耗品費"),
+            Some("サンプル商会 /".to_string())
         );
     }
 
@@ -299,13 +299,19 @@ mod tests {
     #[test]
     fn the_same_counterparty_is_grouped_together() {
         let csv = to_csv(&[
-            row_on("2026-05-29", 1, 43_967, "ドメイン / GMOペパボ", "通信費"),
-            row_on("2026-04-27", 2, 35_835, "CLAUDE.AI SUBSCRIPTION", "通信費"),
+            row_on(
+                "2026-05-29",
+                1,
+                35_480,
+                "ドメイン / サンプルホスティング",
+                "通信費",
+            ),
+            row_on("2026-04-27", 2, 28_920, "SAMPLE AI SUBSCRIPTION", "通信費"),
             row_on(
                 "2026-06-17",
                 3,
-                43_967,
-                "ドメイン更新 / GMOペパボ",
+                35_480,
+                "ドメイン更新 / サンプルホスティング",
                 "通信費",
             ),
         ]);
@@ -315,7 +321,7 @@ mod tests {
         // 「同じ相手先が隣り合う」ことだけである。
         let lines: Vec<&str> = csv.lines().collect();
         let gmo: Vec<usize> = (1..=3)
-            .filter(|i| lines[*i].contains("GMOペパボ"))
+            .filter(|i| lines[*i].contains("サンプルホスティング"))
             .collect();
         assert_eq!(gmo.len(), 2, "{csv}");
         assert_eq!(gmo[1] - gmo[0], 1, "隣り合わせにすること: {csv}");
@@ -329,12 +335,12 @@ mod tests {
     fn rows_without_a_hint_go_last() {
         let csv = to_csv(&[
             row_on("2026-01-23", 1, 410_000, "地代家賃", "地代家賃"),
-            row_on("2026-04-27", 2, 35_835, "CLAUDE.AI SUBSCRIPTION", "通信費"),
+            row_on("2026-04-27", 2, 28_920, "SAMPLE AI SUBSCRIPTION", "通信費"),
         ]);
 
         let lines: Vec<&str> = csv.lines().collect();
         assert!(
-            lines[1].contains("CLAUDE.AI"),
+            lines[1].contains("SAMPLE AI"),
             "手がかりのある方が先: {csv}"
         );
         assert!(lines[2].contains("地代家賃"), "{csv}");
@@ -375,12 +381,18 @@ mod tests {
         let csv = to_csv(&[row_on(
             "2026-05-29",
             1,
-            43_967,
-            "ドメイン / GMOペパボ",
+            35_480,
+            "ドメイン / サンプルホスティング",
             "通信費",
         )]);
 
         assert!(csv.contains("相手先の手がかり"), "見出し: {csv}");
-        assert!(csv.lines().nth(1).unwrap().ends_with("GMOペパボ"), "{csv}");
+        assert!(
+            csv.lines()
+                .nth(1)
+                .unwrap()
+                .ends_with("サンプルホスティング"),
+            "{csv}"
+        );
     }
 }

@@ -115,7 +115,7 @@ async fn the_preview_shows_the_tags_from_the_rule(
         "with_tags",
         "- id: shop\n  priority: 10\n  match:\n    contains: テストショウテン\n  \
          account: \"609\"\n  counter_account: \"110\"\n  \
-         tax_category: PURCHASE_10_QUALIFIED\n  counterparty: bitech\n  active: true\n",
+         tax_category: PURCHASE_10_QUALIFIED\n  counterparty: abc\n  active: true\n",
     );
 
     let (stdout, stderr, ok) = run_journalize(&app, &rules);
@@ -127,7 +127,7 @@ async fn the_preview_shows_the_tags_from_the_rule(
         "税区分を出すこと: {stdout}"
     );
     assert!(
-        stdout.contains("counterparty=bitech"),
+        stdout.contains("counterparty=abc"),
         "取引先を出すこと: {stdout}"
     );
 }

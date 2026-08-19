@@ -216,9 +216,9 @@ pub fn tax_included_in(
 
     // **割り算を最後にする。** `rate / (1 + rate)` を先に求めると、
     // 10% で 0.0909090909… という割り切れない小数になり、桁が落ちる。
-    // 実際、12,070,080円 の税額が 1,097,279円 になった（正しくは 1,097,280円）。
+    // 実際、9,757,440円 の税額が 887,039円 になった（正しくは 887,040円）。
     //
-    // 掛けてから割れば、10% の場合は 1,207,008 ÷ 1.1 = 1,097,280 で
+    // 掛けてから割れば、10% の場合は 975,744 ÷ 1.1 = 887,040 で
     // 割り切れる。
     let base = Decimal::try_from_i128_with_scale(amount.minor(), 0).map_err(|_| {
         kaikei_core::CoreError::InvalidAmount {
@@ -328,13 +328,13 @@ mod tests {
 
     /// **本命。** 税込から税額を割り戻す。
     ///
-    /// 実帳簿の課税売上 12,070,080円（税込10%）なら 1,097,280円。
+    /// 実帳簿の課税売上 9,757,440円（税込10%）なら 887,040円。
     #[test]
     fn the_tax_is_backed_out_of_a_tax_included_amount() {
         let rate = Ratio::parse_rate("0.10").unwrap();
         assert_eq!(
-            tax_included_in(&yen(12_070_080), rate).unwrap().minor(),
-            1_097_280
+            tax_included_in(&yen(9_757_440), rate).unwrap().minor(),
+            887_040
         );
     }
 
@@ -358,28 +358,28 @@ mod tests {
     /// **本命。** 売上は貸方に立つので、正の値で出す。
     #[test]
     fn sales_are_reported_as_a_positive_amount() {
-        let lines = vec![line(Some("SALES_10"), Side::Credit, 12_070_080)];
+        let lines = vec![line(Some("SALES_10"), Side::Credit, 9_757_440)];
 
         let summary = summarize(&lines, &table()).unwrap();
 
-        assert_eq!(summary.taxable_sales().minor(), 12_070_080);
-        assert_eq!(summary.tax_on_sales().minor(), 1_097_280);
+        assert_eq!(summary.taxable_sales().minor(), 9_757_440);
+        assert_eq!(summary.tax_on_sales().minor(), 887_040);
     }
 
     /// **本命。** 貸方に立つ課税仕入れ（返金）は差し引く。
     ///
-    /// 借方だけを足すと控除額が過大になる。実帳簿では返金5件・60,831円 が
-    /// これに当たる。
+    /// 借方だけを足すと控除額が過大になる。検証帳簿ではドメイン代の返金が
+    /// これに当たった。
     #[test]
     fn a_refund_reduces_the_taxable_purchase() {
         let lines = vec![
-            line(Some("PURCHASE_10_QUALIFIED"), Side::Debit, 2_974_712),
-            line(Some("PURCHASE_10_QUALIFIED"), Side::Credit, 60_831),
+            line(Some("PURCHASE_10_QUALIFIED"), Side::Debit, 2_407_340),
+            line(Some("PURCHASE_10_QUALIFIED"), Side::Credit, 49_380),
         ];
 
         let summary = summarize(&lines, &table()).unwrap();
 
-        assert_eq!(summary.taxable_purchases().minor(), 2_913_881);
+        assert_eq!(summary.taxable_purchases().minor(), 2_357_960);
     }
 
     /// 売上の返還（返品・値引き）も差し引く。
@@ -432,7 +432,7 @@ mod tests {
     /// **0 と `None` は違う。** 0 と書くと「計算した結果0」に読める。
     #[test]
     fn a_category_without_a_rate_has_no_tax() {
-        let lines = vec![line(Some("OUT_OF_SCOPE"), Side::Debit, 13_434)];
+        let lines = vec![line(Some("OUT_OF_SCOPE"), Side::Debit, 10_880)];
 
         let summary = summarize(&lines, &table()).unwrap();
 
@@ -468,19 +468,19 @@ mod tests {
     #[test]
     fn it_reproduces_the_real_book() {
         let lines = vec![
-            line(Some("SALES_10"), Side::Credit, 12_070_080),
-            line(Some("PURCHASE_10_QUALIFIED"), Side::Debit, 2_974_712),
-            line(Some("PURCHASE_10_QUALIFIED"), Side::Credit, 60_831),
-            line(Some("OUT_OF_SCOPE"), Side::Debit, 13_434),
-            line(Some("TAX_FREE"), Side::Debit, 205_000),
+            line(Some("SALES_10"), Side::Credit, 9_757_440),
+            line(Some("PURCHASE_10_QUALIFIED"), Side::Debit, 2_407_340),
+            line(Some("PURCHASE_10_QUALIFIED"), Side::Credit, 49_380),
+            line(Some("OUT_OF_SCOPE"), Side::Debit, 10_880),
+            line(Some("TAX_FREE"), Side::Debit, 168_000),
         ];
 
         let summary = summarize(&lines, &table()).unwrap();
 
-        assert_eq!(summary.taxable_sales().minor(), 12_070_080);
-        assert_eq!(summary.tax_on_sales().minor(), 1_097_280);
-        assert_eq!(summary.taxable_purchases().minor(), 2_913_881);
-        assert_eq!(summary.tax_on_purchases().minor(), 264_898);
+        assert_eq!(summary.taxable_sales().minor(), 9_757_440);
+        assert_eq!(summary.tax_on_sales().minor(), 887_040);
+        assert_eq!(summary.taxable_purchases().minor(), 2_357_960);
+        assert_eq!(summary.tax_on_purchases().minor(), 214_360);
     }
     // ─── 売上の税額だけで決まる特例 ─────────────────
 
@@ -517,21 +517,21 @@ mod tests {
 
     // **本命。** 納付税額は売上の税額だけで決まる。
     //
-    // 実帳簿（2026年）の売上税額 1,097,280円 で、2割なら 219,456円。
-    // 一般課税は 1,097,280 − 264,898 = 832,382円 なので、差は 612,926円。
+    // 実帳簿（2026年）の売上税額 887,040円 で、2割なら 177,408円。
+    // 一般課税は 887,040 − 214,360 = 672,680円 なので、差は 495,272円。
     #[test]
     fn the_twenty_percent_rule_uses_only_the_sales_tax() {
         assert_eq!(
-            tax_under(SpecialRule::TwentyPercent, yen(1_097_280)).minor(),
-            219_456
+            tax_under(SpecialRule::TwentyPercent, yen(887_040)).minor(),
+            177_408
         );
     }
 
     #[test]
     fn the_thirty_percent_rule_takes_three_tenths() {
         assert_eq!(
-            tax_under(SpecialRule::ThirtyPercent, yen(1_097_280)).minor(),
-            329_184
+            tax_under(SpecialRule::ThirtyPercent, yen(887_040)).minor(),
+            266_112
         );
     }
 

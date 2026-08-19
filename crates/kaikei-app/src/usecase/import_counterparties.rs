@@ -2,14 +2,14 @@
 //!
 //! # なぜこのユースケースが要るのか
 //!
-//! `counterparties` に行を入れる経路が本番コードに1つも無かった。実帳簿
-//! （weBanana.SP）は **0 件**である。その結果、
+//! `counterparties` に行を入れる経路が本番コードに1つも無かった。検証帳簿
+//! の取引先も **0 件**である。その結果、
 //!
 //! - `counterparty` タグを付けようとすると `PolicyError::UnknownCounterparty`
 //!   で記帳が弾かれる
 //! - 誰も取引先タグを付けないので、`JpTaxPolicy` の適格請求書の検証
 //!   （取引先タグが**有る**ときにしか動かない）がすり抜ける
-//! - 実際に、適格請求書が要る税区分の明細が **603 件**あるのに、相手方が
+//! - 実際に、適格請求書が要る税区分の明細が**数百件**あるのに、相手方が
 //!   1件も記録されていない状態になっていた（`DECISIONS.md` D-099）
 //!
 //! # 冪等性: 追加しかしない（[`import_chart`] と同じ。`DECISIONS.md` D-081）
@@ -27,10 +27,11 @@
 //! どうかを決めている。外部システムの「false」は多くの場合**誰も入力して
 //! いないだけ**で、非適格だと確認したわけではない。
 //!
-//! 実際に freee の取引先 34 件を調べたところ、`invoice_registration_number`
-//! は全件 `null`、`qualified_invoice_issuer` は全件 `false` だった。これを
-//! `Some(false)` として取り込むと、**34 社すべてを「非適格だと確認済み」に
-//! 仕立てることになる。** 投入側は未確認なら `None` を渡すこと。
+//! 実際に外部の会計サービスの取引先一覧を調べたところ、
+//! `invoice_registration_number` は全件 `null`、`qualified_invoice_issuer` は
+//! 全件 `false` だった。これを `Some(false)` として取り込むと、**全社を
+//! 「非適格だと確認済み」に仕立てることになる。** 投入側は未確認なら
+//! `None` を渡すこと。
 //!
 //! [`import_chart`]: crate::usecase::import_chart
 
@@ -135,8 +136,8 @@ fn summarize(c: &Counterparty) -> String {
 ///
 /// 入力に同じコードが2回出てきた場合は**最初のものだけを見る**。2回目以降は
 /// 1回目と比べ、違えば [`ImportCounterpartiesOutput::kept_existing`] に載る
-/// （外部システムでは表記ゆれの重複が普通にある。実際に freee には
-/// 「株式会社 ビーテック」と「株式会社ビーテック」が別々に登録されていた）。
+/// （外部システムでは表記ゆれの重複が普通にある。実際に外部の会計サービスには
+/// 「株式会社 ABC」と「株式会社ABC」が別々に登録されていた）。
 ///
 /// # Errors
 ///
@@ -301,16 +302,16 @@ mod tests {
 
     // 入力の中に同じコードが2回あっても壊れない。
     //
-    // 外部システムでは表記ゆれの重複が普通にある（freee には
-    // 「株式会社 ビーテック」と「株式会社ビーテック」が別に登録されていた）。
+    // 外部システムでは表記ゆれの重複が普通にある（外部の会計サービスには
+    // 「株式会社 ABC」と「株式会社ABC」が別に登録されていた）。
     #[tokio::test]
     async fn a_duplicate_code_within_the_input_is_reported_not_inserted_twice() {
         let store = InMemoryStore::new();
         let out = import(
             &store,
             &[
-                cp("bitech", "株式会社ビーテック", None),
-                cp("bitech", "株式会社 ビーテック", None),
+                cp("abc", "株式会社ABC", None),
+                cp("abc", "株式会社 ABC", None),
             ],
         )
         .await;
@@ -324,16 +325,12 @@ mod tests {
     #[tokio::test]
     async fn a_renamed_counterparty_keeps_the_existing_name() {
         let store = InMemoryStore::new();
-        store.set_counterparties(CounterpartyIndex::new(vec![cp(
-            "bitech",
-            "ビーテック",
-            None,
-        )]));
+        store.set_counterparties(CounterpartyIndex::new(vec![cp("abc", "ABC", None)]));
 
-        let out = import(&store, &[cp("bitech", "株式会社ビーテック", None)]).await;
+        let out = import(&store, &[cp("abc", "株式会社ABC", None)]).await;
 
         assert_eq!(out.inserted_rows, 0);
         assert_eq!(out.kept_existing.len(), 1);
-        assert_eq!(out.kept_existing[0].existing.name, "ビーテック");
+        assert_eq!(out.kept_existing[0].existing.name, "ABC");
     }
 }

@@ -194,7 +194,7 @@ async fn kaikei_migrator_truncate_journal_tables_is_rejected_by_trigger(
 /// 証憑を1件入れる。追記はできる（禁じているのは訂正と削除）。
 async fn insert_document(pool: &sqlx::PgPool, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO documents          (id, blob_hash, original_name, mime_type, byte_size, doc_date,           amount_minor, counterparty, doc_type, received_via, received_at, created_at)          VALUES ($1, repeat('a', 64), '請求書.pdf', 'application/pdf', 1024,                  DATE '2026-06-15', 550000, 'ビーテック', 'invoice', 'email', now(), now())",
+        "INSERT INTO documents          (id, blob_hash, original_name, mime_type, byte_size, doc_date,           amount_minor, counterparty, doc_type, received_via, received_at, created_at)          VALUES ($1, repeat('a', 64), '請求書.pdf', 'application/pdf', 1024,                  DATE '2026-06-15', 550000, 'ABC', 'invoice', 'email', now(), now())",
     )
     .bind(uuid::Uuid::parse_str(id).unwrap())
     .execute(pool)

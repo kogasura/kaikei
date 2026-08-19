@@ -525,7 +525,7 @@ mod tests {
     fn not_exported_row() -> NotExported {
         NotExported {
             folder: "電子取引".to_string(),
-            file_name: "2026-03-24_グランデ_515720_invoice.txt".to_string(),
+            file_name: "2026-03-24_サンプル不動産_418900_invoice.txt".to_string(),
             original_name: "inv1.txt".to_string(),
             blob_hash: "9dbaa4f7".to_string(),
             reason: "中身が保存時から変わっています".to_string(),

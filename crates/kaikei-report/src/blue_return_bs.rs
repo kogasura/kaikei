@@ -145,19 +145,19 @@ mod tests {
             BsSection {
                 title: "資産の部".to_string(),
                 rows: vec![
-                    row(Some("現金"), Some(557_052), 552_542),
+                    row(Some("現金"), Some(483_610), 479_105),
                     row(None, None.map(|x: i128| x).or(Some(0)), 0),
-                    row(Some("事業主貸"), None, 10_069_266),
-                    row(Some("合計"), Some(50_975), 10_037_243),
+                    row(Some("事業主貸"), None, 8_100_472),
+                    row(Some("合計"), Some(64_400), 8_081_877),
                 ],
             },
             BsSection {
                 title: "負債・資本の部".to_string(),
                 rows: vec![
-                    row(Some("未払金"), Some(1_865_236), 2_470_356),
-                    row(Some("元入金"), Some(-1_814_261), -1_814_261),
-                    row(Some("青色申告特別控除前の所得金額"), None, 8_368_714),
-                    row(Some("合計"), Some(50_975), 10_036_809),
+                    row(Some("未払金"), Some(1_502_385), 2_013_470),
+                    row(Some("元入金"), Some(-1_437_985), -1_437_985),
+                    row(Some("青色申告特別控除前の所得金額"), None, 6_685_880),
+                    row(Some("合計"), Some(64_400), 8_081_365),
                 ],
             },
         ]
@@ -168,9 +168,9 @@ mod tests {
     fn the_csv_carries_both_columns() {
         let csv = to_csv(&sections());
 
-        assert!(csv.contains("資産の部,現金,557052,552542"), "{csv}");
+        assert!(csv.contains("資産の部,現金,483610,479105"), "{csv}");
         assert!(
-            csv.contains("負債・資本の部,未払金,1865236,2470356"),
+            csv.contains("負債・資本の部,未払金,1502385,2013470"),
             "{csv}"
         );
     }
@@ -184,7 +184,7 @@ mod tests {
         let csv = to_csv(&sections());
 
         assert!(
-            csv.contains("資産の部,事業主貸,—,10069266"),
+            csv.contains("資産の部,事業主貸,—,8100472"),
             "期首欄が斜線の行は 0 ではなく空欄と分かる表示にすること: {csv}"
         );
         assert!(
@@ -203,9 +203,9 @@ mod tests {
     // BS-HTML-1: **本命。** 貸借が合わなければ差額を注記に出す。
     #[test]
     fn an_imbalance_is_always_reported() {
-        let html = to_html("貸借対照表", "", &sections(), Some(yen(434)), &[]);
+        let html = to_html("貸借対照表", "", &sections(), Some(yen(512)), &[]);
 
-        assert!(html.contains("434"), "差額を出すこと: {html}");
+        assert!(html.contains("512"), "差額を出すこと: {html}");
         assert!(html.contains("ずれています"), "{html}");
     }
 
@@ -229,7 +229,7 @@ mod tests {
         let csv = to_csv(&sections());
         let html = to_html("貸借対照表", "", &sections(), Some(yen(0)), &[]);
 
-        for value in ["557052", "10069266", "8368714", "-1814261"] {
+        for value in ["483610", "8100472", "6685880", "-1437985"] {
             assert!(csv.contains(value), "CSV に値が無い: {value}");
             assert!(html.contains(value), "HTML に値が無い: {value}");
         }

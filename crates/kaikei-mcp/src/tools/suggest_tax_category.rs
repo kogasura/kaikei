@@ -352,10 +352,10 @@ mod tests {
     // 摘要は絞り込みに使わない（使っていないことを応答で明示する）。
     #[test]
     fn the_description_is_echoed_but_never_used_to_filter() {
-        let with_text = body_for(None, Some("ｶ)ｱﾏｿﾞﾝ ｼﾞﾔﾊﾟﾝ"));
+        let with_text = body_for(None, Some("ｶ)ｻﾝﾌﾟﾙ ｼﾖｳｼﾞ"));
         let without_text = body_for(None, None);
 
-        assert_eq!(with_text["description"], json!("ｶ)ｱﾏｿﾞﾝ ｼﾞﾔﾊﾟﾝ"));
+        assert_eq!(with_text["description"], json!("ｶ)ｻﾝﾌﾟﾙ ｼﾖｳｼﾞ"));
         assert_eq!(
             with_text["candidates"], without_text["candidates"],
             "摘要で候補が変わっています（推論を書いてしまっています）"

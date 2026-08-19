@@ -62,7 +62,7 @@ mod tests {
 
     fn summary() -> MonthlySales {
         MonthlySales {
-            revenue: vec![row("500", "売上高", 410_000, 12_070_080)],
+            revenue: vec![row("500", "売上高", 410_000, 9_757_440)],
             purchases: vec![row("555", "仕入金額", 0, 0)],
         }
     }
@@ -93,8 +93,8 @@ mod tests {
     fn the_amounts_have_no_thousands_separator() {
         let csv = to_csv(&summary());
 
-        assert!(csv.contains("12070080"), "{csv}");
-        assert!(!csv.contains("12,070,080"), "{csv}");
+        assert!(csv.contains("9757440"), "{csv}");
+        assert!(!csv.contains("9,757,440"), "{csv}");
     }
 
     // 取引が無くても行は残す。**行が消えると様式の欄が埋まらない。**

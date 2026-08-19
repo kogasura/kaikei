@@ -15,7 +15,7 @@
 //!
 //! # 摘要は段階的に緩めて探す
 //!
-//! 銀行の摘要には可変部分が混ざる（`カ)アマゾン ジヤパン 12345` の番号）。
+//! 銀行の摘要には可変部分が混ざる（`カ)サンプル シヨウジ 12345` の番号）。
 //! 全体で探すと1件も当たらないので、当たらなければ**摘要から取り出した
 //! 最も長い語**でもう一度探す。どちらで当たったかは根拠に載せる——緩めた
 //! ことを隠すと、たまたま当たった別の取引を「よく似ている」と読んでしまう。
@@ -204,7 +204,7 @@ async fn run_search(
 
 /// 摘要から最も長い語を取り出す。
 ///
-/// 銀行の摘要には可変部分が混ざる（`カ)アマゾン ジヤパン 12345` の番号）。
+/// 銀行の摘要には可変部分が混ざる（`カ)サンプル シヨウジ 12345` の番号）。
 /// **数字と記号で区切り、最も長い部分を使う。** 数字そのものは使わない——
 /// 取引ごとに変わるので、それで探しても当たらない。
 ///
@@ -364,7 +364,7 @@ mod tests {
     /// 番号込みで探すと1件も当たらない。
     #[test]
     fn a_varying_number_is_not_used_as_the_search_key() {
-        let word = longest_word("カ)アマゾン ジヤパン 12345").expect("語が取れること");
+        let word = longest_word("カ)サンプル シヨウジ 12345").expect("語が取れること");
         assert!(!word.contains('1'), "{word}");
         assert!(!word.contains(')'), "{word}");
     }
@@ -372,7 +372,7 @@ mod tests {
     /// 最も長い語を採る。
     #[test]
     fn the_longest_word_is_taken() {
-        assert_eq!(longest_word("カ)アマゾン 12"), Some("アマゾン".to_string()));
+        assert_eq!(longest_word("カ)サンプル 12"), Some("サンプル".to_string()));
         assert_eq!(longest_word("ﾋﾞｰﾃﾂｸ(ｶ"), Some("ﾋﾞｰﾃﾂｸ".to_string()));
     }
 
@@ -382,8 +382,8 @@ mod tests {
     #[test]
     fn a_tie_keeps_the_first_word() {
         assert_eq!(
-            longest_word("アマゾン ジヤパン"),
-            Some("アマゾン".to_string())
+            longest_word("サンプル シヨウジ"),
+            Some("サンプル".to_string())
         );
     }
 

@@ -12,7 +12,7 @@
 //!
 //! | 見るもの | なぜ |
 //! |---|---|
-//! | 1万円以上だけが載る | 566件を並べても作業リストにならない |
+//! | 1万円以上だけが載る | 1万円未満まで並べても作業リストにならない |
 //! | 証憑を付けたら消える | **減らない一覧は作業リストとして使えない** |
 //! | 契約書では消えない | 契約書があっても請求書が揃ったことにはならない |
 
@@ -179,7 +179,7 @@ async fn only_transactions_of_ten_thousand_or_more_are_listed(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed(&app, 1, 43_967).await;
+    seed(&app, 1, 35_480).await;
     seed(&app, 2, 220).await;
     let out = temp_dir("list-out");
     let blob = temp_dir("list-blob");
@@ -188,14 +188,14 @@ async fn only_transactions_of_ten_thousand_or_more_are_listed(
 
     assert!(ok, "{log}");
     let csv = read_list(&out);
-    assert!(csv.contains("43967"), "1万円以上は載る: {csv}");
+    assert!(csv.contains("35480"), "1万円以上は載る: {csv}");
     assert!(!csv.contains(",220,"), "1万円未満は載せない: {csv}");
     assert!(log.contains("揃えるべき取引が 1 件"), "{log}");
 }
 
 /// **本命。** 証憑を付けたら一覧から消える。
 ///
-/// **減らない一覧は作業リストとして使えない。** 32件を順に片付けても件数が
+/// **減らない一覧は作業リストとして使えない。** 一覧を順に片付けても件数が
 /// 変わらなければ、どこまで進んだか分からない。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn an_entry_with_an_invoice_leaves_the_list(
@@ -204,8 +204,8 @@ async fn an_entry_with_an_invoice_leaves_the_list(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed(&app, 1, 43_967).await;
-    seed(&app, 2, 35_829).await;
+    seed(&app, 1, 35_480).await;
+    seed(&app, 2, 28_914).await;
     let out = temp_dir("done-out");
     let blob = temp_dir("done-blob");
     let file = blob.join("invoice.txt");
@@ -238,8 +238,8 @@ async fn an_entry_with_an_invoice_leaves_the_list(
         "外したことを言うこと: {after}"
     );
     let csv = read_list(&out);
-    assert!(!csv.contains("43967"), "済んだ行は消える: {csv}");
-    assert!(csv.contains("35829"), "残りは載ったまま: {csv}");
+    assert!(!csv.contains("35480"), "済んだ行は消える: {csv}");
+    assert!(csv.contains("28914"), "残りは載ったまま: {csv}");
 }
 
 /// **本命。** 契約書が付いていても一覧から消えない。
@@ -252,7 +252,7 @@ async fn a_contract_does_not_take_it_off_the_list(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed(&app, 1, 43_967).await;
+    seed(&app, 1, 35_480).await;
     let out = temp_dir("contract-out");
     let blob = temp_dir("contract-blob");
     let file = blob.join("contract.txt");
@@ -277,7 +277,7 @@ async fn a_contract_does_not_take_it_off_the_list(
 
     assert!(ok, "{log}");
     assert!(log.contains("揃えるべき取引が 1 件"), "残ること: {log}");
-    assert!(read_list(&out).contains("43967"), "{log}");
+    assert!(read_list(&out).contains("35480"), "{log}");
 }
 
 /// 領収書でも消える（請求書と同じ扱い）。
@@ -288,7 +288,7 @@ async fn a_receipt_also_takes_it_off_the_list(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed(&app, 1, 43_967).await;
+    seed(&app, 1, 35_480).await;
     let out = temp_dir("receipt-out");
     let blob = temp_dir("receipt-blob");
     let file = blob.join("receipt.txt");
@@ -313,7 +313,7 @@ async fn a_receipt_also_takes_it_off_the_list(
 
     assert!(ok, "{log}");
     assert!(log.contains("揃えるべき取引が 0 件") || !log.contains("揃えるべき取引"));
-    assert!(!read_list(&out).contains("43967"), "消えること");
+    assert!(!read_list(&out).contains("35480"), "消えること");
 }
 
 /// 決算振替の仕訳を1本入れる（`entry_kind: closing` タグ付き）。
@@ -374,7 +374,7 @@ async fn the_blue_return_does_not_change_when_the_closing_entry_is_posted(
     .execute(&app)
     .await
     .expect("元入金");
-    seed(&app, 1, 43_967).await;
+    seed(&app, 1, 35_480).await;
     let blob = temp_dir("closing-blob");
 
     let before_dir = temp_dir("closing-before");
@@ -382,7 +382,7 @@ async fn the_blue_return_does_not_change_when_the_closing_entry_is_posted(
     assert!(ok, "{log}");
     let before = std::fs::read_to_string(before_dir.join("blue_return.csv")).unwrap();
 
-    seed_closing_entry(&app, 900, 43_967).await;
+    seed_closing_entry(&app, 900, 35_480).await;
 
     let after_dir = temp_dir("closing-after");
     let (log, ok) = run_report(&app, &after_dir, &blob);
@@ -395,7 +395,7 @@ async fn the_blue_return_does_not_change_when_the_closing_entry_is_posted(
     );
     // **空になっていないことも見る。** 両方とも空なら「同じ」は成り立つ。
     assert!(
-        before.contains("43967"),
+        before.contains("35480"),
         "そもそも決算書に金額が載っていること: {before}"
     );
 }
@@ -418,14 +418,14 @@ async fn the_journal_book_does_grow_when_the_closing_entry_is_posted(
     .execute(&app)
     .await
     .expect("元入金");
-    seed(&app, 1, 43_967).await;
+    seed(&app, 1, 35_480).await;
     let blob = temp_dir("journal-blob");
 
     let before_dir = temp_dir("journal-before");
     run_report(&app, &before_dir, &blob);
     let before = std::fs::read_to_string(before_dir.join("journal_book.csv")).unwrap();
 
-    seed_closing_entry(&app, 900, 43_967).await;
+    seed_closing_entry(&app, 900, 35_480).await;
 
     let after_dir = temp_dir("journal-after");
     run_report(&app, &after_dir, &blob);
@@ -529,8 +529,8 @@ async fn seed_owner_accounts(pool: &PgPool) {
 /// **決算書の貸借対照表から事業主貸が消える。** 青色申告決算書の様式には
 /// この欄があり、期末残高をそのまま書く。0 で提出することになる。
 ///
-/// 実帳簿の複製で試したら再現した——事業主貸 9,923,381円 と
-/// 事業主借 1,012,434円 が消え、`verify` は終了コード0のままだった。
+/// 実帳簿の複製で試したら再現した——事業主貸 7,984,381円 と
+/// 事業主借 820,512円 が消え、`verify` は終了コード0のままだった。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn an_opening_transfer_posted_within_the_year_is_reported(
     pool_opts: PgPoolOptions,
@@ -584,7 +584,7 @@ async fn a_year_without_any_drawing_is_quiet(
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
     seed_owner_accounts(&app).await;
-    seed(&app, 1, 43_967).await;
+    seed(&app, 1, 35_480).await;
     let out = temp_dir("nodraw-out");
     let blob = temp_dir("nodraw-blob");
 
@@ -612,7 +612,7 @@ async fn an_early_opening_transfer_is_reported_even_without_other_drawings(
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
     seed_owner_accounts(&app).await;
-    seed(&app, 1, 43_967).await;
+    seed(&app, 1, 35_480).await;
     // **前年からの繰越**を作る。貸借対照表は帳簿の最初からの累計なので、
     // 前年の事業主貸が残高として乗る。
     seed_drawing_in(&app, 2025, 1, 500_000, "2025-06-10").await;
@@ -642,7 +642,7 @@ async fn the_report_includes_the_consumption_tax_summary(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed(&app, 1, 43_967).await;
+    seed(&app, 1, 35_480).await;
     let out = temp_dir("ctax-out");
     let blob = temp_dir("ctax-blob");
 
@@ -652,8 +652,8 @@ async fn the_report_includes_the_consumption_tax_summary(
     let csv = std::fs::read_to_string(out.join("consumption_tax.csv"))
         .expect("consumption_tax.csv が出ていること");
     assert!(csv.contains("PURCHASE_10_QUALIFIED"), "{csv}");
-    assert!(csv.contains("43967"), "{csv}");
-    // 43,967 × 10/110 = 3,997
+    assert!(csv.contains("35480"), "{csv}");
+    // 35,480 × 10/110 = 3,997
     assert!(csv.contains("3997"), "税額を出すこと: {csv}");
 
     // **注意書きも一緒に出す。** 数字だけ渡すと申告書の金額と読まれる。
@@ -679,7 +679,7 @@ async fn the_report_works_without_any_tax_settings(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed(&app, 1, 43_967).await;
+    seed(&app, 1, 35_480).await;
     let out = temp_dir("noenv-out");
     let blob = temp_dir("noenv-blob");
 
@@ -747,7 +747,7 @@ async fn seed_with_description(pool: &PgPool, entry_no: i32, amount: i64, descri
 /// **本命。** 摘要が科目名だけの取引の件数を、画面にも出す。
 ///
 /// CSV には「相手先の手がかり」列があるが、**開かないと分からない。**
-/// 件数だけを見せると全部が同じ手間に見える。実帳簿では32件中11件が
+/// 件数だけを見せると全部が同じ手間に見える。検証帳簿でも三分の一ほどが
 /// これで、残り21件は摘要から相手先を辿れた——**手間がまるで違う。**
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn the_count_without_a_hint_is_printed(
@@ -759,16 +759,16 @@ async fn the_count_without_a_hint_is_printed(
     let out = temp_dir("hint_count");
     let blob = temp_dir("hint_count_blob");
     // 摘要が科目名だけ＝手がかりなし。
-    seed_with_description(&app, 1, 26_136, "通信費").await;
+    seed_with_description(&app, 1, 21_090, "通信費").await;
     // 摘要に相手先がある＝手がかりあり。
-    seed_with_description(&app, 2, 43_967, "ドメイン / GMOペパボ").await;
+    seed_with_description(&app, 2, 35_480, "ドメイン / サンプルホスティング").await;
 
     let (log, ok) = run_report(&app, &out, &blob);
 
     assert!(ok, "{log}");
     assert!(log.contains("2 件あります"), "全体の件数: {log}");
     assert!(
-        log.contains("うち 1 件（26,136 円）"),
+        log.contains("うち 1 件（21,090 円）"),
         "手がかりの無い件数と金額: {log}"
     );
 }

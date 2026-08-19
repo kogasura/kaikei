@@ -122,7 +122,7 @@ async fn commit_actually_inserts_rows(pool_opts: PgPoolOptions, conn_opts: PgCon
         "kaikei_cp_commit.csv",
         "code,name,invoice_registration_no,is_qualified\n\
          anthropic,Anthropic,,\n\
-         bitech,株式会社ビーテック,T7123456789012,true\n",
+         abc,株式会社ABC,T7123456789012,true\n",
     );
 
     let (stdout, stderr, ok) = run_import(&app, &csv, true);
@@ -137,7 +137,7 @@ async fn commit_actually_inserts_rows(pool_opts: PgPoolOptions, conn_opts: PgCon
         rows[0].2, None,
         "空欄は未確認（NULL）で入ること。false にしてはいけない"
     );
-    assert_eq!(rows[1].0, "bitech");
+    assert_eq!(rows[1].0, "abc");
     assert_eq!(rows[1].2, Some(true));
 }
 
@@ -182,8 +182,8 @@ async fn a_second_import_does_not_overwrite_the_qualified_flag(
 
 /// 入力の中に同じコードが2回あっても、1件しか入らない。
 ///
-/// 外部システムには表記ゆれの重複が普通にある（freee には
-/// 「株式会社 ビーテック」と「株式会社ビーテック」が別々に登録されていた）。
+/// 外部システムには表記ゆれの重複が普通にある（外部の会計サービスには
+/// 「株式会社 ABC」と「株式会社ABC」が別々に登録されていた）。
 /// 挿入自体は `ON CONFLICT DO NOTHING` が飛ばすので落ちないが、
 /// **入る件数と報告する件数が食い違わないこと**をここで固定する。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
@@ -195,7 +195,7 @@ async fn a_duplicate_code_within_one_file_does_not_fail(
     let _ = pool_opts;
     let csv = write_csv(
         "kaikei_cp_dup.csv",
-        "code,name\nbitech,株式会社ビーテック\nbitech,株式会社 ビーテック\n",
+        "code,name\nabc,株式会社ABC\nabc,株式会社 ABC\n",
     );
 
     let (stdout, stderr, ok) = run_import(&app, &csv, true);
@@ -207,7 +207,7 @@ async fn a_duplicate_code_within_one_file_does_not_fail(
         "同時投入のせいにしないこと（重複は入力の中にある）: {stdout}"
     );
     assert!(
-        stderr.contains("株式会社ビーテック"),
+        stderr.contains("株式会社ABC"),
         "どちらを残したかを見せること: {stderr}"
     );
     assert_eq!(codes_in_db(&app).await.len(), 1);
@@ -259,7 +259,7 @@ async fn seed_counterparty(pool: &PgPool, code: &str, name: &str) {
 /// # この経路が無いと詰む
 ///
 /// `counterparty import` は `ON CONFLICT DO NOTHING` なので、既存行に登録番号を
-/// 入れられない。**実帳簿の取引先31件はすべて登録番号が空**で、CSV から入れ
+/// 入れられない。**登録番号が空のまま投入された取引先**は、CSV から入れ
 /// 直そうとしても「既存を優先」で無視されていた（警告は出るが書き込まれない）。
 ///
 /// 相手が適格請求書発行事業者かどうかは**後から分かる**情報なので、追加しか
@@ -271,13 +271,13 @@ async fn a_registration_number_can_be_recorded_later(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed_counterparty(&app, "jdf", "JDF株式会社").await;
+    seed_counterparty(&app, "def", "DEF株式会社").await;
 
     let (stdout, stderr, ok) = run_verify(
         &app,
         &[
             "--code",
-            "jdf",
+            "def",
             "--registration-no",
             "T7123456789012",
             "--qualified",
@@ -293,13 +293,13 @@ async fn a_registration_number_can_be_recorded_later(
 
     // 日付は文字列で受ける（この crate は chrono を直接持たない）。
     let row: (String, Option<String>, Option<bool>, Option<String>) = sqlx::query_as(
-        "SELECT name, invoice_reg_no, is_qualified, verified_at::text          FROM counterparties WHERE code = 'jdf'",
+        "SELECT name, invoice_reg_no, is_qualified, verified_at::text          FROM counterparties WHERE code = 'def'",
     )
     .fetch_one(&app)
     .await
     .expect("取引先");
 
-    assert_eq!(row.0, "JDF株式会社", "**名前は変えない**");
+    assert_eq!(row.0, "DEF株式会社", "**名前は変えない**");
     assert_eq!(row.1.as_deref(), Some("T7123456789012"));
     assert_eq!(row.2, Some(true));
     assert_eq!(row.3.as_deref(), Some("2026-08-18"));
@@ -310,18 +310,18 @@ async fn a_registration_number_can_be_recorded_later(
 async fn a_dry_run_does_not_write(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed_counterparty(&app, "jdf", "JDF株式会社").await;
+    seed_counterparty(&app, "def", "DEF株式会社").await;
 
     let (stdout, stderr, ok) = run_verify(
         &app,
-        &["--code", "jdf", "--registration-no", "T7123456789012"],
+        &["--code", "def", "--registration-no", "T7123456789012"],
     );
 
     assert!(ok, "{stderr}");
     assert!(stdout.contains("下見"), "{stdout}");
 
     let reg: Option<String> =
-        sqlx::query_scalar("SELECT invoice_reg_no FROM counterparties WHERE code = 'jdf'")
+        sqlx::query_scalar("SELECT invoice_reg_no FROM counterparties WHERE code = 'def'")
             .fetch_one(&app)
             .await
             .expect("取引先");
@@ -339,16 +339,16 @@ async fn a_non_qualified_issuer_can_be_recorded(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed_counterparty(&app, "povo", "povo").await;
+    seed_counterparty(&app, "carrier", "carrier").await;
 
     let (_stdout, stderr, ok) = run_verify(
         &app,
-        &["--code", "povo", "--qualified", "false", "--commit"],
+        &["--code", "carrier", "--qualified", "false", "--commit"],
     );
 
     assert!(ok, "{stderr}");
     let is_qualified: Option<bool> =
-        sqlx::query_scalar("SELECT is_qualified FROM counterparties WHERE code = 'povo'")
+        sqlx::query_scalar("SELECT is_qualified FROM counterparties WHERE code = 'carrier'")
             .fetch_one(&app)
             .await
             .expect("取引先");
@@ -366,12 +366,12 @@ async fn an_omitted_field_keeps_its_existing_value(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed_counterparty(&app, "jdf", "JDF株式会社").await;
+    seed_counterparty(&app, "def", "DEF株式会社").await;
     run_verify(
         &app,
         &[
             "--code",
-            "jdf",
+            "def",
             "--registration-no",
             "T7123456789012",
             "--commit",
@@ -380,11 +380,11 @@ async fn an_omitted_field_keeps_its_existing_value(
 
     // 登録番号は指定せず、適格の判定だけ変える。
     let (_stdout, stderr, ok) =
-        run_verify(&app, &["--code", "jdf", "--qualified", "true", "--commit"]);
+        run_verify(&app, &["--code", "def", "--qualified", "true", "--commit"]);
 
     assert!(ok, "{stderr}");
     let reg: Option<String> =
-        sqlx::query_scalar("SELECT invoice_reg_no FROM counterparties WHERE code = 'jdf'")
+        sqlx::query_scalar("SELECT invoice_reg_no FROM counterparties WHERE code = 'def'")
             .fetch_one(&app)
             .await
             .expect("取引先");
@@ -403,13 +403,13 @@ async fn a_bad_registration_number_is_rejected_before_writing(
 ) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    seed_counterparty(&app, "jdf", "JDF株式会社").await;
+    seed_counterparty(&app, "def", "DEF株式会社").await;
 
     let (_stdout, stderr, ok) = run_verify(
         &app,
         &[
             "--code",
-            "jdf",
+            "def",
             "--registration-no",
             // **わざと検査用数字を誤らせた番号。** 基礎番号 123456789012 の
             // 検査用数字は 7 なので、先頭の 1 は誤りである。

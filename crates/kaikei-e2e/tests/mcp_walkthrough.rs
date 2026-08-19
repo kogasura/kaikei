@@ -65,7 +65,7 @@ const FORBIDDEN_TOOLS: [&str; 4] = [
 /// 仕訳にする側は本番と同じ経路**（MCP のツール）を通す。
 async fn seed_imported_line(pool: &sqlx::PgPool) -> String {
     sqlx::query_scalar(
-        "INSERT INTO imported_transactions          (id, source, external_key, occurred_on, amount_minor, direction,           raw_description, balance_after, raw_row, status, imported_at)          VALUES (gen_random_uuid(), 'mizuho', 'k1', DATE '2026-06-15', 19800, 2,                  'ｶ)ｱﾏｿﾞﾝ', 500000, '[]', 'pending', now())          RETURNING id::text",
+        "INSERT INTO imported_transactions          (id, source, external_key, occurred_on, amount_minor, direction,           raw_description, balance_after, raw_row, status, imported_at)          VALUES (gen_random_uuid(), 'example_bank', 'k1', DATE '2026-06-15', 19800, 2,                  'ｶ)ｻﾝﾌﾟﾙ', 500000, '[]', 'pending', now())          RETURNING id::text",
     )
     .fetch_one(pool)
     .await

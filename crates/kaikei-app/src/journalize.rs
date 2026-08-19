@@ -42,8 +42,8 @@ pub enum DescriptionPattern {
 impl DescriptionPattern {
     /// 摘要に当たるか。
     ///
-    /// **大文字小文字を区別しない。** 銀行の摘要は表記が揺れる（`Amazon` と
-    /// `AMAZON` が同じ明細で混ざる）。区別すると、同じ店なのに片方だけ
+    /// **大文字小文字を区別しない。** 銀行の摘要は表記が揺れる（`Sample` と
+    /// `SAMPLE` が同じ明細で混ざる）。区別すると、同じ店なのに片方だけ
     /// 自動化されないという分かりにくい状態になる。
     pub fn matches(&self, description: &str) -> bool {
         let haystack = description.to_lowercase();
@@ -257,7 +257,7 @@ mod tests {
         direction: ImportDirection,
     ) -> MatchTarget<'a> {
         MatchTarget {
-            source: "mizuho",
+            source: "example_bank",
             occurred_on: AccountingDate::new(2026, 6, 15).unwrap(),
             amount_minor: amount,
             direction,
@@ -269,42 +269,42 @@ mod tests {
 
     #[test]
     fn contains_starts_with_and_equals_each_do_what_they_say() {
-        let text = "カ)アマゾン ジヤパン";
-        assert!(DescriptionPattern::Contains("アマゾン".into()).matches(text));
+        let text = "カ)サンプル シヨウジ";
+        assert!(DescriptionPattern::Contains("サンプル".into()).matches(text));
         assert!(DescriptionPattern::StartsWith("カ)".into()).matches(text));
         assert!(DescriptionPattern::Equals(text.into()).matches(text));
 
-        assert!(!DescriptionPattern::StartsWith("アマゾン".into()).matches(text));
-        assert!(!DescriptionPattern::Equals("アマゾン".into()).matches(text));
+        assert!(!DescriptionPattern::StartsWith("サンプル".into()).matches(text));
+        assert!(!DescriptionPattern::Equals("サンプル".into()).matches(text));
     }
 
     /// 表記の揺れで当たらなくならない。
     ///
-    /// 銀行の摘要は `Amazon` と `AMAZON` が同じ口座で混ざる。区別すると
+    /// 銀行の摘要は `Sample` と `SAMPLE` が同じ口座で混ざる。区別すると
     /// 「同じ店なのに片方だけ自動化されない」という分かりにくい状態になる。
     #[test]
     fn matching_ignores_letter_case() {
-        let pattern = DescriptionPattern::Contains("amazon".into());
-        assert!(pattern.matches("AMAZON.CO.JP"));
-        assert!(pattern.matches("Amazon Japan"));
+        let pattern = DescriptionPattern::Contains("sample".into());
+        assert!(pattern.matches("SAMPLE.CO.JP"));
+        assert!(pattern.matches("Sample Shokai"));
     }
 
     /// **本命。** 優先度の小さいものが勝つ。
     #[test]
     fn the_lowest_priority_number_wins() {
         let mut specific = rule(
-            "amazon_books",
-            DescriptionPattern::Contains("アマゾン".into()),
+            "sample_books",
+            DescriptionPattern::Contains("サンプル".into()),
         );
         specific.priority = 10;
         specific.account = code("501");
         let general = rule("everything", DescriptionPattern::Contains("".into()));
 
         let rules = vec![general, specific];
-        let chosen = first_matching(&rules, &target("アマゾン", 1980, ImportDirection::Out))
+        let chosen = first_matching(&rules, &target("サンプル", 1980, ImportDirection::Out))
             .expect("当たること");
 
-        assert_eq!(chosen.id, "amazon_books");
+        assert_eq!(chosen.id, "sample_books");
     }
 
     /// 優先度が同じなら名前の順で決まる。
@@ -313,12 +313,12 @@ mod tests {
     #[test]
     fn a_tie_is_broken_by_name_so_the_result_does_not_drift() {
         let rules = vec![
-            rule("zebra", DescriptionPattern::Contains("アマゾン".into())),
-            rule("alpha", DescriptionPattern::Contains("アマゾン".into())),
+            rule("zebra", DescriptionPattern::Contains("サンプル".into())),
+            rule("alpha", DescriptionPattern::Contains("サンプル".into())),
         ];
 
         let chosen =
-            first_matching(&rules, &target("アマゾン", 1980, ImportDirection::Out)).unwrap();
+            first_matching(&rules, &target("サンプル", 1980, ImportDirection::Out)).unwrap();
 
         assert_eq!(chosen.id, "alpha");
     }
@@ -326,11 +326,11 @@ mod tests {
     /// 止めたルールは当たらない。
     #[test]
     fn an_inactive_rule_is_skipped() {
-        let mut stopped = rule("stopped", DescriptionPattern::Contains("アマゾン".into()));
+        let mut stopped = rule("stopped", DescriptionPattern::Contains("サンプル".into()));
         stopped.active = false;
 
         assert!(
-            first_matching(&[stopped], &target("アマゾン", 1980, ImportDirection::Out)).is_none()
+            first_matching(&[stopped], &target("サンプル", 1980, ImportDirection::Out)).is_none()
         );
     }
 
@@ -339,7 +339,7 @@ mod tests {
     fn a_rule_can_be_narrowed_by_direction_source_and_amount() {
         let mut narrow = rule("narrow", DescriptionPattern::Contains("ｺﾝﾋﾞﾆ".into()));
         narrow.direction = Some(ImportDirection::Out);
-        narrow.source = Some("mizuho".to_string());
+        narrow.source = Some("example_bank".to_string());
         narrow.amount_min = Some(1_000);
         narrow.amount_max = Some(5_000);
         let rules = vec![narrow];
@@ -353,7 +353,7 @@ mod tests {
 
         // 取り込み元が違う。
         let other = MatchTarget {
-            source: "rakuten",
+            source: "example_card",
             ..target("ｺﾝﾋﾞﾆ", 2_000, ImportDirection::Out)
         };
         assert!(first_matching(&rules, &other).is_none());
@@ -376,8 +376,8 @@ mod tests {
     #[test]
     fn no_rule_matches_is_not_an_error() {
         let rules = vec![rule(
-            "amazon",
-            DescriptionPattern::Contains("アマゾン".into()),
+            "sample",
+            DescriptionPattern::Contains("サンプル".into()),
         )];
         assert!(first_matching(&rules, &target("ｽｰﾊﾟｰ", 500, ImportDirection::Out)).is_none());
     }
@@ -389,11 +389,11 @@ mod tests {
     /// 入れ替わると経費が収入になる。
     #[test]
     fn a_payment_puts_the_expense_on_the_debit_side() {
-        let rule = rule("amazon", DescriptionPattern::Contains("アマゾン".into()));
+        let rule = rule("sample", DescriptionPattern::Contains("サンプル".into()));
 
         let built = build_entry(
             &rule,
-            &target("カ)アマゾン", 1_980, ImportDirection::Out),
+            &target("カ)サンプル", 1_980, ImportDirection::Out),
             Currency::JPY,
         )
         .unwrap();
@@ -444,15 +444,15 @@ mod tests {
     #[test]
     fn the_description_comes_from_the_statement_not_the_rule() {
         let built = build_entry(
-            &rule("amazon_shohin", DescriptionPattern::Contains("".into())),
-            &target("カ)アマゾン ジヤパン", 1_980, ImportDirection::Out),
+            &rule("sample_shohin", DescriptionPattern::Contains("".into())),
+            &target("カ)サンプル シヨウジ", 1_980, ImportDirection::Out),
             Currency::JPY,
         )
         .unwrap();
 
-        assert_eq!(built.entry.description, "カ)アマゾン ジヤパン");
+        assert_eq!(built.entry.description, "カ)サンプル シヨウジ");
         // どのルールで作ったかは別に返す（提案には根拠が要る）。
-        assert_eq!(built.rule_id, "amazon_shohin");
+        assert_eq!(built.rule_id, "sample_shohin");
     }
 
     /// 税区分と取引先は科目の側にだけ付く。

@@ -95,7 +95,7 @@ pub struct BalanceSpec {
 /// 1つの CSV フォーマット。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CsvProfile {
-    /// 識別子（`mizuho_business` など）。
+    /// 識別子（`example_bank` など）。
     pub id: String,
     /// 表示名。
     pub name: String,
@@ -435,7 +435,7 @@ fn convert_era_to_western(raw: &str) -> Result<String, ImportError> {
 
 /// 半角カナを全角にする。
 ///
-/// **検索できるようにするため。** `ｱﾏｿﾞﾝ` と `アマゾン` が別物として扱われると、
+/// **検索できるようにするため。** `ｻﾝﾌﾟﾙ` と `サンプル` が別物として扱われると、
 /// 取引先で絞り込めない。濁点・半濁点は前の文字に合成する。
 fn normalize_halfwidth_kana(text: &str) -> String {
     const BASE: &[(char, char)] = &[
@@ -592,7 +592,7 @@ mod tests {
                 "",
                 "1,234",
                 "",
-                "ｶ)ﾋﾞｰﾃｯｸ",
+                "ｶ)ｻﾝﾌﾟﾙ",
                 "振込",
                 "50,000",
             ]))
@@ -609,14 +609,14 @@ mod tests {
 
     // PR-3: **本命。** 半角カナが全角になる（濁点も合成される）。
     //
-    //       `ｱﾏｿﾞﾝ` と `アマゾン` が別物だと、取引先で絞り込めない。
+    //       `ｻﾝﾌﾟﾙ` と `サンプル` が別物だと、取引先で絞り込めない。
     #[test]
     fn halfwidth_kana_becomes_fullwidth_with_voiced_marks_composed() {
         let row = bank()
-            .parse_row(&cells(&["2026/06/15", "", "100", "", "ｱﾏｿﾞﾝ", "ｼﾞﾔﾊﾟﾝ", "1"]))
+            .parse_row(&cells(&["2026/06/15", "", "100", "", "ｻﾝﾌﾟﾙ", "ｼﾖｳｼﾞ", "1"]))
             .unwrap();
 
-        assert_eq!(row.raw_description, "アマゾン ジヤパン", "{row:?}");
+        assert_eq!(row.raw_description, "サンプル シヨウジ", "{row:?}");
     }
 
     // PR-4: 符号付き1列の明細を読める。負なら向きが反転する。
@@ -760,12 +760,12 @@ mod tests {
                 "",
                 "1,234",
                 "",
-                "ｶ)ﾋﾞｰﾃｯｸ",
+                "ｶ)ｻﾝﾌﾟﾙ",
                 "",
                 "50,000",
             ]))
             .expect("通ること");
 
-        assert_eq!(row.raw_description, "カ)ビーテック", "区切りが余らないこと");
+        assert_eq!(row.raw_description, "カ)サンプル", "区切りが余らないこと");
     }
 }

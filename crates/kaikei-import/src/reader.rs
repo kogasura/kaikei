@@ -298,13 +298,13 @@ mod tests {
     /// 元の行が残る。
     #[test]
     fn the_original_row_is_kept() {
-        let csv = "日付,出金,入金,摘要\n2026/06/15,1980,,ｱﾏｿﾞﾝ\n";
+        let csv = "日付,出金,入金,摘要\n2026/06/15,1980,,ｻﾝﾌﾟﾙ\n";
 
         let parsed = parse_csv(&profile(""), &source(), csv).unwrap();
 
         assert_eq!(
             parsed.transactions[0].raw_row,
-            serde_json::json!(["2026/06/15", "1980", "", "ｱﾏｿﾞﾝ"])
+            serde_json::json!(["2026/06/15", "1980", "", "ｻﾝﾌﾟﾙ"])
         );
     }
 

@@ -529,67 +529,67 @@ mod tests {
         }
     }
 
-    /// WeBanana.SP の期首（2025-12-31 時点）。
+    /// 検証帳簿の期首（2025-12-31 時点）。
     fn opening() -> Statement {
         statement(
             vec![
                 StatementSection {
                     title: "資産".to_string(),
                     lines: vec![
-                        line("100", "現金", 557_052),
-                        line("110", "普通預金", -894_794),
-                        line("205", "機械装置", 118_800),
-                        line("210", "工具器具備品", 161_917),
-                        line("220", "車両運搬具", 108_000),
+                        line("100", "現金", 483_610),
+                        line("110", "普通預金", -762_415),
+                        line("205", "機械装置", 97_200),
+                        line("210", "工具器具備品", 140_405),
+                        line("220", "車両運搬具", 105_600),
                     ],
-                    subtotal: yen(50_975),
+                    subtotal: yen(64_400),
                 },
                 StatementSection {
                     title: "負債".to_string(),
-                    lines: vec![line("325", "未払金", 1_865_236)],
-                    subtotal: yen(1_865_236),
+                    lines: vec![line("325", "未払金", 1_502_385)],
+                    subtotal: yen(1_502_385),
                 },
                 StatementSection {
                     title: "純資産".to_string(),
-                    lines: vec![line("400", "元入金", -1_814_261)],
-                    subtotal: yen(-1_814_261),
+                    lines: vec![line("400", "元入金", -1_437_985)],
+                    subtotal: yen(-1_437_985),
                 },
             ],
-            50_975,
+            64_400,
         )
     }
 
-    /// WeBanana.SP の期末（2026-12-31 時点）。
+    /// 検証帳簿の期末（2026-12-31 時点）。
     fn closing() -> Statement {
         statement(
             vec![
                 StatementSection {
                     title: "資産".to_string(),
                     lines: vec![
-                        line("100", "現金", 552_542),
-                        line("110", "普通預金", -973_282),
-                        line("205", "機械装置", 118_800),
-                        line("210", "工具器具備品", 161_917),
-                        line("220", "車両運搬具", 108_000),
-                        line("410", "事業主貸", -10_069_266),
+                        line("100", "現金", 479_105),
+                        line("110", "普通預金", -840_905),
+                        line("205", "機械装置", 97_200),
+                        line("210", "工具器具備品", 140_405),
+                        line("220", "車両運搬具", 105_600),
+                        line("410", "事業主貸", -8_100_472),
                     ],
-                    subtotal: yen(-10_101_289),
+                    subtotal: yen(-8_119_067),
                 },
                 StatementSection {
                     title: "負債".to_string(),
-                    lines: vec![line("325", "未払金", 2_470_356)],
-                    subtotal: yen(2_470_356),
+                    lines: vec![line("325", "未払金", 2_013_470)],
+                    subtotal: yen(2_013_470),
                 },
                 StatementSection {
                     title: "純資産".to_string(),
                     lines: vec![
-                        line("400", "元入金", -1_814_261),
-                        line("420", "事業主借", 1_012_000),
+                        line("400", "元入金", -1_437_985),
+                        line("420", "事業主借", 820_000),
                     ],
-                    subtotal: yen(-802_261),
+                    subtotal: yen(-617_985),
                 },
             ],
-            -10_101_289,
+            -8_119_067,
         )
     }
 
@@ -629,17 +629,17 @@ mod tests {
     // BS-3: 普通預金は「その他の預金」に入る（様式に普通預金の欄が無い）。
     #[test]
     fn the_ordinary_deposit_account_goes_to_the_other_deposits_row() {
-        let filled = fill(&form(), &opening(), &closing(), &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &closing(), &pl_fields(6_685_880)).unwrap();
 
         let row = row_of(&filled, "その他の預金");
-        assert_eq!(row.closing, yen(-973_282));
-        assert_eq!(row.opening, Some(yen(-894_794)));
+        assert_eq!(row.closing, yen(-840_905));
+        assert_eq!(row.opening, Some(yen(-762_415)));
     }
 
     // BS-4: 期首欄に斜線がある行は期首を出さない。
     #[test]
     fn rows_struck_through_on_the_form_have_no_opening_amount() {
-        let filled = fill(&form(), &opening(), &closing(), &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &closing(), &pl_fields(6_685_880)).unwrap();
 
         for label in ["事業主貸", "事業主借", "青色申告特別控除前の所得金額"]
         {
@@ -654,21 +654,21 @@ mod tests {
     // BS-5: 元入金は期首と期末が同額（様式の書き方が明記している）。
     #[test]
     fn the_owners_capital_is_the_same_in_both_columns() {
-        let filled = fill(&form(), &opening(), &closing(), &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &closing(), &pl_fields(6_685_880)).unwrap();
 
         let row = row_of(&filled, "元入金");
         assert_eq!(row.opening, Some(row.closing));
-        assert_eq!(row.closing, yen(-1_814_261));
+        assert_eq!(row.closing, yen(-1_437_985));
     }
 
     // BS-6: 所得金額は損益計算書の㊸を転記する。
     #[test]
     fn the_income_amount_is_carried_over_from_the_income_statement() {
-        let filled = fill(&form(), &opening(), &closing(), &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &closing(), &pl_fields(6_685_880)).unwrap();
 
         assert_eq!(
             row_of(&filled, "青色申告特別控除前の所得金額").closing,
-            yen(8_368_714)
+            yen(6_685_880)
         );
     }
 
@@ -690,19 +690,19 @@ mod tests {
     //       決算書をそのまま提出する。
     #[test]
     fn the_form_can_check_that_it_balances() {
-        let filled = fill(&form(), &opening(), &closing(), &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &closing(), &pl_fields(6_685_880)).unwrap();
 
-        // 資産合計 = 現金552,542 + その他の預金-973,282 + 機械装置118,800
-        //          + 工具161,917 + 車両108,000 + 事業主貸10,069,266（符号反転）
-        //          = 10,037,243
-        // 負債・資本合計 = 未払金2,470,356 + 事業主借1,012,000
-        //                + 元入金-1,814,261 + 所得金額8,368,714
-        //                = 10,036,809
+        // 資産合計 = 現金479,105 + その他の預金-840,905 + 機械装置97,200
+        //          + 工具140,405 + 車両105,600 + 事業主貸8,100,472（符号反転）
+        //          = 8,081,877
+        // 負債・資本合計 = 未払金2,013,470 + 事業主借820,000
+        //                + 元入金-1,437,985 + 所得金額6,685,880
+        //                = 8,081,365
         let imbalance = filled.imbalance().expect("2区分あるので検算できる");
         assert_eq!(
             imbalance,
-            yen(434),
-            "この帳簿は貸借が合わない。決算書から除いた受取利息434の相手科目が\
+            yen(512),
+            "この帳簿は貸借が合わない。決算書から除いた受取利息512の相手科目が\
              資産（普通預金）に残っているため、ちょうどその分だけ資産が多い。\
              差額そのものを固定しておくと、原因の特定に使える"
         );
@@ -711,16 +711,16 @@ mod tests {
     // BS-9: 貸借が合う帳簿では差が 0 になる。
     #[test]
     fn a_balanced_book_reports_no_imbalance() {
-        // 事業主借を 434 増やして、除いた受取利息の分を吸収した帳簿。
+        // 事業主借を 512 増やして、除いた受取利息の分を吸収した帳簿。
         let mut balanced = closing();
-        balanced.sections[2].lines[1] = line("420", "事業主借", 1_012_434);
+        balanced.sections[2].lines[1] = line("420", "事業主借", 820_512);
 
-        let filled = fill(&form(), &opening(), &balanced, &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &balanced, &pl_fields(6_685_880)).unwrap();
 
         assert_eq!(
             filled.imbalance(),
             Some(yen(0)),
-            "受取利息434を事業主借へ振り替えると貸借が合う"
+            "受取利息512を事業主借へ振り替えると貸借が合う"
         );
     }
 
@@ -736,7 +736,7 @@ mod tests {
         let mut after_closing = closing();
         after_closing.sections[2].lines[0] = line("400", "元入金", 6_554_453);
 
-        let filled = fill(&form(), &opening(), &after_closing, &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &after_closing, &pl_fields(6_685_880)).unwrap();
 
         assert_eq!(
             filled.same_column_mismatches.len(),
@@ -745,14 +745,14 @@ mod tests {
         );
         let (label, book_opening, book_closing) = &filled.same_column_mismatches[0];
         assert_eq!(label, "元入金");
-        assert_eq!(*book_opening, yen(-1_814_261));
+        assert_eq!(*book_opening, yen(-1_437_985));
         assert_eq!(*book_closing, yen(6_554_453));
     }
 
     // BS-9c: 動いていなければ検出しない。
     #[test]
     fn a_capital_account_that_did_not_move_is_not_flagged() {
-        let filled = fill(&form(), &opening(), &closing(), &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &closing(), &pl_fields(6_685_880)).unwrap();
 
         assert!(filled.same_column_mismatches.is_empty());
     }
@@ -800,7 +800,7 @@ sections:
             .lines
             .push(line("260", "差入保証金", 30_000));
 
-        let filled = fill(&form(), &opening(), &with_extra, &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &with_extra, &pl_fields(6_685_880)).unwrap();
 
         let reported = filled
             .not_on_form
@@ -814,7 +814,7 @@ sections:
     // BS-13: 当てはめ済みの科目は報告に出ない。
     #[test]
     fn accounts_that_are_on_the_form_are_not_reported() {
-        let filled = fill(&form(), &opening(), &closing(), &pl_fields(8_368_714)).unwrap();
+        let filled = fill(&form(), &opening(), &closing(), &pl_fields(6_685_880)).unwrap();
 
         assert!(
             filled.not_on_form.is_empty(),

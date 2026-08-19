@@ -27,7 +27,7 @@
 pub struct ImportedTxId(u128);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceId(String);       // "mizuho_business", "rakuten_card"
+pub struct SourceId(String);       // "example_bank", "example_card"
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction { In, Out }     // 入金 / 出金
@@ -41,7 +41,7 @@ pub struct ImportedTransaction {
     pub amount_minor: i64,         // 常に正。符号は direction で表現
     pub currency: String,
     pub direction: Direction,
-    pub raw_description: String,   // "ｶ)ｱﾏｿﾞﾝ ｼﾞﾔﾊﾞﾝ"
+    pub raw_description: String,   // "ｶ)ｻﾝﾌﾟﾙ ｼﾖｳｼﾞ"
     pub balance_after: Option<i64>,
     pub raw_row: serde_json::Value,  // 元CSV行を丸ごと保持
     pub status: ImportStatus,
@@ -135,7 +135,7 @@ pub struct ImportResult {
 ### スキーマ
 
 ```yaml
-id: mizuho_business
+id: example_bank
 name: みずほ銀行 ビジネスWEB
 kind: bank                    # bank | credit_card
 encoding: Shift_JIS           # ★ ほぼ全ての邦銀がこれ
@@ -226,7 +226,7 @@ pub enum DescriptionPattern {
 }
 ```
 
-`"ｶ)ｱﾏｿﾞﾝ"` → 消耗品費 / 課税仕入10%（適格）
+`"ｶ)ｻﾝﾌﾟﾙ"` → 消耗品費 / 課税仕入10%（適格）
 
 `priority` の昇順で評価し、最初にマッチしたルールを採用する。
 
@@ -236,7 +236,7 @@ pub enum DescriptionPattern {
 
 ここがこのプロダクトの差別化点。既存の会計ソフトも学習型の自動仕訳を持つが、
 **「なぜその科目にしたか」を説明できない。**
-AI なら「Amazon での購入、金額1,980円、過去の類似取引は消耗品費」と根拠を出せる。
+AI なら「サンプル商会での購入、金額1,980円、過去の類似取引は消耗品費」と根拠を出せる。
 
 ### 設計上の鉄則
 
@@ -279,8 +279,8 @@ Journalized の取り消しは？
 ```
 kaikei-import/tests/
 ├── fixtures/
-│   ├── mizuho_sample.csv          Shift-JIS のダミーデータ
-│   ├── rakuten_card_sample.csv
+│   ├── example_bank_sample.csv          Shift-JIS のダミーデータ
+│   ├── example_card_sample.csv
 │   ├── era_date_sample.csv        和暦
 │   ├── signed_column_sample.csv
 │   └── broken_rows.csv            エラー行を含む

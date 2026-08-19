@@ -122,8 +122,8 @@ fn main() {
             (2026, 6, 1),
             "ドメイン更新料 <年額> & SSL",
             vec![
-                line("604", Side::Debit, 4_309, Some("ムームードメイン")),
-                line("100", Side::Credit, 4_309, None),
+                line("604", Side::Debit, 3_480, Some("サンプルドメイン")),
+                line("100", Side::Credit, 3_480, None),
             ],
         ),
     ];
@@ -150,10 +150,10 @@ fn main() {
     let trial = TrialBalanceView::new(
         vec![
             balance_row("135", AccountType::Asset, 660_000, 550_000),
-            balance_row("100", AccountType::Asset, 0, 4_309),
+            balance_row("100", AccountType::Asset, 0, 3_480),
             balance_row("330", AccountType::Liability, 50_000, 60_000),
             balance_row("500", AccountType::Revenue, 500_000, 600_000),
-            balance_row("604", AccountType::Expense, 4_309, 0),
+            balance_row("604", AccountType::Expense, 3_480, 0),
         ],
         Currency::JPY,
     );

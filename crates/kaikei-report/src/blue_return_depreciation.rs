@@ -147,16 +147,16 @@ mod tests {
         DepreciationRow {
             name: "パソコン・周辺機器".to_string(),
             acquired: "2025-07".to_string(),
-            acquisition_cost: yen(280_717),
-            base_amount: yen(280_717),
+            acquisition_cost: yen(227_412),
+            base_amount: yen(227_412),
             method: "定額法".to_string(),
             useful_life_years: Some(4),
             rate: Some("0.250".to_string()),
             period: "6/12".to_string(),
-            before_ratio: yen(35_089),
+            before_ratio: yen(28_426),
             business_ratio: "100%".to_string(),
-            amount: yen(35_089),
-            book_value: yen(245_628),
+            amount: yen(28_426),
+            book_value: yen(198_986),
             note: String::new(),
         }
     }
@@ -165,16 +165,16 @@ mod tests {
         DepreciationRow {
             name: "pc".to_string(),
             acquired: "2022-08".to_string(),
-            acquisition_cost: yen(118_800),
-            base_amount: yen(118_800),
+            acquisition_cost: yen(97_200),
+            base_amount: yen(97_200),
             method: "一括償却".to_string(),
             useful_life_years: None,
             rate: None,
             period: "12/12".to_string(),
-            before_ratio: yen(39_600),
+            before_ratio: yen(32_400),
             business_ratio: "100%".to_string(),
-            amount: yen(39_600),
-            book_value: yen(79_200),
+            amount: yen(32_400),
+            book_value: yen(64_800),
             note: "3年均等".to_string(),
         }
     }
@@ -221,8 +221,8 @@ mod tests {
     // 合計を必ず出す。損益計算書の減価償却費と突き合わせるための数字である。
     #[test]
     fn the_html_states_the_total() {
-        let html = to_html("2025-01-01 〜 2025-12-31", &[straight_line()], &yen(35_089));
-        assert!(html.contains("35089"), "{html}");
+        let html = to_html("2025-01-01 〜 2025-12-31", &[straight_line()], &yen(28_426));
+        assert!(html.contains("28426"), "{html}");
         assert!(
             html.contains("損益計算書の減価償却費と一致するか"),
             "合計の使い道を言うこと"

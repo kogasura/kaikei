@@ -12,7 +12,7 @@
 //! | 見るもの | なぜ |
 //! |---|---|
 //! | 固定資産があるのに減価償却費が0なら指摘する | 貸借は一致したままなので決算書を見ても分からない |
-//! | 資産がマイナス残高なら指摘する | 同上。実際に4年間気づかれなかった誤りがある |
+//! | 資産がマイナス残高なら指摘する | 同上。実際に数年間気づかれなかった誤りがある |
 //! | 指摘があっても終了コードは 0 | 誤りと決まったわけではない。失敗させると償却額が決まるまで検査が通らない |
 //! | 正常な帳簿では指摘が出ない | 正しい帳簿で毎回出る指摘は、当たり前になって本当の異常を覆い隠す |
 
@@ -259,7 +259,7 @@ async fn seed_entry_with_tags_on_credit(
 
 /// **本命。** 適格請求書が要る税区分に取引先が無ければ指摘する。
 ///
-/// 実際に weBanana.SP の帳簿が 603 件この状態だった。`JpTaxPolicy` は
+/// 検証帳簿では大量の仕訳がこの状態だった。`JpTaxPolicy` は
 /// 取引先タグが**有る**ときにしか適格性を見ないので、無いまま記帳されると
 /// 検証がすり抜ける。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
@@ -277,7 +277,7 @@ async fn verify_reports_a_qualified_purchase_without_a_counterparty(
         1,
         "609",
         "110",
-        35_829,
+        28_914,
         r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#,
     )
     .await;
@@ -294,8 +294,8 @@ async fn verify_reports_a_qualified_purchase_without_a_counterparty(
 
 /// **本命。** 少額特例の境目で分けて数える。
 ///
-/// 件数だけでは動けない。実帳簿は 603件 だが、取引単位で1万円未満と1万円以上に
-/// 分けると **570件 / 33件** になる。請求書を実際に揃える必要があるのは後者だけ
+/// 件数だけでは動けない。取引単位で1万円未満と1万円以上に分けると、検証帳簿では
+/// **大半が1万円未満**になった。請求書を実際に揃える必要があるのは後者だけ
 /// かもしれず、**手を付けられる大きさかどうかが変わる**。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn verify_splits_the_count_at_the_small_amount_threshold(
@@ -310,7 +310,7 @@ async fn verify_splits_the_count_at_the_small_amount_threshold(
     // 1万円未満が2件、1万円以上が1件。
     seed_entry_with_tags(&app, 1, "609", "110", 9_999, qualified).await;
     seed_entry_with_tags(&app, 2, "609", "110", 220, qualified).await;
-    seed_entry_with_tags(&app, 3, "609", "110", 35_829, qualified).await;
+    seed_entry_with_tags(&app, 3, "609", "110", 28_914, qualified).await;
 
     let (_stdout, stderr, ok) = run_verify(&app);
 
@@ -320,7 +320,7 @@ async fn verify_splits_the_count_at_the_small_amount_threshold(
         "1万円未満の件数: {stderr}"
     );
     assert!(
-        stderr.contains("1万円以上 1 件・35,829 円"),
+        stderr.contains("1万円以上 1 件・28,914 円"),
         "1万円以上は件数と金額の両方: {stderr}"
     );
     // **免除されるのは請求書の保存だけ**であることを必ず添える。
@@ -337,8 +337,8 @@ async fn verify_splits_the_count_at_the_small_amount_threshold(
 /// **本命。** 貸方に立つ課税仕入れ（返金・値引き）は数えない。
 ///
 /// 返還に要るのは適格請求書ではなく**適格返還請求書**である。同じ数に混ぜると
-/// 「請求書を探しても見つからない」ことになる。実帳簿では 603件 のうち5件が
-/// これ（ドメイン代の返金 60,831円）だった。
+/// 「請求書を探しても見つからない」ことになる。検証帳簿でも数件が
+/// これ（ドメイン代の返金 49,380円）だった。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn a_refund_on_the_credit_side_is_not_counted(
     pool_opts: PgPoolOptions,
@@ -350,15 +350,15 @@ async fn a_refund_on_the_credit_side_is_not_counted(
     seed_account(&app, "110", "普通預金", 1).await;
     let qualified = r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#;
     // 仕入れ（借方 通信費）。
-    seed_entry_with_tags(&app, 1, "609", "110", 43_967, qualified).await;
+    seed_entry_with_tags(&app, 1, "609", "110", 35_480, qualified).await;
     // 返金（借方 普通預金 / 貸方 通信費）。税区分は貸方に付く。
-    seed_entry_with_tags_on_credit(&app, 2, "110", "609", 43_967, qualified).await;
+    seed_entry_with_tags_on_credit(&app, 2, "110", "609", 35_480, qualified).await;
 
     let (_stdout, stderr, ok) = run_verify(&app);
 
     assert!(ok, "{stderr}");
     assert!(
-        stderr.contains("1万円以上 1 件・43,967 円"),
+        stderr.contains("1万円以上 1 件・35,480 円"),
         "返金を数えないこと: {stderr}"
     );
     // **貸方に何件あるかは言う。** 黙って落とすと「1件しか無い」と読まれる。
@@ -392,7 +392,7 @@ async fn nothing_is_said_about_the_credit_side_when_there_is_none(
         1,
         "609",
         "110",
-        43_967,
+        35_480,
         r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}}"#,
     )
     .await;
@@ -442,7 +442,7 @@ async fn a_qualified_purchase_with_a_counterparty_is_not_reported(
         1,
         "609",
         "110",
-        35_829,
+        28_914,
         r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}, "counterparty": {"t": "code", "v": "ANTHROPIC"}}"#,
     )
     .await;
@@ -467,7 +467,7 @@ async fn verify_reports_missing_depreciation(
     // 1=Asset, 3=Equity。工具器具備品を元入金から取得した形にする。
     seed_account(&app, "210", "工具器具備品", 1).await;
     seed_account(&app, "400", "元入金", 3).await;
-    seed_entry(&app, 1, "210", "400", 161_917).await;
+    seed_entry(&app, 1, "210", "400", 140_405).await;
 
     let (_stdout, stderr, ok) = run_verify(&app);
 
@@ -478,7 +478,7 @@ async fn verify_reports_missing_depreciation(
 
 /// **本命。** 資産のマイナス残高を指摘する。
 ///
-/// 実際に weBanana.SP で4年間気づかれなかった形である。
+/// 検証帳簿で数年間気づかれなかった形である。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn verify_reports_an_asset_with_a_negative_balance(
     pool_opts: PgPoolOptions,
@@ -489,7 +489,7 @@ async fn verify_reports_an_asset_with_a_negative_balance(
     seed_account(&app, "210", "工具器具備品", 1).await;
     seed_account(&app, "610", "減価償却費", 5).await;
     // 取得価額を計上しないまま償却だけ積む（借 減価償却費 / 貸 工具器具備品）。
-    seed_entry(&app, 1, "610", "210", 118_800).await;
+    seed_entry(&app, 1, "610", "210", 97_200).await;
 
     let (_stdout, stderr, ok) = run_verify(&app);
 
@@ -656,7 +656,7 @@ async fn advisory_findings_alone_do_not_fail_the_check(
     seed_account(&app, "110", "普通預金", 1).await;
     seed_account(&app, "604", "通信費", 5).await;
     seed_account(&app, "621", "新聞図書費", 5).await;
-    // 毎月2日に 2,280円。科目が2つに分かれている（実帳簿の YouTube Premium）。
+    // 毎月2日に 2,280円。科目が2つに分かれている（検証帳簿の動画サブスクリプション）。
     seed_entry_on(&app, 1, "604", "110", 2_280, "2026-01-02").await;
     seed_entry_on(&app, 2, "604", "110", 2_280, "2026-02-02").await;
     seed_entry_on(&app, 3, "621", "110", 2_280, "2026-03-02").await;
@@ -788,7 +788,7 @@ async fn a_confirmed_non_qualified_counterparty_with_a_qualified_category_is_rep
     seed_account(&app, "609", "通信費", 5).await;
     seed_account(&app, "110", "普通預金", 1).await;
     sqlx::query(
-        "INSERT INTO counterparties (code, name, is_qualified) VALUES ('povo','povo',false)",
+        "INSERT INTO counterparties (code, name, is_qualified) VALUES ('carrier','carrier',false)",
     )
     .execute(&app)
     .await
@@ -799,7 +799,7 @@ async fn a_confirmed_non_qualified_counterparty_with_a_qualified_category_is_rep
         "609",
         "110",
         550,
-        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}, "counterparty": {"t": "code", "v": "povo"}}"#,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}, "counterparty": {"t": "code", "v": "carrier"}}"#,
     )
     .await;
 
@@ -807,7 +807,7 @@ async fn a_confirmed_non_qualified_counterparty_with_a_qualified_category_is_rep
 
     assert!(ok, "指摘があっても検査は失敗しないこと: {stderr}");
     assert!(stderr.contains("非適格と確認済み"), "{stderr}");
-    assert!(stderr.contains("povo"), "相手の名前を出すこと: {stderr}");
+    assert!(stderr.contains("carrier"), "相手の名前を出すこと: {stderr}");
     assert!(stderr.contains("550"), "金額を出すこと: {stderr}");
     assert!(stderr.contains("経過措置"), "{stderr}");
 }
@@ -864,7 +864,7 @@ async fn a_confirmed_qualified_counterparty_is_quiet(
     seed_account(&app, "110", "普通預金", 1).await;
     sqlx::query(
         "INSERT INTO counterparties (code, name, invoice_reg_no, is_qualified) \
-         VALUES ('jdf','JDF株式会社','T7123456789012',true)",
+         VALUES ('def','DEF株式会社','T7123456789012',true)",
     )
     .execute(&app)
     .await
@@ -875,7 +875,7 @@ async fn a_confirmed_qualified_counterparty_is_quiet(
         "609",
         "110",
         1_000,
-        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}, "counterparty": {"t": "code", "v": "jdf"}}"#,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_QUALIFIED"}, "counterparty": {"t": "code", "v": "def"}}"#,
     )
     .await;
 
@@ -899,7 +899,7 @@ async fn switching_to_the_non_qualified_category_clears_the_finding(
     seed_account(&app, "609", "通信費", 5).await;
     seed_account(&app, "110", "普通預金", 1).await;
     sqlx::query(
-        "INSERT INTO counterparties (code, name, is_qualified) VALUES ('povo','povo',false)",
+        "INSERT INTO counterparties (code, name, is_qualified) VALUES ('carrier','carrier',false)",
     )
     .execute(&app)
     .await
@@ -910,7 +910,7 @@ async fn switching_to_the_non_qualified_category_clears_the_finding(
         "609",
         "110",
         550,
-        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_NON_QUALIFIED"}, "counterparty": {"t": "code", "v": "povo"}}"#,
+        r#"{"tax_category": {"t": "code", "v": "PURCHASE_10_NON_QUALIFIED"}, "counterparty": {"t": "code", "v": "carrier"}}"#,
     )
     .await;
 
@@ -922,8 +922,8 @@ async fn switching_to_the_non_qualified_category_clears_the_finding(
 
 /// 取引先が無い課税仕入れを、科目ごとに分けて出す。
 ///
-/// **件数だけでは動けない。** 実帳簿は 603 件と出るが、うち 433 件が
-/// 旅費交通費（交通系ICの入出場、合計 98,093円）で、そちらの手当ては
+/// **件数だけでは動けない。** 件数はまとめて出るが、うち大半が
+/// 旅費交通費（交通系ICの入出場、合計 82,140円）で、そちらの手当ては
 /// 適格請求書ではない。科目で割らないとそれが見えない。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn the_missing_counterparties_are_broken_down_by_account(
@@ -1044,13 +1044,13 @@ async fn an_empty_fixed_asset_ledger_is_reported(
     let _ = pool_opts;
     seed_account(&app, "210", "工具器具備品", 1).await;
     seed_account(&app, "400", "元入金", 3).await;
-    seed_entry(&app, 1, "210", "400", 161_917).await;
+    seed_entry(&app, 1, "210", "400", 140_405).await;
 
     let (_stdout, stderr, ok) = run_verify(&app);
 
     assert!(ok, "指摘があっても検査は失敗しないこと: {stderr}");
     assert!(stderr.contains("固定資産台帳にありません"), "{stderr}");
-    assert!(stderr.contains("161,917"), "金額を出すこと: {stderr}");
+    assert!(stderr.contains("140,405"), "金額を出すこと: {stderr}");
     // **行き止まりにしない。** 台帳に入れれば計算できることを言う。
     assert!(
         stderr.contains("fixedasset add"),
@@ -1098,10 +1098,10 @@ async fn the_depreciation_warning_separates_what_is_in_the_ledger(
     seed_account(&app, "205", "機械装置", 1).await;
     seed_account(&app, "210", "工具器具備品", 1).await;
     seed_account(&app, "400", "元入金", 3).await;
-    seed_entry(&app, 1, "205", "400", 118_800).await;
-    seed_entry(&app, 2, "210", "400", 161_917).await;
+    seed_entry(&app, 1, "205", "400", 97_200).await;
+    seed_entry(&app, 2, "210", "400", 140_405).await;
     sqlx::query(
-        "INSERT INTO fixed_assets (id, name, account_code, acquired_on, acquisition_cost,          currency, currency_minor_unit, method)          VALUES (gen_random_uuid(), 'パソコン', '205', DATE '2022-08-05', 118800,          'JPY', 0, $1)",
+        "INSERT INTO fixed_assets (id, name, account_code, acquired_on, acquisition_cost,          currency, currency_minor_unit, method)          VALUES (gen_random_uuid(), 'パソコン', '205', DATE '2022-08-05', 97200,          'JPY', 0, $1)",
     )
     // 2 = 一括償却資産（kaikei-store の method の符号化）。
     .bind(2_i16)
@@ -1112,9 +1112,9 @@ async fn the_depreciation_warning_separates_what_is_in_the_ledger(
     let (_stdout, stderr, ok) = run_verify(&app);
 
     assert!(ok, "{stderr}");
-    assert!(stderr.contains("205 118,800（台帳にあります）"), "{stderr}");
+    assert!(stderr.contains("205 97,200（台帳にあります）"), "{stderr}");
     assert!(
-        stderr.contains("210 161,917 円"),
+        stderr.contains("210 140,405 円"),
         "足すべきものだけを名指しすること: {stderr}"
     );
 }
@@ -1138,7 +1138,7 @@ async fn assets_missing_from_the_ledger_are_reported_even_when_depreciation_exis
     seed_account(&app, "210", "工具器具備品", 1).await;
     seed_account(&app, "400", "元入金", 3).await;
     seed_account(&app, "610", "減価償却費", 5).await;
-    seed_entry(&app, 1, "210", "400", 161_917).await;
+    seed_entry(&app, 1, "210", "400", 140_405).await;
     // 償却費を1円だけ計上する。**これで償却費の指摘は出なくなる。**
     seed_entry_with_tags(
         &app,
