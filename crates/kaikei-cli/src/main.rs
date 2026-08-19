@@ -1776,6 +1776,70 @@ fn warn_if_export_does_not_match_the_book(
     eprintln!("  このファイルからは帳簿を復元できません。");
 }
 
+/// 全件エクスポートの仕訳の件数とタグの数が、帳簿と一致するかを確かめる。
+///
+/// # なぜ金額の突合だけでは足りないのか
+///
+/// [`warn_if_export_does_not_match_the_book`] は科目ごとの借貸を見る。
+/// **タグが1つ残らず落ちても、金額は1円も動かないので一致する。**
+///
+/// タグには税区分と取引先が入っている。前者が無ければ消費税を集計できず、
+/// 後者が無ければ適格請求書の相手方を辿れない。この JSON は**このソフトが
+/// 無くなっても帳簿が残る**ための出口なので、落ちていると気づいたときには
+/// もう元の帳簿が無い。
+fn warn_if_export_loses_entries_or_tags(json: &str, entries: &[kaikei_core::JournalEntry]) {
+    match kaikei_report::export::count_entries(json) {
+        Err(reason) => {
+            eprintln!("注意: 全件エクスポートの件数を読み直せませんでした: {reason}");
+            return;
+        }
+        Ok(count) if count != entries.len() => {
+            eprintln!(
+                "注意: 全件エクスポートの仕訳が {} 件で、帳簿の {} 件と違います。",
+                count,
+                entries.len()
+            );
+            eprintln!("  このファイルからは帳簿を復元できません。");
+        }
+        Ok(_) => {}
+    }
+
+    // 帳簿側のタグの数を、タグキーごとに数える。
+    let mut in_book: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for entry in entries {
+        for line in entry.lines() {
+            for (key, _) in line.tags().iter() {
+                *in_book.entry(key.as_str().to_string()).or_default() += 1;
+            }
+        }
+    }
+
+    let in_json = match kaikei_report::export::count_tags(json) {
+        Ok(counts) => counts,
+        Err(reason) => {
+            eprintln!("注意: 全件エクスポートのタグを読み直せませんでした: {reason}");
+            return;
+        }
+    };
+    if in_book == in_json {
+        return;
+    }
+
+    eprintln!("注意: 全件エクスポートのタグの数が帳簿と違います:");
+    let mut keys: std::collections::BTreeSet<&String> = in_book.keys().collect();
+    keys.extend(in_json.keys());
+    for key in keys {
+        let (book, json) = (
+            in_book.get(key).copied().unwrap_or(0),
+            in_json.get(key).copied().unwrap_or(0),
+        );
+        if book != json {
+            eprintln!("  {key}: 帳簿 {book} 件 / export.json {json} 件");
+        }
+    }
+    eprintln!("  税区分が落ちれば消費税を集計できず、取引先が落ちれば相手方を辿れません。");
+}
+
 /// 弥生向けの出力が帳簿の試算表と一致するかを確かめる。
 ///
 /// # なぜ要るのか
@@ -5264,6 +5328,7 @@ async fn write_reports(
     // 中身が欠けていても、必要になったときに初めて気づく——そのときにはもう
     // 元の帳簿が無い。
     warn_if_export_does_not_match_the_book(&export_json, &trial_balance);
+    warn_if_export_loses_entries_or_tags(&export_json, &entries);
 
     std::fs::write(&export_path, &export_json)
         .map_err(|error| format!("書き出せませんでした: {}（{error}）", export_path.display()))?;
