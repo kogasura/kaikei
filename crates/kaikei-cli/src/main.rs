@@ -684,33 +684,38 @@ async fn write_document_export(
 
     let mut written = Vec::new();
     let mut checksums = String::new();
-    let mut failed: Vec<String> = Vec::new();
+    // **理由だけでなく、どの証憑かを構造で持つ。** 渡す一式に残すため
+    // （`not_exported.csv`）、画面用の文字列では足りない。
+    let mut failed: Vec<kaikei_report::documents::NotExported> = Vec::new();
+    let note = |entry: &kaikei_report::documents::ExportEntry, reason: String| {
+        kaikei_report::documents::NotExported {
+            folder: entry.folder.clone(),
+            file_name: entry.file_name.clone(),
+            original_name: entry.document.original_name.clone(),
+            blob_hash: entry.document.blob_hash.clone(),
+            reason,
+        }
+    };
 
     for entry in &planned {
         let hash = match kaikei_core::BlobHash::parse_hex(&entry.document.blob_hash) {
             Ok(hash) => hash,
             Err(error) => {
-                failed.push(format!(
-                    "{}: ハッシュが不正です（{error}）",
-                    entry.document.original_name
-                ));
+                failed.push(note(entry, format!("ハッシュが不正です（{error}）")));
                 continue;
             }
         };
         let bytes = match store.get(&hash).await {
             Ok(bytes) => bytes,
             Err(error) => {
-                failed.push(format!("{}: {error}", entry.document.original_name));
+                failed.push(note(entry, error.to_string()));
                 continue;
             }
         };
         // **書き出す前に中身を確かめる。** 変わっているものをそのまま提出用の
         // フォルダへ入れると、改変に気づかないまま提出することになる。
         if kaikei_blob::hash_of(&bytes) != hash {
-            failed.push(format!(
-                "{}: 中身が保存時から変わっています",
-                entry.document.original_name
-            ));
+            failed.push(note(entry, "中身が保存時から変わっています".to_string()));
             continue;
         }
 
@@ -742,6 +747,23 @@ async fn write_document_export(
     .map_err(|error| format!("書き出せませんでした: {}（{error}）", index_path.display()))?;
     written.push(index_path);
 
+    // **書き出せなかったものを渡す一式に残す。** index.csv は全件を載せ、
+    // checksums.txt は書き出せたものしか載らない。受け取った側は2つを
+    // 突き合わせて初めて欠けに気づく。**画面の警告は一式に残らない。**
+    // 0 件でも見出しだけのファイルを書く（`yayoi_skipped.csv` と同じ）。
+    let not_exported_path = dir.join("not_exported.csv");
+    std::fs::write(
+        &not_exported_path,
+        kaikei_report::documents::not_exported_to_csv(&failed),
+    )
+    .map_err(|error| {
+        format!(
+            "書き出せませんでした: {}（{error}）",
+            not_exported_path.display()
+        )
+    })?;
+    written.push(not_exported_path);
+
     let checksums_path = dir.join("checksums.txt");
     std::fs::write(&checksums_path, checksums).map_err(|error| {
         format!(
@@ -753,14 +775,15 @@ async fn write_document_export(
 
     println!(
         "証憑を書き出しました: {} 件（全 {} 件）",
-        written.len() - 2,
+        planned.len() - failed.len(),
         planned.len()
     );
     if !failed.is_empty() {
         eprintln!("注意: 書き出せなかった証憑が {} 件あります:", failed.len());
-        for message in &failed {
-            eprintln!("  {message}");
+        for row in &failed {
+            eprintln!("  {}: {}", row.original_name, row.reason);
         }
+        eprintln!("  一覧は documents/not_exported.csv にも書き出しました。");
     }
     Ok(written)
 }
