@@ -6,47 +6,101 @@
       {
         "ordinal": 0,
         "name": "entry_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "journal_lines",
+            "name": "entry_id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "line_no",
-        "type_info": "Int2"
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "journal_lines",
+            "name": "line_no"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "account_code",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "journal_lines",
+            "name": "account_code"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "side",
-        "type_info": "Int2"
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "journal_lines",
+            "name": "side"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "amount_minor",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "journal_lines",
+            "name": "amount_minor"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "currency",
-        "type_info": "Bpchar"
+        "type_info": "Bpchar",
+        "origin": {
+          "Table": {
+            "table": "journal_lines",
+            "name": "currency"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "currency_minor_unit",
-        "type_info": "Int2"
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "journal_lines",
+            "name": "currency_minor_unit"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "tags",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "journal_lines",
+            "name": "tags"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "memo",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "journal_lines",
+            "name": "memo"
+          }
+        }
       }
     ],
     "parameters": {
