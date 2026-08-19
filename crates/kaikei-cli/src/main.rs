@@ -2156,6 +2156,43 @@ fn warn_if_the_ledger_does_not_match_the_book(
     eprintln!("  元帳と試算表は別々に集計しています。どちらかの集計が間違っています。");
 }
 
+/// 仕訳IDから、その仕訳に紐付いた証憑の内容ハッシュを引く。
+///
+/// # なぜ CLI で集めるのか
+///
+/// `JournalEntry::document_refs` は Phase 1 で保留され（`journal/mod.rs`）、
+/// 紐付けは `entry_documents` へ移った。**`JournalEntry` 側は常に空**である。
+///
+/// `export.json` はそれを出していたので、**DB に紐付けがあってもエクスポート
+/// は空だった。** 帳簿と証憑の相互関連性は電子帳簿保存法の要件で、この JSON
+/// は「このソフトが無くなっても帳簿が残る」ための出口である。**復元したときに
+/// 紐付けが消えるのでは、要件を満たさない。**
+async fn collect_document_links(
+    query: &PgDocumentQuery,
+    entries: &[kaikei_core::JournalEntry],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+    use kaikei_app::ports::DocumentQueryPort;
+
+    let mut links = std::collections::BTreeMap::new();
+    for entry in entries {
+        let documents = query
+            .documents_of_entry(entry.id())
+            .await
+            .map_err(|error| format!("証憑の紐付けを読めませんでした: {error}"))?;
+        if documents.is_empty() {
+            continue;
+        }
+        links.insert(
+            uuid::Uuid::from_u128(entry.id().as_u128()).to_string(),
+            documents
+                .into_iter()
+                .map(|document| document.blob_hash)
+                .collect(),
+        );
+    }
+    Ok(links)
+}
+
 /// 拡張子から MIME タイプを決める。
 ///
 /// **分からなければ推測しない。** 誤った型で保存すると、後から中身が何かを
@@ -5557,7 +5594,12 @@ async fn write_reports(
     // 全件 JSON。**この出力はこのソフトが消えてもデータが残るためのもの**
     // なので、既定で必ず出す（docs/03-database.md §8）。
     let export_path = out_dir.join("export.json");
-    let export_json = kaikei_report::export::to_json(&entries, &chart);
+    // **仕訳と証憑の紐付けを集める。** `JournalEntry` は持っていない
+    // （Phase 1 で保留され、紐付けは entry_documents へ移った）ので、
+    // ここで引いて渡す。相互関連性は電子帳簿保存法の要件であり、
+    // この JSON は復元用の出口である。
+    let document_links = collect_document_links(&pool_for_documents, &entries).await?;
+    let export_json = kaikei_report::export::to_json(&entries, &chart, &document_links);
 
     // ★書き出したものを読み直して、帳簿と突き合わせる★
     //
