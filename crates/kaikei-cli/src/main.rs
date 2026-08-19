@@ -5274,6 +5274,31 @@ async fn write_reports(
             "適格請求書を揃えるべき取引が {} 件あります（invoices_to_collect.csv）",
             to_collect.len()
         );
+        // **手がかりの無い件数を、CSVを開かなくても分かるようにする。**
+        // 摘要が科目名だけの取引は、通帳やカードの明細を見に行くしかない。
+        // 件数だけを見せると全部が同じ手間に見えるが、実帳簿では32件中
+        // 11件（1,018,496円）がこれで、残り21件は摘要から相手先を辿れた。
+        let (blind, blind_total): (usize, i128) = to_collect
+            .iter()
+            .filter(|row| {
+                kaikei_report::invoices_to_collect::counterparty_hint(
+                    &row.description,
+                    &row.account_name,
+                )
+                .is_none()
+            })
+            .fold((0, 0), |(count, total), row| {
+                (count + 1, total + row.amount_minor)
+            });
+        if blind > 0 {
+            println!(
+                "  うち {blind} 件（{} 円）は摘要が科目名だけで、相手先を辿れません。",
+                kaikei_core::Money::from_minor(blind_total, kaikei_core::Currency::JPY)
+                    .to_display_string()
+            );
+            println!("    通帳やカードの明細を見に行くことになります。");
+            println!("    記帳のとき摘要に相手先を残すと、次からこれが減ります。");
+        }
     }
 
     // 消費税の集計。**税理士へ渡す一式に入れる。**
