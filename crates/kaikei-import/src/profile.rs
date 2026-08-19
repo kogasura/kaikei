@@ -164,7 +164,7 @@ impl CsvProfile {
     pub fn parse_row(&self, cells: &[String]) -> Result<ParsedRow, ImportError> {
         let occurred_on = self.parse_date(cells)?;
         let (amount_minor, direction) = self.parse_amount(cells)?;
-        let raw_description = self.build_description(cells);
+        let raw_description = self.build_description(cells)?;
         let balance_after = self.parse_balance(cells)?;
         Ok(ParsedRow {
             occurred_on,
@@ -268,12 +268,30 @@ impl CsvProfile {
         }
     }
 
-    fn build_description(&self, cells: &[String]) -> String {
-        let parts: Vec<String> = self
-            .description
-            .columns
+    /// 摘要を組み立てる。
+    ///
+    /// # 列が無ければエラーにする
+    ///
+    /// 以前は `filter_map` で**黙って飛ばしていた**。プロファイルが指す列が
+    /// CSV に無くても「エラー 0件」と出て、**摘要が空のまま取り込まれる。**
+    ///
+    /// これは現実に起きる——プロファイルを取り違える、銀行が書き出し形式を
+    /// 変えて列が1つずれる、など。そして摘要が空の明細は、後から相手先を
+    /// 辿れない。実帳簿では摘要が科目名だけの取引が11件あり、通帳とカードの
+    /// 明細を見に行くことになった。**それを黙って大量に作る形だった。**
+    ///
+    /// 日付と金額は `cell()` で列の欠けをエラーにしている。摘要だけ扱いが
+    /// 違っていたので揃える。
+    ///
+    /// **空のセルはエラーにしない。** 列はあるが中身が無い行は普通にある。
+    /// 区別しているのは「列そのものが無い」ことである。
+    fn build_description(&self, cells: &[String]) -> Result<String, ImportError> {
+        let mut found = Vec::with_capacity(self.description.columns.len());
+        for index in &self.description.columns {
+            found.push(self.cell(cells, *index, "摘要")?.to_string());
+        }
+        let parts: Vec<String> = found
             .iter()
-            .filter_map(|index| cells.get(*index))
             .map(|text| {
                 let text = if self.description.trim {
                     text.trim()
@@ -288,7 +306,7 @@ impl CsvProfile {
             })
             .filter(|text| !text.is_empty())
             .collect();
-        parts.join(&self.description.separator)
+        Ok(parts.join(&self.description.separator))
     }
 
     fn parse_balance(&self, cells: &[String]) -> Result<Option<i64>, ImportError> {
@@ -698,5 +716,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(row.amount_minor, 1_234);
+    }
+    // ─── 摘要の列が無いとき ─────────────────────────
+
+    /// **本命。** 摘要の列が無ければエラーにする。黙って空にしない。
+    ///
+    /// 以前は `filter_map` で飛ばしていた。プロファイルが指す列が CSV に
+    /// 無くても「エラー 0件」と出て、**摘要が空のまま取り込まれる。**
+    ///
+    /// プロファイルの取り違えや、銀行が書き出し形式を変えて列が1つずれた
+    /// ときに起きる。**摘要が空の明細は、後から相手先を辿れない。**
+    #[test]
+    fn a_missing_description_column_is_an_error() {
+        // 摘要は列 4・5 にあるはずだが、この行は 4 列しかない。
+        let error = bank()
+            .parse_row(&cells(&["2026/06/15", "", "1,234", ""]))
+            .expect_err("エラーになること");
+
+        let message = format!("{error}");
+        assert!(message.contains("摘要"), "何の列かを言うこと: {message}");
+        assert!(message.contains("4"), "列の番号を言うこと: {message}");
+    }
+
+    /// **本命。** 列はあるが空のセルは、エラーにしない。
+    ///
+    /// 摘要が空の行は普通にある。**区別しているのは「列そのものが無い」
+    /// ことである。**
+    #[test]
+    fn an_empty_description_cell_is_not_an_error() {
+        let row = bank()
+            .parse_row(&cells(&["2026/06/15", "", "1,234", "", "", "", "50,000"]))
+            .expect("空のセルは通ること");
+
+        assert_eq!(row.raw_description, "");
+    }
+
+    /// 片方だけ埋まっているときは、埋まっている方だけを使う。
+    #[test]
+    fn only_the_filled_description_column_is_used() {
+        let row = bank()
+            .parse_row(&cells(&[
+                "2026/06/15",
+                "",
+                "1,234",
+                "",
+                "ｶ)ﾋﾞｰﾃｯｸ",
+                "",
+                "50,000",
+            ]))
+            .expect("通ること");
+
+        assert_eq!(row.raw_description, "カ)ビーテック", "区切りが余らないこと");
     }
 }
