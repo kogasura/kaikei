@@ -1828,6 +1828,67 @@ fn warn_if_yayoi_does_not_match_the_book(
     eprintln!("  このファイルを税理士に渡すと、決算書と違う数字が取り込まれます。");
 }
 
+/// 弥生CSVに出た税区分が、写像表にある名前かを確かめる。
+///
+/// # なぜ科目の突合だけでは足りないのか
+///
+/// [`warn_if_yayoi_does_not_match_the_book`] は科目ごとの借貸を見るので、
+/// **金額が正しければ税区分がおかしくても気づけない。** 未変換のコード
+/// （`PURCHASE_10_QUALIFIED` がそのまま出る）や空欄が混ざっていても、
+/// 金額は1円も動かない。
+///
+/// 弥生は税区分を必須にしているので、知らない名前や空欄が入った行は
+/// 取り込みで弾かれるか、別の扱いで取り込まれる。**渡す前に気づきたい。**
+///
+/// # 写像表を正とする
+///
+/// 表に載っている名前（売上側・仕入側の両方）と、税区分が無い明細に使う
+/// 「対象外」だけを認める。**表そのものが正しいかは別の話**で、それは
+/// 実機での確認が要る（相談5）。
+fn warn_if_yayoi_has_an_unknown_tax_category(
+    rows: &[Vec<String>],
+    tax_map: &std::collections::BTreeMap<String, kaikei_report::yayoi::YayoiCategory>,
+) {
+    let mut known: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for category in tax_map.values() {
+        known.insert(category.sales.as_str());
+        if let Some(purchase) = &category.purchase {
+            known.insert(purchase.as_str());
+        }
+    }
+    // 税区分が付いていない明細に使う既定の区分。
+    known.insert("対象外");
+
+    let used = kaikei_report::yayoi::sum_by_tax_category(rows);
+    let unknown: Vec<(&String, i128)> = used
+        .iter()
+        .filter(|(name, _)| !known.contains(name.as_str()))
+        .map(|(name, (debit, credit))| (name, debit + credit))
+        .collect();
+    if unknown.is_empty() {
+        return;
+    }
+
+    eprintln!();
+    eprintln!(
+        "注意: 弥生向けの出力に、写像表に無い税区分が {} 種類あります:",
+        unknown.len()
+    );
+    for (name, amount) in &unknown {
+        let shown = if name.is_empty() {
+            "（空欄）"
+        } else {
+            name
+        };
+        eprintln!(
+            "  {shown}  {} 円",
+            kaikei_core::Money::from_minor(*amount, kaikei_core::Currency::JPY).to_display_string()
+        );
+    }
+    eprintln!("  弥生は税区分を必須にしているので、取り込みで弾かれるか別の扱いになります。");
+    eprintln!("  金額は帳簿と合っていても、税務上の扱いが変わります。");
+}
+
 /// 拡張子から MIME タイプを決める。
 ///
 /// **分からなければ推測しない。** 誤った型で保存すると、後から中身が何かを
@@ -5557,6 +5618,7 @@ fn write_yayoi(
     // 列のずれ・金額の取り違え・行の脱落は、書き出したものを数えないと
     // 分からない。
     warn_if_yayoi_does_not_match_the_book(&conversion.rows, chart, trial_balance);
+    warn_if_yayoi_has_an_unknown_tax_category(&conversion.rows, &tax_map);
 
     let mut written = Vec::new();
     let csv_path = out_dir.join("yayoi_journal.csv");
