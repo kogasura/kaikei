@@ -57,7 +57,7 @@ jobs:
       # pg-tests が全滅する）。`.env.example` も同じ向きに揃えてある。
       DATABASE_URL: postgres://kaikei_migrator:kaikei_migrator_ci_password@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -86,7 +86,7 @@ jobs:
       - name: ロール作成と権限付与（docker-compose と同じファイルを流す）
         run: psql -f docker/postgres/init/01-roles.sql
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
