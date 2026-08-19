@@ -2077,6 +2077,85 @@ async fn warn_if_the_entry_counter_drifted(pool: &kaikei_store::pool::PgPool) {
     eprintln!("  entry_counters の next_no を、その年度の最大の仕訳番号 + 1 にしてください。");
 }
 
+/// 総勘定元帳が帳簿の試算表と一致するかを確かめる。
+///
+/// # なぜ要るのか
+///
+/// **元帳と試算表は仕訳から別々に集計される。** 元帳は科目ごとに行を並べて
+/// 残高を積み、試算表は科目ごとに借貸を足す。同じ帳簿から出ている以上
+/// 一致するはずで、**しないならどちらかの集計が間違っている。**
+///
+/// 元帳は税理士へ渡す一式に入るうえ、青色申告の要件でもある。書き出した
+/// ものを数え直さないと、列のずれや行の脱落に気づけない（`export.json` と
+/// 弥生CSVで同じことをしている）。
+///
+/// # 比べるのは「期中の増減」
+///
+/// 試算表の行は**期中の借方合計・貸方合計**しか持たない（期首も期末も
+/// 持たない）。元帳の残高は期首から積んだ額なので、そのまま比べると
+/// 期首残高のぶんだけ食い違う。**実際にそれで実帳簿の健全な6科目を
+/// 「不一致」と報告しかけた。**
+///
+/// そこで元帳側も「最終残高 − 期首残高」にして、同じものを比べる。
+///
+/// # 符号は借方を正に揃える
+///
+/// 元帳の `opening_balance` / `closing_balance` は科目の種別で符号の向きが
+/// 変わる（純資産は貸方が正）。試算表の借貸から作る増減は借方が正なので、
+/// **元帳側の差も同じ向きに直してから比べる。**
+fn warn_if_the_ledger_does_not_match_the_book(
+    csv: &str,
+    pages: &[kaikei_app::view::LedgerPageView],
+    trial_balance: &kaikei_app::view::TrialBalanceView,
+) {
+    use kaikei_core::AccountType;
+
+    let from_csv = kaikei_report::ledger::closing_balances(csv);
+
+    let mut mismatched: Vec<String> = Vec::new();
+    for page in pages {
+        let code = page.account.as_str();
+        let Some(closing) = from_csv.get(code).copied() else {
+            // 取引が1件も無い科目はページが作られない。
+            continue;
+        };
+        // 元帳の増減（書き出した CSV の最終残高 − 期首残高）。
+        let mut moved = closing - page.opening_balance.minor();
+        // **貸方が正の科目は向きを直す。** 負債・純資産・収益がこれに
+        // 当たる（試算表の借貸から作る増減は借方が正なので揃える）。
+        if matches!(
+            page.account_type,
+            AccountType::Liability | AccountType::Equity | AccountType::Revenue
+        ) {
+            moved = -moved;
+        }
+
+        let Some(row) = trial_balance
+            .rows()
+            .iter()
+            .find(|row| row.account.as_str() == code)
+        else {
+            continue;
+        };
+        let in_book = row.debit_total.minor() - row.credit_total.minor();
+        if moved != in_book {
+            mismatched.push(format!("  {code}: 帳簿 {in_book} / 元帳 {moved}"));
+        }
+    }
+
+    if mismatched.is_empty() {
+        return;
+    }
+    eprintln!(
+        "注意: 総勘定元帳が帳簿と一致しません（{} 科目）:",
+        mismatched.len()
+    );
+    for line in &mismatched {
+        eprintln!("{line}");
+    }
+    eprintln!("  元帳と試算表は別々に集計しています。どちらかの集計が間違っています。");
+}
+
 /// 拡張子から MIME タイプを決める。
 ///
 /// **分からなければ推測しない。** 誤った型で保存すると、後から中身が何かを
@@ -5239,10 +5318,18 @@ async fn write_reports(
         &kaikei_report::journal_book::to_csv(&entries, &chart),
         &kaikei_report::journal_book::to_html(&entries, &chart, &period_label, &[]),
     )?);
+    let ledger_csv = kaikei_report::ledger::to_csv(&ledger_pages);
+
+    // ★書き出したものを読み直して、試算表と突き合わせる★
+    //
+    // **元帳と試算表は仕訳から別々に集計される。** 同じ帳簿から出ている
+    // 以上一致するはずで、しないならどちらかが間違っている。
+    warn_if_the_ledger_does_not_match_the_book(&ledger_csv, &ledger_pages, &trial_balance);
+
     written.extend(write_pair(
         &out_dir,
         "general_ledger",
-        &kaikei_report::ledger::to_csv(&ledger_pages),
+        &ledger_csv,
         &kaikei_report::ledger::to_html(&ledger_pages, &period_label, &[]),
     )?);
     written.extend(write_pair(

@@ -25,11 +25,12 @@
 //! 「期首残高がある」科目に限る——**どちらも無い科目は、その期間の帳簿に
 //! 現れる理由が無い。**
 
-use crate::csv::CsvBuilder;
+use crate::csv::{CsvBuilder, UTF8_BOM};
 use crate::html::PrintableTable;
 use kaikei_app::amount::money_to_plain_string;
 use kaikei_app::view::{LedgerPageView, LedgerRowView};
 use kaikei_app::wire::side_code;
+use std::collections::BTreeMap;
 
 /// 表の見出し。CSV と HTML で共有する。
 const HEADERS: &[&str] = &[
@@ -123,6 +124,49 @@ fn row_to_cells(code: &str, name: &str, row: &LedgerRowView) -> Vec<String> {
         money_to_plain_string(&row.running_balance),
         row.memo.clone().unwrap_or_default(),
     ]
+}
+
+/// 書き出した CSV を読み直して、科目ごとの最終残高を拾う。
+///
+/// # なぜ書いたものを読み直すのか
+///
+/// **`LedgerPageView` をそのまま数えると、書き出しの誤りを見逃す。**
+/// 列の取り違えや行の脱落は、出力を読み直して初めて分かる（`export.json`
+/// や弥生CSVで同じことをしている）。
+///
+/// # なぜ試算表と突き合わせるのか
+///
+/// 元帳と試算表は**仕訳から別々に集計される**。同じ帳簿から出ている以上
+/// 一致するはずで、**しないならどちらかの集計が間違っている。**
+///
+/// 元帳は「科目ごとに1ページ、行ごとに残高を積む」形なので、科目の最後の
+/// 行の残高がその科目の期末残高になる。
+///
+/// # 空欄の残高は読み飛ばす
+///
+/// 期首残高の行など、残高だけを持つ行もある。数として読めない行は
+/// 飛ばす——**読めない行を 0 として数えると、突合が黙って通る。**
+#[must_use]
+pub fn closing_balances(csv: &str) -> BTreeMap<String, i128> {
+    let mut last: BTreeMap<String, i128> = BTreeMap::new();
+    for line in csv.lines().skip(1) {
+        // **素朴に分ける。** 科目コードと残高は数字だけなので、引用符の
+        // 中にカンマが来ることは無い（摘要には来るが、そこは読まない）。
+        let cells: Vec<&str> = line.split(',').collect();
+        // 科目コード(0) と 残高(8)。
+        let (Some(code), Some(balance)) = (cells.first(), cells.get(8)) else {
+            continue;
+        };
+        let code = code.trim_start_matches(UTF8_BOM);
+        if code.is_empty() {
+            continue;
+        }
+        let Ok(value) = balance.trim().parse::<i128>() else {
+            continue;
+        };
+        last.insert(code.to_string(), value);
+    }
+    last
 }
 
 /// 総勘定元帳の CSV。
@@ -346,5 +390,72 @@ mod tests {
             assert!(csv.contains(value), "CSV に値が無い: {value}");
             assert!(html.contains(value), "HTML に値が無い: {value}");
         }
+    }
+    // ─── 書き出した CSV から残高を読み直す ─────────────
+
+    /// 見出し行。
+    const HEADER: &str = "科目コード,勘定科目,取引日,仕訳番号,摘要,相手科目,貸借,金額,残高,備考";
+
+    /// **本命。** 科目ごとの最後の行の残高を拾う。
+    ///
+    /// 元帳は科目ごとに行を並べて残高を積む形なので、最後の行がその科目の
+    /// 期末残高になる。
+    #[test]
+    fn the_last_balance_of_each_account_is_picked_up() {
+        let csv = [
+            HEADER,
+            "100,現金,2026-01-05,1,売上,500,1,1000,1000,",
+            "100,現金,2026-02-05,2,仕入,600,2,300,700,",
+            "110,普通預金,2026-03-05,3,振替,100,1,500,500,",
+        ]
+        .join(
+            "
+",
+        );
+
+        let balances = closing_balances(&csv);
+
+        assert_eq!(balances.get("100"), Some(&700), "最後の行を取ること");
+        assert_eq!(balances.get("110"), Some(&500));
+    }
+
+    /// **本命。** 残高が読めない行は飛ばす。
+    ///
+    /// 期首残高の行など、金額の欄が空の行がある。**読めない行を 0 として
+    /// 数えると、突合が黙って通る。**
+    #[test]
+    fn a_row_without_a_readable_balance_is_skipped() {
+        let csv = [
+            HEADER,
+            "100,現金,2026-01-05,1,売上,500,1,1000,1000,",
+            "100,現金,,,合計,,,,,",
+        ]
+        .join(
+            "
+",
+        );
+
+        assert_eq!(
+            closing_balances(&csv).get("100"),
+            Some(&1000),
+            "空の行で上書きしない"
+        );
+    }
+
+    /// 負の残高も読む。
+    #[test]
+    fn a_negative_balance_is_read() {
+        let csv = [HEADER, "110,普通預金,2026-01-05,1,出金,100,2,900,-282754,"].join(
+            "
+",
+        );
+
+        assert_eq!(closing_balances(&csv).get("110"), Some(&-282_754));
+    }
+
+    /// 見出しだけなら空。
+    #[test]
+    fn a_header_only_csv_has_no_balances() {
+        assert!(closing_balances(HEADER).is_empty());
     }
 }
