@@ -1215,3 +1215,100 @@ async fn a_year_with_entries_does_not_say_it_is_empty(
         "余計なことを言わない: {stdout}"
     );
 }
+
+/// **本命。** 採番カウンタが帳簿とずれていたら指摘する。
+///
+/// 仕訳番号は `entry_counters` が払い出す。`journal_entries` を直に触って
+/// 仕訳を入れると、この表が付いてこない。**次に払い出す番号が既にある
+/// 仕訳と衝突し、以降の記帳がすべて失敗する。**
+///
+/// そのときのエラーは「既に存在するデータと重複するため保存できません」で、
+/// **理由が分からない。** 同じ仕訳を二重に入れたのだと読める。
+///
+/// 現実に起きるのは復元したときである。`export.json` は仕訳を仕訳番号
+/// つきで持っているが、カウンタは持っていない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_drifted_entry_counter_is_reported(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "400", "元入金", 3).await;
+    // `seed_entry` は journal_entries を直に触るので、カウンタが付いてこない。
+    seed_entry(&app, 1, "110", "400", 100_000).await;
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "指摘があっても検査は失敗しないこと: {stderr}");
+    assert!(
+        stderr.contains("採番カウンタが帳簿とずれています"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("カウンタがありません"),
+        "行が無いことを言うこと: {stderr}"
+    );
+    // **直し方まで書く。** 気づいても何をすればよいか分からないと止まる。
+    assert!(stderr.contains("entry_counters"), "{stderr}");
+}
+
+/// カウンタが揃っていれば黙る。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_matching_entry_counter_is_quiet(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "400", "元入金", 3).await;
+    seed_entry(&app, 1, "110", "400", 100_000).await;
+    sqlx::query("INSERT INTO entry_counters (fiscal_year, next_no) VALUES (2026, 2)")
+        .execute(&app)
+        .await
+        .expect("カウンタを入れられること");
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        !stderr.contains("採番カウンタが帳簿とずれています"),
+        "揃っていれば黙ること: {stderr}"
+    );
+}
+
+/// **本命。** 次に払い出す番号が、帳簿の最大とちょうど同じでも指摘する。
+///
+/// この形がいちばん起きやすい——仕訳を1件だけ直に足すと、カウンタは
+/// そのままなので「次は N」「帳簿の最大も N」になる。**次の記帳で必ず
+/// 衝突する。**
+///
+/// 条件を `<=` ではなく `<` にすると、この場合を見逃す。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_counter_equal_to_the_largest_entry_no_is_reported(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "400", "元入金", 3).await;
+    seed_entry(&app, 1, "110", "400", 100_000).await;
+    seed_entry(&app, 2, "110", "400", 200_000).await;
+    // 次は 2 を払い出すが、帳簿には既に 2 がある。
+    sqlx::query("INSERT INTO entry_counters (fiscal_year, next_no) VALUES (2026, 2)")
+        .execute(&app)
+        .await
+        .expect("カウンタを入れられること");
+
+    let (_stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("採番カウンタが帳簿とずれています"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("次に払い出す番号 2"),
+        "衝突する番号を出すこと: {stderr}"
+    );
+}

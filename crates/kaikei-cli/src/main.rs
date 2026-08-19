@@ -561,6 +561,9 @@ async fn run_verify(fiscal_year: i32) -> Result<Vec<PathBuf>, String> {
     let store = PgStore::new(pool.clone());
 
     // 証憑の検査に使う。**クロージャへ移す前に取っておく。**
+    // **採番カウンタのずれ。** 気づかないと次の記帳が理由不明で失敗する。
+    warn_if_the_entry_counter_drifted(&pool).await;
+
     let documents = PgDocumentQuery::new(pool.clone());
 
     let schema = catalog.schema().clone();
@@ -2021,6 +2024,57 @@ fn tags_for_preview(tags: &kaikei_core::TagSet) -> String {
         return String::new();
     }
     format!("  [{}]", parts.join(" "))
+}
+
+/// 採番カウンタが帳簿とずれていないかを知らせる。
+///
+/// # なぜ要るのか
+///
+/// 仕訳番号は `entry_counters` が払い出す。`journal_entries` を直に触って
+/// 仕訳を入れると、この表が付いてこない。**次に払い出す番号が既にある
+/// 仕訳と衝突し、以降の記帳がすべて失敗する。**
+///
+/// そのときのエラーは「既に存在するデータと重複するため保存できません」で、
+/// **理由が分からない**（実際に踏んで、原因に行き着くまで数手かかった）。
+/// 同じ仕訳を二重に入れたのだと読める。
+///
+/// 現実に起きるのは**復元したとき**である。`export.json` は仕訳を仕訳番号
+/// つきで持っているが、カウンタは持っていない。
+async fn warn_if_the_entry_counter_drifted(pool: &kaikei_store::pool::PgPool) {
+    let rows = match kaikei_store::numbering::counter_drift(pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            // **読めないことを「ずれ無し」にしない。**
+            eprintln!("注意: 採番カウンタを読めませんでした: {error}");
+            return;
+        }
+    };
+
+    let mut bad = Vec::new();
+    for row in rows {
+        let (year, max_no) = (row.fiscal_year, row.max_entry_no);
+        match row.next_no {
+            None => bad.push(format!(
+                "  {year} 年度: カウンタがありません（帳簿の最大は {max_no}）"
+            )),
+            Some(next) if next <= max_no => bad.push(format!(
+                "  {year} 年度: 次に払い出す番号 {next} が、帳簿にある最大 {max_no} 以下です"
+            )),
+            Some(_) => {}
+        }
+    }
+    if bad.is_empty() {
+        return;
+    }
+
+    eprintln!();
+    eprintln!("注意: 仕訳番号の採番カウンタが帳簿とずれています:");
+    for line in &bad {
+        eprintln!("{line}");
+    }
+    eprintln!("  このままだと次の記帳が「既に存在するデータと重複する」で失敗します。");
+    eprintln!("  仕訳を直に入れた（復元したなど）場合に起きます。");
+    eprintln!("  entry_counters の next_no を、その年度の最大の仕訳番号 + 1 にしてください。");
 }
 
 /// 拡張子から MIME タイプを決める。

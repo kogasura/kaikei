@@ -3,7 +3,10 @@
 
 use crate::error::from_sqlx_error;
 use kaikei_app::error::RepoError;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
+
+/// 接続プール。**呼び出し側が sqlx に直接依存しなくて済むよう再輸出する。**
+pub use sqlx::postgres::PgPool;
 use std::time::Duration;
 
 /// アプリ実行用プールの最大接続数。
