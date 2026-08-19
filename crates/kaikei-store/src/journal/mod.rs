@@ -46,20 +46,38 @@ fn reject_nul(s: &str) -> Result<(), RepoError> {
 /// 1件取得（`find_entry`）と期間取得（`list_entries_in_period`）で共有する。
 /// 列を片方にだけ足すと [`JournalEntryRow`] の `FromRow` が**実行時にしか**
 /// 落ちない（コンパイルは通る）。1箇所に置いて、その事故が起きない形にする。
-const ENTRY_COLUMNS: &str = "id, fiscal_year, entry_no, entry_date, description, \
-                             reverses, reverse_reason, recorded_at";
+/// **マクロにしてあるのは `concat!` に渡すため。** `const` では `concat!` の
+/// 引数にできず、`format!` で組み立てることになる。それだと SQL が実行時に
+/// 作られる文字列になり、sqlx 0.9 以降は「動的 SQL」として明示的な監査
+/// （`AssertSqlSafe`）を求められる。
+///
+/// ここで差し込むのはコンパイル時の定数だけで、値はすべて `bind` している
+/// ——**そもそも動的ではない。** マクロにすれば連結もコンパイル時に済み、
+/// 断り書きが要らなくなる。
+macro_rules! entry_columns {
+    () => {
+        "id, fiscal_year, entry_no, entry_date, description, \
+         reverses, reverse_reason, recorded_at"
+    };
+}
 
 /// `journal_lines` から SELECT する列。同上。
-const LINE_COLUMNS: &str = "entry_id, line_no, account_code, side, amount_minor, \
-                            currency, currency_minor_unit, tags, memo";
+macro_rules! line_columns {
+    () => {
+        "entry_id, line_no, account_code, side, amount_minor, \
+         currency, currency_minor_unit, tags, memo"
+    };
+}
 
 #[async_trait]
 impl JournalRepo for PgTx<'_> {
     async fn find_entry(&mut self, id: EntryId) -> Result<Option<JournalEntry>, RepoError> {
         let uuid = entry_id_to_uuid(id);
 
-        let entry_row: Option<JournalEntryRow> = sqlx::query_as(&format!(
-            "SELECT {ENTRY_COLUMNS} FROM journal_entries WHERE id = $1"
+        let entry_row: Option<JournalEntryRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM journal_entries WHERE id = $1"
         ))
         .bind(uuid)
         .fetch_optional(self.conn())
@@ -70,8 +88,10 @@ impl JournalRepo for PgTx<'_> {
             return Ok(None);
         };
 
-        let line_rows: Vec<JournalLineRow> = sqlx::query_as(&format!(
-            "SELECT {LINE_COLUMNS} FROM journal_lines WHERE entry_id = $1 ORDER BY line_no"
+        let line_rows: Vec<JournalLineRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            line_columns!(),
+            " FROM journal_lines WHERE entry_id = $1 ORDER BY line_no"
         ))
         .bind(uuid)
         .fetch_all(self.conn())
@@ -97,10 +117,10 @@ impl JournalRepo for PgTx<'_> {
         // `entry_no` は会計年度ごとの連番なので、年度をまたぐ期間では
         // `entry_date` が先に効く必要がある（順序を入れ替えると年度の
         // 切り替わりで並びが崩れる）。
-        let entry_rows: Vec<JournalEntryRow> = sqlx::query_as(&format!(
-            "SELECT {ENTRY_COLUMNS} FROM journal_entries \
-             WHERE entry_date >= $1 AND entry_date <= $2 \
-             ORDER BY entry_date, entry_no"
+        let entry_rows: Vec<JournalEntryRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM journal_entries \n             WHERE entry_date >= $1 AND entry_date <= $2 \n             ORDER BY entry_date, entry_no"
         ))
         .bind(from_date)
         .bind(to_date)
@@ -115,9 +135,10 @@ impl JournalRepo for PgTx<'_> {
         // 明細は1回のクエリでまとめて取る。仕訳ごとに引き直すと件数ぶんの
         // 往復になる（決算では1年分＝数千件を読む）。
         let ids: Vec<uuid::Uuid> = entry_rows.iter().map(|row| row.id).collect();
-        let line_rows: Vec<JournalLineRow> = sqlx::query_as(&format!(
-            "SELECT {LINE_COLUMNS} FROM journal_lines \
-             WHERE entry_id = ANY($1) ORDER BY entry_id, line_no"
+        let line_rows: Vec<JournalLineRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            line_columns!(),
+            " FROM journal_lines \n             WHERE entry_id = ANY($1) ORDER BY entry_id, line_no"
         ))
         .bind(&ids)
         .fetch_all(self.conn())
