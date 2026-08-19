@@ -479,7 +479,7 @@ mod tests {
     /// 住宅の家賃・支払利息・保険料のような**非課税の仕入が売上として
     /// 出力される**。税理士に渡す CSV で経費が売上に化ける。
     ///
-    /// 実際に weBanana.SP の帳簿で、非課税仕入の地代家賃 205,000 円が
+    /// 検証帳簿で、非課税仕入の地代家賃 168,000 円が
     /// 「非課売上」として出力されていた。
     #[test]
     fn a_tax_free_purchase_is_not_written_as_a_tax_free_sale() {
@@ -487,8 +487,8 @@ mod tests {
             1,
             "地代家賃",
             vec![
-                line("615", Side::Debit, 205_000, Some("TAX_FREE")),
-                line("110", Side::Credit, 205_000, None),
+                line("615", Side::Debit, 168_000, Some("TAX_FREE")),
+                line("110", Side::Credit, 168_000, None),
             ],
         )];
 

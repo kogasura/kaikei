@@ -288,21 +288,21 @@ mod tests {
     // **本命。** 借方は1行にまとめ、貸方は資産ごとに分ける。
     #[test]
     fn the_proposal_has_one_debit_and_one_credit_per_asset() {
-        let a = row("220", (2025, 3, 10), 108_000, 1, Some(2));
-        let b = row("210", (2025, 7, 24), 280_717, 1, Some(4));
+        let a = row("220", (2025, 3, 10), 105_600, 1, Some(2));
+        let b = row("210", (2025, 7, 24), 227_412, 1, Some(4));
         let rows = vec![
             (&a, Money::from_minor(54_000, Currency::JPY)),
-            (&b, Money::from_minor(70_179, Currency::JPY)),
+            (&b, Money::from_minor(56_853, Currency::JPY)),
         ];
         let year = FiscalYear::calendar_year(2026);
 
-        let proposal = build_proposal(&rows, 124_179, &year).unwrap();
+        let proposal = build_proposal(&rows, 109_653, &year).unwrap();
         let lines = proposal["lines"].as_array().unwrap();
 
         assert_eq!(lines.len(), 3, "借方1 + 貸方2");
         assert_eq!(lines[0]["account"], json!("610"));
         assert_eq!(lines[0]["side"], json!("debit"));
-        assert_eq!(lines[0]["amount"], json!("124179"));
+        assert_eq!(lines[0]["amount"], json!("109653"));
         assert_eq!(
             lines[0]["tags"]["tax_category"],
             json!("NOT_APPLICABLE"),
@@ -343,7 +343,7 @@ mod tests {
     // 除却した年から対象外（D-108）。
     #[test]
     fn a_disposed_asset_is_outside_from_the_year_of_disposal() {
-        let mut asset = row("220", (2025, 3, 10), 108_000, 1, Some(2));
+        let mut asset = row("220", (2025, 3, 10), 105_600, 1, Some(2));
         asset.disposed_on = Some(AccountingDate::new(2026, 6, 30).unwrap());
         assert!(!is_outside_the_ledger_for(&asset, 2025));
         assert!(is_outside_the_ledger_for(&asset, 2026));

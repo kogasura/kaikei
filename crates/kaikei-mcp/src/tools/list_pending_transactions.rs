@@ -49,7 +49,7 @@ pub struct ListPendingTransactions;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListPendingTransactionsInput {
-    /// 取り込み元（mizuho_business など。完全一致）。
+    /// 取り込み元（example_bank など。完全一致）。
     #[serde(default)]
     pub source: Option<String>,
     /// 状態。pending / journalized / ignored。既定は pending。

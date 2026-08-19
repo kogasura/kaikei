@@ -68,7 +68,7 @@
 //! | [`year_end_household_split`] | 決算 | 2行（事業主貸・対象科目の取消） |
 //!
 //! 決算時一括を後から足したのは、実際の帳簿がそれを必要としたためである。
-//! WeBanana.SP の2026年は8か月分の家賃・電気代を全額計上したまま
+//! 検証帳簿の2026年は8か月分の家賃・電気代を全額計上したまま
 //! 「按分は確定申告時」と摘要に書いて先送りしており、**既に計上した分を
 //! 後から按分する形でなければ処理できなかった**。
 //!
@@ -231,15 +231,15 @@ pub struct YearEndHouseholdSplitInput {
 /// こちらは**既に全額を経費に計上した後**で、家事分を経費から抜く。
 ///
 /// ```text
-/// 借 事業主貸    1,292,004
-/// 貸 地代家賃            1,292,004  <business_ratio:0.3>
+/// 借 事業主貸    1,076,040
+/// 貸 地代家賃            1,076,040  <business_ratio:0.3>
 /// ```
 ///
 /// # なぜ両方が要るのか
 ///
 /// 記帳時按分は月次の損益が正しくなるが、**払うたびに事業割合が確定して
-/// いる必要がある**。事業割合は決算で決めることが多く、実際 WeBanana.SP の
-/// 2026年の帳簿は、8か月分の家賃・電気代を全額計上したまま
+/// いる必要がある**。事業割合は決算で決めることが多く、検証帳簿の
+/// 2026年も、8か月分の家賃・電気代を全額計上したまま
 /// 「按分は確定申告時」と摘要に書いて先送りしていた。既に計上した分を
 /// 後から按分するには、この形しかない。
 ///
@@ -727,12 +727,12 @@ mod tests {
 
     /// **本命。** 既に全額を経費に計上した後、家事分を経費から抜く。
     ///
-    /// WeBanana.SP の2026年の地代家賃 1,845,720円 を事業割合30%で按分する形。
+    /// 検証帳簿の2026年の地代家賃 1,537,200円 を事業割合30%で按分する形。
     #[test]
     fn year_end_split_moves_the_household_portion_out_of_the_expense() {
         let settings = settings_with(RoundMode::Floor);
         let result =
-            year_end_household_split(year_end_input(1_845_720, "0.30", None), &settings).unwrap();
+            year_end_household_split(year_end_input(1_537_200, "0.30", None), &settings).unwrap();
 
         assert_eq!(result.len(), 2, "決算時按分は2行");
 
@@ -741,14 +741,14 @@ mod tests {
             .find(|l| l.account().as_str() == "410")
             .unwrap();
         assert_eq!(owner.side(), Side::Debit, "事業主貸は借方");
-        assert_eq!(owner.amount().minor(), 1_292_004);
+        assert_eq!(owner.amount().minor(), 1_076_040);
 
         let expense = result
             .iter()
             .find(|l| l.account().as_str() == "615")
             .unwrap();
         assert_eq!(expense.side(), Side::Credit, "経費を減らすので貸方");
-        assert_eq!(expense.amount().minor(), 1_292_004);
+        assert_eq!(expense.amount().minor(), 1_076_040);
     }
 
     /// **本命。** 記帳時按分と家事分が1円まで一致する。
@@ -759,7 +759,7 @@ mod tests {
     fn year_end_split_agrees_with_the_at_entry_split_to_the_yen() {
         for rounding in [RoundMode::Floor, RoundMode::Ceil, RoundMode::HalfUp] {
             let settings = settings_with(rounding);
-            for total in [1_845_720_i128, 77_261, 100_000, 1, 3, 7, 999_999] {
+            for total in [1_537_200_i128, 64_380, 100_000, 1, 3, 7, 999_999] {
                 for ratio in ["0.30", "0.333", "0.5", "0.67"] {
                     let at_entry = household_split(input(total, ratio, None), &settings).unwrap();
                     let at_year_end =
@@ -829,7 +829,7 @@ mod tests {
     fn year_end_split_returns_nothing_when_the_business_ratio_is_one() {
         let settings = settings_with(RoundMode::Floor);
         let result =
-            year_end_household_split(year_end_input(1_845_720, "1", None), &settings).unwrap();
+            year_end_household_split(year_end_input(1_537_200, "1", None), &settings).unwrap();
 
         assert!(result.is_empty(), "振り替えるものが無ければ空");
     }

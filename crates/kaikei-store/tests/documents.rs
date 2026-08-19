@@ -32,7 +32,7 @@ fn document(id: &str, doc_date: AccountingDate) -> NewDocument {
         byte_size: 1024,
         doc_date,
         amount_minor: Some(550_000),
-        counterparty: Some("ビーテック".to_string()),
+        counterparty: Some("ABC".to_string()),
         doc_type: "invoice".to_string(),
         received_via: "email".to_string(),
         received_at: Timestamp::from_unix_nanos(1_700_000_000_000_000_000),
@@ -70,7 +70,7 @@ async fn a_registered_document_can_be_found(pool_opts: PgPoolOptions, conn_opts:
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].doc_date, date(2026, 6, 15));
     assert_eq!(found[0].amount_minor, Some(550_000));
-    assert_eq!(found[0].counterparty.as_deref(), Some("ビーテック"));
+    assert_eq!(found[0].counterparty.as_deref(), Some("ABC"));
     assert_eq!(found[0].doc_type, "invoice");
 }
 

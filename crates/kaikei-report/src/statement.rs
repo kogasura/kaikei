@@ -129,19 +129,19 @@ mod tests {
             sections: vec![
                 StatementSection {
                     title: "収益".to_string(),
-                    lines: vec![line("500", "売上高", 1_705_000)],
-                    subtotal: yen(1_705_000),
+                    lines: vec![line("500", "売上高", 1_428_000)],
+                    subtotal: yen(1_428_000),
                 },
                 StatementSection {
                     title: "費用".to_string(),
                     lines: vec![
-                        line("604", "通信費", 133_209),
-                        line("609", "旅費交通費", 24_225),
+                        line("604", "通信費", 108_420),
+                        line("609", "旅費交通費", 19_720),
                     ],
-                    subtotal: yen(157_434),
+                    subtotal: yen(128_140),
                 },
             ],
-            total: yen(1_547_566),
+            total: yen(1_299_860),
         }
     }
 
@@ -149,9 +149,9 @@ mod tests {
     fn every_line_carries_its_section() {
         let csv = to_csv(&income_statement());
 
-        assert!(csv.contains("収益,500,売上高,1705000"), "{csv}");
-        assert!(csv.contains("費用,604,通信費,133209"), "{csv}");
-        assert!(csv.contains("費用,609,旅費交通費,24225"), "{csv}");
+        assert!(csv.contains("収益,500,売上高,1428000"), "{csv}");
+        assert!(csv.contains("費用,604,通信費,108420"), "{csv}");
+        assert!(csv.contains("費用,609,旅費交通費,19720"), "{csv}");
     }
 
     // 区分ごとの小計が本文に、全体の合計が表の最後に出る。
@@ -160,9 +160,9 @@ mod tests {
         let csv = to_csv(&income_statement());
         let html = to_html(&income_statement(), "2026-01-01 〜 2026-12-31", &[]);
 
-        assert!(csv.contains("収益,,小計,1705000"), "{csv}");
-        assert!(csv.contains("費用,,小計,157434"), "{csv}");
-        assert!(csv.contains(",,合計,1547566"), "{csv}");
+        assert!(csv.contains("収益,,小計,1428000"), "{csv}");
+        assert!(csv.contains("費用,,小計,128140"), "{csv}");
+        assert!(csv.contains(",,合計,1299860"), "{csv}");
 
         // HTML では合計だけが tfoot に入る（小計は本文）。
         let body_end = html.find("</tbody>").unwrap();
@@ -211,7 +211,7 @@ mod tests {
             assert!(csv.contains(header), "CSV に見出しが無い: {header}");
             assert!(html.contains(header), "HTML に見出しが無い: {header}");
         }
-        for value in ["売上高", "1705000", "旅費交通費", "1547566"] {
+        for value in ["売上高", "1428000", "旅費交通費", "1299860"] {
             assert!(csv.contains(value), "CSV に値が無い: {value}");
             assert!(html.contains(value), "HTML に値が無い: {value}");
         }

@@ -24,12 +24,12 @@ use sqlx::{PgPool, Row};
 fn imported(id: &str, external_key: &str) -> NewImportedTransaction {
     NewImportedTransaction {
         id: format!("00000000-0000-0000-0000-{id:0>12}"),
-        source: "mizuho_business".to_string(),
+        source: "example_bank".to_string(),
         external_key: external_key.to_string(),
         occurred_on: AccountingDate::new(2026, 6, 15).unwrap(),
         amount_minor: 1_980,
         direction: ImportDirection::Out,
-        raw_description: "カ）アマゾンジャパン".to_string(),
+        raw_description: "カ）サンプルショウジ".to_string(),
         balance_after: Some(500_000),
         raw_row: r#"{"date":"2026/06/15","amount":"1,980"}"#.to_string(),
         imported_at: Timestamp::from_unix_nanos(1_700_000_000_000_000_000),
@@ -368,7 +368,7 @@ async fn the_list_can_be_narrowed(pool_opts: PgPoolOptions, conn_opts: PgConnect
     let other_bank = query
         .list_imported(
             &ImportedTxQuerySpec {
-                source: Some("rakuten".to_string()),
+                source: Some("example_card".to_string()),
                 ..Default::default()
             },
             100,

@@ -443,7 +443,7 @@ mod tests {
                 id: EntryId::new(1),
                 entry_no: EntryNumber::new(1),
                 entry_date: AccountingDate::new(2026, 6, 15).unwrap(),
-                description: "ビーテック 5月分 請求".to_string(),
+                description: "ABC 5月分 請求".to_string(),
                 lines: vec![
                     JournalLine::new(
                         AccountCode::parse("110").unwrap(),
@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(entry["entry_no"], json!(1));
         assert_eq!(entry["fiscal_year"], json!(2026));
         assert_eq!(entry["entry_date"], json!("2026-06-15"));
-        assert_eq!(entry["description"], json!("ビーテック 5月分 請求"));
+        assert_eq!(entry["description"], json!("ABC 5月分 請求"));
         assert_eq!(entry["reverses"], Value::Null);
         assert!(entry["id"].is_string());
         assert!(entry["recorded_at_unix_nanos"].is_string());

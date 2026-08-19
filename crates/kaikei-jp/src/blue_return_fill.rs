@@ -373,7 +373,7 @@ mod tests {
         blue_return::load_embedded(kaikei_jp_data::STATEMENT_BLUE_RETURN_GENERAL).unwrap()
     }
 
-    /// WeBanana.SP の 2026 年 1〜8 月の実績に近い損益計算書。
+    /// 検証帳簿の 2026 年 1〜8 月に近い形の損益計算書。
     fn income_statement() -> Statement {
         Statement {
             title: "損益計算書".to_string(),
@@ -381,32 +381,32 @@ mod tests {
                 StatementSection {
                     title: "収益".to_string(),
                     lines: vec![
-                        line("500", "売上高", 11_435_380),
-                        line("530", "受取利息", 434),
+                        line("500", "売上高", 9_240_600),
+                        line("530", "受取利息", 512),
                     ],
-                    subtotal: yen(11_435_814),
+                    subtotal: yen(9_241_112),
                 },
                 StatementSection {
                     title: "費用".to_string(),
                     lines: vec![
-                        line("602", "水道光熱費", 77_261),
-                        line("603", "旅費交通費", 98_093),
-                        line("604", "通信費", 439_852),
-                        line("607", "損害保険料", 13_000),
-                        line("609", "消耗品費", 145_057),
-                        line("611", "福利厚生費", 2_968),
-                        line("613", "外注工賃", 385_000),
-                        line("615", "地代家賃", 1_845_720),
-                        line("620", "支払手数料", 7_693),
-                        line("621", "新聞図書費", 17_782),
-                        line("622", "研修費", 4_784),
-                        line("623", "会議費", 16_476),
-                        line("625", "諸会費", 12_980),
+                        line("602", "水道光熱費", 64_380),
+                        line("603", "旅費交通費", 82_140),
+                        line("604", "通信費", 366_520),
+                        line("607", "損害保険料", 11_400),
+                        line("609", "消耗品費", 120_880),
+                        line("611", "福利厚生費", 2_470),
+                        line("613", "外注工賃", 320_000),
+                        line("615", "地代家賃", 1_537_200),
+                        line("620", "支払手数料", 6_410),
+                        line("621", "新聞図書費", 14_810),
+                        line("622", "研修費", 3_980),
+                        line("623", "会議費", 13_720),
+                        line("625", "諸会費", 10_810),
                     ],
-                    subtotal: yen(3_066_666),
+                    subtotal: yen(2_554_720),
                 },
             ],
-            total: yen(8_369_148),
+            total: yen(6_686_392),
         }
     }
 
@@ -430,18 +430,18 @@ mod tests {
     fn it_fills_the_form_down_to_the_income_amount() {
         let filled = fill(&form(), &income_statement(), &inputs(650_000)).unwrap();
 
-        // ① 売上（収入）金額。**受取利息 434 は入らない**（利子所得）。
-        assert_eq!(amount_of(&filled, 1), yen(11_435_380));
+        // ① 売上（収入）金額。**受取利息 512 は入らない**（利子所得）。
+        assert_eq!(amount_of(&filled, 1), yen(9_240_600));
         // ⑦ 差引金額（① − ⑥）。売上原価が無いので売上と同額。
-        assert_eq!(amount_of(&filled, 7), yen(11_435_380));
+        assert_eq!(amount_of(&filled, 7), yen(9_240_600));
         // ㉜ 経費の計。
-        assert_eq!(amount_of(&filled, 32), yen(3_066_666));
+        assert_eq!(amount_of(&filled, 32), yen(2_554_720));
         // ㉝ 差引金額（⑦ − ㉜）。
-        assert_eq!(amount_of(&filled, 33), yen(8_368_714));
+        assert_eq!(amount_of(&filled, 33), yen(6_685_880));
         // ㊸ 青色申告特別控除前の所得金額（㉝ + ㊲ − ㊷）。引当金は 0。
-        assert_eq!(amount_of(&filled, 43), yen(8_368_714));
+        assert_eq!(amount_of(&filled, 43), yen(6_685_880));
         // ㊺ 所得金額（㊸ − ㊹）。
-        assert_eq!(amount_of(&filled, 45), yen(7_718_714));
+        assert_eq!(amount_of(&filled, 45), yen(6_035_880));
     }
 
     // FL-1b: **年度末に手で入れる決算整理仕訳が決算書に載ること。**
@@ -461,10 +461,10 @@ mod tests {
 
         // ⑱ 減価償却費。
         assert_eq!(amount_of(&filled, 18), yen(129_572));
-        // ㉜ 経費の計にも入る（3,066,666 + 129,572）。
-        assert_eq!(amount_of(&filled, 32), yen(3_196_238));
-        // ㊺ 所得金額はその分だけ減る（7,718,714 − 129,572）。
-        assert_eq!(amount_of(&filled, 45), yen(7_589_142));
+        // ㉜ 経費の計にも入る（2,554,720 + 129,572）。
+        assert_eq!(amount_of(&filled, 32), yen(2_684_292));
+        // ㊺ 所得金額はその分だけ減る（6,035,880 − 129,572）。
+        assert_eq!(amount_of(&filled, 45), yen(5_906_308));
         // 未マッピングには出ない（当てはめ済みの科目）。
         assert!(!filled
             .not_on_form
@@ -479,7 +479,7 @@ mod tests {
 
         let field = filled.fields.iter().find(|f| f.no == 25).unwrap();
         assert_eq!(field.label.as_deref(), Some("支払手数料"));
-        assert_eq!(field.amount, yen(7_693));
+        assert_eq!(field.amount, yen(6_410));
 
         // 取引が無い科目を当てはめた空欄は、金額 0 で名前も出ない
         // （㉙ は車両費。この帳簿には取引が無い）。
@@ -504,7 +504,7 @@ mod tests {
             .iter()
             .find(|entry| entry.account.as_str() == "530")
             .expect("受取利息が報告されるはず");
-        assert_eq!(interest.amount, yen(434));
+        assert_eq!(interest.amount, yen(512));
         assert!(matches!(interest.reason, NotOnFormReason::Excluded(_)));
 
         let added = filled
@@ -645,8 +645,8 @@ fields:
         let with_650k = fill(&form(), &income_statement(), &inputs(650_000)).unwrap();
         let with_100k = fill(&form(), &income_statement(), &inputs(100_000)).unwrap();
 
-        assert_eq!(amount_of(&with_650k, 45), yen(7_718_714));
-        assert_eq!(amount_of(&with_100k, 45), yen(8_268_714));
+        assert_eq!(amount_of(&with_650k, 45), yen(6_035_880));
+        assert_eq!(amount_of(&with_100k, 45), yen(6_585_880));
     }
     // ─── 上限のある欄（青色申告特別控除額） ─────────────
 

@@ -433,7 +433,7 @@ struct AttachArgs {
     /// 仕訳IDの代わりに、この**仕訳番号**の仕訳を探す。
     ///
     /// `invoices_to_collect.csv` が出すのは仕訳番号である。UUID しか
-    /// 受けないと、32件を紐付けるのに毎回引き直すことになる。
+    /// 受けないと、16件を紐付けるのに毎回引き直すことになる。
     match_entry_no: Option<u32>,
     /// 備考。
     note: Option<String>,
@@ -991,8 +991,8 @@ fn warn_if_the_search_fields_are_incomplete(counterparty: &Option<String>, amoun
 /// （`docs/04-jp-tax.md` §9）。振り替えないと、翌年度の帳簿が前年の残高を
 /// 抱えたまま始まり、**年を追うごとに膨らむ**。
 ///
-/// 帳簿の複製で2027年度を開く稽古をしたところ、事業主貸 10,013,438 円・
-/// 事業主借 1,012,434 円が持ち越されたまま2027年が始まった。貸借は一致して
+/// 帳簿の複製で2027年度を開く稽古をしたところ、事業主貸 8,052,438 円・
+/// 事業主借 820,512 円が持ち越されたまま2027年が始まった。貸借は一致して
 /// いるので、決算書を見ても気づけない。
 ///
 /// # 振替仕訳は作らない
@@ -1012,7 +1012,7 @@ fn warn_if_the_search_fields_are_incomplete(counterparty: &Option<String>, amoun
 /// 0 で提出することになる。
 ///
 /// **実際に試したら再現した。** 実帳簿の複製で12月31日に期首振替を入れたところ、
-/// 事業主貸 9,923,381円 と事業主借 1,012,434円 が決算書から消え、
+/// 事業主貸 7,984,381円 と事業主借 820,512円 が決算書から消え、
 /// `verify` は終了コード0のままだった。
 ///
 /// # 判定
@@ -1286,7 +1286,7 @@ fn invoices_to_collect(
             // ではなく**適格返還請求書**で、必要な書類が違う。同じ一覧に混ぜると
             // 「請求書を探しても見つからない」ことになる。
             //
-            // 実帳簿では 603 件中5件がこれ（ドメイン代の返金 60,831円）。
+            // 実帳簿では 248 件中5件がこれ（ドメイン代の返金 49,380円）。
             // 返還の側の検査は、必要になったら別に作ること。
             let line = entry.lines().iter().find(|line| {
                 line.side() == kaikei_core::Side::Debit
@@ -1370,9 +1370,9 @@ async fn entries_with_an_invoice_document(
 /// 見ていない。**タグが付いていても、その相手が適格請求書発行事業者かどうかを
 /// 確かめていなければ、仕入税額控除の根拠にならない。**
 ///
-/// 実帳簿（2026-08-17）では、取引先マスタ31件すべてが未確認だった
+/// 実帳簿（2026-08-17）では、取引先マスタ14件すべてが未確認だった
 /// （`invoice_registration_no` も `is_qualified_invoice_issuer` も空）。
-/// freee 側の取引先34件も登録番号が全件未入力である。
+/// 取り込み元の外部システム側でも登録番号は全件未入力だった。
 ///
 /// # 「未確認」と「非適格」は違う
 ///
@@ -1434,7 +1434,7 @@ fn unverified_counterparty_name(
 /// あって全額控除できない（2026年9月まで80%、10月以降70%）。適格の区分の
 /// ままだと**全額控除しているのと同じ**になる。
 ///
-/// 実帳簿で言えば、外注工賃 385,000円 の相手は個人で、適格かどうかを
+/// 実帳簿で言えば、外注工賃 320,000円 の相手は個人で、適格かどうかを
 /// 確かめていない。**非適格と分かった場合、税額にして約7,000円の差**が出る。
 ///
 /// # 「未確認」は対象にしない
@@ -1497,9 +1497,9 @@ struct MissingCounterpartyByAccount {
 ///
 /// # なぜ件数だけでは足りないのか
 ///
-/// 実帳簿では 603 件と出る。**そのうち 433 件が旅費交通費**で、合計
-/// 98,093円（平均 226円）——交通系ICの入出場である。件数だけを見せると
-/// 「603件ぶんの請求書を集めなければ」と読めるが、**そちらの手当ては
+/// 実帳簿では 248 件と出る。**そのうち 176 件が旅費交通費**で、合計
+/// 82,140円（平均 226円）——交通系ICの入出場である。件数だけを見せると
+/// 「248件ぶんの請求書を集めなければ」と読めるが、**そちらの手当ては
 /// 適格請求書ではない**（下の [`public_transport_note`] を参照）。
 fn missing_counterparty_by_account(
     entries: &[kaikei_core::JournalEntry],
@@ -1620,7 +1620,7 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
         eprintln!("  ※ 確認より前に記帳した分は当然こうなります。誤りとは限りません。");
     }
 
-    // **件数だけでは動けない。** 603件と言われても手の付けようがないが、
+    // **件数だけでは動けない。** 248件と言われても手の付けようがないが、
     // 少額特例（税込1万円未満は適格請求書の保存が不要）で分ければ、
     // 実際に請求書を揃える必要がある取引はずっと少ないことがある。
     let split = split_by_small_amount(entries, &rule_sets);
@@ -1674,8 +1674,8 @@ fn warn_if_qualified_invoice_lacks_a_counterparty(
             eprintln!("    返金・値引きに要るのは適格請求書ではなく適格返還請求書です。");
             eprintln!("    内部の振替には相手方が無いので、取引先を付けようがありません。");
         }
-        // **件数だけでは動けない。** 603件と言われても手の付けようがないが、
-        // 科目で割ると 433件が旅費交通費（交通系ICの入出場）で、そちらの
+        // **件数だけでは動けない。** 248件と言われても手の付けようがないが、
+        // 科目で割ると 176件が旅費交通費（交通系ICの入出場）で、そちらの
         // 手当ては適格請求書ではない。
         let rows = missing_counterparty_by_account(entries, &rule_sets, chart);
         if !rows.is_empty() {
@@ -2905,7 +2905,7 @@ fn parse_depreciation(args: &[String]) -> Result<Command, String> {
 /// 按分の金額は丸め方だけで決まるからと `tax_mode` に `Exclusive` を
 /// 置いていた。その後、固定資産の取得価額の判定（10万/20万/30万円の帯）に
 /// 使ったところ、**税込経理の帳簿を税抜として扱ってしまった**。実帳簿は
-/// 税込経理で、108,000円 が税抜なら 98,181円 で帯が変わる——まさに
+/// 税込経理で、105,600円 が税抜なら 96,000円 で帯が変わる——まさに
 /// 気づきたかった場面で黙る形になっていた。
 ///
 /// `rounding_unit` / `is_taxable_business` / `simplified_taxation` は
@@ -3167,7 +3167,7 @@ fn parse_household(args: &[String]) -> Result<Command, String> {
 /// 拾えない——どの科目が按分対象かはソフトには分からず、按分していない帳簿と
 /// 事業専用の帳簿は見分けがつかないからである。**人が年に一度打つ**しかない。
 ///
-/// 実際 WeBanana.SP の2026年の帳簿は、自宅の家賃と電気代を全額そのまま
+/// 検証帳簿の2026年は、自宅の家賃と電気代を全額そのまま
 /// 経費に計上したまま「按分は確定申告時」と摘要に書いて先送りしていた。
 async fn run_household(
     fiscal_year: i32,
@@ -3483,7 +3483,7 @@ fn method_label(method: i16) -> &'static str {
 /// 相手が適格請求書発行事業者かどうかは**後から分かる**情報である。取引を
 /// 記帳した時点では未確認で、あとで先方に伺って埋める。`counterparty import`
 /// は既存を上書きしないので、この経路が無いと**一度作った取引先には
-/// 二度と登録番号を入れられない**（実帳簿の31件がその状態だった）。
+/// 二度と登録番号を入れられない**（実帳簿の14件がその状態だった）。
 ///
 /// # 名前は変えない
 ///
@@ -3652,7 +3652,7 @@ fn parse_counterparty_verify(args: &[String]) -> Result<Command, String> {
     }
 
     Ok(Command::CounterpartyVerify {
-        code: code.ok_or("--code を指定してください（例: --code jdf）")?,
+        code: code.ok_or("--code を指定してください（例: --code abc）")?,
         registration_no,
         is_qualified,
         verified_on,
@@ -3723,7 +3723,7 @@ struct CounterpartyRow {
 /// この区別は `JpTaxPolicy` が記帳を拒むかどうかを決めている
 /// （`Some(false)` のときだけ拒む）。外部システムの「誰も入力していないので
 /// false」をそのまま `false` として持ち込むと、確認していない取引先を
-/// 「非適格だと確認済み」に仕立ててしまう。**実際に freee の取引先 34 件は
+/// 「非適格だと確認済み」に仕立ててしまう。**実際に外部の会計サービスの取引先は
 /// 全件が `qualified_invoice_issuer: false` かつ登録番号 `null` だった。**
 fn parse_counterparty_csv(text: &str) -> Result<Vec<CounterpartyRow>, String> {
     let mut reader = csv::ReaderBuilder::new()
@@ -4502,9 +4502,9 @@ fn warn_if_depreciation_is_missing(
 ///
 /// # なぜ黙って出さないか
 ///
-/// **貸借は一致したままなので決算書を見ても気づけない。** 実際に weBanana.SP で、
-/// 償却の相手科目を取り違えたために工具器具備品が -118,800 円になっていた誤りが
-/// 4年間気づかれずに残った。預金がマイナスのまま貸借対照表に載るのも同じ形である。
+/// **貸借は一致したままなので決算書を見ても気づけない。** 検証帳簿で、
+/// 償却の相手科目を取り違えたために工具器具備品が -97,200 円になっていた誤りが
+/// 数年間気づかれずに残った。預金がマイナスのまま貸借対照表に載るのも同じ形である。
 ///
 /// # 評価勘定は指摘しない
 ///
@@ -4922,7 +4922,7 @@ const MAX_ENTRY_CANDIDATES: usize = 10;
 ///
 /// `invoices_to_collect.csv`（適格請求書を揃えるべき取引の一覧）が出すのは
 /// **仕訳番号**である。`--entry` が UUID しか受けないと、一覧の行ごとに
-/// 帳簿を引き直して UUID を調べることになる。32件でそれをやらせない。
+/// 帳簿を引き直して UUID を調べることになる。16件でそれをやらせない。
 ///
 /// # 金額で引くのとの違い
 ///
@@ -5465,7 +5465,7 @@ async fn write_reports(
 
     // 適格請求書を揃えるべき取引の一覧。
     //
-    // **件数だけでは進まない。** verify が「1万円以上は 33 件」と言っても、
+    // **件数だけでは進まない。** verify が「1万円以上は 17 件」と言っても、
     // どの取引なのかが分からなければ請求書を探しに行けない。日付・金額・
     // 摘要・科目があれば、通帳やメールから元の取引を辿れる。
     // 0 件でも見出しだけのファイルを書く（`blue_return_not_on_form.csv` と同じ）。
@@ -5473,7 +5473,7 @@ async fn write_reports(
         .map_err(|error| format!("同梱の消費税区分マスタを読めませんでした: {error}"))?;
     let mut to_collect = invoices_to_collect(&entries, &rule_sets, &chart);
     // **済んだ分は落とす。** 減らない一覧は作業リストとして使えない。
-    // 32件を順に片付けても件数が変わらなければ、どこまで進んだか分からない。
+    // 16件を順に片付けても件数が変わらなければ、どこまで進んだか分からない。
     let done = entries_with_an_invoice_document(&pool_for_documents, &entries, &to_collect).await?;
     let before = to_collect.len();
     to_collect.retain(|row| !done.contains(&row.entry_no));
@@ -5502,7 +5502,7 @@ async fn write_reports(
         );
         // **手がかりの無い件数を、CSVを開かなくても分かるようにする。**
         // 摘要が科目名だけの取引は、通帳やカードの明細を見に行くしかない。
-        // 件数だけを見せると全部が同じ手間に見えるが、実帳簿では32件中
+        // 件数だけを見せると全部が同じ手間に見えるが、実帳簿では16件中
         // 11件（1,018,496円）がこれで、残り21件は摘要から相手先を辿れた。
         let (blind, blind_total): (usize, i128) = to_collect
             .iter()
@@ -6383,7 +6383,7 @@ mod tests {
         let rows = parse_counterparty_csv(
             "code,name,invoice_registration_no,is_qualified
              anthropic,Anthropic,,
-             bitech,ビーテック,T7123456789012,true
+             abc,ABC,T7123456789012,true
              kojin,個人商店,,false
 ",
         )
@@ -6512,25 +6512,25 @@ abc,A,7123456789012
             code: "603".to_string(),
             name: name.to_string(),
             count,
-            total_minor: 98_093,
+            total_minor: 82_140,
             under_thirty_thousand: under,
         }
     }
 
     // **本命。** 旅費交通費があれば案内を出す。
     //
-    // 実帳簿では「取引先が無い 603 件」のうち 433 件が旅費交通費で、
-    // 合計 98,093円（平均 226円）＝交通系ICの入出場である。件数だけを
-    // 見せると「603件ぶんの請求書を集めなければ」と読めるが、**そちらの
+    // 実帳簿では「取引先が無い 248 件」のうち 176 件が旅費交通費で、
+    // 合計 82,140円（平均 226円）＝交通系ICの入出場である。件数だけを
+    // 見せると「248件ぶんの請求書を集めなければ」と読めるが、**そちらの
     // 手当ては適格請求書ではない。**
     #[test]
     fn travel_expenses_get_the_public_transport_note() {
-        let text = public_transport_note(&[row("旅費交通費", 433, 433)]).join(
+        let text = public_transport_note(&[row("旅費交通費", 176, 176)]).join(
             "
 ",
         );
 
-        assert!(text.contains("433"), "件数を出すこと: {text}");
+        assert!(text.contains("176"), "件数を出すこと: {text}");
         assert!(text.contains("公共交通機関特例"), "{text}");
         assert!(
             text.contains("適格請求書は要りません"),
@@ -6544,7 +6544,7 @@ abc,A,7123456789012
     // 読める。特例に該当する旨の記載は**要る**（タックスアンサー No.6497）。
     #[test]
     fn the_note_says_what_the_book_must_record() {
-        let text = public_transport_note(&[row("旅費交通費", 433, 433)]).join(
+        let text = public_transport_note(&[row("旅費交通費", 176, 176)]).join(
             "
 ",
         );
@@ -6566,7 +6566,7 @@ abc,A,7123456789012
     // タクシー代まで特例で通してしまう。**
     #[test]
     fn the_note_always_excludes_taxis_and_planes() {
-        let text = public_transport_note(&[row("旅費交通費", 433, 433)]).join(
+        let text = public_transport_note(&[row("旅費交通費", 176, 176)]).join(
             "
 ",
         );
@@ -6622,7 +6622,7 @@ abc,A,7123456789012
             ),
             (
                 "counterparty",
-                kaikei_core::TagValue::Code("bitech".to_string()),
+                kaikei_core::TagValue::Code("abc".to_string()),
             ),
         ]);
 
@@ -6632,7 +6632,7 @@ abc,A,7123456789012
             shown.contains("tax_category=PURCHASE_10_QUALIFIED"),
             "{shown}"
         );
-        assert!(shown.contains("counterparty=bitech"), "{shown}");
+        assert!(shown.contains("counterparty=abc"), "{shown}");
     }
 
     // タグが無ければ何も足さない。**金額の後ろに空の括弧が出ると読みにくい。**
@@ -6725,7 +6725,7 @@ abc,
         "--acquired",
         "2025-07-24",
         "--cost",
-        "280717",
+        "227412",
     ];
 
     fn with(extra: &[&str]) -> Vec<String> {
@@ -6829,13 +6829,13 @@ abc,
             "--acquired",
             "2025-07-24",
             "--cost",
-            "280,717",
+            "227,412",
             "--method",
             "lump-sum",
         ];
         v.dedup();
         match parse_args(&fixed_asset_args(&v)).unwrap() {
-            Command::FixedAsset(args) => assert_eq!(args.cost, 280_717),
+            Command::FixedAsset(args) => assert_eq!(args.cost, 227_412),
             other => panic!("{other:?}"),
         }
     }
@@ -6943,7 +6943,7 @@ abc,
     // 申告上の判断なので、このソフトは計算しない。
     #[test]
     fn the_year_of_disposal_is_already_outside_the_ledger() {
-        let mut asset = fa("220", (2025, 3, 10), 108_000, 1, Some(2));
+        let mut asset = fa("220", (2025, 3, 10), 105_600, 1, Some(2));
         asset.disposed_on = Some(AccountingDate::new(2026, 6, 30).unwrap());
 
         assert!(
@@ -7015,10 +7015,10 @@ abc,
     // **本命。** 償却済みの資産が帳簿に取得価額のまま残っていれば拾う。
     //
     // 実帳簿がこれ。2022年取得の pc（一括償却）は2024年で償却し終えている
-    // のに、償却の相手科目を取り違えていたため機械装置が 118,800 のまま残った。
+    // のに、償却の相手科目を取り違えていたため機械装置が 97,200 のまま残った。
     #[test]
     fn a_fully_depreciated_asset_still_on_the_books_is_caught() {
-        let assets = [fa("205", (2022, 8, 5), 118_800, 2, None)];
+        let assets = [fa("205", (2022, 8, 5), 97_200, 2, None)];
         let ledger = fixed_asset_book_values(&assets, 2026).unwrap();
         assert_eq!(
             ledger,
@@ -7027,35 +7027,35 @@ abc,
 
         let found = fixed_asset_accounts_that_do_not_match(
             &ledger,
-            &balance_sheet_with(&[("205", 118_800)]),
+            &balance_sheet_with(&[("205", 97_200)]),
         );
-        assert_eq!(found, vec![("205".to_string(), 0, 118_800)]);
+        assert_eq!(found, vec![("205".to_string(), 0, 97_200)]);
     }
 
     // **本命。** 償却の記帳漏れを拾う。
     #[test]
     fn an_unposted_depreciation_is_caught() {
-        // 2025年取得・定額法2年。2026年末の簿価は 9,000。
-        let assets = [fa("220", (2025, 3, 10), 108_000, 1, Some(2))];
+        // 2025年取得・定額法2年。2026年末の簿価は 8,800。
+        let assets = [fa("220", (2025, 3, 10), 105_600, 1, Some(2))];
         let ledger = fixed_asset_book_values(&assets, 2026).unwrap();
-        assert_eq!(ledger[0].1, 9_000);
+        assert_eq!(ledger[0].1, 8_800);
 
         // 帳簿は取得価額のまま（1円も償却していない）。
         let found = fixed_asset_accounts_that_do_not_match(
             &ledger,
-            &balance_sheet_with(&[("220", 108_000)]),
+            &balance_sheet_with(&[("220", 105_600)]),
         );
-        assert_eq!(found, vec![("220".to_string(), 9_000, 108_000)]);
+        assert_eq!(found, vec![("220".to_string(), 8_800, 105_600)]);
     }
 
     // 合っていれば何も出ない。
     #[test]
     fn a_matching_ledger_reports_nothing() {
-        let assets = [fa("220", (2025, 3, 10), 108_000, 1, Some(2))];
+        let assets = [fa("220", (2025, 3, 10), 105_600, 1, Some(2))];
         let ledger = fixed_asset_book_values(&assets, 2026).unwrap();
         assert!(fixed_asset_accounts_that_do_not_match(
             &ledger,
-            &balance_sheet_with(&[("220", 9_000)])
+            &balance_sheet_with(&[("220", 8_800)])
         )
         .is_empty());
     }
@@ -7691,32 +7691,40 @@ abc,
     /// 勝手に先頭を使うと、別の銀行の列の対応で読んで桁が狂う。
     #[test]
     fn several_profiles_without_a_choice_stops_instead_of_guessing() {
-        let error = choose_profile(vec![profile("mizuho"), profile("mufg")], None).unwrap_err();
+        let error = choose_profile(
+            vec![profile("example_bank"), profile("example_other")],
+            None,
+        )
+        .unwrap_err();
 
         assert!(error.contains("--profile-id"), "{error}");
         // どれが選べるかを出す（利用者が次に何をすればよいか分かるように）。
-        assert!(error.contains("mizuho"), "{error}");
-        assert!(error.contains("mufg"), "{error}");
+        assert!(error.contains("example_bank"), "{error}");
+        assert!(error.contains("example_other"), "{error}");
     }
 
     #[test]
     fn a_single_profile_needs_no_choice() {
-        let chosen = choose_profile(vec![profile("mizuho")], None).unwrap();
-        assert_eq!(chosen.id, "mizuho");
+        let chosen = choose_profile(vec![profile("example_bank")], None).unwrap();
+        assert_eq!(chosen.id, "example_bank");
     }
 
     #[test]
     fn a_named_profile_is_picked_out_of_several() {
-        let chosen =
-            choose_profile(vec![profile("mizuho"), profile("mufg")], Some("mufg")).unwrap();
-        assert_eq!(chosen.id, "mufg");
+        let chosen = choose_profile(
+            vec![profile("example_bank"), profile("example_other")],
+            Some("example_other"),
+        )
+        .unwrap();
+        assert_eq!(chosen.id, "example_other");
     }
 
     #[test]
     fn an_unknown_profile_id_lists_what_is_available() {
-        let error = choose_profile(vec![profile("mizuho")], Some("rakuten")).unwrap_err();
-        assert!(error.contains("rakuten"), "{error}");
-        assert!(error.contains("mizuho"), "{error}");
+        let error =
+            choose_profile(vec![profile("example_bank")], Some("example_card")).unwrap_err();
+        assert!(error.contains("example_card"), "{error}");
+        assert!(error.contains("example_bank"), "{error}");
     }
 
     #[test]
@@ -7757,14 +7765,19 @@ abc,
     #[test]
     fn journalize_takes_a_year_and_a_source() {
         let command = parse_journalize(&args(&[
-            "--rules", "r.yaml", "--year", "2026", "--source", "mizuho",
+            "--rules",
+            "r.yaml",
+            "--year",
+            "2026",
+            "--source",
+            "example_bank",
         ]))
         .unwrap();
         match command {
             Command::Journalize(args) => {
                 assert_eq!(args.rules, PathBuf::from("r.yaml"));
                 assert_eq!(args.fiscal_year, Some(2026));
-                assert_eq!(args.source.as_deref(), Some("mizuho"));
+                assert_eq!(args.source.as_deref(), Some("example_bank"));
             }
             other => panic!("journalize が返らない: {other:?}"),
         }
@@ -7779,7 +7792,7 @@ abc,
     fn unmatched(description: &str, amount: i64) -> kaikei_app::view::ImportedTxView {
         kaikei_app::view::ImportedTxView {
             id: format!("id-{description}-{amount}"),
-            source: "mizuho".to_string(),
+            source: "example_bank".to_string(),
             occurred_on: AccountingDate::new(2026, 6, 15).unwrap(),
             amount_minor: amount,
             is_money_in: false,
@@ -7886,7 +7899,7 @@ abc,
     #[test]
     fn a_book_with_depreciation_is_not_warned_about() {
         let pl = statement("損益計算書", vec![("610", 50_000)]);
-        let bs = statement("貸借対照表", vec![("210", 161_917)]);
+        let bs = statement("貸借対照表", vec![("210", 140_405)]);
 
         // 指摘は stderr に出るので、ここで見るのは「落ちないこと」と
         // 「呼び出しが成功すること」である。中身の判定は下の2つが持つ。
@@ -7898,7 +7911,7 @@ abc,
     fn a_book_without_depreciable_assets_is_not_warned_about() {
         let pl = statement("損益計算書", vec![]);
         // 現金しかない帳簿。
-        let bs = statement("貸借対照表", vec![("100", 552_542)]);
+        let bs = statement("貸借対照表", vec![("100", 479_105)]);
 
         assert!(warn_if_depreciation_is_missing(&pl, &bs, &[]).is_ok());
     }
@@ -7910,7 +7923,7 @@ abc,
     #[test]
     fn a_book_that_should_be_warned_about_still_produces_output() {
         let pl = statement("損益計算書", vec![]);
-        let bs = statement("貸借対照表", vec![("210", 161_917)]);
+        let bs = statement("貸借対照表", vec![("210", 140_405)]);
 
         assert!(
             warn_if_depreciation_is_missing(&pl, &bs, &[]).is_ok(),
@@ -7941,12 +7954,12 @@ abc,
 
     /// **本命。** 資産のマイナス残高を見つける。
     ///
-    /// 実際に weBanana.SP で、償却の相手科目を取り違えたために工具器具備品が
-    /// -118,800 円になっていた誤りが4年間気づかれずに残った。貸借は一致した
+    /// 検証帳簿で、償却の相手科目を取り違えたために工具器具備品が
+    /// -97,200 円になっていた誤りが数年間気づかれずに残った。貸借は一致した
     /// ままなので決算書を見ても分からない。
     #[test]
     fn an_asset_with_a_negative_balance_is_reported() {
-        let bs = statement("貸借対照表", vec![("210", -118_800)]);
+        let bs = statement("貸借対照表", vec![("210", -97_200)]);
 
         let wrong = accounts_on_the_wrong_side(&bs, &chart_for_sides(), &[]);
 
@@ -8121,7 +8134,7 @@ abc,
     fn a_year_with_no_revenue_and_no_expense_is_reported() {
         let pl = statement("損益計算書", vec![("500", 0), ("609", 0)]);
 
-        assert!(year_looks_closed(&pl, 695));
+        assert!(year_looks_closed(&pl, 120));
     }
 
     /// 仕訳が無い年度では指摘しない。
@@ -8140,9 +8153,9 @@ abc,
     /// 正しい帳簿で毎回出る指摘は、当たり前になって本当の異常を覆い隠す。
     #[test]
     fn a_year_with_activity_is_not_reported() {
-        let pl = statement("損益計算書", vec![("500", 11_520_080), ("609", 0)]);
+        let pl = statement("損益計算書", vec![("500", 9_314_600), ("609", 0)]);
 
-        assert!(!year_looks_closed(&pl, 695));
+        assert!(!year_looks_closed(&pl, 120));
     }
 
     // 使い方に、書き出すファイル名と要る環境変数が載っている
@@ -8214,7 +8227,7 @@ abc,
 
     // **本命。** 科目の一部だけを按分できる。
     //
-    // 実帳簿の通信費 476,631円 のうち、按分対象は携帯の 105,991円 だけで、
+    // 実帳簿の通信費 386,880円 のうち、按分対象は携帯の 86,020円 だけで、
     // 残りはドメイン・サーバー・AI で事業専用である。科目まるごとしか
     // 按分できないと、この科目は手計算に落ちる。
     #[test]
@@ -8227,11 +8240,11 @@ abc,
             "--ratio",
             "0.3",
             "--amount",
-            "105991",
+            "86020",
         ]))
         .unwrap()
         {
-            Command::Household { amount, .. } => assert_eq!(amount, Some(105_991)),
+            Command::Household { amount, .. } => assert_eq!(amount, Some(86_020)),
             other => panic!("{other:?}"),
         }
     }
@@ -8247,11 +8260,11 @@ abc,
             "--ratio",
             "0.3",
             "--amount",
-            "105,991",
+            "86,020",
         ]))
         .unwrap()
         {
-            Command::Household { amount, .. } => assert_eq!(amount, Some(105_991)),
+            Command::Household { amount, .. } => assert_eq!(amount, Some(86_020)),
             other => panic!("{other:?}"),
         }
     }
@@ -8506,7 +8519,7 @@ abc,
     fn counterparty_verify_takes_a_registration_number() {
         match parse_args(&verify_args(&[
             "--code",
-            "jdf",
+            "def",
             "--registration-no",
             "T7123456789012",
         ]))
@@ -8519,7 +8532,7 @@ abc,
                 commit,
                 ..
             } => {
-                assert_eq!(code, "jdf");
+                assert_eq!(code, "def");
                 assert_eq!(registration_no.as_deref(), Some("T7123456789012"));
                 assert_eq!(is_qualified, None, "指定しなければ変えない");
                 assert!(!commit, "既定は下見");
@@ -8534,7 +8547,7 @@ abc,
     // なので、false を記録する手段が要る（D-122）。
     #[test]
     fn counterparty_verify_can_record_a_non_qualified_issuer() {
-        match parse_args(&verify_args(&["--code", "povo", "--qualified", "false"])).unwrap() {
+        match parse_args(&verify_args(&["--code", "carrier", "--qualified", "false"])).unwrap() {
             Command::CounterpartyVerify { is_qualified, .. } => {
                 assert_eq!(is_qualified, Some(false));
             }
@@ -8548,7 +8561,7 @@ abc,
     // 「確認したのに何も分からなかった」状態になる。
     #[test]
     fn counterparty_verify_refuses_a_call_that_changes_nothing() {
-        let error = parse_args(&verify_args(&["--code", "jdf"])).unwrap_err();
+        let error = parse_args(&verify_args(&["--code", "def"])).unwrap_err();
         assert!(error.contains("--registration-no"), "{error}");
         assert!(error.contains("--qualified"), "{error}");
     }
@@ -8557,7 +8570,7 @@ abc,
     #[test]
     fn counterparty_verify_rejects_a_qualified_value_that_is_not_a_boolean() {
         let error =
-            parse_args(&verify_args(&["--code", "jdf", "--qualified", "maybe"])).unwrap_err();
+            parse_args(&verify_args(&["--code", "def", "--qualified", "maybe"])).unwrap_err();
         assert!(error.contains("true"), "{error}");
         assert!(
             error.contains("未確認"),
@@ -8575,7 +8588,7 @@ abc,
     fn counterparty_verify_takes_a_verification_date() {
         match parse_args(&verify_args(&[
             "--code",
-            "jdf",
+            "def",
             "--qualified",
             "true",
             "--on",

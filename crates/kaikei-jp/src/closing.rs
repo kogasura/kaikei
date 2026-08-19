@@ -1540,19 +1540,19 @@ mod tests {
 
     // ---- 手順4: 翌年期首の元入金振替（opening_entries） ----
 
-    /// **本命。** 実帳簿（weBanana.SP の2026年）と同じ数字で確かめる。
+    /// **本命。** 検証帳簿（2026年）と同じ数字で確かめる。
     ///
-    /// 事業主貸 10,013,438（借方）／事業主借 1,012,434（貸方）。
+    /// 事業主貸 8,052,438（借方）／事業主借 820,512（貸方）。
     /// 期待: 事業主貸を貸方でゼロ化、事業主借を借方でゼロ化、差額
-    /// 9,001,004 を元入金の借方（＝元入金が減る）。
+    /// 7,231,926 を元入金の借方（＝元入金が減る）。
     #[test]
     fn opening_entries_transfers_owner_accounts_into_capital() {
         let chart = test_chart();
         let schema = schema();
         let fy = fy();
         let entries = [
-            cash_entry(&chart, &schema, &fy, 1, "410", Side::Debit, 10_013_438),
-            cash_entry(&chart, &schema, &fy, 2, "420", Side::Credit, 1_012_434),
+            cash_entry(&chart, &schema, &fy, 1, "410", Side::Debit, 8_052_438),
+            cash_entry(&chart, &schema, &fy, 2, "420", Side::Credit, 820_512),
         ];
         let tb = TrialBalance::from_entries(entries.iter(), &chart, &schema, &[]).unwrap();
 
@@ -1568,9 +1568,9 @@ mod tests {
         );
         assert_eq!(entry.entry_date.year(), fy.label() + 1);
 
-        assert_eq!(balance_of(entry, "410"), Some((Side::Credit, 10_013_438)));
-        assert_eq!(balance_of(entry, "420"), Some((Side::Debit, 1_012_434)));
-        assert_eq!(balance_of(entry, "400"), Some((Side::Debit, 9_001_004)));
+        assert_eq!(balance_of(entry, "410"), Some((Side::Credit, 8_052_438)));
+        assert_eq!(balance_of(entry, "420"), Some((Side::Debit, 820_512)));
+        assert_eq!(balance_of(entry, "400"), Some((Side::Debit, 7_231_926)));
         assert_eq!(debit_total(entry), credit_total(entry));
     }
 

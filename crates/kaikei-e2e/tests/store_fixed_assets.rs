@@ -32,7 +32,7 @@ fn asset(id: &str, method: i16, life: Option<i16>) -> FixedAssetRow {
         name: "テスト資産".to_string(),
         account: AccountCode::parse("210").unwrap(),
         acquired_on: AccountingDate::new(2025, 7, 24).unwrap(),
-        acquisition_cost: Money::from_minor(280_717, Currency::JPY),
+        acquisition_cost: Money::from_minor(227_412, Currency::JPY),
         method,
         useful_life_years: life,
         business_ratio: None,
@@ -70,7 +70,7 @@ async fn a_fixed_asset_round_trips(pool_opts: PgPoolOptions, conn_opts: PgConnec
     let mut a = asset("11111111-1111-1111-1111-111111111111", 1, Some(4));
     a.name = "パソコン・周辺機器".to_string();
     a.business_ratio = Some("0.8".to_string());
-    a.note = Some("Amazon で購入".to_string());
+    a.note = Some("サンプル商会で購入".to_string());
 
     assert_eq!(insert(&app, vec![a.clone()]).await.unwrap(), 1);
 
@@ -80,7 +80,7 @@ async fn a_fixed_asset_round_trips(pool_opts: PgPoolOptions, conn_opts: PgConnec
     assert_eq!(got.name, "パソコン・周辺機器");
     assert_eq!(got.account.as_str(), "210");
     assert_eq!(got.acquired_on, a.acquired_on);
-    assert_eq!(got.acquisition_cost.minor(), 280_717);
+    assert_eq!(got.acquisition_cost.minor(), 227_412);
     assert_eq!(got.method, 1);
     assert_eq!(got.useful_life_years, Some(4));
     assert_eq!(
@@ -88,7 +88,7 @@ async fn a_fixed_asset_round_trips(pool_opts: PgPoolOptions, conn_opts: PgConnec
         Some("0.8000"),
         "NUMERIC(5,4) なので桁が揃う。Ratio::parse_fraction はこれを解釈できる"
     );
-    assert_eq!(got.note.as_deref(), Some("Amazon で購入"));
+    assert_eq!(got.note.as_deref(), Some("サンプル商会で購入"));
     assert!(got.disposed_on.is_none());
 }
 
@@ -299,7 +299,7 @@ fn run_add(pool: &PgPool, extra: &[&str], commit: bool) -> (String, String, bool
         .args(["--name", "パソコン・周辺機器"])
         .args(["--account", "210"])
         .args(["--acquired", "2025-07-24"])
-        .args(["--cost", "280717"])
+        .args(["--cost", "227412"])
         .args(extra)
         .env("APP_DATABASE_URL", app_url(pool));
     if commit {
@@ -327,7 +327,7 @@ async fn a_dry_run_shows_the_schedule_without_writing(
 
     assert!(ok, "{stderr}");
     assert!(stdout.contains("2025 年"), "予定表を出すこと: {stdout}");
-    assert!(stdout.contains("35,089"), "初年度は月割: {stdout}");
+    assert!(stdout.contains("28,426"), "初年度は月割: {stdout}");
     assert!(
         stdout.contains("2029 年"),
         "耐用年数より1年多くかかる: {stdout}"

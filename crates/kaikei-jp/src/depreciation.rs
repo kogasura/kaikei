@@ -25,9 +25,9 @@
 //! 定率法は実装しない。**個人事業主の法定償却方法は定額法**であり、定率法を
 //! 使うには届出が要る。必要になってから足す。
 //!
-//! # 実例（weBanana.SP）
+//! # 実例
 //!
-//! 2022-08-05 取得の「pc」118,800円 は、2022〜2024年に 39,600円ずつ償却されて
+//! 2022-08-05 取得の「pc」97,200円 は、2022〜2024年に 32,400円ずつ償却されて
 //! いた。これは**一括償却資産**（20万円未満・3年均等・月割なし）の形と一致する
 //! （パソコンの法定耐用年数は4年なので、定額法なら3年では終わらない）。
 //! [`Schedule::lump_sum_matches_the_real_book`] のテストで固定している。
@@ -308,8 +308,8 @@ const NOT_DEPRECIABLE_LIMIT: i128 = 100_000;
 ///
 /// # 税込経理で境目をまたぐ場合
 ///
-/// 実例がある。電動アシスト自転車等 108,000円（税込）は10万円以上だが、
-/// 税抜なら 98,181円 で10万円を下回り、**全額を必要経費にできる区分**
+/// 実例がある。電動アシスト自転車等 105,600円（税込）は10万円以上だが、
+/// 税抜なら 96,000円 で10万円を下回り、**全額を必要経費にできる区分**
 /// （所令138条）に落ちる。金額の帯が変わるので、経理方式の選択が償却額を
 /// 左右する。境目の近くではそれを伝える。
 pub fn cost_concerns(
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn only_straight_line_has_a_rate() {
         let lump = schedule(&asset(
-            118_800,
+            97_200,
             on(2022, 8, 5),
             DepreciationMethod::LumpSumOverThreeYears,
         ))
@@ -518,13 +518,13 @@ mod tests {
 
     // **本命。** 実帳簿の「pc」と一致する。
     //
-    // 2022-08-05 取得の 118,800円 は 2022〜2024年に 39,600円ずつ償却されていた。
+    // 2022-08-05 取得の 97,200円 は 2022〜2024年に 32,400円ずつ償却されていた。
     // 一括償却資産（3年均等・月割なし）の形である。8月取得でも初年度が
     // 満額なのが決め手で、定額法なら月割で 5/12 になる。
     #[test]
     fn lump_sum_matches_the_real_book() {
         let s = schedule(&asset(
-            118_800,
+            97_200,
             on(2022, 8, 5),
             DepreciationMethod::LumpSumOverThreeYears,
         ))
@@ -532,21 +532,21 @@ mod tests {
 
         assert_eq!(
             amounts(&s),
-            vec![(2022, 39_600), (2023, 39_600), (2024, 39_600)]
+            vec![(2022, 32_400), (2023, 32_400), (2024, 32_400)]
         );
         assert_eq!(s.years[0].months, 12, "一括償却は月割しない");
         assert_eq!(s.years[2].book_value.minor(), 0, "3年で全額償却する");
-        assert_eq!(s.total().unwrap().minor(), 118_800);
+        assert_eq!(s.total().unwrap().minor(), 97_200);
     }
 
     // **本命。** 定額法は初年度を月割し、耐用年数より1年多くかかる。
     //
-    // 2025-07-24 取得のパソコン 280,717円 / 耐用年数4年。
+    // 2025-07-24 取得のパソコン 227,412円 / 耐用年数4年。
     // 7月取得なので初年度は 6か月分。
     #[test]
     fn straight_line_prorates_the_first_year_and_needs_one_more_year() {
         let s = schedule(&asset(
-            280_717,
+            227_412,
             on(2025, 7, 24),
             DepreciationMethod::StraightLine {
                 useful_life_years: 4,
@@ -558,17 +558,17 @@ mod tests {
         assert_eq!(
             amounts(&s),
             vec![
-                (2025, 35_089),
-                (2026, 70_179),
-                (2027, 70_179),
-                (2028, 70_179),
-                (2029, 35_090),
+                (2025, 28_426),
+                (2026, 56_853),
+                (2027, 56_853),
+                (2028, 56_853),
+                (2029, 28_426),
             ],
             "耐用年数4年でも5暦年にわたる"
         );
         assert_eq!(
             s.total().unwrap().minor(),
-            280_716,
+            227_411,
             "備忘価額1円を残すので取得価額より1円少ない"
         );
         assert_eq!(s.years.last().unwrap().book_value.minor(), 1);
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn straight_line_over_two_years_from_march() {
         let s = schedule(&asset(
-            108_000,
+            105_600,
             on(2025, 3, 10),
             DepreciationMethod::StraightLine {
                 useful_life_years: 2,
@@ -589,9 +589,9 @@ mod tests {
         assert_eq!(s.years[0].months, 10, "3月取得は 3〜12 の10か月");
         assert_eq!(
             amounts(&s),
-            vec![(2025, 45_000), (2026, 54_000), (2027, 8_999)]
+            vec![(2025, 44_000), (2026, 52_800), (2027, 8_799)]
         );
-        assert_eq!(s.total().unwrap().minor(), 107_999);
+        assert_eq!(s.total().unwrap().minor(), 105_599);
     }
 
     // 1月取得なら月割しても満額なので、耐用年数どおりで終わる。
@@ -639,13 +639,13 @@ mod tests {
     #[test]
     fn immediate_expense_takes_everything_in_the_first_year() {
         let s = schedule(&asset(
-            280_717,
+            227_412,
             on(2025, 7, 24),
             DepreciationMethod::ImmediateExpense,
         ))
         .unwrap();
 
-        assert_eq!(amounts(&s), vec![(2025, 280_717)]);
+        assert_eq!(amounts(&s), vec![(2025, 227_412)]);
         assert_eq!(s.years[0].book_value.minor(), 0);
     }
 
@@ -727,12 +727,12 @@ mod tests {
     #[test]
     fn a_year_can_be_looked_up() {
         let s = schedule(&asset(
-            118_800,
+            97_200,
             on(2022, 8, 5),
             DepreciationMethod::LumpSumOverThreeYears,
         ))
         .unwrap();
-        assert_eq!(s.year(2023).unwrap().amount.minor(), 39_600);
+        assert_eq!(s.year(2023).unwrap().amount.minor(), 32_400);
         assert!(s.year(2025).is_none(), "償却し終わった年は無い");
         assert!(s.year(2021).is_none(), "取得前の年も無い");
     }
@@ -743,12 +743,12 @@ mod tests {
 
     /// **本命。** 20万円以上に一括償却を当てたら指摘する。
     ///
-    /// 実帳簿のパソコン・周辺機器 280,717円 でこれを選ぶと、3年で全額が
+    /// 実帳簿のパソコン・周辺機器 227,412円 でこれを選ぶと、3年で全額が
     /// 経費になる。所令139条は20万円未満が対象である。
     #[test]
     fn lump_sum_over_two_hundred_thousand_is_flagged() {
         let concerns = cost_concerns(
-            &yen(280_717),
+            &yen(227_412),
             DepreciationMethod::LumpSumOverThreeYears,
             Some(TaxMode::Exclusive),
         );
@@ -791,11 +791,11 @@ mod tests {
         assert_eq!(concerns[0].basis, "租税特別措置法28条の2");
     }
 
-    /// 実帳簿の 280,717円 に少額特例は帯としては通る。
+    /// 実帳簿の 227,412円 に少額特例は帯としては通る。
     #[test]
     fn the_real_book_pc_fits_the_immediate_expense_band() {
         let concerns = cost_concerns(
-            &yen(280_717),
+            &yen(227_412),
             DepreciationMethod::ImmediateExpense,
             Some(TaxMode::Exclusive),
         );
@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn under_one_hundred_thousand_points_at_the_immediate_deduction() {
         let concerns = cost_concerns(
-            &yen(98_181),
+            &yen(96_000),
             DepreciationMethod::LumpSumOverThreeYears,
             Some(TaxMode::Exclusive),
         );
@@ -820,7 +820,7 @@ mod tests {
     #[test]
     fn the_immediate_expense_under_one_hundred_thousand_says_nothing() {
         let concerns = cost_concerns(
-            &yen(98_181),
+            &yen(96_000),
             DepreciationMethod::ImmediateExpense,
             Some(TaxMode::Exclusive),
         );
@@ -829,19 +829,19 @@ mod tests {
 
     /// **本命。** 税込経理で境目をまたぐ額は、それを伝える。
     ///
-    /// 実帳簿の電動アシスト自転車等 108,000円（税込）は10万円以上だが、
-    /// 税抜なら 98,181円 で10万円を下回る。**経理方式の選択が償却額を
+    /// 実帳簿の電動アシスト自転車等 105,600円（税込）は10万円以上だが、
+    /// 税抜なら 96,000円 で10万円を下回る。**経理方式の選択が償却額を
     /// 左右する**ので、気づけないと選択そのものを誤る。
     #[test]
     fn an_amount_that_crosses_a_band_without_tax_is_reported() {
         let concerns = cost_concerns(
-            &yen(108_000),
+            &yen(105_600),
             DepreciationMethod::LumpSumOverThreeYears,
             Some(TaxMode::Inclusive),
         );
         assert_eq!(concerns.len(), 1, "{concerns:?}");
         assert!(
-            concerns[0].message.contains("98181"),
+            concerns[0].message.contains("96000"),
             "税抜額を出すこと: {concerns:?}"
         );
         assert!(concerns[0].message.contains("10万円"), "{concerns:?}");
@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn the_band_note_is_only_for_tax_inclusive_books() {
         let concerns = cost_concerns(
-            &yen(108_000),
+            &yen(105_600),
             DepreciationMethod::LumpSumOverThreeYears,
             Some(TaxMode::Exclusive),
         );
@@ -877,7 +877,7 @@ mod tests {
     #[test]
     fn an_unknown_tax_mode_is_said_out_loud() {
         let concerns = cost_concerns(
-            &yen(108_000),
+            &yen(105_600),
             DepreciationMethod::LumpSumOverThreeYears,
             None,
         );
@@ -914,7 +914,7 @@ mod tests {
     /// 定額法には帯の制限が無い（どの額でも選べる）。
     #[test]
     fn the_straight_line_has_no_band() {
-        for amount in [100_000_i128, 280_717, 5_000_000] {
+        for amount in [100_000_i128, 227_412, 5_000_000] {
             let concerns = cost_concerns(
                 &yen(amount),
                 DepreciationMethod::StraightLine {
@@ -931,7 +931,7 @@ mod tests {
     fn every_concern_carries_its_basis() {
         let cases = [
             (
-                280_717_i128,
+                227_412_i128,
                 DepreciationMethod::LumpSumOverThreeYears,
                 Some(TaxMode::Exclusive),
             ),
@@ -941,12 +941,12 @@ mod tests {
                 Some(TaxMode::Exclusive),
             ),
             (
-                98_181,
+                96_000,
                 DepreciationMethod::LumpSumOverThreeYears,
                 Some(TaxMode::Exclusive),
             ),
             (
-                108_000,
+                105_600,
                 DepreciationMethod::LumpSumOverThreeYears,
                 Some(TaxMode::Inclusive),
             ),

@@ -180,8 +180,8 @@ async fn insert_imported(
         "INSERT INTO imported_transactions \
          (id, source, external_key, occurred_on, amount_minor, direction, \
           raw_description, balance_after, raw_row, status, entry_id, ignore_reason, imported_at) \
-         VALUES (gen_random_uuid(), 'mizuho', $1, make_date(2026, 6, $2), $3, $4, \
-                 'ｶ)ｱﾏｿﾞﾝ', 500000, '[]', $5, $6::uuid, $7, now())",
+         VALUES (gen_random_uuid(), 'example_bank', $1, make_date(2026, 6, $2), $3, $4, \
+                 'ｶ)ｻﾝﾌﾟﾙ', 500000, '[]', $5, $6::uuid, $7, now())",
     )
     .bind(key)
     .bind(day as i32)
@@ -287,7 +287,7 @@ async fn the_list_can_be_narrowed(pool_opts: PgPoolOptions, conn_opts: PgConnect
     assert_eq!(body(&first_half)["count"], json!(1), "期間の端を含むこと");
 
     let other_bank =
-        call::<ListPendingTransactions>(&runtime, json!({ "source": "rakuten" })).await;
+        call::<ListPendingTransactions>(&runtime, json!({ "source": "example_card" })).await;
     assert_eq!(body(&other_bank)["count"], json!(0));
     assert_eq!(
         body(&other_bank)["counts"]["total"],
@@ -384,7 +384,7 @@ async fn journalizing_records_the_entry_and_advances_the_line(
     let posted = body(&response);
     // 取引日と摘要は明細から採る。
     assert_eq!(posted["entry_date"], json!("2026-06-15"), "{posted}");
-    assert_eq!(posted["description"], json!("ｶ)ｱﾏｿﾞﾝ"), "{posted}");
+    assert_eq!(posted["description"], json!("ｶ)ｻﾝﾌﾟﾙ"), "{posted}");
     assert_eq!(posted["imported_tx_id"], json!(id), "{posted}");
 
     assert_eq!(journal_entry_count(&app).await, 1, "帳簿に1件入ること");

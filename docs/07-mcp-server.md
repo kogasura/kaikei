@@ -2831,7 +2831,7 @@ Phase 3 時点では `imported_tx_id` を解決する経路も `similar_entries`
     "occurred_on": "2026-04-20",
     "amount": "1980",
     "direction": "out",
-    "description": "ｶ)ｱﾏｿﾞﾝ ｼﾞﾔﾊﾞﾝ"
+    "description": "ｶ)ｻﾝﾌﾟﾙ ｼﾖｳｼﾞ"
   },
   "candidates": [
     {
@@ -2841,7 +2841,7 @@ Phase 3 時点では `imported_tx_id` を解決する経路も `similar_entries`
           "tags": { "tax_category": "PURCHASE_10_QUALIFIED" } },
         { "account": "100", "side": "credit", "amount": "1980" }
       ],
-      "reasoning": "摘要が仕訳化ルール #3（'ｱﾏｿﾞﾝ' を含む → 消耗品費）にマッチ。過去12ヶ月で同摘要の取引が8件あり、いずれも消耗品費で処理されています。",
+      "reasoning": "摘要が仕訳化ルール #3（'ｻﾝﾌﾟﾙ' を含む → 消耗品費）にマッチ。過去12ヶ月で同摘要の取引が8件あり、いずれも消耗品費で処理されています。",
       "similar_entries": ["0191...", "0190..."]
     }
   ],

@@ -228,10 +228,10 @@ mod tests {
 
     fn sample_fields() -> Vec<FormRow> {
         vec![
-            field(1, Some("売上（収入）金額（雑収入を含む）"), 11_435_380),
-            field(25, Some("支払手数料"), 7_693),
+            field(1, Some("売上（収入）金額（雑収入を含む）"), 9_240_600),
+            field(25, Some("支払手数料"), 6_410),
             field(29, None, 0),
-            field(45, Some("所得金額"), 7_718_714),
+            field(45, Some("所得金額"), 6_035_880),
         ]
     }
 
@@ -239,7 +239,7 @@ mod tests {
         vec![NotOnFormRow {
             account: "530".to_string(),
             label: "受取利息".to_string(),
-            amount: yen(434),
+            amount: yen(512),
             reason: "預貯金の利子は利子所得であり事業所得ではない".to_string(),
         }]
     }
@@ -250,11 +250,11 @@ mod tests {
         let csv = to_csv(&sample_fields());
 
         assert!(
-            csv.contains("1,売上（収入）金額（雑収入を含む）,11435380"),
+            csv.contains("1,売上（収入）金額（雑収入を含む）,9240600"),
             "{csv}"
         );
-        assert!(csv.contains("25,支払手数料,7693"), "{csv}");
-        assert!(csv.contains("45,所得金額,7718714"), "{csv}");
+        assert!(csv.contains("25,支払手数料,6410"), "{csv}");
+        assert!(csv.contains("45,所得金額,6035880"), "{csv}");
     }
 
     // BR-CSV-2: 科目が当てはまっていない空欄も行として出す。
@@ -280,7 +280,7 @@ mod tests {
             !main.contains("受取利息"),
             "本表に混ぜると表計算で読めなくなる: {main}"
         );
-        assert!(aside.contains("530,受取利息,434,"), "{aside}");
+        assert!(aside.contains("530,受取利息,512,"), "{aside}");
         assert!(aside.contains("利子所得"), "理由も運ぶこと: {aside}");
     }
 
@@ -357,7 +357,7 @@ mod tests {
         let csv = to_csv(&sample_fields());
         let html = to_html("決算書", "", &sample_fields(), &[], &[]);
 
-        for value in ["11435380", "7693", "7718714"] {
+        for value in ["9240600", "6410", "6035880"] {
             assert!(csv.contains(value), "CSV に値が無い: {value}");
             assert!(html.contains(value), "HTML に値が無い: {value}");
         }

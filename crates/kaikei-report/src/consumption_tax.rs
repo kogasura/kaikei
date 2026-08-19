@@ -64,8 +64,8 @@ pub fn to_csv(summary: &Summary) -> String {
 ///
 /// # なぜ出すのか
 ///
-/// 実帳簿（2026年）では、一般課税 832,382円 に対して2割特例なら 219,456円。
-/// **差は 612,926円。** しかも2026年分は2割特例が使える最後の年である。
+/// 実帳簿（2026年）では、一般課税 672,680円 に対して2割特例なら 177,408円。
+/// **差は 495,272円。** しかも2026年分は2割特例が使える最後の年である。
 /// 集計表に一般課税しか出さないと、この選択肢が見えない。
 ///
 /// # 勧めない
@@ -77,7 +77,7 @@ pub fn to_csv(summary: &Summary) -> String {
 ///
 /// # 表示から切り離してある
 ///
-/// **金額だけが独り歩きすると危ない。** 「2割特例なら 219,456円」だけを
+/// **金額だけが独り歩きすると危ない。** 「2割特例なら 177,408円」だけを
 /// 読んで、使えるかどうかを確かめずに申告されると困る。金額と但し書きが
 /// 必ず一緒に出ることをテストで固定したいので、組み立てを分けている。
 pub fn special_rule_estimate_lines(year: i32, summary: &Summary) -> Vec<String> {
@@ -139,7 +139,7 @@ pub fn notes_to_text(summary: &Summary, year: i32) -> String {
     ];
 
     // **特例の試算は、この注記と同じファイルに置く。** 画面には出るのに
-    // 渡すファイルに無いと、税理士まで届かない。実帳簿では差が 612,926円 で、
+    // 渡すファイルに無いと、税理士まで届かない。実帳簿では差が 495,272円 で、
     // しかも2026年分が2割特例の最後の年である。
     lines.extend(special_rule_estimate_lines(year, summary));
     if summary.lines_without_a_category > 0 {
@@ -180,8 +180,8 @@ mod tests {
                     code: "SALES_10".to_string(),
                     label: "課税売上 10%".to_string(),
                     direction: TaxDirection::Sales,
-                    amount: yen(12_070_080),
-                    tax: Some(yen(1_097_280)),
+                    amount: yen(9_757_440),
+                    tax: Some(yen(887_040)),
                 },
                 CategoryTotal {
                     code: "OUT_OF_SCOPE".to_string(),
@@ -201,8 +201,8 @@ mod tests {
     fn the_csv_has_rows_and_totals() {
         let csv = to_csv(&summary());
         assert!(csv.contains("SALES_10"), "{csv}");
-        assert!(csv.contains("12070080"), "{csv}");
-        assert!(csv.contains("1097280"), "{csv}");
+        assert!(csv.contains("9757440"), "{csv}");
+        assert!(csv.contains("887040"), "{csv}");
         assert!(csv.contains("課税売上"), "合計行: {csv}");
         assert!(csv.contains("課税仕入"), "合計行: {csv}");
     }
@@ -222,8 +222,8 @@ mod tests {
 
     #[test]
     fn the_amount_has_no_thousands_separator() {
-        assert!(to_csv(&summary()).contains("12070080"));
-        assert!(!to_csv(&summary()).contains("12,070,080"));
+        assert!(to_csv(&summary()).contains("9757440"));
+        assert!(!to_csv(&summary()).contains("9,757,440"));
     }
 
     #[test]
@@ -247,12 +247,12 @@ mod tests {
     #[test]
     fn the_notes_report_lines_that_were_skipped() {
         let mut s = summary();
-        s.lines_without_a_category = 774;
+        s.lines_without_a_category = 128;
         s.lines_with_an_unknown_category = 3;
 
         let notes = notes_to_text(&s, 2029);
 
-        assert!(notes.contains("774 件"), "{notes}");
+        assert!(notes.contains("128 件"), "{notes}");
         assert!(notes.contains("3 件"), "{notes}");
     }
 
@@ -292,17 +292,17 @@ mod tests {
 
     // **本命。** 金額を出すなら、判定していないことも必ず出す。
     //
-    // 「2割特例なら 219,456円」だけが独り歩きして、使えるかどうかを
+    // 「2割特例なら 177,408円」だけが独り歩きして、使えるかどうかを
     // 確かめずに申告されると困る。**数字と但し書きは切り離せない。**
     #[test]
     fn the_estimate_never_appears_without_the_caveat() {
-        let lines = special_rule_estimate_lines(2026, &summary_with(1_097_280, 264_898));
+        let lines = special_rule_estimate_lines(2026, &summary_with(887_040, 214_360));
 
         let text = lines.join(
             "
 ",
         );
-        assert!(text.contains("219,456"), "試算を出すこと: {text}");
+        assert!(text.contains("177,408"), "試算を出すこと: {text}");
         assert!(
             text.contains("このソフトは判定しません"),
             "判定していないことを言うこと: {text}"
@@ -313,18 +313,18 @@ mod tests {
     // **本命。** 一般課税との差を出す。実帳簿の値で確かめる。
     #[test]
     fn the_estimate_shows_the_difference() {
-        let text = special_rule_estimate_lines(2026, &summary_with(1_097_280, 264_898)).join(
+        let text = special_rule_estimate_lines(2026, &summary_with(887_040, 214_360)).join(
             "
 ",
         );
 
-        assert!(text.contains("832,382"), "一般課税: {text}");
-        assert!(text.contains("612,926"), "差: {text}");
+        assert!(text.contains("672,680"), "一般課税: {text}");
+        assert!(text.contains("495,272"), "差: {text}");
     }
 
     // **本命。** 2026年分が最後であることを言う。
     //
-    // 見逃すと 612,926円 の選択肢を1年分まるごと失う。
+    // 見逃すと 495,272円 の選択肢を1年分まるごと失う。
     #[test]
     fn the_last_year_of_the_twenty_percent_rule_is_called_out() {
         let text = special_rule_estimate_lines(2026, &summary_with(1_000, 0)).join(
@@ -358,14 +358,14 @@ mod tests {
     // **本命。** 試算は注記ファイルにも載る。
     //
     // 画面には出るのに渡すファイルに無いと、税理士まで届かない。実帳簿では
-    // 差が 612,926円 で、しかも2026年分が2割特例の最後の年である。
+    // 差が 495,272円 で、しかも2026年分が2割特例の最後の年である。
     // **届かなければ選択肢が無かったのと同じ。**
     #[test]
     fn the_notes_carry_the_special_rule_estimate() {
-        let notes = notes_to_text(&summary_with(1_097_280, 264_898), 2026);
+        let notes = notes_to_text(&summary_with(887_040, 214_360), 2026);
 
-        assert!(notes.contains("219,456"), "試算を載せること: {notes}");
-        assert!(notes.contains("612,926"), "差を載せること: {notes}");
+        assert!(notes.contains("177,408"), "試算を載せること: {notes}");
+        assert!(notes.contains("495,272"), "差を載せること: {notes}");
         assert!(
             notes.contains("このソフトは判定しません"),
             "但し書きも一緒に載せること: {notes}"

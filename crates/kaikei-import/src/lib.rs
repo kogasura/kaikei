@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// 明細の出どころ（`mizuho_business`・`rakuten_card` など）。
+/// 明細の出どころ（`example_bank`・`example_card` など）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SourceId(String);
 
@@ -93,7 +93,7 @@ pub struct ImportedTransaction {
     pub currency: String,
     /// 入金か出金か。
     pub direction: Direction,
-    /// 明細の摘要（`ｶ)ｱﾏｿﾞﾝ ｼﾞﾔﾊﾟﾝ` のような生の文字列）。
+    /// 明細の摘要（`ｶ)ｻﾝﾌﾟﾙ ｼﾖｳｼﾞ` のような生の文字列）。
     pub raw_description: String,
     /// 取引後残高。**冪等性キーに効く**ので、あれば必ず入れる。
     pub balance_after: Option<i64>,
@@ -339,8 +339,8 @@ mod tests {
         assert!(SourceId::parse("").is_err());
         assert!(SourceId::parse("   ").is_err());
         assert_eq!(
-            SourceId::parse(" rakuten_card ").unwrap().as_str(),
-            "rakuten_card"
+            SourceId::parse(" example_card ").unwrap().as_str(),
+            "example_card"
         );
     }
 

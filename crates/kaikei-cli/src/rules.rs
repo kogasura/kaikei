@@ -176,9 +176,9 @@ mod tests {
     use super::*;
 
     const ONE_RULE: &str = "\
-- id: amazon
+- id: sample
   match:
-    contains: アマゾン
+    contains: サンプル
   account: \"500\"
   counter_account: \"100\"
 ";
@@ -188,13 +188,13 @@ mod tests {
         let rules = load_rules(ONE_RULE).unwrap();
 
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].id, "amazon");
+        assert_eq!(rules[0].id, "sample");
         assert_eq!(rules[0].priority, 100);
         assert!(rules[0].active, "既定で有効");
         assert_eq!(rules[0].direction, None, "既定では入金・出金の両方");
         assert_eq!(
             rules[0].pattern,
-            DescriptionPattern::Contains("アマゾン".to_string())
+            DescriptionPattern::Contains("サンプル".to_string())
         );
     }
 
@@ -203,7 +203,7 @@ mod tests {
         let yaml = "\
 - id: konbini
   priority: 10
-  source: mizuho
+  source: example_bank
   direction: out
   match:
     starts_with: ｾﾌﾞﾝ
@@ -219,7 +219,7 @@ mod tests {
         let rule = &rules[0];
 
         assert_eq!(rule.priority, 10);
-        assert_eq!(rule.source.as_deref(), Some("mizuho"));
+        assert_eq!(rule.source.as_deref(), Some("example_bank"));
         assert_eq!(rule.direction, Some(ImportDirection::Out));
         assert_eq!(rule.amount_min, Some(100));
         assert_eq!(rule.amount_max, Some(5_000));
@@ -237,9 +237,9 @@ mod tests {
     #[test]
     fn a_misspelled_key_is_rejected() {
         let yaml = "\
-- id: amazon
+- id: sample
   match:
-    contains: アマゾン
+    contains: サンプル
   acount: \"500\"
   account: \"500\"
   counter_account: \"100\"
@@ -254,9 +254,9 @@ mod tests {
     #[test]
     fn writing_two_conditions_is_rejected_instead_of_picking_one() {
         let yaml = "\
-- id: amazon
+- id: sample
   match:
-    contains: アマゾン
+    contains: サンプル
     starts_with: カ)
   account: \"500\"
   counter_account: \"100\"
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn writing_no_condition_is_rejected() {
         let yaml = "\
-- id: amazon
+- id: sample
   match: {}
   account: \"500\"
   counter_account: \"100\"
@@ -286,7 +286,7 @@ mod tests {
         let yaml = format!("{ONE_RULE}{ONE_RULE}");
         let error = load_rules(&yaml).unwrap_err();
         assert!(error.contains("重複"), "{error}");
-        assert!(error.contains("amazon"), "{error}");
+        assert!(error.contains("sample"), "{error}");
     }
 
     /// 金額の範囲が逆なら止める。
@@ -295,9 +295,9 @@ mod tests {
     #[test]
     fn a_reversed_amount_range_is_rejected() {
         let yaml = "\
-- id: amazon
+- id: sample
   match:
-    contains: アマゾン
+    contains: サンプル
   amount_min: 5000
   amount_max: 100
   account: \"500\"
@@ -310,10 +310,10 @@ mod tests {
     #[test]
     fn an_unknown_direction_is_rejected() {
         let yaml = "\
-- id: amazon
+- id: sample
   direction: 入金
   match:
-    contains: アマゾン
+    contains: サンプル
   account: \"500\"
   counter_account: \"100\"
 ";
@@ -324,14 +324,14 @@ mod tests {
     #[test]
     fn a_bad_account_code_names_the_rule_and_the_field() {
         let yaml = "\
-- id: amazon
+- id: sample
   match:
-    contains: アマゾン
+    contains: サンプル
   account: \"\"
   counter_account: \"100\"
 ";
         let error = load_rules(yaml).unwrap_err();
-        assert!(error.contains("amazon"), "{error}");
+        assert!(error.contains("sample"), "{error}");
         assert!(error.contains("account"), "{error}");
     }
 

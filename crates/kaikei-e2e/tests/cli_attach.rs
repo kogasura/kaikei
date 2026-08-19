@@ -109,7 +109,7 @@ async fn seed_entry(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO journal_entries \
          (id, fiscal_year, entry_no, entry_date, description, recorded_at) \
-         VALUES ($1::uuid, 2026, 900, DATE '2026-07-14', 'カ)アマゾン', now())",
+         VALUES ($1::uuid, 2026, 900, DATE '2026-07-14', 'カ)サンプル', now())",
     )
     .bind(ENTRY_ID)
     .execute(pool)
@@ -118,9 +118,9 @@ async fn seed_entry(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO journal_lines \
          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit, tags) \
-         VALUES ($1::uuid, 1, '609', 1, 11332, 'JPY', 0, \
+         VALUES ($1::uuid, 1, '609', 1, 9145, 'JPY', 0, \
                  '{\"counterparty\":{\"t\":\"code\",\"v\":\"CP0001\"}}'), \
-                ($1::uuid, 2, '110', 2, 11332, 'JPY', 0, '{}')",
+                ($1::uuid, 2, '110', 2, 9145, 'JPY', 0, '{}')",
     )
     .bind(ENTRY_ID)
     .execute(pool)
@@ -157,14 +157,14 @@ async fn the_search_fields_are_filled_from_the_entry(
     let _ = pool_opts;
     seed_entry(&app).await;
     let blob = std::env::temp_dir().join("kaikei-attach-blob-1");
-    let file = temp_file("filled.txt", "アマゾンの領収書");
+    let file = temp_file("filled.txt", "サンプルの領収書");
 
     let (out, ok) = run_attach(&app, &blob, &file, &["--entry", ENTRY_ID]);
 
     assert!(ok, "--date なしで通ること: {out}");
     let (date, amount, counterparty) = registered(&app).await;
     assert_eq!(date, "2026-07-14", "仕訳の取引日");
-    assert_eq!(amount, Some(11_332), "仕訳の借方合計");
+    assert_eq!(amount, Some(9_145), "仕訳の借方合計");
     assert_eq!(counterparty.as_deref(), Some("CP0001"), "仕訳の取引先タグ");
 }
 
@@ -218,26 +218,26 @@ async fn an_entry_can_be_found_by_its_amount(
     let _ = pool_opts;
     seed_entry(&app).await;
     let blob = std::env::temp_dir().join("kaikei-attach-blob-4");
-    let file = temp_file("byamount.txt", "アマゾンの領収書");
+    let file = temp_file("byamount.txt", "サンプルの領収書");
 
     let (out, ok) = run_attach(
         &app,
         &blob,
         &file,
-        &["--match-amount", "11332", "--match-year", "2026"],
+        &["--match-amount", "9145", "--match-year", "2026"],
     );
 
     assert!(ok, "金額だけで紐付けられること: {out}");
     let (date, amount, _) = registered(&app).await;
     assert_eq!(date, "2026-07-14", "見つけた仕訳の取引日");
-    assert_eq!(amount, Some(11_332));
+    assert_eq!(amount, Some(9_145));
 }
 
 /// **本命。** 仕訳番号だけで紐付けられる。
 ///
 /// `invoices_to_collect.csv`（適格請求書を揃えるべき取引の一覧）が出すのは
 /// **仕訳番号**である。UUID しか受けないと、一覧の行ごとに帳簿を引き直して
-/// UUID を調べることになる。実帳簿では32件がその対象である。
+/// UUID を調べることになる。検証帳簿でも数十件がその対象だった。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn an_entry_number_is_enough_to_link(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
     let app = common::app_pool(conn_opts).await;
@@ -257,7 +257,7 @@ async fn an_entry_number_is_enough_to_link(pool_opts: PgPoolOptions, conn_opts: 
     // 取引年月日と取引金額は仕訳から埋まる。
     let (date, amount, _) = registered(&app).await;
     assert_eq!(date, "2026-07-14");
-    assert_eq!(amount, Some(11_332));
+    assert_eq!(amount, Some(9_145));
 }
 
 /// **本命。** 無い仕訳番号は、年と番号を言って止まる。
@@ -318,13 +318,13 @@ async fn several_entries_with_the_same_amount_stop_with_candidates(
     seed_entry(&app).await;
     // 同じ額の仕訳をもう1件（毎月同額のサブスクリプションを模す）。
     sqlx::query(
-        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ('66666666-6666-6666-6666-666666666666'::uuid, 2026, 901,                  DATE '2026-08-14', 'カ)アマゾン 2回目', now())",
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ('66666666-6666-6666-6666-666666666666'::uuid, 2026, 901,                  DATE '2026-08-14', 'カ)サンプル 2回目', now())",
     )
     .execute(&app)
     .await
     .expect("仕訳");
     sqlx::query(
-        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ('66666666-6666-6666-6666-666666666666'::uuid, 1, '609', 1, 11332, 'JPY', 0),                 ('66666666-6666-6666-6666-666666666666'::uuid, 2, '110', 2, 11332, 'JPY', 0)",
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ('66666666-6666-6666-6666-666666666666'::uuid, 1, '609', 1, 9145, 'JPY', 0),                 ('66666666-6666-6666-6666-666666666666'::uuid, 2, '110', 2, 9145, 'JPY', 0)",
     )
     .execute(&app)
     .await
@@ -336,7 +336,7 @@ async fn several_entries_with_the_same_amount_stop_with_candidates(
         &app,
         &blob,
         &file,
-        &["--match-amount", "11332", "--match-year", "2026"],
+        &["--match-amount", "9145", "--match-year", "2026"],
     );
 
     assert!(!ok, "止まること: {out}");
@@ -357,14 +357,14 @@ async fn a_reversal_is_not_a_candidate(pool_opts: PgPoolOptions, conn_opts: PgCo
     seed_entry(&app).await;
     // 原仕訳を取り消す赤伝（同じ額・借方貸方が逆）。
     sqlx::query(
-        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at,           reverses, reverse_reason)          VALUES ('77777777-7777-7777-7777-777777777777'::uuid, 2026, 902,                  DATE '2026-07-20', '【訂正】カ)アマゾン', now(), $1::uuid, '誤記帳のため')",
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at,           reverses, reverse_reason)          VALUES ('77777777-7777-7777-7777-777777777777'::uuid, 2026, 902,                  DATE '2026-07-20', '【訂正】カ)サンプル', now(), $1::uuid, '誤記帳のため')",
     )
     .bind(ENTRY_ID)
     .execute(&app)
     .await
     .expect("赤伝");
     sqlx::query(
-        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ('77777777-7777-7777-7777-777777777777'::uuid, 1, '110', 1, 11332, 'JPY', 0),                 ('77777777-7777-7777-7777-777777777777'::uuid, 2, '609', 2, 11332, 'JPY', 0)",
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ('77777777-7777-7777-7777-777777777777'::uuid, 1, '110', 1, 9145, 'JPY', 0),                 ('77777777-7777-7777-7777-777777777777'::uuid, 2, '609', 2, 9145, 'JPY', 0)",
     )
     .execute(&app)
     .await
@@ -376,7 +376,7 @@ async fn a_reversal_is_not_a_candidate(pool_opts: PgPoolOptions, conn_opts: PgCo
         &app,
         &blob,
         &file,
-        &["--match-amount", "11332", "--match-year", "2026"],
+        &["--match-amount", "9145", "--match-year", "2026"],
     );
 
     assert!(ok, "赤伝を数えず1件に絞れること: {out}");
@@ -395,14 +395,14 @@ async fn seed_entry_without_counterparty(pool: &PgPool) {
     .await
     .expect("科目");
     sqlx::query(
-        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, 2026, 900, DATE '2026-07-14', 'カ)アマゾン', now())",
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, 2026, 900, DATE '2026-07-14', 'カ)サンプル', now())",
     )
     .bind(ENTRY_ID)
     .execute(pool)
     .await
     .expect("仕訳");
     sqlx::query(
-        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ($1::uuid, 1, '609', 1, 11332, 'JPY', 0),                 ($1::uuid, 2, '110', 2, 11332, 'JPY', 0)",
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit)          VALUES ($1::uuid, 1, '609', 1, 9145, 'JPY', 0),                 ($1::uuid, 2, '110', 2, 9145, 'JPY', 0)",
     )
     .bind(ENTRY_ID)
     .execute(pool)
@@ -508,7 +508,7 @@ async fn entry_and_match_amount_cannot_be_combined(
         &app,
         &blob,
         &file,
-        &["--entry", ENTRY_ID, "--match-amount", "11332"],
+        &["--entry", ENTRY_ID, "--match-amount", "9145"],
     );
 
     assert!(!ok, "拒否されること: {out}");
