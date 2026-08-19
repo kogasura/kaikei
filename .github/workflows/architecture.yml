@@ -20,7 +20,7 @@ jobs:
     # 止まったまま6時間待たないための上限。
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
 
       - name: kaikei-core は許可された依存のみ
@@ -465,7 +465,7 @@ jobs:
       # これが無いと sqlx マクロが接続を要求し、後続 PR で必須チェックが赤のままマージ不能になる。
       SQLX_OFFLINE: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
