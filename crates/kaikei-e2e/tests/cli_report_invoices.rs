@@ -712,3 +712,63 @@ async fn the_report_works_without_any_tax_settings(
         "理由（設定が無い）を言うこと: {log}"
     );
 }
+
+/// 摘要を指定して仕入の仕訳を入れる。**科目名は「通信費」（609）。**
+async fn seed_with_description(pool: &PgPool, entry_no: i32, amount: i64, description: &str) {
+    sqlx::query(
+        "INSERT INTO accounts (code, name, account_type, postable)          VALUES ('609','通信費',5,true), ('110','普通預金',1,true)          ON CONFLICT (code) DO NOTHING",
+    )
+    .execute(pool)
+    .await
+    .expect("科目");
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO journal_entries          (id, fiscal_year, entry_no, entry_date, description, recorded_at)          VALUES ($1::uuid, 2026, $2, DATE '2026-06-15', $3, now())",
+    )
+    .bind(&id)
+    .bind(entry_no)
+    .bind(description)
+    .execute(pool)
+    .await
+    .expect("仕訳");
+    sqlx::query(
+        "INSERT INTO journal_lines          (entry_id, line_no, account_code, side, amount_minor, currency, currency_minor_unit, tags)          VALUES ($1::uuid, 1, '609', 1, $2, 'JPY', 0,                  '{\"tax_category\":{\"t\":\"code\",\"v\":\"PURCHASE_10_QUALIFIED\"}}'),                 ($1::uuid, 2, '110', 2, $2, 'JPY', 0, '{}')",
+    )
+    .bind(&id)
+    .bind(amount)
+    .execute(pool)
+    .await
+    .expect("明細");
+}
+
+/// **本命。** 摘要が科目名だけの取引の件数を、画面にも出す。
+///
+/// CSV には「相手先の手がかり」列があるが、**開かないと分からない。**
+/// 件数だけを見せると全部が同じ手間に見える。実帳簿では32件中11件が
+/// これで、残り21件は摘要から相手先を辿れた——**手間がまるで違う。**
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn the_count_without_a_hint_is_printed(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    let out = temp_dir("hint_count");
+    let blob = temp_dir("hint_count_blob");
+    // 摘要が科目名だけ＝手がかりなし。
+    seed_with_description(&app, 1, 26_136, "通信費").await;
+    // 摘要に相手先がある＝手がかりあり。
+    seed_with_description(&app, 2, 43_967, "ドメイン / GMOペパボ").await;
+
+    let (log, ok) = run_report(&app, &out, &blob);
+
+    assert!(ok, "{log}");
+    assert!(log.contains("2 件あります"), "全体の件数: {log}");
+    assert!(
+        log.contains("うち 1 件（26,136 円）"),
+        "手がかりの無い件数と金額: {log}"
+    );
+}
