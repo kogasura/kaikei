@@ -60,6 +60,11 @@ fn app_url(pool: &PgPool) -> String {
 
 /// `kaikei verify` を走らせて、標準出力と標準エラーを返す。
 fn run_verify(pool: &PgPool) -> (String, String, bool) {
+    run_verify_for(pool, 2026)
+}
+
+/// 年度を指定して検査する。
+fn run_verify_for(pool: &PgPool, year: i32) -> (String, String, bool) {
     let mut command = Command::new(cli_binary());
     // **親の環境変数を引き継がせない。** `Command` は既定で引き継ぐので、
     // `.env` を読んだシェルから走らせると**渡していないつもりの設定が
@@ -82,7 +87,7 @@ fn run_verify(pool: &PgPool) -> (String, String, bool) {
         command.env_remove(key);
     }
     let output = command
-        .args(["verify", "--year", "2026"])
+        .args(["verify", "--year", &year.to_string()])
         .env("APP_DATABASE_URL", app_url(pool))
         .env("KAIKEI_BOOK_CURRENCY", "JPY")
         .env("KAIKEI_FISCAL_YEAR_RULE", "calendar_year")
@@ -1157,4 +1162,56 @@ async fn assets_missing_from_the_ledger_are_reported_even_when_depreciation_exis
         "台帳に無いことは、償却費があっても言うこと: {stderr}"
     );
     assert!(stderr.contains("210"), "{stderr}");
+}
+
+/// **本命。** 仕訳が1件も無い年度は、そう言い切る。
+///
+/// 貸借対照表は前年から繰り越すので、仕訳が無い年度でも残高は残る。実帳簿で
+/// 2027年（まだ1件も記帳していない）を検査したところ、減価償却・台帳・貸借の
+/// 向きで4件の指摘が出た。**その年度の問題に見える。**
+///
+/// いちばん危ないのは `--year` の打ち間違いである。もっともらしい出力が出る
+/// ので、違う年度を見ていることに気づけない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_year_with_no_entries_says_so(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "400", "元入金", 3).await;
+    // 2026年に記帳するが、検査するのは 2027年。
+    seed_entry(&app, 1, "110", "400", 100_000).await;
+
+    let (stdout, stderr, ok) = run_verify_for(&app, 2027);
+
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("検査した仕訳: 0 件"), "{stdout}");
+    assert!(
+        stdout.contains("仕訳が1件もありません"),
+        "言い切ること: {stdout}"
+    );
+    assert!(
+        stdout.contains("--year"),
+        "年度の指定を疑うよう促すこと: {stdout}"
+    );
+}
+
+/// 仕訳がある年度では言わない。
+#[sqlx::test(migrations = "../kaikei-store/migrations")]
+async fn a_year_with_entries_does_not_say_it_is_empty(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let app = common::app_pool(conn_opts).await;
+    let _ = pool_opts;
+    seed_account(&app, "110", "普通預金", 1).await;
+    seed_account(&app, "400", "元入金", 3).await;
+    seed_entry(&app, 1, "110", "400", 100_000).await;
+
+    let (stdout, stderr, ok) = run_verify(&app);
+
+    assert!(ok, "{stderr}");
+    assert!(
+        !stdout.contains("仕訳が1件もありません"),
+        "余計なことを言わない: {stdout}"
+    );
 }
