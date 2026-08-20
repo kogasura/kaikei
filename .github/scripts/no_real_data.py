@@ -48,8 +48,13 @@ import sys
 # 検査対象にする拡張子。バイナリと Cargo.lock は見ない。
 TEXT_SUFFIXES = {
     ".rs", ".md", ".yaml", ".yml", ".sql", ".toml", ".txt", ".example",
-    ".json", ".gitignore", ".gitattributes",
+    ".json",
 }
+
+# 拡張子を持たないが検査したいファイル。**`splitext(".gitignore")` が返すのは
+# `(".gitignore", "")` で、拡張子は空文字列である。** 拡張子の集合に名前を
+# 並べても素通りするので、名前の側で拾う。ローカルパスが混ざりやすい場所。
+TEXT_NAMES = {".gitignore", ".gitattributes"}
 
 # この検査スクリプト自身は、検査したいパターンを本文に持つので対象外。
 SELF = ".github/scripts/no_real_data.py"
@@ -91,9 +96,18 @@ SECRET_ALLOW = (
 REAL_LEDGER = re.compile(r"実帳簿|実際の帳簿|本番の帳簿|実運用の帳簿")
 
 # 3桁以上の数。識別子の一部（D-101、E0432）と桁区切りの途中は数えない。
-BIG_NUMBER = re.compile(r"(?<![-\w.,])\d{1,3}(?:,\d{3})+(?![\d,])|(?<![-\w.,])\d{3,}(?![\d,])")
-# 「9件」のような小さな数も、規模を示すなら拾う。
-COUNTED = re.compile(r"(?<![-\w])(\d+)\s*(件|行|明細|取引|社|名)")
+#
+# **後読みを `\w` で書いてはいけない。** Python の `\w` は Unicode の単語文字
+# なので、かな・漢字にもマッチする。`実帳簿では105,600円` の `1` の直前は `は`
+# であり、`\w` だと否定後読みがそこで成立せず——`0` の前は `1`、というように
+# 先も潰れるので——**その行から1件も拾えなくなる**。日本語の地の文に埋まった
+# 金額こそが拾いたいものなので、ASCII の英数字と `_` だけに限る。
+BIG_NUMBER = re.compile(
+    r"(?<![-0-9A-Za-z_.,])\d{1,3}(?:,\d{3})+(?![\d,])"
+    r"|(?<![-0-9A-Za-z_.,])\d{3,}(?![\d,])"
+)
+# 「9件」のような小さな数も、規模を示すなら拾う。後読みの理由は上と同じ。
+COUNTED = re.compile(r"(?<![-0-9A-Za-z_])(\d+)\s*(件|行|明細|取引|社|名)")
 
 # 年は数えない（「実帳簿の2026年」は規模を示さない）。
 def _is_year(text: str) -> bool:
@@ -101,9 +115,11 @@ def _is_year(text: str) -> bool:
     return digits.isdigit() and 1900 <= int(digits) <= 2100
 
 
-# 「実帳簿」の行から何行先までを同じ文脈と見るか。
-# doc コメントは3行程度で1つの文になることが多い。
-CONTEXT_LINES = 3
+# 「実帳簿」の行の前後、何行までを同じ文脈と見るか。
+# doc コメントは3行程度で1つの文になることが多い。**前も1行見る**——表や箇条書き
+# の下に「実帳簿ではこうだった」と注記を置く書き方があり、数はその上にある。
+CONTEXT_BEFORE = 1
+CONTEXT_AFTER = 3
 
 
 def tracked_files() -> list[str]:
@@ -111,8 +127,13 @@ def tracked_files() -> list[str]:
     return [f for f in out.split("\n") if f]
 
 
+def is_text(path: str) -> bool:
+    return (os.path.splitext(path)[1] in TEXT_SUFFIXES
+            or os.path.basename(path) in TEXT_NAMES)
+
+
 def read_lines(path: str) -> list[str] | None:
-    if os.path.splitext(path)[1] not in TEXT_SUFFIXES:
+    if not is_text(path):
         return None
     try:
         with open(path, encoding="utf-8") as handle:
@@ -140,7 +161,7 @@ def check_real_ledger(path: str, lines: list[str]) -> list[str]:
     for index, line in enumerate(lines):
         if not REAL_LEDGER.search(line):
             continue
-        window = lines[index:index + CONTEXT_LINES]
+        window = lines[max(0, index - CONTEXT_BEFORE):index + CONTEXT_AFTER]
         if any("ci-allow: real-ledger-mention" in text for text in window):
             continue
         for text in window:
@@ -196,7 +217,7 @@ def added_numbers(base: str) -> list[str]:
             continue
         if line.startswith("--- ") or line.startswith("+++ "):
             continue
-        if os.path.splitext(path)[1] not in TEXT_SUFFIXES:
+        if not is_text(path):
             continue
         if line.startswith("+"):
             for raw in _interesting_numbers(line[1:]):
