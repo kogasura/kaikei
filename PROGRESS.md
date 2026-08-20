@@ -1152,9 +1152,9 @@ Phase 2 の E2E が手作業で組み立てている提案と一致すること�
 
 ### Phase 5 の完了確認（2026-08-16）
 
-実帳簿の複製で通しの確認をした。
+検証帳簿の複製で通しの確認をした。
 
-- 決算書・弥生CSV・全件JSON: `/kaikei-year-end` の手順どおりに出る（弥生 708行・変換できなかった仕訳 0件）
+- 決算書・弥生CSV・全件JSON: `/kaikei-year-end` の手順どおりに出る（弥生CSV は数百行・変換できなかった仕訳 0件）
 - **`export_for_audit` 相当は `kaikei report` に入っている。** `KAIKEI_BLOB_ROOT` を
   設定すると `documents/電子取引/` 等に「日付_取引先_金額_種別」の名前で書き出し、
   `index.csv`（検索要件3項目つき）と `checksums.txt`（SHA-256）を添える。

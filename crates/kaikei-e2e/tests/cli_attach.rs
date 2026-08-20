@@ -386,7 +386,7 @@ async fn a_reversal_is_not_a_candidate(pool_opts: PgPoolOptions, conn_opts: PgCo
 
 /// 取引先タグの**無い**仕訳を仕込む。
 ///
-/// 実帳簿はこちらが普通である（1,395明細中、取引先タグは0件）。
+/// 検証帳簿はこちらが普通である（取引先タグは1件も無い）。
 async fn seed_entry_without_counterparty(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO accounts (code, name, account_type, postable)          VALUES ('609','消耗品費',5,true), ('110','普通預金',1,true)          ON CONFLICT (code) DO NOTHING",
@@ -413,7 +413,7 @@ async fn seed_entry_without_counterparty(pool: &PgPool) {
 /// **本命。** 取引先が空のまま登録するときは知らせる。
 ///
 /// 電子取引データは取引年月日・取引金額・取引先で検索できる必要がある。
-/// 実帳簿には取引先タグが1件も無い（1,395明細中0件）ので、仕訳から埋め
+/// 検証帳簿には取引先タグが1件も無いので、仕訳から埋め
 /// られない。**証憑は後から書き換えられない**ので、登録時に言う。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn an_empty_counterparty_is_reported(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
