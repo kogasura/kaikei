@@ -227,6 +227,10 @@ MCP 経由で AI が自己修正できる形にする。
 | `database` | `database.yml` | マイグレーション適用、`.sqlx` の陳腐化、append-only の権限・トリガ実効性（`pg-tests`） |
 | `no-real-data` | `no-real-data.yml` | §14 / §15。形式で分かる機密と、「実帳簿」＋具体的な数の同居 |
 
+> `no-real-data.yml` が `.github/workflows-staged/` にある間は**検査が動かない**。
+> `.github/workflows/` へ移して、上の `gh api` で必須チェックに登録すること。
+> 移し終えたらこの注記も消す。
+
 ### 新しい CI ジョブを追加したときの掟
 
 **必須チェックのリストは手動管理であり、ジョブを増やしても自動では追加されない。**
