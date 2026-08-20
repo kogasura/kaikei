@@ -1920,6 +1920,20 @@ fn warn_if_yayoi_does_not_match_the_book(
         }
     }
 
+    // 諸口は勘定科目表に無いので上の突合を素通りする。**借方と貸方が
+    // 揃っているかだけは見る**——複合仕訳の展開が片側だけ落ちても、
+    // 他の科目の合計は合ったままになり、ここでしか気づけない。
+    let (suspense_debit, suspense_credit) = from_csv
+        .get(kaikei_report::yayoi::SUSPENSE_ACCOUNT)
+        .copied()
+        .unwrap_or((0, 0));
+    if suspense_debit != suspense_credit {
+        mismatched.push(format!(
+            "  （{}）: 借{suspense_debit} 貸{suspense_credit} で釣り合っていません",
+            kaikei_report::yayoi::SUSPENSE_ACCOUNT
+        ));
+    }
+
     if mismatched.is_empty() {
         return;
     }

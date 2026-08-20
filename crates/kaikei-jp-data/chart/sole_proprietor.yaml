@@ -68,6 +68,7 @@ accounts:
   - { code: "230", name: "ソフトウェア", type: Asset, sort: 230 }
   - { code: "240", name: "減価償却累計額", type: Asset, sort: 240 }
   - { code: "250", name: "敷金・保証金", type: Asset, sort: 250 }
+  - { code: "260", name: "繰延資産",     type: Asset, sort: 260 }
 
   # ===== 負債 =====
   - { code: "300", name: "支払手形",     type: Liability, sort: 300 }
