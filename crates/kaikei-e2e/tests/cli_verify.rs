@@ -1033,7 +1033,7 @@ async fn a_large_travel_expense_does_not_get_the_note(
 /// **本命。** 帳簿に償却対象の資産があるのに台帳が空なら指摘する。
 ///
 /// **空の台帳を「ずれ無し」と読まない。** 台帳と帳簿を突き合わせる検査は
-/// 以前、台帳が空だと黙って戻っていた。実帳簿（資産 388,717円・台帳0件）で
+/// 以前、台帳が空だと黙って戻っていた。検証帳簿（資産 343,205円・台帳0件）で
 /// 何も出なかった。**考えうる最大のずれである。**
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn an_empty_fixed_asset_ledger_is_reported(
