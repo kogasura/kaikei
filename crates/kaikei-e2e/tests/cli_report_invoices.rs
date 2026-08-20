@@ -529,7 +529,7 @@ async fn seed_owner_accounts(pool: &PgPool) {
 /// **決算書の貸借対照表から事業主貸が消える。** 青色申告決算書の様式には
 /// この欄があり、期末残高をそのまま書く。0 で提出することになる。
 ///
-/// 実帳簿の複製で試したら再現した——事業主貸 7,984,381円 と
+/// 検証帳簿の複製で試したら再現した——事業主貸 7,984,381円 と
 /// 事業主借 820,512円 が消え、`verify` は終了コード0のままだった。
 #[sqlx::test(migrations = "../kaikei-store/migrations")]
 async fn an_opening_transfer_posted_within_the_year_is_reported(

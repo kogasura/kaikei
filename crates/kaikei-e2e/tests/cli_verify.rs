@@ -637,7 +637,7 @@ async fn two_documents_on_one_entry_still_count_as_one_entry(
 /// # この穴で実際に壊れた
 ///
 /// `inconsistent_account` と `inconsistent_tax_category` を足したとき、
-/// `FindingKind::is_suspicion` を更新し忘れて**実帳簿の verify が終了コード1で
+/// `FindingKind::is_suspicion` を更新し忘れて**検証帳簿の verify が終了コード1で
 /// 失敗するようになっていた**（D-124）。どちらも「誤りとは限らない」と
 /// 言いながら、である。
 ///
@@ -1123,7 +1123,7 @@ async fn the_depreciation_warning_separates_what_is_in_the_ledger(
 ///
 /// 以前は「台帳に無い」という指摘が償却費の指摘の中にあった。償却費の
 /// 指摘は**償却費が0のときしか出ない**ので、**1円でも記帳した途端に、
-/// 残りの資産が台帳に無いことを誰も言わなくなった**（実帳簿の複製で
+/// 残りの資産が台帳に無いことを誰も言わなくなった**（検証帳簿の複製で
 /// 確かめた。1円入れただけで消えた）。
 ///
 /// 「償却しているか」と「台帳に載っているか」は別の話である。
@@ -1166,7 +1166,7 @@ async fn assets_missing_from_the_ledger_are_reported_even_when_depreciation_exis
 
 /// **本命。** 仕訳が1件も無い年度は、そう言い切る。
 ///
-/// 貸借対照表は前年から繰り越すので、仕訳が無い年度でも残高は残る。実帳簿で
+/// 貸借対照表は前年から繰り越すので、仕訳が無い年度でも残高は残る。検証帳簿で
 /// 2027年（まだ1件も記帳していない）を検査したところ、減価償却・台帳・貸借の
 /// 向きで4件の指摘が出た。**その年度の問題に見える。**
 ///

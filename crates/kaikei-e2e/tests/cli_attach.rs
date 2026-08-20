@@ -419,7 +419,7 @@ async fn seed_entry_without_counterparty(pool: &PgPool) {
 async fn an_empty_counterparty_is_reported(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
     let app = common::app_pool(conn_opts).await;
     let _ = pool_opts;
-    // 取引先タグの無い仕訳（実帳簿はこちらが普通）。
+    // 取引先タグの無い仕訳（検証帳簿はこちらが普通）。
     seed_entry_without_counterparty(&app).await;
     let blob = std::env::temp_dir().join("kaikei-attach-blob-8");
     let file = temp_file("nocp.txt", "取引先の分からない領収書");
