@@ -798,14 +798,14 @@ sections:
         let mut with_extra = closing();
         with_extra.sections[0]
             .lines
-            .push(line("260", "差入保証金", 30_000));
+            .push(line("265", "差入保証金", 30_000));
 
         let filled = fill(&form(), &opening(), &with_extra, &pl_fields(6_685_880)).unwrap();
 
         let reported = filled
             .not_on_form
             .iter()
-            .find(|entry| entry.account.as_str() == "260")
+            .find(|entry| entry.account.as_str() == "265")
             .expect("当てはめ表に無い科目は報告するはず");
         assert_eq!(reported.closing, yen(30_000));
         assert_eq!(reported.label, "差入保証金");
