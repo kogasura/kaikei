@@ -1,0 +1,77 @@
+# ★★ このファイルは `.github/workflows/real-data-review.yml` へ移してください ★★
+#
+# GitHub が読むのは `.github/workflows/` の下だけなので、**ここに置いてある間は
+# レビューが動きません。** ここに置いてあるのは、この PR を作った資格情報が
+# `.github/workflows/` への書き込み権限を持たなかったためです。
+#
+#   git mv .github/workflows-staged/real-data-review.yml .github/workflows/
+#   git commit -m "実データの自動レビューを置く"
+#
+# 動かす前に、リポジトリのシークレットに `ANTHROPIC_API_KEY` を登録してください:
+#
+#   gh secret set ANTHROPIC_API_KEY
+#
+# **必須チェックには登録しないこと。** 判定がブレるものを門番に据えると、
+# 落ちても「またか」と再実行されるようになり、本物の検出まで一緒に無視される
+# （CLAUDE.md §13 の必須チェックは決定的なものだけに絞る）。
+#
+# ----------------------------------------------------------------------
+#
+# .github/workflows/real-data-review.yml
+#
+# PR の差分を Claude に読ませ、**指摘があるときだけ** PR にコメントする。
+#
+# 正規表現の検査（`no-real-data`）は固有名詞を拾えない——「株式会社ビーテック」が
+# 実在かどうかを denylist 無しにパターンで判定する方法は無く、denylist は置かないと
+# 決めている（CLAUDE.md §15）。実際に見つかった漏洩は種類でいえば大半が固有名詞
+# だったので、そこを埋める。判断の理由は `.github/scripts/real_data_review.py` の
+# 冒頭にある。
+#
+# **落とさない。** 鍵が無くても、API が落ちていても、終了コードは 0 のまま。
+
+name: real-data-review
+
+on:
+  # push では走らせない（理由は supply-chain.yml の同じ位置のコメント）。
+  pull_request:
+
+# **既定の権限を絞る。** コメントを書くために必要な分だけ与える。
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  real-data-review:
+    runs-on: ubuntu-latest
+    # **fork からの PR では走らせない。** シークレットが渡らないので鍵が空になり、
+    # スクリプトは黙って飛ばすだけになる。走らせるだけ無駄なので入口で外す。
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    # 止まったまま6時間待たないための上限。
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 差分を取るために base との共通祖先まで遡れる必要がある。
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: SDK を入れる
+        run: pip install --disable-pip-version-check "anthropic>=1,<2"
+
+      - name: 差分をレビューする
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          # `actions/checkout` が用意するのは PR のマージ先コミットで、
+          # base の追跡ブランチ（origin/main）は無いことがある。
+          git fetch --no-tags origin \
+            "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+          python3 .github/scripts/real_data_review.py --diff "origin/$BASE_REF"

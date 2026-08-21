@@ -56,8 +56,13 @@ TEXT_SUFFIXES = {
 # 並べても素通りするので、名前の側で拾う。ローカルパスが混ざりやすい場所。
 TEXT_NAMES = {".gitignore", ".gitattributes"}
 
-# この検査スクリプト自身は、検査したいパターンを本文に持つので対象外。
-SELF = ".github/scripts/no_real_data.py"
+# 検査スクリプト自身は、検査したいパターンを本文に持つので対象外にする。
+# **ここを増やすのは「そのファイルは検査しない」と決めることなので、**
+# **検査そのものを書いたファイル以外は入れないこと。**
+SELF = (
+    ".github/scripts/no_real_data.py",
+    ".github/scripts/real_data_review.py",
+)
 
 # --- 1. 形式で機密と分かるもの ------------------------------------------
 
@@ -239,7 +244,7 @@ def main() -> int:
     secrets: list[str] = []
     ledger: list[str] = []
     for path in tracked_files():
-        if path == SELF:
+        if path in SELF:
             continue
         lines = read_lines(path)
         if lines is None:
