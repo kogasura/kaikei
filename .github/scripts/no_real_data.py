@@ -184,6 +184,18 @@ def check_real_ledger(path: str, lines: list[str]) -> list[str]:
     return problems
 
 
+# issue/PR 番号（`#156`）と行番号への参照（`foo.rs:123`）。**帳簿の数ではない。**
+#
+# 一覧に出す側だけで落とす。門番（`check_real_ledger`）はこれを見ない——あちらは
+# 拾いすぎる側に倒しておく方が安全で、誤検知には `ci-allow` の逃げ道がある。
+# 一覧のほうには逃げ道が無く、**参照番号で埋まると読まれなくなる**。読まれるのが
+# 仕事なので、そちらだけ黙らせる。
+#
+# 形は厳しく限る。直前が `#` そのもの、または拡張子付きファイル名＋`:` のときだけ。
+# `# 105,600` や `合計: 105,600` のように空白や語を挟むものは落とさない。
+_REFERENCE_BEFORE = re.compile(r"(?:#|\.[A-Za-z0-9]{1,6}:)$")
+
+
 def _interesting_numbers(text: str) -> list[str]:
     """非まるめの数値だけを拾う。丸い数・年・ゾロ目は架空値として自然なので除く。"""
     out = []
@@ -193,6 +205,8 @@ def _interesting_numbers(text: str) -> list[str]:
         if not value.isdigit() or _is_year(raw):
             continue
         if int(value) % 1000 == 0 or len(set(value)) == 1:
+            continue
+        if _REFERENCE_BEFORE.search(text[:found.start()]):
             continue
         out.append(raw)
     return out
