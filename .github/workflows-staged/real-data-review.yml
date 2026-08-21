@@ -59,7 +59,7 @@ jobs:
     steps:
       # スキルと投稿スクリプトをランナーに置くために要る。差分を読むので
       # 履歴も要る（fetch-depth: 1 だと base と比べられない）。
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
