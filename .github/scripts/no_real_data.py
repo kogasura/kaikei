@@ -61,7 +61,7 @@ TEXT_NAMES = {".gitignore", ".gitattributes"}
 # **検査そのものを書いたファイル以外は入れないこと。**
 SELF = (
     ".github/scripts/no_real_data.py",
-    ".github/scripts/real_data_review.py",
+    ".claude/skills/real-data-review/SKILL.md",
 )
 
 # --- 1. 形式で機密と分かるもの ------------------------------------------

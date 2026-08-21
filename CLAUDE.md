@@ -356,9 +356,27 @@ python3 .github/scripts/no_real_data.py --diff origin/main # 差分の数値も�
 という設計にしてある。担当も分けてある——固有名詞は `real-data-review`、鍵・メール・
 住所・「実帳簿」＋数の同居は `no-real-data`。
 
-動かすにはリポジトリのシークレットに `ANTHROPIC_API_KEY` が要る。手元で試すには:
+### 何を見るかはスキルに置く
+
+判断の基準は `.claude/skills/real-data-review/SKILL.md` にある。ワークフローは
+`anthropics/claude-code-action@v1` にそれを `/real-data-review` として渡すだけ。
+**同じものを手元でも走らせられる**（Claude Code で `/real-data-review`）ので、
+基準を変えたいときは PR を出す前に手元で確かめられる。
+
+投稿の機構だけは `.github/scripts/post_review_comment.sh` に固定してある。
+**判断と機構を分ける。** 何を指摘するかはモデルが決めてよいが、コメントを1つに
+保つ手順は決定的でよい——モデルに `gh api` を組み立てさせると、引数を1つ間違えた
+だけで黙って別のことをする。
+
+### 動かすのに要るもの
+
+サブスクリプション（Pro / Max / Team / Enterprise）のトークンを使う。API の
+従量課金ではない。
 
 ```bash
-ANTHROPIC_API_KEY=... python3 .github/scripts/real_data_review.py \
-  --diff origin/main --dry-run   # コメントは投げず、標準出力に出すだけ
+claude setup-token                      # 手元で長期トークンを作る
+gh secret set CLAUDE_CODE_OAUTH_TOKEN   # そのトークンを貼る
 ```
+
+あわせて Claude GitHub App（https://github.com/apps/claude）をこのリポジトリに
+入れておくこと。fork からの PR では走らない（シークレットが渡らないため）。

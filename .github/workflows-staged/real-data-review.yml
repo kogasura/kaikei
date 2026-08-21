@@ -7,9 +7,14 @@
 #   git mv .github/workflows-staged/real-data-review.yml .github/workflows/
 #   git commit -m "実データの自動レビューを置く"
 #
-# 動かす前に、リポジトリのシークレットに `ANTHROPIC_API_KEY` を登録してください:
+# 動かす前に、サブスクリプションのトークンをリポジトリのシークレットに入れて
+# ください（Pro / Max / Team / Enterprise で使えます）:
 #
-#   gh secret set ANTHROPIC_API_KEY
+#   claude setup-token                       # 手元で長期トークンを作る
+#   gh secret set CLAUDE_CODE_OAUTH_TOKEN    # そのトークンを貼る
+#
+# あわせて Claude GitHub App をこのリポジトリに入れておくこと
+# （https://github.com/apps/claude）。
 #
 # **必須チェックには登録しないこと。** 判定がブレるものを門番に据えると、
 # 落ちても「またか」と再実行されるようになり、本物の検出まで一緒に無視される
@@ -24,10 +29,10 @@
 # 正規表現の検査（`no-real-data`）は固有名詞を拾えない——「株式会社ビーテック」が
 # 実在かどうかを denylist 無しにパターンで判定する方法は無く、denylist は置かないと
 # 決めている（CLAUDE.md §15）。実際に見つかった漏洩は種類でいえば大半が固有名詞
-# だったので、そこを埋める。判断の理由は `.github/scripts/real_data_review.py` の
-# 冒頭にある。
+# だったので、そこを埋める。
 #
-# **落とさない。** 鍵が無くても、API が落ちていても、終了コードは 0 のまま。
+# 何を見るか・何を見ないかは `.claude/skills/real-data-review/SKILL.md` にある。
+# **同じものを手元でも走らせられる**（Claude Code で `/real-data-review`）。
 
 name: real-data-review
 
@@ -35,43 +40,50 @@ on:
   # push では走らせない（理由は supply-chain.yml の同じ位置のコメント）。
   pull_request:
 
-# **既定の権限を絞る。** コメントを書くために必要な分だけ与える。
 permissions:
   contents: read
+  # コメントを書くために要る。
   pull-requests: write
+  issues: write
+  # claude-code-action が GitHub App として認証するのに要る。
+  id-token: write
 
 jobs:
   real-data-review:
     runs-on: ubuntu-latest
-    # **fork からの PR では走らせない。** シークレットが渡らないので鍵が空になり、
-    # スクリプトは黙って飛ばすだけになる。走らせるだけ無駄なので入口で外す。
+    # **fork からの PR では走らせない。** public リポジトリでは fork 由来の実行に
+    # シークレットが渡らないので、トークンが空になって失敗するだけになる。
     if: github.event.pull_request.head.repo.full_name == github.repository
     # 止まったまま6時間待たないための上限。
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      # スキルと投稿スクリプトをランナーに置くために要る。差分を読むので
+      # 履歴も要る（fetch-depth: 1 だと base と比べられない）。
+      - uses: actions/checkout@v6
         with:
-          # 差分を取るために base との共通祖先まで遡れる必要がある。
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: SDK を入れる
-        run: pip install --disable-pip-version-check "anthropic>=1,<2"
-
-      - name: 差分をレビューする
+      - name: base の追跡ブランチを用意する
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
-          # `actions/checkout` が用意するのは PR のマージ先コミットで、
-          # base の追跡ブランチ（origin/main）は無いことがある。
           git fetch --no-tags origin \
             "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
-          python3 .github/scripts/real_data_review.py --diff "origin/$BASE_REF"
+
+      - uses: anthropics/claude-code-action@v1
+        env:
+          # 投稿スクリプトが使う。**`github_token` 入力には渡さない**
+          # （渡すと action が GitHub App ではなくこのトークンで認証する）。
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        with:
+          # サブスクリプションのトークン。API キーではない。
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # `prompt` があると自動実行モードになる（`@claude` を待たない）。
+          prompt: "/real-data-review"
+          claude_args: |
+            --model claude-sonnet-5
+            --max-turns 20
