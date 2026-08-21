@@ -1,20 +1,22 @@
-# ★★ このファイルは `.github/workflows/real-data-review.yml` へ移してください ★★
+# ★★ トークンを入れてから `.github/workflows/` へ移してください ★★
 #
-# GitHub が読むのは `.github/workflows/` の下だけなので、**ここに置いてある間は
-# レビューが動きません。** ここに置いてあるのは、この PR を作った資格情報が
-# `.github/workflows/` への書き込み権限を持たなかったためです。
+# **ここに置いてある間はレビューが動きません**（GitHub が読むのは
+# `.github/workflows/` の下だけ）。動かすには次の2つが要ります:
+#
+#   1. Claude GitHub App をこのリポジトリに入れる（https://github.com/apps/claude）
+#   2. サブスクリプションのトークンをリポジトリのシークレットに入れる
+#      （Pro / Max / Team / Enterprise で使える）
+#
+#        claude setup-token                       # 手元で長期トークンを作る
+#        gh secret set CLAUDE_CODE_OAUTH_TOKEN    # そのトークンを貼る
+#
+# **順番を逆にしない。** トークンが無いまま移すと、このジョブは空のトークンで
+# 起動して毎回失敗する（`continue-on-error` で赤は付かないが、レビューは
+# 動いていないのに動いているように見える。そのほうが質が悪い）。
 #
 #   git mv .github/workflows-staged/real-data-review.yml .github/workflows/
+#   rmdir .github/workflows-staged
 #   git commit -m "実データの自動レビューを置く"
-#
-# 動かす前に、サブスクリプションのトークンをリポジトリのシークレットに入れて
-# ください（Pro / Max / Team / Enterprise で使えます）:
-#
-#   claude setup-token                       # 手元で長期トークンを作る
-#   gh secret set CLAUDE_CODE_OAUTH_TOKEN    # そのトークンを貼る
-#
-# あわせて Claude GitHub App をこのリポジトリに入れておくこと
-# （https://github.com/apps/claude）。
 #
 # **必須チェックには登録しないこと。** 判定がブレるものを門番に据えると、
 # 落ちても「またか」と再実行されるようになり、本物の検出まで一緒に無視される
@@ -71,7 +73,11 @@ jobs:
           git fetch --no-tags origin \
             "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
 
+      # **落ちても緑にする。** §14 が「鍵が無くても API が落ちていても終了
+      # コードは 0」と決めている。門番ではないものが赤を出すと、他の赤と
+      # 見分けが付かなくなる。
       - uses: anthropics/claude-code-action@v1
+        continue-on-error: true
         env:
           # 投稿スクリプトが使う。**`github_token` 入力には渡さない**
           # （渡すと action が GitHub App ではなくこのトークンで認証する）。

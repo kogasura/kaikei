@@ -1,7 +1,7 @@
 ---
 name: real-data-review
 description: PR の差分に実在のデータ（事業者名・取引先名・サービス名・人名・実額）が混ざっていないか読み、指摘があるときだけ PR にコメントする。CLAUDE.md §14 / §15 の規律のうち、正規表現では拾えない固有名詞を担当する。
-allowed-tools: Bash(.github/scripts/post_review_comment.sh:*), Bash(git diff:*), Bash(git log:*), Read, Grep, Glob
+allowed-tools: Bash(.github/scripts/post_review_comment.sh:*), Bash(git diff:*), Bash(git log:*), Bash(cat:*), Write, Read, Grep, Glob
 ---
 
 # 実データが混ざっていないか読む

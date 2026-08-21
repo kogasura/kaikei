@@ -1,22 +1,3 @@
-# ★★ このファイルは `.github/workflows/no-real-data.yml` へ移してください ★★
-#
-# GitHub が読むのは `.github/workflows/` の下だけなので、**ここに置いてある間は
-# 検査が動きません。** ここに置いてあるのは、この PR を作った資格情報が
-# `.github/workflows/` への書き込み権限を持たず（git push は `workflow` スコープ
-# 不足で拒否、Contents API と Git Data API はいずれも 404）、正しい場所に
-# 置けなかったためです。
-#
-#   git mv .github/workflows-staged/no-real-data.yml .github/workflows/
-#   rmdir .github/workflows-staged
-#   git commit -m "実データの混入を検査するワークフローを置く"
-#
-# 移したあと、§13 の掟どおり必須チェックにも登録してください:
-#
-#   gh api repos/kogasura/kaikei/branches/main/protection/required_status_checks/contexts \
-#     -X POST -f 'contexts[]=no-real-data'
-#
-# ----------------------------------------------------------------------
-
 # .github/workflows/no-real-data.yml
 #
 # 実データの混入を検査する（CLAUDE.md §14 / §15）。
