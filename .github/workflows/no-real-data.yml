@@ -1,0 +1,47 @@
+# .github/workflows/no-real-data.yml
+#
+# 実データの混入を検査する（CLAUDE.md §14 / §15）。
+#
+# **「実データを検出する」検査ではない。** `105,600` が架空値か実額かは値から
+# 判定できないので、それを名乗る仕組みは作れない。ここが見るのは
+#
+#   1. 形式で機密と分かる文字列（鍵・トークン・メール・住所・ローカルパス）
+#   2. 「実帳簿では〜」と書いて具体的な数を添える**書き方**
+#
+# の2つで、実装と理由は `.github/scripts/no_real_data.py` の冒頭にある。
+# 検査は手元でも同じものを走らせられる（CI で初めて落ちるのを避けるため）:
+#
+#   python3 .github/scripts/no_real_data.py
+
+name: no-real-data
+
+on:
+  # **push では走らせない。PR だけで検査する。**
+  # 理由は supply-chain.yml の同じ位置のコメントに書いてある
+  # （二重起動を避ける／`pull_request` は base にマージした状態を検査するので、
+  #   ブランチ保護の `strict: true` の下では検査済みの状態がそのまま main になる）。
+  pull_request:
+
+jobs:
+  no-real-data:
+    runs-on: ubuntu-latest
+    # 止まったまま6時間待たないための上限。grep 相当の検査なので1分あれば足りる。
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 差分の一覧（この PR が持ち込んだ非まるめの数値）を出すために
+          # base との共通祖先まで遡れる必要がある。
+          fetch-depth: 0
+
+      - name: 実データの混入を検査する
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          # `actions/checkout` が用意するのは PR のマージ先コミットで、
+          # base の**追跡ブランチ**（origin/main）は無いことがある。
+          # refspec を明示して確実に作る（無いと --diff が黙って空になる）。
+          git fetch --no-tags origin \
+            "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+          python3 .github/scripts/no_real_data.py --diff "origin/$BASE_REF"

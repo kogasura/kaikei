@@ -13,6 +13,10 @@
 # `git add -A` で誤ってコミットされる（.gitignore の下の注記を参照）。
 .mcp.json
 
+# CI の検査スクリプトを手元で走らせたときに残る。
+__pycache__/
+*.pyc
+
 *.sqlite
 *.sqlite3
 .DS_Store

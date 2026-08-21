@@ -179,7 +179,7 @@ fn assert_two_rows(rows: &[AuditRow], tool: &str, expected_status: &str) {
 /// `[売上A, 消耗品, 売上B, 取消対象, 赤伝, 二重訂正の対象, 赤伝1, 赤伝2,
 ///   通信費4行, 郵便料金]`。
 ///
-/// # 実帳簿の形（末尾2件）を土台に入れる理由（PR-H レビュー2巡目）
+/// # 検証帳簿の形（末尾2件）を土台に入れる理由（PR-H レビュー2巡目）
 ///
 /// 6件目までは**すべて2行の仕訳**で、
 ///
@@ -285,7 +285,7 @@ async fn post_sample_entries(runtime: &Runtime) -> Vec<String> {
     ids.insert(4, single_reversal);
     ids.extend(double_reversals);
 
-    // ★実帳簿の形★ 仮払消費税等（180）を含む4行仕訳と、その対照になる
+    // ★検証帳簿の形★ 仮払消費税等（180）を含む4行仕訳と、その対照になる
     // 2行仕訳（上の doc）。既存の添字を動かさないよう**末尾に足す**。
     for (entry_date, description, lines) in [
         (

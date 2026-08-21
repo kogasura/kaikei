@@ -328,7 +328,7 @@ mod tests {
 
     /// **本命。** 税込から税額を割り戻す。
     ///
-    /// 実帳簿の課税売上 9,757,440円（税込10%）なら 887,040円。
+    /// 検証帳簿の課税売上 9,757,440円（税込10%）なら 887,040円。
     #[test]
     fn the_tax_is_backed_out_of_a_tax_included_amount() {
         let rate = Ratio::parse_rate("0.10").unwrap();
@@ -464,7 +464,7 @@ mod tests {
         assert_eq!(codes, sorted, "{codes:?}");
     }
 
-    /// **本命。** 実帳簿（2026年）の数字を再現する。
+    /// **本命。** 検証帳簿（2026年）の数字を再現する。
     #[test]
     fn it_reproduces_the_real_book() {
         let lines = vec![
@@ -517,7 +517,7 @@ mod tests {
 
     // **本命。** 納付税額は売上の税額だけで決まる。
     //
-    // 実帳簿（2026年）の売上税額 887,040円 で、2割なら 177,408円。
+    // 検証帳簿（2026年）の売上税額 887,040円 で、2割なら 177,408円。
     // 一般課税は 887,040 − 214,360 = 672,680円 なので、差は 495,272円。
     #[test]
     fn the_twenty_percent_rule_uses_only_the_sales_tax() {

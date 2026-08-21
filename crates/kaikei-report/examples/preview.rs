@@ -7,7 +7,8 @@
 //! **見た目の設計は目で見ないと分からない。** 桁が揃っているか、罫線が細すぎ
 //! ないか、印刷プレビューで見出しが各ページに繰り返されるか——テストが見られる
 //! のは値の一致までである。土台は実際の帳簿に似せてある（桁数の違う金額・
-//! 3行仕訳・長い摘要・赤伝・HTML の特殊文字）。
+//! 3行仕訳・長い摘要・赤伝・HTML の特殊文字）。**並んでいる数は土台の形で
+//! あって帳簿の規模ではない。** ci-allow: real-ledger-mention
 
 use kaikei_app::view::{BalanceRowView, GroupKeyView, TrialBalanceView};
 use kaikei_core::{
