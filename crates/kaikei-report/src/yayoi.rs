@@ -112,15 +112,15 @@ pub fn convert(
             .filter(|line| line.side() == Side::Credit)
             .collect();
 
-        // 借方も貸方も2本以上あると、どう組み合わせるかが決まらない。
-        // **勝手に組み合わせない**——取り込んだ側では元の仕訳が分からなくなる。
+        // 借方も貸方も2本以上ある仕訳（複合仕訳）は、片側を **諸口** にして
+        // 1明細1行に展開する。**勝手に組み合わせない**——借方と貸方を
+        // 総当たりで対応づけると、取り込んだ側では元の仕訳が分からなくなる。
+        // 諸口なら明細がそのまま残り、金額も税区分も動かない。
         if debits.len() > 1 && credits.len() > 1 {
-            out.skipped.push(fail(format!(
-                "借方 {} 本・貸方 {} 本の仕訳は、弥生の「借方1つ＋貸方1つ」への\
-                 割り方が一意に決まりません。手で分けてください",
-                debits.len(),
-                credits.len()
-            )));
+            match compound_rows(entry, chart, tax_map, &date, &description) {
+                Ok(rows) => record(&mut out, entry_no, &description, rows),
+                Err(reason) => out.skipped.push(fail(reason)),
+            }
             continue;
         }
         if debits.is_empty() || credits.is_empty() {
@@ -220,28 +220,121 @@ pub fn convert(
 
         match failed {
             Some(reason) => out.skipped.push(fail(reason)),
-            None => {
-                if half_width_len(&description) > DESCRIPTION_LIMIT_HALF_WIDTH {
-                    out.truncated_descriptions.push(entry_no);
-                }
-                // Shift-JIS に無い文字は置換文字に化ける。**どの仕訳かを
-                // 記録する**——化けたことだけ知らせても直しようがない。
-                let unmappable: String = rows
-                    .iter()
-                    .flat_map(|row| row.iter())
-                    .flat_map(|cell| unmappable_chars(cell).into_iter())
-                    .collect::<std::collections::BTreeSet<char>>()
-                    .into_iter()
-                    .collect();
-                if !unmappable.is_empty() {
-                    out.unmappable_characters.push((entry_no, unmappable));
-                }
-                out.rows.extend(rows);
-            }
+            None => record(&mut out, entry_no, &description, rows),
         }
     }
 
     out
+}
+
+/// 弥生で複合仕訳の相手方に使う科目名。
+///
+/// 弥生は「借方1つ＋貸方1つ」の並びしか取り込めない。借方も貸方も複数ある
+/// 仕訳は、片側をこの科目にして1明細1行に展開する。
+pub const SUSPENSE_ACCOUNT: &str = "諸口";
+
+/// 諸口側に入れる税区分。金額の計算に関わらないので対象外にする。
+const SUSPENSE_TAX_CATEGORY: &str = "対象外";
+
+/// 変換できた行を [`Conversion`] に足す。摘要の長さと Shift-JIS も見る。
+fn record(out: &mut Conversion, entry_no: u32, description: &str, rows: Vec<Vec<String>>) {
+    if half_width_len(description) > DESCRIPTION_LIMIT_HALF_WIDTH {
+        out.truncated_descriptions.push(entry_no);
+    }
+    // Shift-JIS に無い文字は置換文字に化ける。**どの仕訳かを記録する**
+    // ——化けたことだけ知らせても直しようがない。
+    let unmappable: String = rows
+        .iter()
+        .flat_map(|row| row.iter())
+        .flat_map(|cell| unmappable_chars(cell).into_iter())
+        .collect::<std::collections::BTreeSet<char>>()
+        .into_iter()
+        .collect();
+    if !unmappable.is_empty() {
+        out.unmappable_characters.push((entry_no, unmappable));
+    }
+    out.rows.extend(rows);
+}
+
+/// 借方も貸方も2本以上ある仕訳を、諸口を相手にした1明細1行へ展開する。
+///
+/// # なぜ諸口なのか
+///
+/// 借方と貸方を総当たりで対応づけると、**元の仕訳とは別のものになる**。
+/// 借方6本・貸方2本なら組み合わせは何通りもあり、どれを選んでも
+/// 「この費用はこの資金で払った」という嘘が1つ増える。諸口を挟めば
+/// 明細はそのまま残り、金額も税区分も動かない。
+///
+/// 借方の各行は「その科目 / 諸口」、貸方の各行は「諸口 / その科目」に
+/// なる。諸口の借方合計と貸方合計は、仕訳が均衡している限り一致する。
+fn compound_rows(
+    entry: &JournalEntry,
+    chart: &ChartOfAccounts,
+    tax_map: &BTreeMap<String, YayoiCategory>,
+    date: &str,
+    description: &str,
+) -> Result<Vec<Vec<String>>, String> {
+    let total = entry.lines().len();
+    let mut rows = Vec::with_capacity(total);
+
+    for (index, line) in entry.lines().iter().enumerate() {
+        let account = match chart.get(line.account()) {
+            Some(def) => def.name.clone(),
+            None => {
+                return Err(format!(
+                    "科目 {} が勘定科目表にありません",
+                    line.account().as_str()
+                ));
+            }
+        };
+        let tax = tax_category_of(line, chart, tax_map)?;
+        let amount = money_to_plain_string(line.amount());
+
+        let (debit_account, debit_tax, credit_account, credit_tax) = match line.side() {
+            Side::Debit => (
+                account,
+                tax,
+                SUSPENSE_ACCOUNT.to_string(),
+                SUSPENSE_TAX_CATEGORY.to_string(),
+            ),
+            Side::Credit => (
+                SUSPENSE_ACCOUNT.to_string(),
+                SUSPENSE_TAX_CATEGORY.to_string(),
+                account,
+                tax,
+            ),
+        };
+
+        rows.push(vec![
+            flag_for(index, total).to_string(), // A 識別フラグ
+            String::new(),                      // B 伝票No.
+            String::new(),                      // C 決算
+            to_yayoi_date(date),                // D 取引日付
+            debit_account,                      // E 借方勘定科目
+            String::new(),                      // F 借方補助科目
+            String::new(),                      // G 借方部門
+            debit_tax,                          // H 借方税区分
+            amount.clone(),                     // I 借方金額
+            String::new(),                      // J 借方税金額（税込経理なので空）
+            credit_account,                     // K 貸方勘定科目
+            String::new(),                      // L 貸方補助科目
+            String::new(),                      // M 貸方部門
+            credit_tax,                         // N 貸方税区分
+            amount,                             // O 貸方金額
+            String::new(),                      // P 貸方税金額
+            description.to_string(),            // Q 摘要
+            String::new(),                      // R 番号
+            String::new(),                      // S 期日
+            "0".to_string(),                    // T タイプ（0 = 仕訳）
+            String::new(),                      // U 生成元
+            String::new(),                      // V 仕訳メモ
+            String::new(),                      // W 付箋1
+            String::new(),                      // X 付箋2
+            "no".to_string(),                   // Y 調整
+        ]);
+    }
+
+    Ok(rows)
 }
 
 /// 書き出した行を読み直して、科目ごとの借方・貸方を集計する。
@@ -498,6 +591,67 @@ mod tests {
         let row = &result.rows[0];
         assert_eq!(row[4], "地代家賃");
         assert_eq!(row[7], "非課仕入", "費用の明細を売上側の区分で出さないこと");
+    }
+
+    /// 借方も貸方も複数ある仕訳は、諸口を挟んで1明細1行に展開される。
+    ///
+    /// 以前はこの形の仕訳を丸ごと落としていた。**落とすと、弥生に取り込んだ
+    /// 帳簿から金額がまるごと消える**——それでいて他の科目の合計は合った
+    /// ままなので、取り込んだ側では気づけない。
+    #[test]
+    fn a_compound_entry_is_expanded_through_the_suspense_account() {
+        let entries = vec![entry(
+            1,
+            "不動産初期費用",
+            vec![
+                line("615", Side::Debit, 274_190, Some("TAX_FREE")),
+                line("609", Side::Debit, 33_000, Some("PURCHASE_10_QUALIFIED")),
+                line("110", Side::Credit, 200_000, None),
+                line("100", Side::Credit, 107_190, None),
+            ],
+        )];
+
+        let result = convert(&entries, &chart(), &tax_map());
+
+        assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+        assert_eq!(result.rows.len(), 4, "明細の数だけ行が出ること");
+
+        // 借方の明細は「その科目 / 諸口」、貸方は「諸口 / その科目」。
+        assert_eq!(
+            (result.rows[0][4].as_str(), result.rows[0][10].as_str()),
+            ("地代家賃", SUSPENSE_ACCOUNT)
+        );
+        assert_eq!(
+            (result.rows[1][4].as_str(), result.rows[1][10].as_str()),
+            ("消耗品費", SUSPENSE_ACCOUNT)
+        );
+        assert_eq!(
+            (result.rows[2][4].as_str(), result.rows[2][10].as_str()),
+            (SUSPENSE_ACCOUNT, "普通預金")
+        );
+        assert_eq!(
+            (result.rows[3][4].as_str(), result.rows[3][10].as_str()),
+            (SUSPENSE_ACCOUNT, "現金")
+        );
+
+        // 税区分は明細のものが残り、諸口側は対象外になる。
+        assert_eq!(result.rows[0][7], "非課仕入");
+        // 諸口側は「対象外」。**定数と比べない**——定数ごと変えられると
+        // 気づけないので、弥生に取り込まれる名前をそのまま書く。
+        assert_eq!(result.rows[0][13], "対象外");
+        assert_eq!(result.rows[2][7], "対象外");
+
+        // 諸口は借方と貸方が釣り合う。
+        let totals = sum_by_account(&result.rows);
+        let (debit, credit) = totals[SUSPENSE_ACCOUNT];
+        assert_eq!(debit, credit, "諸口が釣り合わないと帳簿と合わない");
+        assert_eq!(debit, 307_190);
+
+        // 元の科目の金額は1円も動かない。
+        assert_eq!(totals["地代家賃"], (274_190, 0));
+        assert_eq!(totals["消耗品費"], (33_000, 0));
+        assert_eq!(totals["普通預金"], (0, 200_000));
+        assert_eq!(totals["現金"], (0, 107_190));
     }
 
     /// 非課税の売上は売上側の区分のままである。
@@ -764,11 +918,12 @@ mod tests {
         assert_eq!(flags, vec!["2110", "2100", "2101"]);
     }
 
-    // YA-4: **本命。** 借方も貸方も2本以上なら変換せず一覧する。
+    // YA-4: **本命。** 借方も貸方も2本以上なら、諸口を挟んで展開する。
     //
-    //       割り方が一意に決まらないので、勝手に組み合わせない。
+    //       借方と貸方を総当たりで対応づけない——割り方が一意に
+    //       決まらないので、どれを選んでも元の仕訳とは別のものになる。
     #[test]
-    fn an_entry_with_many_on_both_sides_is_listed_not_guessed() {
+    fn an_entry_with_many_on_both_sides_is_not_guessed() {
         let entries = vec![entry(
             4,
             "期首残高",
@@ -782,14 +937,23 @@ mod tests {
 
         let result = convert(&entries, &chart(), &tax_map());
 
-        assert!(result.rows.is_empty(), "勝手に組み合わせないこと");
-        assert_eq!(result.skipped.len(), 1);
-        assert_eq!(result.skipped[0].entry_no, 4);
-        assert!(
-            result.skipped[0].reason.contains("一意に決まりません"),
-            "{:?}",
-            result.skipped[0]
-        );
+        assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+        assert_eq!(result.rows.len(), 4);
+
+        // どの行も片側が諸口である＝借方と貸方を直接つないでいない。
+        for row in &result.rows {
+            assert!(
+                row[4] == SUSPENSE_ACCOUNT || row[10] == SUSPENSE_ACCOUNT,
+                "借方と貸方を勝手に組み合わせないこと: {row:?}"
+            );
+        }
+
+        let totals = sum_by_account(&result.rows);
+        assert_eq!(totals[SUSPENSE_ACCOUNT], (300, 300));
+        assert_eq!(totals["現金"], (100, 0));
+        assert_eq!(totals["普通預金"], (200, 0));
+        assert_eq!(totals["売上高"], (0, 150));
+        assert_eq!(totals["通信費"], (0, 150));
     }
 
     // YA-5: **本命。** 写像に無い税区分は変換せず一覧する。

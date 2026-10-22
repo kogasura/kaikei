@@ -82,8 +82,8 @@ sections:
         accounts: ["240"] # 減価償却累計額
       - label: null
         accounts: ["250"] # 敷金・保証金
-      - label: null
-        accounts: []
+      - label: 繰延資産
+        accounts: ["260"]
       - label: null
         accounts: []
       # 期首欄は様式で斜線。
